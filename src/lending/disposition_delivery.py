@@ -7,9 +7,10 @@ a caller changes the result, so a call is never counted twice.
 """
 from __future__ import annotations
 
+import json
 import logging
 from datetime import datetime, timezone
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Mapping, Optional
 from zoneinfo import ZoneInfo
 
 from sqlalchemy import text
@@ -17,14 +18,18 @@ from sqlalchemy import text
 from config.lending_dispositions import (
     BOOKED_CODE,
     DELIVERY_LATENCY_TARGET_SECONDS,
+    AUTO_DIALER_LABEL,
+    AUTO_DIALER_UNKNOWN_CAMPAIGN,
     DNC_CODE,
+    NO_RESULT_YET_LABEL,
+    RECORDING_RECORDED,
     SHEET_COLUMNS,
     SHEET_TIMEZONE,
 )
 from config.settings import get_settings
 from src.lending.cora_inbox import add_to_inbox_in_own_session
 from src.lending.db import lending_session
-from src.lending.dispositions import last4, lookup_load_record
+from src.lending.dispositions import is_no_result, last4, lookup_load_record
 from src.lending.slack_channels import BOT_TOKEN, report_unset
 from src.lending.slack_names import name_and_ref, names_by_phone
 from src.lending.slack_test_filter import log_skipped, hidden_phones
@@ -41,6 +46,46 @@ def _et(dt: Optional[datetime]) -> str:
     return dt.astimezone(ZoneInfo(SHEET_TIMEZONE)).strftime("%Y-%m-%d %H:%M:%S") if dt else ""
 
 
+def _clock_et(dt: Optional[datetime]) -> str:
+    return dt.astimezone(ZoneInfo(SHEET_TIMEZONE)).strftime("%-I:%M %p ET") if dt else ""
+
+
+def _recording_line(row: dict) -> Optional[str]:
+    """The BatchDialer contact link for a recorded call, with the call time (a contact page lists all its calls)."""
+    url = row.get("recording_view_url")
+    if row.get("recording_status") != RECORDING_RECORDED or not url:
+        return None
+    at = _clock_et(row.get("call_started_at") or row.get("call_ended_at"))
+    return f"*Recording:* <{url}|Open in BatchDialer>" + (f" (call at {at})" if at else "")
+
+
+def _campaign_name(row: Mapping[str, Any]) -> Optional[str]:
+    raw = row.get("raw_event")
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw)
+        except ValueError:
+            raw = None
+    campaign = raw.get("campaign") if isinstance(raw, dict) else None
+    return (campaign.get("name") if isinstance(campaign, dict) else None) or row.get("dialer_campaign_id") or None
+
+
+def caller_label(row: Mapping[str, Any]) -> str:
+    """The caller, or for a BatchDialer dial nobody was on, its campaign ("Auto-dialer (Verified maturity)")."""
+    who = row.get("caller_name") or row.get("caller_seat")
+    if who:
+        return str(who)
+    if row.get("call_source", "batchdialer") == "batchdialer":
+        return AUTO_DIALER_LABEL.format(campaign=_campaign_name(row) or AUTO_DIALER_UNKNOWN_CAMPAIGN)
+    return "—"
+
+
+def awaiting_result(row: dict) -> bool:
+    """A connected call the caller left as "Unknown": shown as "No result yet" until a real result arrives."""
+    return row.get("disposition") is None and is_no_result(row.get("disposition_raw")) \
+        and (row.get("talk_duration_sec") or 0) > 0
+
+
 def _yn(flag: bool) -> str:
     return "Y" if flag else "N"
 
@@ -53,17 +98,18 @@ def build_sheet_row(row: dict, now: datetime) -> list[str]:
     return [
         row["dialer_call_id"],
         _et(row["call_started_at"] or row["call_ended_at"]),
-        row["caller_name"] or "",
+        row["caller_name"] or ("" if row["caller_seat"] else caller_label(row).replace("—", "")),
         row["caller_seat"] or "",
         row["queue"] or row["campaign_tag"] or "",
         row["phone"] or "",
-        disposition or row.get("disposition_raw") or "",
+        disposition or (NO_RESULT_YET_LABEL if awaiting_result(row) else row.get("disposition_raw")) or "",
         str(row["talk_duration_sec"] if row["talk_duration_sec"] is not None else ""),
         _yn(booked),
         _yn(disposition == DNC_CODE),
         cause,
         row.get("disposition_list_version") or "",
         _et(now),
+        row.get("recording_view_url") or "",
     ]
 
 
@@ -79,10 +125,15 @@ def build_slack_message(row: dict, record: Optional[dict]) -> tuple[str, list[di
         f"*Property:* {slack_escape(record.get('property_address') or '—')}",
         f"*Phone:* {row['phone'] or '—'}",
         f"*Queue:* {row['queue'] or row['campaign_tag'] or '—'}",
-        f"*Caller:* {row['caller_name'] or row['caller_seat'] or '—'}",
+        f"*Caller:* {slack_escape(caller_label(row))}",
         f"*Talk time:* {row['talk_duration_sec'] if row['talk_duration_sec'] is not None else '—'} s",
     ]
-    if disposition is None:
+    recording = _recording_line(row)
+    if recording:
+        lines.append(recording)
+    if disposition is None and awaiting_result(row):
+        title = f":grey_question: {NO_RESULT_YET_LABEL} — set the call result in BatchDialer"
+    elif disposition is None:
         title = ":arrows_counterclockwise: Result removed — waiting for a new result"
     elif disposition == BOOKED_CODE and row.get("booking_blocked"):
         title = ":warning: BOOKED on a nurture-only list — not counted as a booking"
@@ -216,11 +267,17 @@ def _deliver_locked(row_id: int, session_factory: Callable, slack_client: Any, s
         if not row:
             return
         row = dict(row)
-        if row["sheet_synced_disposition"] != row["disposition"] and (sheets_service or _configured_sheet()):
+        # Delivered (or deliberately skipped) = its *_at marker is set. The data fix sets both on calls from before
+        # the fix, so no old call is posted; a failed delivery keeps retrying whether or not the alert has run.
+        awaiting = awaiting_result(row)
+        sheet_behind = row["sheet_synced_disposition"] != row["disposition"] or (awaiting and not row.get("sheet_synced_at"))
+        if sheet_behind and (sheets_service or _configured_sheet()):
             _deliver_sheet(db, row, sheets_service)
-        # A removed result only needs Slack when an earlier post exists to update.
+        # A removed result only needs Slack when an earlier post exists to update; a call awaiting its result is
+        # posted once as "No result yet" and that post is updated when the result arrives.
         slack_behind = row["slack_posted_disposition"] != row["disposition"]
-        slack_needed = slack_behind and (row["disposition"] or row["slack_ts"])
+        slack_needed = ((slack_behind and (row["disposition"] or row["slack_ts"]))
+                        or (awaiting and not row["slack_ts"] and not row.get("slack_posted_at")))
         if slack_needed and (slack_client or _configured_slack()):
             _deliver_slack(db, row, slack_client)
         elif slack_needed:
@@ -246,7 +303,8 @@ def _deliver_sheet(db, row: dict, service: Any) -> None:
 def _deliver_slack(db, row: dict, client: Any) -> None:
     if row["phone"] in hidden_phones(db, [row["phone"]]):
         # Marked delivered with no post (slack_ts stays NULL), so the retry job does not pick it up again.
-        db.execute(text("UPDATE lending.call_dispositions SET slack_posted_disposition = :d WHERE id = :id"),
+        db.execute(text("UPDATE lending.call_dispositions SET slack_posted_disposition = :d, "
+                        "slack_posted_at = COALESCE(slack_posted_at, now()) WHERE id = :id"),
                    {"d": row["disposition"], "id": row["id"]})
         db.commit()
         log_skipped("disposition card", f"call {row['dialer_call_id']}")

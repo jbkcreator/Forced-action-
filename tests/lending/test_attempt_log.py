@@ -23,9 +23,10 @@ LEAD = LeadRef(lead_id=7, vendor_lead_id="LF-7", phone="+18135550123", received_
 
 def call(minutes: int, *, direction: str = "outbound", disposition: str | None = "NO_ANSWER", talk: int = 0,
          source: str = "batchdialer", recording_status: str | None = None, recording_ref: str | None = None,
-         raw: str | None = None, call_id: str | None = None) -> CallRow:
+         raw: str | None = None, call_id: str | None = None, view_url: str | None = None) -> CallRow:
     return CallRow(at=T0 + timedelta(minutes=minutes), direction=direction, disposition=disposition,
-                   disposition_raw=raw, talk_sec=talk, call_source=source, recording_status=recording_status, recording_ref=recording_ref, call_id=call_id)
+                   disposition_raw=raw, talk_sec=talk, call_source=source, recording_status=recording_status,
+                   recording_ref=recording_ref, call_id=call_id, recording_view_url=view_url)
 
 
 def message(minutes: int, *, kind: str = "TYPE_SMS", direction: str = "outbound", source: str | None = "workflow",
@@ -87,7 +88,7 @@ def test_bad_number_and_wrong_person_are_flagged() -> None:
 def test_raw_dialer_results_are_mapped_to_our_codes() -> None:
     log = build_attempt_log(LEAD, [call(5, disposition=None, raw="Answering Machine"),
                                    call(9, disposition=None, raw="DISCONNECTED_NUMBER")], [])
-    assert [a.channel for a in log.attempts] == ["voicemail", "call"]
+    assert [a.channel for a in log.attempts] == ["call", "call"]  # a machine hang-up left no voicemail
     assert log.bad_number
 
 
@@ -102,9 +103,12 @@ def test_an_inbound_call_counts_as_a_reply_even_when_missed() -> None:
 
 
 def test_call_rows_carry_the_recording_state() -> None:
-    log = build_attempt_log(LEAD, [call(5, recording_status="readable", recording_ref="rec-1"), call(9)], [])
-    assert [a.recording for a in log.attempts] == ["readable", ""]
-    assert [a.recording_url for a in log.attempts] == ["rec-1", ""]
+    """BatchDialer's own recording link answers 404, so the link shown is the contact page where recordings play."""
+    view = "https://app.batchdialer.com/contacts/view/559662160"
+    log = build_attempt_log(LEAD, [call(5, talk=48, recording_status="recorded", recording_ref="rec-1", view_url=view),
+                                   call(9, recording_status="none")], [])
+    assert [a.recording for a in log.attempts] == ["recorded", "none"]
+    assert [a.recording_url for a in log.attempts] == [view, ""]
 
 
 def test_csv_has_one_row_per_attempt_and_no_full_phone() -> None:

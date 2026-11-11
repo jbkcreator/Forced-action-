@@ -94,7 +94,7 @@ def test_unanswered_call_queues_one_text_signal_per_contact_per_day(lending_db):
     d.record_dialer_event(lending_db, _ev("c1", duration=0, disposition_raw="No Answer"))  # replay
     rows = lending_db.execute(text("SELECT dialer_call_id, status FROM lending.missed_call_events ORDER BY 1")).all()
     assert [tuple(r) for r in rows] == [("c1", "pending"), ("c2", "duplicate_day")]
-    assert _row(lending_db, "c2")["disposition"] == "LEFT_VOICEMAIL"
+    assert _row(lending_db, "c2")["disposition"] == "NO_ANSWER"  # a machine hang-up left no voicemail
 
 
 def test_unanswered_without_any_disposition_still_counts(lending_db):
@@ -167,14 +167,24 @@ def test_recording_reference_and_disclosure_are_stored_only_when_sent(lending_db
     assert _row(lending_db, "c2")["recording_disclosure_logged"] is False
 
 
-def test_new_recording_enters_the_check_and_no_recording_stays_null(lending_db):
-    d.record_dialer_event(lending_db, _ev(recording_ref="https://x/rec"))
-    d.record_dialer_event(lending_db, _ev("c2"))
-    assert _row(lending_db)["recording_status"] == "pending"
-    assert _row(lending_db, "c2")["recording_status"] is None
-    lending_db.execute(text("UPDATE lending.call_dispositions SET recording_status = 'readable' WHERE dialer_call_id = 'c1'"))
-    d.record_dialer_event(lending_db, _ev(recording_ref="https://x/rec"))
-    assert _row(lending_db)["recording_status"] == "readable"
+def test_recording_status_follows_talk_time_and_the_dialer_flag(lending_db):
+    d.record_dialer_event(lending_db, _ev(recording_ref="https://x/rec", recording_enabled=True, contact_id="559662160"))
+    d.record_dialer_event(lending_db, _ev("c2", duration=0, recording_enabled=True))
+    d.record_dialer_event(lending_db, _ev("c3", recording_enabled=False))
+    row = _row(lending_db)
+    assert row["recording_status"] == "recorded"
+    assert row["recording_view_url"] == "https://app.batchdialer.com/contacts/view/559662160"
+    assert _row(lending_db, "c2")["recording_status"] == "none" and _row(lending_db, "c2")["recording_view_url"] is None
+    assert _row(lending_db, "c3")["recording_status"] == "none"
+
+
+def test_rescan_keeps_the_view_url_and_upgrades_none_to_recorded(lending_db):
+    d.record_dialer_event(lending_db, _ev(duration=0, contact_id="559662160"))
+    assert _row(lending_db)["recording_status"] == "none"
+    d.record_dialer_event(lending_db, _ev(duration=48, contact_id=None))
+    row = _row(lending_db)
+    assert row["recording_status"] == "recorded"
+    assert row["recording_view_url"] == "https://app.batchdialer.com/contacts/view/559662160"
 
 
 def test_campaign_id_is_stored_and_a_later_event_without_one_keeps_it(lending_db):
@@ -326,3 +336,46 @@ def test_abandoned_call_is_logged_as_no_answer_but_never_queued_for_the_missed_c
     assert _row(lending_db, "ab1")["disposition"] == "NO_ANSWER"
     queued = lending_db.execute(text("SELECT dialer_call_id FROM lending.missed_call_events")).scalars().all()
     assert queued == ["na1"]
+
+
+def test_unknown_with_talk_time_keeps_the_raw_result(lending_db):
+    recorded = d.record_dialer_event(lending_db, _ev(duration=288, disposition_raw="Unknown"))
+    row = _row(lending_db)
+    assert row["disposition"] is None and row["disposition_raw"] == "Unknown" and recorded.unknown_code is None
+
+
+def test_unknown_then_real_result_replaces_no_answer(lending_db):
+    d.record_dialer_event(lending_db, _ev(duration=0, disposition_raw="Unknown"))
+    assert _row(lending_db)["disposition"] == "NO_ANSWER"
+    d.record_dialer_event(lending_db, _ev(duration=0, disposition_raw="CALLBACK_REQUESTED"))
+    assert _row(lending_db)["disposition"] == "CALLBACK_REQUESTED"
+
+
+def test_unknown_gaining_talk_time_clears_the_automatic_no_answer(lending_db):
+    """0 s "Unknown" -> NO_ANSWER; the corrected CDR with talk time is a connected call awaiting its result."""
+    d.record_dialer_event(lending_db, _ev(duration=0, disposition_raw="Unknown"))
+    assert _row(lending_db)["disposition"] == "NO_ANSWER"
+    d.record_dialer_event(lending_db, _ev(duration=48, disposition_raw="Unknown"))
+    row = _row(lending_db)
+    assert row["disposition"] is None and row["disposition_raw"] == "Unknown" and row["disposition_at"] is not None
+
+
+def test_sparse_event_after_a_connected_unknown_call_keeps_it_awaiting(lending_db):
+    """A later event with no duration must not turn a connected "Unknown" call into NO_ANSWER."""
+    d.record_dialer_event(lending_db, _ev(duration=48, disposition_raw="Unknown"))
+    d.record_dialer_event(lending_db, _ev(duration=None, disposition_raw="Unknown"))
+    row = _row(lending_db)
+    assert row["disposition"] is None and row["talk_duration_sec"] == 48
+
+
+def test_caller_picked_no_answer_is_never_cleared(lending_db):
+    d.record_dialer_event(lending_db, _ev(duration=0, disposition_raw="No Answer"))
+    d.record_dialer_event(lending_db, _ev(duration=48, disposition_raw="Unknown"))
+    assert _row(lending_db)["disposition"] == "NO_ANSWER"
+
+
+def test_rescan_keeps_no_answer_for_unknown(lending_db):
+    d.record_dialer_event(lending_db, _ev(duration=0, disposition_raw="Unknown"))
+    d.record_dialer_event(lending_db, _ev(duration=0, disposition_raw="Unknown"))
+    rows = lending_db.execute(text("SELECT disposition FROM lending.call_dispositions WHERE dialer_call_id = 'c1'")).all()
+    assert [r[0] for r in rows] == ["NO_ANSWER"]

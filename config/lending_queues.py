@@ -24,6 +24,10 @@ BUILDERS = "builders"
 PARTNERS = "partners"
 WHOLESALERS = "wholesalers"
 NURTURE = "nurture"
+# Pools whose leads asked to hear from us (a form or a lead vendor): their first-contact snapshot is marked warm.
+LENDINGFLOW_POOL = "lendingflow"
+WEBSITE_POOL = "website"
+WARM_POOLS = frozenset({LENDINGFLOW_POOL, WEBSITE_POOL})
 
 SOURCE_TAG_QUEUES: dict[str, str] = {
     "list_1": VERIFIED_MATURITY, "list_5": VERIFIED_MATURITY, "list_8": VERIFIED_MATURITY,

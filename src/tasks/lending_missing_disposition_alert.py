@@ -1,7 +1,8 @@
 """Warn #dial-tasks about connected calls that never got a disposition (brief §3:
 "a skipped disposition is a missed shift"). One warning per call, cron every 5 minutes.
 
-* BatchDialer calls: no disposition and no raw result after LENDING_DISPOSITION_MISSING_ALERT_MINUTES
+* BatchDialer calls: no disposition and no raw result, or BatchDialer's placeholder "Unknown" (the caller picked no
+  result), after LENDING_DISPOSITION_MISSING_ALERT_MINUTES
 * GHL calls (G3): outbound, connected, no outcome attached after GHL_MISSING_DISPOSITION_GRACE_MINUTES (the GHL
   import runs every 15 minutes, so the grace is longer). Only calls ended at/after LENDING_GHL_OUTCOMES_LIVE_SINCE:
   unset = GHL calls are not flagged, so calls from before the GHL disposition workflow existed are never reported.
@@ -19,6 +20,7 @@ from typing import Any, Optional
 from sqlalchemy import text
 
 from config.lending_dispositions import (
+    DIALER_NO_RESULT,
     GHL_DISPOSITION_ALERT_BATCH,
     GHL_DISPOSITION_UNMATCHED_ALERT_HOURS,
     GHL_MISSING_DISPOSITION_GRACE_MINUTES,
@@ -33,7 +35,8 @@ from src.lending.slack_test_filter import log_skipped, hidden_phones
 
 logger = logging.getLogger(__name__)
 
-_BATCHDIALER = ("(call_source = 'batchdialer' AND disposition IS NULL AND disposition_raw IS NULL "
+_BATCHDIALER = ("(call_source = 'batchdialer' AND disposition IS NULL "
+                "AND (disposition_raw IS NULL OR upper(btrim(disposition_raw)) = :no_result) "
                 "AND call_ended_at < now() - make_interval(mins => :m))")
 _GHL = ("(call_source = 'ghl' AND direction = 'outbound' AND disposition IS NULL "
         "AND call_ended_at >= :ghl_since AND call_ended_at < now() - make_interval(mins => :ghl_m))")
@@ -51,7 +54,7 @@ _CLAIM_UNMATCHED = text(
 def _claim_missing(minutes: int) -> list[tuple]:
     ghl_since = getattr(get_settings(), "lending_ghl_outcomes_live_since", None)
     sources = f"({_BATCHDIALER} OR {_GHL})" if ghl_since else _BATCHDIALER
-    params: dict[str, Any] = {"m": minutes}
+    params: dict[str, Any] = {"m": minutes, "no_result": DIALER_NO_RESULT}
     if ghl_since:
         params.update(ghl_m=GHL_MISSING_DISPOSITION_GRACE_MINUTES, ghl_since=ghl_since)
     with lending_session() as db:

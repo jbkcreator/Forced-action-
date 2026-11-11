@@ -41,7 +41,9 @@ UNANSWERED_CODES = frozenset({"NO_ANSWER", "LEFT_VOICEMAIL"})
 SYSTEM_DISPOSITION_ALIASES: dict[str, str] = {
     "NO_ANSWER": "NO_ANSWER",
     "BUSY": "NO_ANSWER",
-    "ANSWERING_MACHINE": "LEFT_VOICEMAIL",
+    # The dialer detected a machine and hung up: nobody left a voicemail (0 s, no voicemailid on every such CDR,
+    # checked 2026-11-10). NO_ANSWER keeps the 10-result list; disposition_raw keeps "Answering Machine".
+    "ANSWERING_MACHINE": "NO_ANSWER",
     "DISCONNECTED_NUMBER": "BAD_NUMBER",
     "DO_NOT_CALL": "DNC_REQUEST",
     "NOT_INTERESTED": "CONNECTED_NOT_INTERESTED",
@@ -55,6 +57,17 @@ SYSTEM_DISPOSITION_ALIASES: dict[str, str] = {
     "VOICEMAIL": "LEFT_VOICEMAIL",
 }
 ABANDONED_RESULT = "ABANDONED"
+# BatchDialer's placeholder Call Result when the caller picked none: stored raw, but it is no disposition, so a
+# connected call carrying it still gets the missing-disposition alert.
+DIALER_NO_RESULT = "UNKNOWN"
+NO_ANSWER_CODE = "NO_ANSWER"
+NO_RESULT_YET_LABEL = "No result yet"
+# A BatchDialer dial no caller was on (predictive mode attaches an agent only to a bridged call): shown under its
+# campaign, never credited to a person.
+AUTO_DIALER_LABEL = "Auto-dialer ({campaign})"
+AUTO_DIALER_UNKNOWN_CAMPAIGN = "unknown campaign"
+# A connected "Unknown" call is posted as "No result yet" only while this recent, so a deploy never posts old calls.
+NO_RESULT_POST_MAX_AGE_HOURS = 24
 
 # Unfunded-cause tags (brief §2.7). Required values for every unfunded outcome.
 CAUSE_TAGS = frozenset({
@@ -159,12 +172,17 @@ HOURLY_POST_HOURS_ET = tuple(range(10, 20))
 SHEET_COLUMNS = (
     "Call ID", "Date/Time (ET)", "Caller", "Caller Seat", "Queue", "Borrower Phone",
     "Disposition", "Talk Duration (sec)", "Booked (caller-reported)", "DNC (Y/N)",
-    "Unfunded Cause (provisional)", "Disposition List Version", "Updated At (ET)",
+    "Unfunded Cause (provisional)", "Disposition List Version", "Updated At (ET)", "Recording (BatchDialer)",
 )
 SHEET_TIMEZONE = "America/New_York"
 
-RECORDING_RETRY_MINUTES = 30  # a forbidden/pending recording is rechecked this often, never given up on
-RECORDING_BATCH_LIMIT = 50
+# Recording state of a BatchDialer call, set when the call is stored. BatchDialer's recording link answers 404 to an
+# API key for every call (checked 2026-11-10), so it cannot tell us whether a recording exists: a call with talk time
+# on a campaign that records (CDR ``recordingenabled``) is recorded, anything else has none.
+RECORDING_RECORDED = "recorded"
+RECORDING_NONE = "none"
+# The BatchDialer contact page, where the contact's call recordings can be played (there is no per-recording link).
+DIALER_CONTACT_VIEW_URL = "https://app.batchdialer.com/contacts/view/{contact_id}"
 
 DELIVERY_LATENCY_TARGET_SECONDS = 30  # spec §12: disposition -> Sheet + Slack
 RETRY_MIN_AGE_SECONDS = 60            # let the request's own background task finish first
@@ -187,6 +205,7 @@ EVENT_FIELD_CANDIDATES: dict[str, tuple[str, ...]] = {
     "duration": ("duration", "talk_duration", "talkTime", "billsec"),
     "disposition": ("disposition", "call_result", "callResult", "result", "disposition_name"),
     "recording": ("callRecordUrl", "recording_url", "recordingUrl", "recording"),
+    "recording_enabled": ("recordingenabled", "recording_enabled"),
     "disclosure": ("recording_disclosure", "disclosure_played"),
 }
 

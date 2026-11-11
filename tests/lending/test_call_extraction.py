@@ -69,6 +69,13 @@ def test_empty_transcript_skips_the_model():
     call.assert_not_called()
 
 
+def test_empty_tool_input_is_an_empty_extraction():
+    """Claude answers {} for a voicemail or a call with nothing to record: a done extraction, not a failure."""
+    result, call = _extract({})
+    assert result == CallExtraction()
+    call.assert_called_once()
+
+
 def test_blocked_model_call_raises_instead_of_storing_empty():
     with pytest.raises(RuntimeError):
         _extract(None)

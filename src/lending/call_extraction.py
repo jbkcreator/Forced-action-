@@ -179,7 +179,9 @@ def extract_call_fields(transcript: str, *, today: date, db=None) -> CallExtract
 
     Raises RuntimeError when the model returns no structured output (for
     example while the vendor-cost pause blocks calls), so a blocked call is
-    never stored as an empty extraction.
+    never stored as an empty extraction. An empty tool input ``{}`` is a real
+    answer (a voicemail or a short call with nothing to record) and gives an
+    empty extraction.
     """
     from src.services.claude_router import call_claude_with_usage
 
@@ -201,7 +203,7 @@ def extract_call_fields(transcript: str, *, today: date, db=None) -> CallExtract
         db=db,
     )
     tool_input = result.get("tool_input")
-    if not tool_input:
+    if tool_input is None:
         raise RuntimeError("call extraction returned no structured output")
     try:
         extraction = CallExtraction.model_validate(tool_input)

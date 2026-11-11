@@ -146,7 +146,8 @@ class _BoardDb:
 def test_caller_key_labels_the_shared_seat():
     key = sb._KEYS["caller"]
     assert "CASE WHEN caller_seat = '118131' THEN 'BatchDialer (shared seat)'" in key
-    assert "COALESCE(NULLIF(caller_name, ''), NULLIF(caller_seat, ''), '(unknown)')" in key
+    assert "COALESCE(NULLIF(caller_name, ''), NULLIF(caller_seat, ''), CASE WHEN call_source = 'batchdialer'" in key
+    assert "ELSE '(unknown)' END)" in key  # a dial no caller was on shows its campaign: "Auto-dialer (<campaign>)"
 
 
 def test_gated_and_nurture_count_nurture_only_with_gate_failed():

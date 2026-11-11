@@ -57,7 +57,8 @@ def main(argv=None, *, now: Optional[datetime] = None) -> int:
     try:
         with lending_session() as db:
             activity = build_activity(db, day, user_id=user_id, flagged_tag=s.lending_flagged_tag.strip(), get=get,
-                                      post=post, base=_GHL_BASE, headers=headers, location_id=account.location_id)
+                                      post=post, base=_GHL_BASE, headers=headers, location_id=account.location_id,
+                                      bd_agent_id=s.lending_david_bd_agent_id.strip())
         message = format_slack(activity, lambda cid: ghl_contact_url(s.lending_ghl_app_url, account.location_id, cid))
         if args.dry_run:
             logger.info("[lending-david] dry run for %s:\n%s", day, message)

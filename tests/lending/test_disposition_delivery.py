@@ -79,7 +79,7 @@ def test_changed_result_updates_the_same_row_in_place():
     service, values = _sheets([["Call ID"], ["other"], ["c1"]])
     dd.sync_sheet(_row(disposition="DNC_REQUEST"), service, NOW)
     values.append.assert_not_called()
-    assert values.update.call_args.kwargs["range"] == "Dispositions!A3:M3"
+    assert values.update.call_args.kwargs["range"] == "Dispositions!A3:N3"
 
 
 def test_empty_sheet_gets_a_header_first():
@@ -318,3 +318,151 @@ def test_dnc_alerts_name_the_borrower_in_the_post_and_in_coras_inbox(inbox_write
     # The inbox escapes summaries when it posts them, so the name is stored unescaped (no double escaping).
     assert event["summary"].startswith(f"{starts}Pat <Doe> (call c9)")
     assert json.loads(event["payload"])["borrower"] == "Pat <Doe>"
+
+
+# ── Recording link ──────────────────────────────────────────────────────────
+
+VIEW = "https://app.batchdialer.com/contacts/view/559662160"
+
+
+def _section_text(row):
+    _text, blocks = dd.build_slack_message(row, None)
+    return blocks[1]["text"]["text"]
+
+
+def test_slack_post_links_the_recording_when_recorded():
+    text = _section_text(_row(recording_status="recorded", recording_view_url=VIEW,
+                              call_started_at=datetime(2026, 11, 4, 14, 34, tzinfo=timezone.utc)))
+    assert f"<{VIEW}|Open in BatchDialer>" in text and "(call at 9:34 AM ET)" in text
+
+
+def test_slack_post_has_no_recording_line_without_talk_time():
+    assert "Recording" not in _section_text(_row(recording_status="none", recording_view_url=VIEW, talk_duration_sec=0))
+
+
+def test_sheet_row_ends_with_the_view_url():
+    line = dd.build_sheet_row(_row(recording_view_url=VIEW), NOW)
+    assert line[-1] == VIEW and len(line) == len(SHEET_COLUMNS) and SHEET_COLUMNS[-1] == "Recording (BatchDialer)"
+
+
+# ── Connected call left as "Unknown" ────────────────────────────────────────
+
+def _awaiting(**over):
+    return _row(disposition=None, disposition_raw="Unknown", talk_duration_sec=288, **over)
+
+
+def test_unknown_connected_call_is_posted_once_as_no_result_yet(monkeypatch):
+    monkeypatch.setattr(dd, "lookup_load_record", lambda *a, **k: None)
+    sheets, values = _sheets([])
+    slack = MagicMock()
+    slack.chat_postMessage.return_value = {"ts": "1.1"}
+    factory, _ = _factory(_awaiting(sheet_synced_at=None))
+
+    dd.deliver_disposition(1, session_factory=factory, slack_client=slack, sheets_service=sheets)
+
+    assert "No result yet" in slack.chat_postMessage.call_args.kwargs["text"]
+    assert values.append.call_args.kwargs["body"]["values"][0][6] == "No result yet"
+
+    slack.reset_mock()
+    values.reset_mock()
+    factory, _ = _factory(_awaiting(slack_ts="1.1", sheet_synced_at=NOW))
+    dd.deliver_disposition(1, session_factory=factory, slack_client=slack, sheets_service=sheets)
+    slack.chat_postMessage.assert_not_called()
+    slack.chat_update.assert_not_called()
+    values.append.assert_not_called()
+
+
+def test_real_result_updates_the_no_result_yet_post(monkeypatch):
+    monkeypatch.setattr(dd, "lookup_load_record", lambda *a, **k: None)
+    sheets, _ = _sheets([])
+    slack = MagicMock()
+    factory, _ = _factory(_row(disposition="CALLBACK_REQUESTED", disposition_raw="Call Back", slack_ts="1.1",
+                               sheet_synced_at=NOW))
+    dd.deliver_disposition(1, session_factory=factory, slack_client=slack, sheets_service=sheets)
+    slack.chat_postMessage.assert_not_called()
+    assert slack.chat_update.call_args.kwargs["ts"] == "1.1"
+
+
+def test_unknown_call_with_no_talk_time_is_not_awaiting_a_result():
+    assert not dd.awaiting_result(_row(disposition=None, disposition_raw="Unknown", talk_duration_sec=0))
+    assert dd.awaiting_result(_awaiting())
+
+
+def test_retry_picks_up_only_recent_no_result_calls(monkeypatch):
+    from src.tasks import lending_disposition_delivery_retry as task
+
+    seen = []
+
+    class _Db:
+        def execute(self, sql, params):
+            seen.append((" ".join(str(sql).split()), params))
+            return MagicMock(all=lambda: [])
+
+    @contextmanager
+    def session():
+        yield _Db()
+
+    monkeypatch.setattr(task, "lending_session", session)
+    task.behind_row_ids()
+    sql, params = seen[0]
+    assert "upper(btrim(disposition_raw)) = :no_result" in sql and "make_interval(hours => :max_age_h)" in sql
+    assert params["no_result"] == "UNKNOWN" and params["max_age_h"] == 24
+    # retries continue after the alert; only the delivery markers say a destination is done
+    assert "disposition_missing_alerted_at" not in sql
+    assert "(slack_ts IS NULL AND slack_posted_at IS NULL) OR sheet_synced_at IS NULL" in sql
+
+
+# ── Caller label for dials no caller was on ─────────────────────────────────
+
+def test_caller_label_names_the_campaign_for_a_dial_with_no_agent():
+    row = _row(caller_name=None, caller_seat=None, call_source="batchdialer",
+               raw_event={"campaign": {"id": 384315, "name": "Verified maturity"}})
+    assert dd.caller_label(row) == "Auto-dialer (Verified maturity)"
+    assert dd.caller_label({**row, "raw_event": json.dumps(row["raw_event"])}) == "Auto-dialer (Verified maturity)"
+    assert dd.build_sheet_row(row, NOW)[2] == "Auto-dialer (Verified maturity)"
+    assert "*Caller:* Auto-dialer (Verified maturity)" in _section_text(row)
+
+
+def test_caller_label_prefers_the_agent():
+    assert dd.caller_label(_row(caller_name="David Willis")) == "David Willis"
+
+
+def test_caller_label_falls_back_to_the_campaign_id_then_unknown():
+    assert dd.caller_label(_row(caller_name=None, caller_seat=None, raw_event=None,
+                                dialer_campaign_id="384315")) == "Auto-dialer (384315)"
+    assert dd.caller_label(_row(caller_name=None, caller_seat=None)) == "Auto-dialer (unknown campaign)"
+
+
+def test_caller_label_for_a_ghl_call_with_no_user_is_a_dash():
+    assert dd.caller_label(_row(caller_name=None, caller_seat=None, call_source="ghl")) == "—"
+
+
+def test_call_from_before_the_fix_is_never_posted(monkeypatch):
+    """The data fix marks old connected "Unknown" calls handled (slack_posted_at / sheet_synced_at, no slack_ts)."""
+    monkeypatch.setattr(dd, "lookup_load_record", lambda *a, **k: None)
+    sheets, values = _sheets([])
+    slack = MagicMock()
+    factory, _ = _factory(_awaiting(sheet_synced_at=NOW, slack_posted_at=NOW, disposition_missing_alerted_at=NOW))
+    dd.deliver_disposition(1, session_factory=factory, slack_client=slack, sheets_service=sheets)
+    slack.chat_postMessage.assert_not_called()
+    values.append.assert_not_called()
+
+
+def test_failed_delivery_still_retries_after_the_missing_result_alert(monkeypatch):
+    """Slack and the Sheet fail, the alert runs, then both recover: the "No result yet" entry is still delivered."""
+    monkeypatch.setattr(dd, "lookup_load_record", lambda *a, **k: None)
+    sheets, values = _sheets([])
+    values.append.side_effect = RuntimeError("quota")
+    slack = MagicMock()
+    slack.chat_postMessage.side_effect = RuntimeError("slack down")
+    factory, _ = _factory(_awaiting(sheet_synced_at=None, slack_posted_at=None))
+    dd.deliver_disposition(1, session_factory=factory, slack_client=slack, sheets_service=sheets)
+
+    values.append.side_effect, slack.chat_postMessage.side_effect = None, None
+    slack.chat_postMessage.return_value = {"ts": "1.1"}
+    factory, db = _factory(_awaiting(sheet_synced_at=None, slack_posted_at=None, disposition_missing_alerted_at=NOW))
+    dd.deliver_disposition(1, session_factory=factory, slack_client=slack, sheets_service=sheets)
+    assert "No result yet" in slack.chat_postMessage.call_args.kwargs["text"]
+    assert values.append.call_args.kwargs["body"]["values"][0][6] == "No result yet"
+    updates = [str(c.args[0]) for c in db.execute.call_args_list if "UPDATE" in str(c.args[0])]
+    assert any("sheet_synced_at" in u for u in updates) and any("slack_posted_at" in u for u in updates)

@@ -93,7 +93,8 @@ def test_missing_alert_covers_connected_outbound_ghl_calls_after_their_own_grace
     alert.run(slack_client=_Slack(), minutes=10)
     sql, params = next((s, p) for s, p in db.sql if "disposition_missing_alerted_at = now()" in s)
     # BatchDialer rule unchanged
-    assert "call_source = 'batchdialer' AND disposition IS NULL AND disposition_raw IS NULL" in sql
+    assert ("call_source = 'batchdialer' AND disposition IS NULL "
+            "AND (disposition_raw IS NULL OR upper(btrim(disposition_raw)) = :no_result)") in sql
     # GHL: outbound only, disposition_raw is always "ghl:<status>" so it is not required to be NULL
     assert "call_source = 'ghl' AND direction = 'outbound' AND disposition IS NULL" in sql
     assert "call_ended_at >= :ghl_since" in sql
@@ -109,7 +110,21 @@ def test_ghl_calls_are_not_flagged_until_the_outcome_workflow_is_live(alert, mon
     monkeypatch.setattr(alert, "lending_session", _session(db))
     alert.run(slack_client=_Slack(), minutes=10)
     sql, params = next((s, p) for s, p in db.sql if "disposition_missing_alerted_at = now()" in s)
-    assert "call_source = 'ghl'" not in sql and params == {"m": 10}
+    assert "call_source = 'ghl'" not in sql and params == {"m": 10, "no_result": "UNKNOWN"}
+
+
+def test_missing_alert_covers_batchdialer_unknown_result(alert, monkeypatch):
+    """BatchDialer stores "Unknown" when the caller picked no result: that connected call still gets the alert."""
+    from config.settings import get_settings
+
+    monkeypatch.setattr(get_settings(), "lending_ghl_outcomes_live_since", None, raising=False)
+    db = _Db([("disposition_missing_alerted_at = now()", [("1223365079", "118924", "David Willis", "+15550001111")])])
+    monkeypatch.setattr(alert, "lending_session", _session(db))
+    slack = _Slack()
+    assert alert.run(slack_client=slack, minutes=10) == 1
+    sql, params = next((s, p) for s, p in db.sql if "disposition_missing_alerted_at = now()" in s)
+    assert "upper(btrim(disposition_raw)) = :no_result" in sql and params["no_result"] == "UNKNOWN"
+    assert len(slack.posts) == 1 and "David Willis: 1 connected call(s) have no disposition" in slack.posts[0]
 
 
 def test_unmatched_ghl_outcome_is_posted_once(alert, monkeypatch):

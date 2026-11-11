@@ -25,13 +25,18 @@ from config.lending_dispositions import (
     CDR_ANSWERED_STATUSES,
     BOOKED_CODE,
     DEFAULT_CAUSE,
+    DIALER_NO_RESULT,
+    NO_ANSWER_CODE,
     DISPOSITION_LIST_VERSION,
+    DIALER_CONTACT_VIEW_URL,
     DIALER_ORIGIN,
     DIRECTION_ALIASES,
     DISPOSITIONS,
     DNC_CODE,
     EVENT_FIELD_CANDIDATES,
     LEGACY_DISPOSITION_ALIASES,
+    RECORDING_NONE,
+    RECORDING_RECORDED,
     SYSTEM_DISPOSITION_ALIASES,
     UNANSWERED_CODES,
 )
@@ -60,6 +65,7 @@ class DialerCallEvent:
     recording_ref: Optional[str]
     disclosure_logged: Optional[bool]
     raw: dict
+    recording_enabled: Optional[bool] = None
 
 
 @dataclass(frozen=True)
@@ -151,6 +157,16 @@ def _recording(value: Any) -> Optional[str]:
     return DIALER_ORIGIN + ref if ref and ref.startswith("/") else ref
 
 
+def contact_view_url(contact_id: Optional[str]) -> Optional[str]:
+    """The BatchDialer contact page (where the call recordings play), or None without a contact id."""
+    return DIALER_CONTACT_VIEW_URL.format(contact_id=contact_id) if contact_id else None
+
+
+def recording_status_for(talk_seconds: Optional[int], recording_enabled: Optional[bool]) -> str:
+    """Recorded when the call had talk time and the campaign records; a CDR without the flag counts as recording."""
+    return RECORDING_RECORDED if (talk_seconds or 0) > 0 and recording_enabled is not False else RECORDING_NONE
+
+
 def parse_event(raw: Any) -> Optional[DialerCallEvent]:
     """Normalize one webhook / poll record. None when it carries no call id."""
     if not isinstance(raw, dict):
@@ -175,6 +191,7 @@ def parse_event(raw: Any) -> Optional[DialerCallEvent]:
         recording_ref=_recording(_pick(data, "recording")),
         disclosure_logged=_to_bool(_pick(data, "disclosure")),
         raw=raw,
+        recording_enabled=_to_bool(_pick(data, "recording_enabled")),
     )
 
 
@@ -193,6 +210,20 @@ def normalize_code(raw: Optional[str]) -> tuple[Optional[str], bool]:
     if key in SYSTEM_DISPOSITION_ALIASES:
         return SYSTEM_DISPOSITION_ALIASES[key], True
     return None, False
+
+
+def is_no_result(raw: Optional[str]) -> bool:
+    """BatchDialer's placeholder "Unknown": the caller picked no result."""
+    return bool(raw) and re.sub(r"[^A-Z0-9]+", "_", raw.upper()).strip("_") == DIALER_NO_RESULT
+
+
+def resolve_dialer_code(raw: Optional[str], talk_seconds: Optional[int]) -> tuple[Optional[str], bool]:
+    """``normalize_code`` plus BatchDialer's "Unknown" (the caller picked no result): a call nobody talked on is a
+    NO_ANSWER; one with talk time has no code but is known, so it gets the missing-result alert, never the
+    unknown-code alert."""
+    if is_no_result(raw):
+        return (NO_ANSWER_CODE, True) if not (talk_seconds or 0) else (None, True)
+    return normalize_code(raw)
 
 
 def is_abandoned(raw: Optional[str]) -> bool:
@@ -264,8 +295,6 @@ def record_dialer_event(db, ev: DialerCallEvent) -> RecordedCall:
     if ev.phone and not phone:
         logger.warning("[lending] call %s: dialed number could not be normalized", ev.call_id)
     ended_at = _effective_end(ev)
-    code, known = normalize_code(ev.disposition_raw)
-
     previous = db.execute(
         text("SELECT disposition_raw FROM lending.call_dispositions WHERE dialer_call_id = :id"),
         {"id": ev.call_id},
@@ -275,10 +304,9 @@ def record_dialer_event(db, ev: DialerCallEvent) -> RecordedCall:
         text(
             "INSERT INTO lending.call_dispositions (dialer_call_id, direction, phone, caller_seat, caller_name, "
             "caller_id_number, dialer_contact_id, seat_group, talk_duration_sec, call_started_at, call_ended_at, "
-            "recording_ref, recording_status, dialer_campaign_id, raw_event) "
+            "recording_ref, recording_status, recording_view_url, dialer_campaign_id, raw_event) "
             "VALUES (:call_id, :direction, :phone, :seat, :name, :did, :contact_id, :group, :duration, :started, "
-            ":ended, :recording, CASE WHEN CAST(:recording AS text) IS NOT NULL THEN 'pending' END, "
-            ":campaign_id, CAST(:raw AS jsonb)) "
+            ":ended, :recording, :rec_status, :view_url, :campaign_id, CAST(:raw AS jsonb)) "
             "ON CONFLICT (dialer_call_id) DO UPDATE SET "
             "direction = COALESCE(EXCLUDED.direction, lending.call_dispositions.direction), "
             "phone = COALESCE(EXCLUDED.phone, lending.call_dispositions.phone), "
@@ -292,12 +320,12 @@ def record_dialer_event(db, ev: DialerCallEvent) -> RecordedCall:
             "call_ended_at = CASE WHEN :real_end THEN EXCLUDED.call_ended_at "
             "ELSE COALESCE(lending.call_dispositions.call_ended_at, EXCLUDED.call_ended_at) END, "
             "recording_ref = COALESCE(EXCLUDED.recording_ref, lending.call_dispositions.recording_ref), "
-            "recording_status = CASE WHEN EXCLUDED.recording_ref IS NOT NULL "
-            "AND lending.call_dispositions.recording_status IS NULL THEN 'pending' "
+            "recording_status = CASE WHEN EXCLUDED.talk_duration_sec IS NOT NULL THEN EXCLUDED.recording_status "
             "ELSE lending.call_dispositions.recording_status END, "
+            "recording_view_url = COALESCE(EXCLUDED.recording_view_url, lending.call_dispositions.recording_view_url), "
             "dialer_campaign_id = COALESCE(EXCLUDED.dialer_campaign_id, lending.call_dispositions.dialer_campaign_id), "
             "raw_event = EXCLUDED.raw_event, updated_at = now() "
-            "RETURNING id, phone, caller_seat, disposition, campaign_tag, queue, dialer_contact_id, "
+            "RETURNING id, phone, caller_seat, disposition, campaign_tag, queue, dialer_contact_id, talk_duration_sec, "
             "call_started_at, call_ended_at, unfunded_cause, opt_out_propagated_at"
         ),
         {
@@ -305,14 +333,20 @@ def record_dialer_event(db, ev: DialerCallEvent) -> RecordedCall:
             "seat": ev.seat_id, "name": ev.seat_name, "did": ev.caller_id_number,
             "contact_id": ev.contact_id, "group": seat_group_for(ev.seat_id),
             "duration": ev.duration, "started": ev.started_at, "ended": ended_at, "real_end": ev.ended_at is not None,
-            "recording": ev.recording_ref, "campaign_id": ev.campaign_id, "raw": json.dumps(ev.raw, default=str),
+            "recording": ev.recording_ref, "campaign_id": ev.campaign_id,
+            "rec_status": recording_status_for(ev.duration, ev.recording_enabled),
+            "view_url": contact_view_url(ev.contact_id), "raw": json.dumps(ev.raw, default=str),
         },
     ).mappings().one()
 
     if ev.seat_id and not seat_group_for(ev.seat_id):
         logger.warning("[lending] call %s: seat %s has no shift group (LENDING_SEAT_GROUPS)", ev.call_id, ev.seat_id)
 
+    # the stored talk time (the upsert keeps the last known one): a later event with no duration must not
+    # turn a connected "Unknown" call into NO_ANSWER
+    code, known = resolve_dialer_code(ev.disposition_raw, row["talk_duration_sec"])
     disposition = row["disposition"]
+    auto_no_answer = disposition == NO_ANSWER_CODE and bool(previous) and is_no_result(previous[0])
     unknown_code = None
     if ev.disposition_raw:
         if not known:
@@ -323,6 +357,16 @@ def record_dialer_event(db, ev: DialerCallEvent) -> RecordedCall:
                 text("UPDATE lending.call_dispositions SET disposition_raw = :raw, disposition_at = clock_timestamp() WHERE id = :id"),
                 {"raw": ev.disposition_raw, "id": row["id"]},
             )
+        elif code is None and is_no_result(ev.disposition_raw) and (disposition is None or auto_no_answer):
+            # "Unknown" with talk time: keep the raw result so delivery shows "No result yet" and the alert fires.
+            # A NO_ANSWER we set from an earlier 0 s "Unknown" is cleared; one the caller picked is never touched.
+            db.execute(
+                text("UPDATE lending.call_dispositions SET disposition = NULL, disposition_raw = :raw, "
+                     "disposition_at = CASE WHEN disposition IS NULL THEN disposition_at ELSE clock_timestamp() END "
+                     "WHERE id = :id AND (disposition IS NOT NULL OR disposition_raw IS DISTINCT FROM :raw)"),
+                {"raw": ev.disposition_raw, "id": row["id"]},
+            )
+            disposition = None
         elif code is not None and code != disposition and disposition == DNC_CODE and row["opt_out_propagated_at"] is None:
             logger.warning("[lending] call %s: kept DNC_REQUEST over a later %s until the opt-out is propagated",
                            ev.call_id, code)

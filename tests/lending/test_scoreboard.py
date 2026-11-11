@@ -159,3 +159,11 @@ def test_show_rate_uses_held_over_booked_per_row(lending_db):
 def test_transfers_are_not_counted_until_a_transfer_code_is_configured(lending_db):
     _call(lending_db, "1", disp="BOOKED")
     assert build_scoreboard(lending_db, DAY, NAMES).total.transfers == 0
+
+
+def test_caller_key_labels_agentless_batchdialer_dials():
+    from src.lending.scoreboard import _caller_key
+
+    sql = _caller_key()
+    assert "'Auto-dialer (' || COALESCE(NULLIF(raw_event->'campaign'->>'name', '')" in sql
+    assert "CASE WHEN call_source = 'batchdialer'" in sql and "ELSE '(unknown)' END" in sql

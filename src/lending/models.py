@@ -280,8 +280,10 @@ class LendingCallDisposition(LendingBase):
     source_tag: Mapped[Optional[str]] = mapped_column(String(40))
     seat_group: Mapped[Optional[str]] = mapped_column(String(10))
     consent_checked_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))  # last on-call "yes" read
-    recording_status: Mapped[Optional[str]] = mapped_column(String(12))  # pending | readable | forbidden | missing
-    recording_checked_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    # recorded | none (BatchDialer, set on ingest). Rows from before 2026-11 may still hold pending/readable/forbidden/missing.
+    recording_status: Mapped[Optional[str]] = mapped_column(String(12))
+    recording_checked_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))  # unused since 2026-11 (recording check removed)
+    recording_view_url: Mapped[Optional[str]] = mapped_column(String(500))  # BatchDialer contact page, where recordings play
     dialer_campaign_id: Mapped[Optional[str]] = mapped_column(String(64))  # BatchDialer campaign (scoreboard)
     # batchdialer (CDR poller) | ghl (calls made in GoHighLevel, imported for the 14-day follow-up). Dialer-only
     # jobs (delivery, missing-disposition alert, soft approval cards) act on batchdialer rows only.
