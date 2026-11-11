@@ -48,7 +48,10 @@ LENDING_CDR_UNIT_DST="/etc/systemd/system/fa-lending-cdr-poller.service"
 # fa-lending-reminder-worker (WP-GL-10) sends nothing until BOOKING_REMINDER_TEXT_ENABLED=true, so installing it is safe.
 # lending-api serves every /webhooks/lending/* route (nginx sends that prefix to 127.0.0.1:8010).
 # Unlike the others it IS a hard gate: deploy fails if nginx lacks the route or :8010/health is down.
-LENDING_UNITS=(fa-lending-opt-out-poller fa-lending-dialer-sweep fa-lending-uncalled-alarm-worker fa-lending-transcript-worker fa-lending-reminder-worker lending-api)
+# fa-lending-cora is Cora (Slack Socket Mode session + minute sweep; exactly one instance, Restart=always). Left out
+# until P0.4, so deploys never cycled her and she kept running stale code. Warn-only like the workers: a Cora problem
+# never rolls back the FA platform; check journalctl -u fa-lending-cora.
+LENDING_UNITS=(fa-lending-opt-out-poller fa-lending-dialer-sweep fa-lending-uncalled-alarm-worker fa-lending-transcript-worker fa-lending-reminder-worker lending-api fa-lending-cora)
 
 cd "$PROJECT_DIR"
 
