@@ -56,9 +56,9 @@ def _tracerfy_submit(rows: list[dict]) -> list[dict]:
 def _write_usage_ledger(session, entries: list[dict]) -> None:
     session.execute(
         text("INSERT INTO enrichment_usage_logs (vendor, purpose, success, cost_cents, property_id, "
-             "target_address, request_ref, created_at) VALUES (:vendor, :purpose, :success, :cost_cents, "
-             ":property_id, :target_address, :request_ref, :created_at)"),
-        entries,
+             "target_address, request_ref, created_at, trace_type) VALUES (:vendor, :purpose, :success, "
+             ":cost_cents, :property_id, :target_address, :request_ref, :created_at, :trace_type)"),
+        [{"trace_type": None, **entry} for entry in entries],
     )
     session.commit()
 

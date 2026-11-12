@@ -1316,3 +1316,126 @@ class LendingPartnerFileUpload(LendingBase):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_now, server_default=text("now()"))
 
     __table_args__ = (Index("idx_lending_partner_file_uploads_file", "file_id"),)
+
+
+_CALLING_LIST_KEYS_SQL = "list_key IN ('verified_maturity', 'cash_buyer', 'wholesaler')"
+
+
+class LendingPrListPull(LendingBase):
+    """One PropertyRadar export run for a calling list (config/lending_calling_lists.py).
+
+    ``exports_consumed`` counts every record PropertyRadar returned (each one is billed), so a
+    failed run still shows what was spent. A list and window that already has a ``done`` pull is
+    not bought again unless the operator forces it.
+    """
+
+    __tablename__ = "pr_list_pulls"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    list_key: Mapped[str] = mapped_column(String(30), nullable=False)
+    window_start: Mapped[date] = mapped_column(Date, nullable=False)
+    window_end: Mapped[date] = mapped_column(Date, nullable=False)
+    criteria: Mapped[Any] = mapped_column(JSONB, nullable=False)  # every criteria set bought, in order
+    matching_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    exports_consumed: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default=text("0"))
+    records_stored: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default=text("0"))
+    status: Mapped[str] = mapped_column(String(10), nullable=False, default="running", server_default=text("'running'"))
+    error: Mapped[Optional[str]] = mapped_column(String(200))
+    started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_now, server_default=text("now()"))
+    finished_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+
+    __table_args__ = (
+        CheckConstraint(_CALLING_LIST_KEYS_SQL, name="ck_lending_pr_list_pulls_list"),
+        CheckConstraint("status IN ('running', 'done', 'failed')", name="ck_lending_pr_list_pulls_status"),
+        Index("idx_lending_pr_list_pulls_list_window", "list_key", "window_start", "window_end"),
+    )
+
+
+class LendingPrListRecord(LendingBase):
+    """One PropertyRadar property on one calling list. Unique per list and property, so a property
+    can be on several lists, apart from the maturity pipeline's public.property_radar_records.
+
+    ``qualifies`` is the post-export check (maturity inside the window, resale within the hold
+    limit); a record that fails it is kept with ``exclusion_reason`` for audit and never loaded.
+    ``contact_key`` groups the records that reach the same person (the owner, or the seller for
+    wholesalers), so each person is traced once.
+    """
+
+    __tablename__ = "pr_list_records"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    list_key: Mapped[str] = mapped_column(String(30), nullable=False)
+    pull_id: Mapped[int] = mapped_column(BigInteger, ForeignKey(f"{LENDING_SCHEMA}.pr_list_pulls.id"), nullable=False)
+    radar_id: Mapped[str] = mapped_column(String(40), nullable=False)
+    state: Mapped[Optional[str]] = mapped_column(String(2))
+    county: Mapped[Optional[str]] = mapped_column(String(80))
+    apn: Mapped[Optional[str]] = mapped_column(String(60))
+    property_address: Mapped[Optional[str]] = mapped_column(Text)
+    city: Mapped[Optional[str]] = mapped_column(String(80))
+    zip: Mapped[Optional[str]] = mapped_column(String(10))
+    property_type: Mapped[Optional[str]] = mapped_column(String(20))
+    owner_name: Mapped[Optional[str]] = mapped_column(Text)
+    ownership_type: Mapped[Optional[str]] = mapped_column(String(30))
+    owner_mailing_address: Mapped[Optional[str]] = mapped_column(Text)
+    owner_mailing_city: Mapped[Optional[str]] = mapped_column(String(80))
+    owner_mailing_state: Mapped[Optional[str]] = mapped_column(String(20))
+    owner_mailing_zip: Mapped[Optional[str]] = mapped_column(String(10))
+    principal_name: Mapped[Optional[str]] = mapped_column(Text)
+    loan_type: Mapped[Optional[str]] = mapped_column(String(30))  # e.g. "Non-Conforming"
+    lender_name: Mapped[Optional[str]] = mapped_column(Text)
+    loan_recorded_date: Mapped[Optional[date]] = mapped_column(Date)
+    loan_amount: Mapped[Optional[float]] = mapped_column(Numeric(14, 2))
+    loan_term_years: Mapped[Optional[int]] = mapped_column(SmallInteger)
+    est_maturity_date: Mapped[Optional[date]] = mapped_column(Date)
+    last_transfer_date: Mapped[Optional[date]] = mapped_column(Date)
+    last_transfer_value: Mapped[Optional[float]] = mapped_column(Numeric(14, 2))
+    last_transfer_seller: Mapped[Optional[str]] = mapped_column(Text)
+    last_transfer_type: Mapped[Optional[str]] = mapped_column(String(40))
+    down_payment_pct: Mapped[Optional[float]] = mapped_column(Numeric(6, 2))
+    prior_transfer_months: Mapped[Optional[int]] = mapped_column(SmallInteger)
+    qualifies: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    match_strength: Mapped[Optional[str]] = mapped_column(String(10))  # confirmed / likely, when it qualifies
+    exclusion_reason: Mapped[Optional[str]] = mapped_column(String(40))
+    contact_key: Mapped[Optional[str]] = mapped_column(String(64))  # sha256 of the normalized person to reach
+    raw: Mapped[Any] = mapped_column(JSONB, nullable=False)
+    first_seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_now, server_default=text("now()"))
+    last_seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_now, server_default=text("now()"))
+
+    __table_args__ = (
+        CheckConstraint(_CALLING_LIST_KEYS_SQL, name="ck_lending_pr_list_records_list"),
+        CheckConstraint("match_strength IS NULL OR match_strength IN ('confirmed', 'likely')",
+                        name="ck_lending_pr_list_records_strength"),
+        CheckConstraint("qualifies = (exclusion_reason IS NULL)", name="ck_lending_pr_list_records_qualifies"),
+        Index("uq_lending_pr_list_records_list_radar", "list_key", "radar_id", unique=True),
+        Index("idx_lending_pr_list_records_contact", "list_key", "contact_key"),
+    )
+
+
+class LendingPrListTraceSubject(LendingBase):
+    """Who Tracerfy is sent for one person on a calling list whose people come as a name only (Wholesalers),
+    and where the name and address came from (src/lending/pr_list_trace_subjects.py). ``source`` 'none' with
+    an ``untraceable_reason`` is kept for audit and never sent."""
+
+    __tablename__ = "pr_list_trace_subjects"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    list_key: Mapped[str] = mapped_column(String(30), nullable=False)
+    contact_key: Mapped[str] = mapped_column(String(64), nullable=False)
+    radar_id: Mapped[str] = mapped_column(String(40), nullable=False)  # the record the subject came from
+    subject_name: Mapped[Optional[str]] = mapped_column(Text)
+    first_name: Mapped[Optional[str]] = mapped_column(String(80))
+    last_name: Mapped[Optional[str]] = mapped_column(String(120))
+    address: Mapped[Optional[str]] = mapped_column(Text)
+    city: Mapped[Optional[str]] = mapped_column(String(80))
+    state: Mapped[Optional[str]] = mapped_column(String(20))
+    zip: Mapped[Optional[str]] = mapped_column(String(10))
+    source: Mapped[str] = mapped_column(String(20), nullable=False)  # seller_property / sunbiz_member / none
+    sunbiz_doc_number: Mapped[Optional[str]] = mapped_column(String(20))
+    untraceable_reason: Mapped[Optional[str]] = mapped_column(String(40))
+    built_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_now, server_default=text("now()"))
+
+    __table_args__ = (
+        CheckConstraint("source IN ('seller_property', 'sunbiz_member', 'none')", name="ck_lending_pr_list_trace_subjects_source"),
+        CheckConstraint("(source = 'none') = (untraceable_reason IS NOT NULL)", name="ck_lending_pr_list_trace_subjects_reason"),
+        Index("uq_lending_pr_list_trace_subjects_list_contact", "list_key", "contact_key", unique=True),
+    )

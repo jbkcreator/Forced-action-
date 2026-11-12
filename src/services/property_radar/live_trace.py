@@ -19,11 +19,12 @@ from typing import Any, Callable, Iterable, Optional, Sequence
 
 from src.services.property_radar.staging import normalize_owner
 from src.services.property_radar.trace_contacts import LeadContacts, parse_contacts
-from src.services.skip_trace_ledger import BillingModel, NORMAL, RunSpendCap, should_submit, trace_key
+from src.services.skip_trace_ledger import ADVANCED, BillingModel, NORMAL, RunSpendCap, should_submit, trace_key
 
 logger = logging.getLogger(__name__)
 
 CENTS_PER_HIT = 2          # Tracerfy: 1 credit per hit = $0.02, a miss is free
+CENTS_PER_ADVANCED_HIT = 4  # address-only trace: 2 credits per hit
 DEFAULT_BATCH_SIZE = 250
 
 Submit = Callable[[list[dict]], list[dict]]
@@ -39,6 +40,7 @@ class TraceOutcome:
     skipped_unkeyable: int = 0
     skipped_cap: int = 0
     skipped_no_result: int = 0
+    skipped_name_mismatch: int = 0
 
 
 def _core(key: str) -> str:
@@ -50,7 +52,13 @@ def _owner(lead: Any) -> str:
 
 
 def _split_name(name: Optional[str]) -> tuple[str, str]:
-    parts = (name or "").split()
+    """(first, last) for Tracerfy. County records give owners as ``LAST,FIRST MIDDLE & CO-OWNER``;
+    the co-owner is dropped and the comma order turned round, or every such row misses."""
+    text = (name or "").split("&", 1)[0].strip()
+    if "," in text:
+        last, _, first = text.partition(",")
+        return first.strip(), last.strip()
+    parts = text.split()
     return (parts[0], " ".join(parts[1:])) if parts else ("", "")
 
 
@@ -71,14 +79,19 @@ def trace_staged_leads(
     cap: RunSpendCap,
     write_contacts: WriteContacts = lambda contacts: None,
     batch_size: int = DEFAULT_BATCH_SIZE,
+    mode: str = NORMAL,
 ) -> TraceOutcome:
+    """``mode=ADVANCED`` is the address-only retry of a normal miss: Tracerfy names whoever it links to the
+    address, so its contacts are kept only when that last name is the owner's (a paid hit is ledgered either
+    way, so the address is never paid for again)."""
+    hit_cents = CENTS_PER_ADVANCED_HIT if mode == ADVANCED else CENTS_PER_HIT
     outcome = TraceOutcome()
     by_key: dict[str, list[Any]] = {}
     for lead in leads:
         key = trace_key(lead.property_address, lead.zip)
         if not key:
             outcome.skipped_unkeyable += 1
-        elif not should_submit(key, NORMAL, ledger, BillingModel.PER_HIT):
+        elif not should_submit(key, mode, ledger, BillingModel.PER_HIT):
             outcome.skipped_already_traced += 1
         else:
             by_key.setdefault(key, []).append(lead)
@@ -86,11 +99,11 @@ def trace_staged_leads(
     keys = list(by_key)
     for start in range(0, len(keys), batch_size):
         batch_keys = keys[start:start + batch_size]
-        if cap.would_exceed(len(batch_keys) * CENTS_PER_HIT):
+        if cap.would_exceed(len(batch_keys) * hit_cents):
             outcome.skipped_cap += sum(len(by_key[k]) for k in keys[start:])
             logger.warning("[pr-live-trace] spend cap reached; %d address(es) left untraced", len(keys) - start)
             break
-        cap.add(len(batch_keys) * CENTS_PER_HIT)
+        cap.add(len(batch_keys) * hit_cents)
         rows = [_submit_row(by_key[k][0]) for k in batch_keys]
         results = submit(rows)
         outcome.submitted += len(batch_keys)
@@ -110,9 +123,13 @@ def trace_staged_leads(
             # so only leads with that owner get the contacts (other units' owners stay untraced).
             owner = _owner(by_key[key][0])
             for lead in by_key[key]:
-                if not contacts.is_empty and _owner(lead) == owner:
-                    traced[lead.radar_id] = contacts
-            entries.append(_ledger_entry(key, not contacts.is_empty))
+                if contacts.is_empty or _owner(lead) != owner:
+                    continue
+                if mode == ADVANCED and not same_last_name(lead, row):
+                    outcome.skipped_name_mismatch += 1
+                    continue
+                traced[lead.radar_id] = contacts
+            entries.append(_ledger_entry(key, not contacts.is_empty, mode=mode))
         write_contacts(traced)
         write_ledger(entries)
         outcome.contacts.update(traced)
@@ -125,7 +142,16 @@ def _submit_row(lead: Any) -> dict:
             "first_name": first, "last_name": last, "label": lead.radar_id}
 
 
-def _ledger_entry(key: str, success: bool) -> dict:
-    return {"vendor": "tracerfy", "purpose": "skip_trace", "success": success,
-            "cost_cents": CENTS_PER_HIT if success else 0, "property_id": None,
+def same_last_name(lead: Any, row: Optional[dict]) -> bool:
+    """The owner's last name is one of the words of the last name Tracerfy returned (hyphens split)."""
+    _, last = _split_name(lead.principal_name or lead.owner_name)
+    wanted = {w for w in last.upper().replace("-", " ").split() if len(w) > 1}
+    returned = str((row or {}).get("last_name") or "").upper().replace("-", " ").split()
+    return bool(wanted) and bool(wanted & set(returned))
+
+
+def _ledger_entry(key: str, success: bool, *, mode: str = NORMAL) -> dict:
+    cents = CENTS_PER_ADVANCED_HIT if mode == ADVANCED else CENTS_PER_HIT
+    return {"vendor": "tracerfy", "purpose": "skip_trace", "success": success, "trace_type": mode,
+            "cost_cents": cents if success else 0, "property_id": None,
             "target_address": key, "request_ref": None, "created_at": datetime.now(timezone.utc)}

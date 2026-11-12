@@ -114,14 +114,18 @@ def already_traced(session: Session, source: str, keys: Iterable[str]) -> dict[s
             modes.add(ADVANCED)
 
     usage_rows = session.execute(sa_text("""
-        SELECT DISTINCT target_address
+        SELECT target_address, bool_or(trace_type = 'advanced') AS did_advanced
         FROM enrichment_usage_logs
         WHERE vendor = :source
           AND target_address = ANY(:keys)
+        GROUP BY target_address
     """), {"source": source, "keys": sorted(unique_keys)}).mappings().all()
 
     for r in usage_rows:
-        ledger.setdefault(r["target_address"], set()).add(NORMAL)
+        modes = ledger.setdefault(r["target_address"], set())
+        modes.add(NORMAL)
+        if r["did_advanced"]:
+            modes.add(ADVANCED)
 
     return ledger
 
