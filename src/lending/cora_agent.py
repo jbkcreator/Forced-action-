@@ -61,12 +61,7 @@ from src.lending.ghl_sms import GhlSmsSender, get_sender
 from src.lending.instantly_client import InstantlyAccount, lending_instantly_account, send_reply
 from src.lending.instantly_email import NdlInstantlySender, get_ndl_instantly_sender
 from src.lending.instantly_replies import CHANNEL as INSTANTLY_CHANNEL, ReplyProcessor
-from src.lending.standing_sends import (
-    backfill_card_edits,
-    evaluate_graduations,
-    make_edit_recorder,
-    make_is_graduated,
-)
+from src.lending.standing_sends import StandingSendsStep, make_edit_recorder, make_is_graduated
 from src.lending.ops_alerts import post_ops_notice, post_replies_notice
 from src.lending.cora_morning_digest import post_morning_digest
 from src.lending.models import LENDING_SCHEMA
@@ -603,13 +598,8 @@ def build_live_services(settings: AppSettings) -> Optional[CoraServices]:
 
 def make_standing_sends_step(engine: Engine) -> Callable[[], Any]:
     """P1.4 sweep step: record any card edit the revise handler missed, then graduate templates that meet the rule.
-    Returns the newly graduated templates."""
-
-    def step() -> Any:
-        backfill_card_edits(engine)
-        return evaluate_graduations(engine)
-
-    return step
+    Incremental (only drafts decided or revised since the last run), with a full pass at start and once a day."""
+    return StandingSendsStep(engine)
 
 
 def make_instantly_replies(engine: Engine, store: AgentStore, config: AgentCoreConfig, messages_client: MessagesClient,

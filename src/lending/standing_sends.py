@@ -30,6 +30,7 @@ import json
 import logging
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 
 from sqlalchemy import create_engine, text
@@ -47,6 +48,10 @@ from config.lending_standing_sends import (
 from src.lending.cora_inbox import add_to_inbox_safely, slack_safe
 
 logger = logging.getLogger(__name__)
+
+# The sweep's incremental check re-reads this far back from its previous run, and does a full pass this often.
+INCREMENTAL_OVERLAP = timedelta(minutes=5)
+FULL_PASS_EVERY = timedelta(hours=24)
 
 
 # ── card edits ───────────────────────────────────────────────────────────────
@@ -123,7 +128,8 @@ def record_card_edit(engine: Engine, action: Any) -> int:
 _MISSING_EDITS = text("""
     SELECT p.action_id, p.tool_name, p.channel, p.payload, p.revisions
       FROM lending.pending_actions p
-     WHERE jsonb_array_length(COALESCE(p.revisions, '[]'::jsonb)) > 0
+     WHERE (CAST(:since AS timestamptz) IS NULL OR p.updated_at >= :since)
+       AND jsonb_array_length(COALESCE(p.revisions, '[]'::jsonb)) > 0
        AND NOT EXISTS (SELECT 1 FROM lending.card_edits e
                         WHERE e.action_id = p.action_id AND e.revision_no = jsonb_array_length(p.revisions))
      ORDER BY p.updated_at DESC
@@ -135,10 +141,11 @@ def _json(value: Any) -> Any:
     return json.loads(value) if isinstance(value, str) else value
 
 
-def backfill_card_edits(engine: Engine, limit: int = 50) -> int:
-    """Cora's sweep: record edits the revise handler missed. Returns how many rows were added."""
+def backfill_card_edits(engine: Engine, limit: int = 50, since: Optional[Any] = None) -> int:
+    """Cora's sweep: record edits the revise handler missed (only drafts changed since ``since`` when given). Returns
+    how many rows were added."""
     with engine.connect() as conn:
-        missing = [dict(row) for row in conn.execute(_MISSING_EDITS, {"limit": limit}).mappings()]
+        missing = [dict(row) for row in conn.execute(_MISSING_EDITS, {"limit": limit, "since": since}).mappings()]
     added = sum(_insert_edits(engine, _edit_rows(row["action_id"], row["tool_name"], row["channel"],
                                                  _json(row["payload"]) or {}, _json(row["revisions"]) or []))
                 for row in missing)
@@ -203,6 +210,7 @@ _STATS = text("""
         SELECT payload->>'template_version' AS template_version, status, decided_by, revisions
           FROM lending.pending_actions
          WHERE COALESCE(payload->>'template_version', '') <> ''
+           AND (CAST(:versions AS text[]) IS NULL OR payload->>'template_version' = ANY(CAST(:versions AS text[])))
     ), counted AS (
         SELECT template_version,
                count(*) FILTER (WHERE decided_by IS NOT NULL AND decided_by NOT LIKE :auto_prefix
@@ -220,9 +228,10 @@ _STATS = text("""
 """)
 
 
-def template_stats(conn: Any) -> list[TemplateStats]:
-    rows = conn.execute(_STATS, {"auto_actor": AUTO_GRADUATED_ACTOR,
-                                 "auto_prefix": f"{AUTO_APPROVER_PREFIX}%"}).mappings()
+def template_stats(conn: Any, versions: Optional[list[str]] = None) -> list[TemplateStats]:
+    """Counts per template version: every one, or only ``versions``."""
+    rows = conn.execute(_STATS, {"auto_actor": AUTO_GRADUATED_ACTOR, "auto_prefix": f"{AUTO_APPROVER_PREFIX}%",
+                                 "versions": versions}).mappings()
     return [TemplateStats(template_version=row["template_version"], approved=int(row["approved"]),
                           edited=int(row["edited"]), rejected=int(row["rejected"]), auto_sent=int(row["auto_sent"]),
                           graduated=bool(row["graduated"]), revoked=bool(row["revoked"])) for row in rows]
@@ -261,12 +270,27 @@ _GRADUATE = text("""
 """)
 
 
-def evaluate_graduations(engine: Engine) -> list[TemplateStats]:
-    """Graduate every template that meets the rule and has never graduated (a revoked one stays revoked). Each new
-    graduation is raised in Cora's inbox in the same transaction. Returns the newly graduated templates."""
+# Template versions with a decision (approve / reject) since a moment: the only ones whose counts can have changed.
+_DECIDED_SINCE = text("""
+    SELECT DISTINCT payload->>'template_version' AS template_version
+      FROM lending.pending_actions
+     WHERE decided_at >= :since AND COALESCE(payload->>'template_version', '') <> ''
+""")
+
+
+def evaluate_graduations(engine: Engine, since: Optional[Any] = None) -> list[TemplateStats]:
+    """Graduate every template that meets the rule and has never graduated (a revoked one stays revoked). With
+    ``since``, only templates with a decision since then are counted (the sweep's incremental check); without it,
+    all of them. Each new graduation is raised in Cora's inbox in the same transaction. Returns the newly graduated
+    templates."""
     graduated: list[TemplateStats] = []
     with engine.begin() as conn:
-        for stats in template_stats(conn):
+        versions = None
+        if since is not None:
+            versions = [row[0] for row in conn.execute(_DECIDED_SINCE, {"since": since})]
+            if not versions:
+                return graduated
+        for stats in template_stats(conn, versions):
             if stats.graduated or not stats.meets_rule:
                 continue
             new = conn.execute(_GRADUATE, {"template_version": stats.template_version, "approvals": stats.approved,
@@ -286,6 +310,29 @@ def evaluate_graduations(engine: Engine) -> list[TemplateStats]:
             logger.info("[standing-sends] %s graduated approvals=%s edited=%s", stats.template_version,
                         stats.approved, stats.edited)
     return graduated
+
+
+class StandingSendsStep:
+    """Cora's minute sweep step. Each run looks only at drafts decided or revised since the previous run (with an
+    overlap, so a slow commit is not missed); a full pass runs on the first call after a start and then once a day,
+    as a safety net. Returns the newly graduated templates."""
+
+    def __init__(self, engine: Engine, clock: Callable[[], datetime] = lambda: datetime.now(timezone.utc)) -> None:
+        self._engine = engine
+        self._clock = clock
+        self._last_run: Optional[datetime] = None
+        self._last_full: Optional[datetime] = None
+
+    def __call__(self) -> list[TemplateStats]:
+        now = self._clock()
+        full = self._last_full is None or now - self._last_full >= FULL_PASS_EVERY
+        since = None if full else self._last_run - INCREMENTAL_OVERLAP
+        backfill_card_edits(self._engine, since=since)
+        graduated = evaluate_graduations(self._engine, since=since)
+        self._last_run = now
+        if full:
+            self._last_full = now
+        return graduated
 
 
 _IS_GRADUATED = text("""

@@ -243,6 +243,14 @@ def test_counts_and_graduation_on_postgres(lending_db):
     assert rows["P14-OTHER-v1"].approved == 1 and rows["P14-OTHER-v1"].state == "collecting"
 
     engine = SimpleNamespace(begin=lambda: _same(conn), connect=lambda: _same(conn))
+    from sqlalchemy import text as sql_text
+
+    since = conn.execute(sql_text("SELECT now() - interval '1 minute'")).scalar()
+    assert "P14-TEST-v1" in [t.template_version for t in standing_sends.template_stats(conn, ["P14-TEST-v1"])]
+    assert standing_sends.template_stats(conn, ["P14-NONE-v1"]) == []
+    # the two revised drafts have no card_edits rows yet: the incremental backfill records them, once
+    assert standing_sends.backfill_card_edits(engine, since=since) >= 2
+    assert standing_sends.backfill_card_edits(engine, since=since) == 0
     graduated = [s.template_version for s in standing_sends.evaluate_graduations(engine)]
     assert "P14-TEST-v1" in graduated and "P14-OTHER-v1" not in graduated
     assert "P14-TEST-v1" not in [s.template_version for s in standing_sends.evaluate_graduations(engine)]  # once
@@ -255,3 +263,47 @@ def test_counts_and_graduation_on_postgres(lending_db):
 @contextmanager
 def _same(conn):
     yield conn
+
+
+# ── performance: the sweep only looks at what changed ────────────────────────
+
+def test_the_sweep_step_runs_full_first_then_incremental_then_full_once_a_day(monkeypatch):
+    from datetime import timedelta
+
+    calls = []
+    monkeypatch.setattr(standing_sends, "backfill_card_edits", lambda engine, since=None: calls.append(("edits", since)))
+    monkeypatch.setattr(standing_sends, "evaluate_graduations",
+                        lambda engine, since=None: calls.append(("graduate", since)) or [])
+    now = [datetime(2026, 11, 12, 12, 0, tzinfo=timezone.utc)]
+    step = standing_sends.StandingSendsStep(engine=None, clock=lambda: now[0])
+
+    step()  # first run after a start: full
+    assert calls == [("edits", None), ("graduate", None)]
+    now[0] += timedelta(minutes=1)
+    calls.clear()
+    step()  # next minute: only what changed since the last run, with the overlap
+    expected_since = datetime(2026, 11, 12, 12, 0, tzinfo=timezone.utc) - standing_sends.INCREMENTAL_OVERLAP
+    assert calls == [("edits", expected_since), ("graduate", expected_since)]
+    now[0] += standing_sends.FULL_PASS_EVERY
+    calls.clear()
+    step()  # a day later: full again
+    assert calls == [("edits", None), ("graduate", None)]
+
+
+def test_an_incremental_check_with_no_new_decisions_counts_nothing():
+    class Engine(CaptureEngine):
+        def execute(self, statement, params=None):
+            self.params.append((str(statement), params))
+            return iter([])  # no template decided since
+
+    engine = Engine()
+    assert standing_sends.evaluate_graduations(engine, since=datetime(2026, 11, 12, tzinfo=timezone.utc)) == []
+    assert len(engine.params) == 1 and "decided_at >= :since" in engine.params[0][0]
+
+
+def test_the_migration_adds_the_lookup_indexes_only_when_missing():
+    from migrations import apply_lending_standing_sends as migration
+
+    names = [name for name, _ in migration._PENDING_ACTION_INDEXES]
+    assert names == ["ix_pending_actions_decided_at", "ix_pending_actions_updated_at",
+                     "ix_pending_actions_template_version"]
