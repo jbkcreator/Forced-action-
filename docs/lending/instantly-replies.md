@@ -7,18 +7,22 @@ everywhere.
 
 | Event from Instantly | What we do | Where it shows |
 |---|---|---|
-| `reply_received`, the lead asks to stop ("STOP", "unsubscribe", "remove me", "take me off", "don't email me", ...) | Suppressed at once through `compliance.propagate_opt_out` (channel email): FA's email/SMS stores, `lending.suppression_list`, every phone that email is on file with in lending, the dialer, and GHL do-not-disturb (synced by the opt-out poller within 15 s). The address is added to the Instantly block list. No answer is drafted. | Notice in `LENDING_OPS_NOTICE_CHANNEL` (#dial-tasks) + Cora's inbox (`ops_notice`) |
+| `reply_received`, the lead asks to stop ("STOP", "Please stop", "No thanks, stop", "unsubscribe", "remove me/us", "take us off your list", "stop all emails", "don't send me any more emails", ...) | Suppressed at once through `compliance.propagate_opt_out` (channel email): FA's email/SMS stores, `lending.suppression_list`, every phone that email is on file with in lending, the dialer, and GHL do-not-disturb (synced by the opt-out poller within 15 s). The address is added to the Instantly block list. No answer is drafted. | Notice in `LENDING_OPS_NOTICE_CHANNEL` (#dial-tasks) + Cora's inbox (`ops_notice`) |
 | `lead_unsubscribed` (Instantly's unsubscribe link) | Same as a STOP reply | Same |
-| `reply_received`, anything else | Stored; Cora's minute sweep classifies it: **deal**, **objection** or **dead** | Triage post in `LENDING_REPLIES_CHANNEL` (#lead-alerts) + Cora's inbox (`replies`) |
+| `reply_received`, anything else | Stored; Cora's minute sweep classifies it: **stop**, **deal**, **objection** or **dead** | Triage post in `LENDING_REPLIES_CHANNEL` (#lead-alerts) + Cora's inbox (`replies`) |
+| ...stop (a stop request in wording the phrase check missed) | Suppressed by the sweep exactly like a STOP reply (stores, dialer, GHL do-not-disturb, Instantly block list), within about a minute. No answer is drafted | Same as a STOP reply (no triage post) |
 | ...deal or objection | Cora drafts an answer (no numbers: anything about pricing is for the call with Josh) onto an Approve / Revise / Reject card | #approvals. Approve sends it inside the Instantly thread, from the inbox the lead replied to |
 | ...dead | Triage only. Never a suppression: only a STOP or unsubscribe suppresses | |
 | any other event | Answered 200 and ignored | |
 
 Only the lead's own words count for STOP: the quoted earlier email (which may say "Reply STOP to unsubscribe") is
-ignored. A whole line that is only "stop" counts; "can't stop thinking about this deal" does not.
+ignored. A line that is only "stop" with a short lead-in ("Please stop", "No thanks, stop") counts; "can't stop
+thinking about this deal" does not. The model is told to choose **stop** whenever a reply could be read as asking
+not to be contacted.
 
 A STOP whose opt-out cannot be written is retried by Cora's sweep every minute; after 5 failures ops is alerted to
-record it by hand. A reply the model cannot classify is retried, then posted as **Unclassified** with no draft.
+record it by hand. A reply the model cannot classify is retried, then posted as **Unclassified** with no draft and a
+note to read it in Instantly and opt the lead out by hand if they asked to stop.
 
 ## Setup
 

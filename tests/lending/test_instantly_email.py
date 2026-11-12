@@ -47,6 +47,15 @@ def _not_halted(monkeypatch):
     monkeypatch.setattr(instantly_email, "is_globally_halted", lambda: False)
 
 
+@pytest.fixture(autouse=True)
+def _unsubscribe_link(monkeypatch):
+    """The real link is signed with SUBSCRIBER_JWT_SECRET, which CI does not set; the footer only needs a link."""
+    from src.services.relay import channels_email
+
+    monkeypatch.setattr(channels_email, "unsubscribe_url",
+                        lambda email: "https://app.example.test/api/email/unsubscribe?token=test-token")
+
+
 def test_send_adds_lead_with_footer_and_unsubscribe() -> None:
     fake = FakeInstantly(_routes())
     NdlInstantlySender(ACCOUNT, fake).send("mark@example.com", "Your refinance", "Hi Mark,\nquick question")
@@ -85,7 +94,7 @@ def test_repeat_send_removes_previous_lead_first() -> None:
     calls = [(method, path) for method, path, _ in fake.calls]
     assert calls == [("POST", "/api/v2/leads/list"), ("DELETE", "/api/v2/leads/lead-old"),
                      ("POST", "/api/v2/leads/add")]
-    assert fake.calls[0][2]["json"] == {"campaign": "camp-ndl", "search": "m@example.com", "limit": 50}
+    assert fake.calls[0][2]["json"] == {"campaign": "camp-ndl", "contacts": ["m@example.com"], "limit": 50}
 
 
 def test_refused_while_halted(monkeypatch) -> None:
@@ -187,3 +196,26 @@ def test_setup_campaign_activates_an_existing_campaign() -> None:
                           ("POST", "/api/v2/campaigns/camp-1/activate"): (200, {})})
     assert instantly_email.setup_campaign("ndl-key", "https://api.instantly.ai", "josh@ndl-mail.com", fake) == "camp-1"
     assert [(m, p) for m, p, _ in fake.calls] == [("GET", "/api/v2/campaigns"), ("POST", "/api/v2/campaigns/camp-1/activate")]
+
+
+
+@pytest.mark.parametrize("result", [{"leads_uploaded": 0, "skipped_count": 1}, {"leads_uploaded": 0, "in_blocklist": 1}])
+def test_skipped_or_blocklisted_lead_is_not_sent(result: dict) -> None:
+    with pytest.raises(InstantlySendError):
+        NdlInstantlySender(ACCOUNT, FakeInstantly(_routes(added=result))).send("m@example.com", "S", "B")
+
+
+def test_blocklisted_error_says_so() -> None:
+    with pytest.raises(InstantlySendError) as err:
+        NdlInstantlySender(ACCOUNT, FakeInstantly(_routes(added={"leads_uploaded": 0, "in_blocklist": 1}))).send(
+            "m@example.com", "S", "B")
+    assert "block list" in str(err.value)
+
+
+def test_setup_campaign_adds_the_unsubscribe_header() -> None:
+    fake = FakeInstantly({("GET", "/api/v2/campaigns"): (200, {"items": []}),
+                          ("POST", "/api/v2/campaigns"): (200, {"id": "camp-new"}),
+                          ("POST", "/api/v2/campaigns/camp-new/activate"): (200, {})})
+    instantly_email.setup_campaign("ndl-key", "https://api.instantly.ai", "josh@ndl-mail.com", fake)
+    created = next(kwargs["json"] for method, path, kwargs in fake.calls if (method, path) == ("POST", "/api/v2/campaigns"))
+    assert created["insert_unsubscribe_header"] is True

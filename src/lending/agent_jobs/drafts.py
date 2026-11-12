@@ -46,8 +46,10 @@ def _fields(job: AgentJob, contact: GhlContact, channel: str) -> dict:
 
 def build_draft(job: AgentJob, contact: GhlContact, rail: Rail) -> EgressDraft:
     channel = COLD_EMAIL_CHANNEL if job.type == "send_email" and rail == "instantly" else JOB_TYPES[job.type]
+    # not_after: the agent's deadline; agent_core caps a revision's expiry at it and the relay never sends after it.
     payload = {"job_id": str(job.job_id), "ghl_contact_id": job.ghl_contact_id,
-               "template_version": job.template_version, **_fields(job, contact, channel)}
+               "template_version": job.template_version, "not_after": job.expires_at.isoformat(),
+               **_fields(job, contact, channel)}
     last4 = f" (…{contact.phone[-4:]})" if contact.phone else ""
     summary = (f"🤖 {job.created_by} · {job.template_version} · via {_RAIL_LABEL[rail]}\n"
                f"{job.contact_label or job.ghl_contact_id}{last4}: {job.reason or job.type}")

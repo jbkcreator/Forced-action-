@@ -223,6 +223,7 @@ def _no_live_crm_writer(monkeypatch) -> None:
     """No test registers the real GHL CRM writer; the CRM tests pass their own."""
     monkeypatch.setattr(cora_agent, "get_crm_writer", lambda: None)
     monkeypatch.setattr(cora_agent, "get_ndl_instantly_sender", lambda: None)
+    monkeypatch.setattr(cora_agent, "lending_instantly_account", lambda: None)  # a developer's .env may hold the key
 
 
 def test_email_is_registered_when_the_ghl_email_sender_is_configured(monkeypatch) -> None:

@@ -13,10 +13,14 @@ FA's accounts. Drafts use the channel ``instantly_cold_email``; P1.3's ``instant
 (``get_ndl_instantly_sender()`` is None) until the key, the campaign and the footer postal address are all set.
 
 Instantly skips a lead already in the campaign, so a repeat email to the same address first removes the earlier
-lead (the 3-day cold-email cap means that email already went out). The lookup sends ``search`` with the address and
-also matches the exact address in the response, so a wrong lead is never removed; ``search`` is not verified against
-Instantly's docs (developer.instantly.ai returned 404 on 2026-11-11). If it is ignored, a repeat send fails as a
-duplicate and the receipt says ``error``.
+lead (the 3-day cold-email cap means that email already went out). The lookup filters by ``campaign`` and the exact
+address (``contacts``) and matches the address again in the response, so a wrong lead is never removed.
+
+Request and response fields checked against Instantly's OpenAPI spec (https://api.instantly.ai/openapi/api_v2.json,
+2026-11-12): ``POST /api/v2/leads/list`` (``campaign``, ``contacts``, ``limit`` <= 100; response ``items``),
+``POST /api/v2/leads/add`` (``campaign_id``, ``leads[].custom_variables``; response ``leads_uploaded``,
+``duplicated_leads``, ``skipped_count``, ``in_blocklist``, ``created_leads[].id``), ``DELETE /api/v2/leads/{id}``,
+``POST /api/v2/campaigns`` and ``/campaigns/{id}/pause|activate`` (no body).
 
 Every send is one HTTP attempt per call, never retried: a duplicate email is worse than a missing one. Errors carry
 the HTTP status only, never an address. Every send and campaign change is refused while the lending emergency halt is
@@ -140,7 +144,7 @@ class NdlInstantlySender:
 
     def _remove_previous_lead(self, email: str) -> None:
         data = self._call("lead lookup", "POST", "/api/v2/leads/list",
-                          json={"campaign": self._account.campaign_id, "search": email, "limit": 50})
+                          json={"campaign": self._account.campaign_id, "contacts": [email], "limit": 50})
         for lead in data.get("items") or data.get("leads") or []:
             if (lead.get("email") or "").strip().lower() == email and lead.get("id"):
                 self._call("previous lead removal", "DELETE", f"/api/v2/leads/{lead['id']}")
@@ -157,7 +161,9 @@ class NdlInstantlySender:
             "leads": [{"email": email, "custom_variables": {"ra_subject": subject,
                                                             "ra_body": self.footer_body(body, email)}}],
         })
-        if result.get("duplicated_leads") or result.get("leads_skipped"):
+        if result.get("in_blocklist"):
+            raise InstantlySendError("Instantly refused the email: the address is on the Instantly block list")
+        if result.get("duplicated_leads") or result.get("skipped_count"):
             raise InstantlySendError("Instantly skipped the email: the address is already in the NDL campaign")
         if not (result.get("leads_uploaded") or result.get("leads_created")):
             raise InstantlySendError("Instantly reported no lead created")
@@ -204,6 +210,7 @@ def setup_campaign(api_key: str, base_url: str, sender_email: str, request: Opti
         "sequences": [{"steps": [{"type": "email", "delay": 0,
                                   "variants": [{"subject": "{{ra_subject}}", "body": "{{ra_body}}"}]}]}],
         "email_list": [sender_email],
+        "insert_unsubscribe_header": True,  # List-Unsubscribe header, alongside the footer link
     })
     campaign_id = str(created["id"])
     sender._call("campaign activate", "POST", f"/api/v2/campaigns/{campaign_id}/activate")

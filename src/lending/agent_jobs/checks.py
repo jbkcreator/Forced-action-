@@ -5,6 +5,8 @@ The rail: ``send_email`` to a contact tagged ``ndl-cold`` in GHL goes through ND
 CAN-SPAM footer); every other job goes through GHL (decision D15). The order of the checks is fixed: the first
 failure decides. The cold-email cap counts Cora's cold emails to the address, sent or still awaiting a decision, so
 two jobs can never both pass the cap while the first one waits for Josh.
+The partner cap (contacts tagged ``ndl-partner``: at most twice in 7 days, plus the Deal Drop) counts Cora's messages to
+the GHL contact the same way, leaving Deal Drops (``template_version`` starting with ``DEAL-DROP``) out.
 """
 from __future__ import annotations
 
@@ -13,15 +15,19 @@ from datetime import datetime
 from typing import Callable, Literal, Optional
 from zoneinfo import ZoneInfo
 
-from sqlalchemy import text
+from sqlalchemy import bindparam, text
 
 from config.lending_agent_jobs import (
     COLD_EMAIL_CHANNEL,
     COLD_EMAIL_MAX_IN_WINDOW,
     COLD_EMAIL_MIN_GAP,
     COLD_EMAIL_WINDOW,
+    DEAL_DROP_TEMPLATE_PREFIX,
     HOURS_RECHECK,
     MESSAGE_JOB_TYPES,
+    PARTNER_MAX_IN_WINDOW,
+    PARTNER_TAG,
+    PARTNER_WINDOW,
 )
 from config.lending_compliance import CALL_WINDOW_END, CALL_WINDOW_START, DEFAULT_TZ, GHL_TAG_COLD_LEAD
 from src.lending.agent_jobs.job import AgentJob
@@ -46,6 +52,16 @@ _COLD_EMAILS = text("""
      WHERE channel = :channel AND recipient_email = :e
        AND status IN ('pending', 'revising', 'approved', 'sending', 'sent')
 """)
+
+# Messages Cora sent (or holds for a decision) to this GHL contact in the window, Deal Drops left out.
+_PARTNER_MESSAGES = text("""
+    SELECT count(*) FROM lending.pending_actions
+     WHERE contact_ref = :contact_ref AND channel IN :channels
+       AND status IN ('pending', 'revising', 'approved', 'sending', 'sent')
+       AND COALESCE(executed_at, created_at) > :since
+       AND lower(COALESCE(payload->>'template_version', '')) NOT LIKE :deal_drop
+""").bindparams(bindparam("channels", expanding=True))
+_MESSAGE_CHANNELS = ("ghl_sms", "ghl_email", COLD_EMAIL_CHANNEL)
 
 
 @dataclass(frozen=True)
@@ -96,6 +112,17 @@ def _over_cold_cap(db, email: str, now: datetime) -> bool:
     return bool(row.recent) or row.in_window >= COLD_EMAIL_MAX_IN_WINDOW
 
 
+def _is_deal_drop(job: AgentJob) -> bool:
+    return job.template_version.casefold().startswith(DEAL_DROP_TEMPLATE_PREFIX)
+
+
+def _over_partner_cap(db, job: AgentJob, now: datetime) -> bool:
+    count = db.execute(_PARTNER_MESSAGES, {"contact_ref": f"ghl:{job.ghl_contact_id}", "channels": list(_MESSAGE_CHANNELS),
+                                           "since": now - PARTNER_WINDOW,
+                                           "deal_drop": f"{DEAL_DROP_TEMPLATE_PREFIX}%"}).scalar()
+    return count >= PARTNER_MAX_IN_WINDOW
+
+
 def check_job(db, job: AgentJob, contact: Optional[GhlContact], now: datetime, *,
               text_window: Callable[..., bool] = text_window_open, instantly_ready: bool = True) -> Verdict:
     if contact is None:
@@ -118,6 +145,8 @@ def check_job(db, job: AgentJob, contact: Optional[GhlContact], now: datetime, *
             return _block("error", problem)
         if rail == "instantly" and _over_cold_cap(db, contact.email, now):
             return _block("blocked_cap", "cold email cap: at most once every 3 days and 4 times in 14 days")
+        if PARTNER_TAG in contact.tags and not _is_deal_drop(job) and _over_partner_cap(db, job, now):
+            return _block("blocked_cap", "partner cap: at most twice a week, plus the Deal Drop")
     if job.not_before is not None and job.not_before > now:
         return Verdict("hold", release_at=job.not_before, held_reason="not_before", rail=rail)
     if is_message:

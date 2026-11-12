@@ -195,6 +195,7 @@ class LendingDialerLoadRecord(LendingBase):
     ghl_sync_attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default=text("0"))
     ghl_synced_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
     ghl_sync_error: Mapped[Optional[str]] = mapped_column(String(200))
+    ghl_contact_id: Mapped[Optional[str]] = mapped_column(String(64))  # GHL contact the sync upserted (P1.1 jobs / P1.2 export key)
 
     __table_args__ = (
         Index("uq_lending_dialer_load_records_active_phone", "phone", unique=True,

@@ -150,3 +150,16 @@ def test_a_deferred_send_that_clears_after_expiry_is_never_sent(queue: PendingAc
     allowed["now"] = True
     assert relay.dispatch(action_id).outcome is DispatchOutcome.BLOCKED
     assert queue.get(action_id).status is ActionStatus.BLOCKED and executor.sent == []
+
+
+def test_send_past_the_payload_deadline_is_blocked(queue: PendingActionQueue, halt: HaltSwitch,
+                                                   executor: RecordingExecutor, clock) -> None:
+    from datetime import timedelta
+
+    action_id = queue.enqueue(tool_name="agent_job", channel="ghl_sms", summary="s", ttl=timedelta(days=3),
+                              payload={"body": "Hi", "not_after": (clock.now + timedelta(minutes=10)).isoformat()})
+    assert queue.approve(action_id, APPROVER)
+    clock.advance(timedelta(minutes=11))
+    result = Relay(queue, halt, {"ghl_sms": executor}).dispatch(action_id)
+    assert result.outcome is DispatchOutcome.BLOCKED and "expired" in result.reason
+    assert executor.sent == []

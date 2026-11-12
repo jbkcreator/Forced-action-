@@ -206,3 +206,55 @@ def test_cold_email_awaiting_approval_counts_toward_cap(db) -> None:
         {"e": EMAIL, "at": NOW - timedelta(hours=1)})
     cold = _contact(tags=frozenset({"ndl-cold"}))
     assert _check(db, _job(type="send_email", subject="Hi"), cold).status == "blocked_cap"
+
+
+# -- partner cap: "partners at most twice a week plus the Deal Drop" (brief section 7), partners tagged ndl-partner --
+
+def _partner() -> GhlContact:
+    return _contact(tags=frozenset({"ndl-partner"}))
+
+
+def _sent_to_partner(db, at: datetime, template: str = "PARTNER-UPDATE-v1") -> None:
+    db.execute(text(
+        "INSERT INTO lending.pending_actions (tool_name, channel, payload, status, contact_ref, executed_at, "
+        "created_at, updated_at) VALUES ('agent_job:send_email', 'ghl_email', :payload, 'sent', 'ghl:ghl-123', :at, "
+        ":at, :at)"), {"payload": json.dumps({"template_version": template}), "at": at})
+
+
+def test_partner_third_message_in_a_week_is_capped(db) -> None:
+    _sent_to_partner(db, NOW - timedelta(days=1))
+    _sent_to_partner(db, NOW - timedelta(days=5))
+    verdict = _check(db, _job(type="send_email", subject="Hi"), _partner())
+    assert verdict.status == "blocked_cap"
+    assert "partner" in verdict.reason
+
+
+def test_partner_second_message_in_a_week_is_allowed(db) -> None:
+    _sent_to_partner(db, NOW - timedelta(days=1))
+    _sent_to_partner(db, NOW - timedelta(days=8))
+    assert _check(db, _job(type="send_email", subject="Hi"), _partner()).outcome == "go"
+
+
+def test_deal_drop_is_outside_the_partner_cap(db) -> None:
+    _sent_to_partner(db, NOW - timedelta(days=1))
+    _sent_to_partner(db, NOW - timedelta(days=2))
+    job = _job(type="send_email", subject="This week's deals", template_version="DEAL-DROP-v3")
+    assert _check(db, job, _partner()).outcome == "go"
+
+
+def test_deal_drops_do_not_use_up_the_partner_cap(db) -> None:
+    _sent_to_partner(db, NOW - timedelta(days=1), template="deal-drop-v3")
+    _sent_to_partner(db, NOW - timedelta(days=2))
+    assert _check(db, _job(type="send_email", subject="Hi"), _partner()).outcome == "go"
+
+
+def test_partner_cap_ignores_crm_jobs(db) -> None:
+    _sent_to_partner(db, NOW - timedelta(days=1))
+    _sent_to_partner(db, NOW - timedelta(days=2))
+    assert _check(db, _job(type="add_note", body="Called"), _partner()).outcome == "go"
+
+
+def test_non_partner_is_not_partner_capped(db) -> None:
+    _sent_to_partner(db, NOW - timedelta(days=1))
+    _sent_to_partner(db, NOW - timedelta(days=2))
+    assert _check(db, _job(type="send_email", subject="Hi")).outcome == "go"

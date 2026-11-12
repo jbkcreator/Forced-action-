@@ -58,7 +58,7 @@ from src.lending.global_halt import EmergencyHalt
 from src.lending.ghl_crm import GhlCrmWriter, get_crm_writer
 from src.lending.ghl_email import GhlEmailSender, get_email_sender
 from src.lending.ghl_sms import GhlSmsSender, get_sender
-from src.lending.instantly_client import InstantlyAccount, lending_instantly_account, send_reply
+from src.lending.instantly_client import InstantlyAccount, block_address, lending_instantly_account, send_reply
 from src.lending.instantly_email import NdlInstantlySender, get_ndl_instantly_sender
 from src.lending.instantly_replies import CHANNEL as INSTANTLY_CHANNEL, ReplyProcessor
 from src.lending.standing_sends import StandingSendsStep, make_edit_recorder, make_is_graduated
@@ -573,9 +573,20 @@ def build_live_services(settings: AppSettings) -> Optional[CoraServices]:
 
     attempt_messages, attempt_recordings = lending_ghl_readers()
 
+    ledger_manifest = None
+    from src.lending.drive_upload import key_path
+
+    if settings.lending_ledger_export_folder_id and key_path():
+        from src.lending.drive_upload import latest_manifest
+
+        folder_id = settings.lending_ledger_export_folder_id
+
+        def ledger_manifest():
+            return latest_manifest(folder_id)
+
     def toolkit_factory(toolkit_engine: Engine, memory: AgentMemory) -> CoraToolkit:
         return CoraToolkit(toolkit_engine, memory, channels=channels, attempt_messages=attempt_messages,
-                           attempt_recordings=attempt_recordings)
+                           attempt_recordings=attempt_recordings, ledger_manifest=ledger_manifest)
 
     store = AgentStore(engine, config.db_schema)
     services = build_session(config, store, chat,
@@ -608,10 +619,12 @@ def make_instantly_replies(engine: Engine, store: AgentStore, config: AgentCoreC
     (posted at once; a refused card is re-posted by ``retry_missing_cards``) and posts the triage."""
     queue = PendingActionQueue(store, default_ttl=timedelta(hours=config.pending_action_ttl_hours))
     memory = AgentMemory(store)
+    instantly = lending_instantly_account()
     processor = ReplyProcessor(
         session_factory=lambda: Session(engine), client=messages_client, model=config.model, enqueue=queue.enqueue,
         post_card=gate.post_card, post_triage=post_replies_notice, post_notice=post_ops_notice,
-        rules=lambda: [rule.rule_text for rule in memory.active_rules()])
+        rules=lambda: [rule.rule_text for rule in memory.active_rules()],
+        block_address=(lambda email: block_address(instantly, email)) if instantly else (lambda email: False))
     return processor.run
 
 
