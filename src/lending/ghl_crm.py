@@ -1,5 +1,5 @@
 """Cora's approved CRM writes to the Next Deal Lending GoHighLevel sub-account: pipeline stage moves,
-contact tags and contact notes.
+contact tags, contact notes and contact tasks; plus the contact read the P1.1 agent job checks use.
 
 Each write runs only after an approver clicked Approve (the relay calls the executor). One HTTP attempt
 per call, never retried here, and error text carries the HTTP status only (never a response body,
@@ -13,14 +13,18 @@ only, and move the contact's open card there. No card or no matching stage fails
 from __future__ import annotations
 
 import logging
+from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Any, Callable, Optional
 
 import requests
 
+from config.lending_compliance import GHL_DND_CHANNELS
 from config.settings import get_settings
 from src.lending.global_halt import is_globally_halted
 from src.lending.ghl_account import GhlAccount, ghl_headers, lending_ghl_account
 from src.services import ghl_webhook
+from src.services.phone_utils import normalize
 
 logger = logging.getLogger(__name__)
 
@@ -32,6 +36,28 @@ _CLOSED_STATUSES = frozenset({"won", "lost", "abandoned"})
 
 class GhlCrmError(RuntimeError):
     """A CRM write was not made (or its outcome is unknown). The message never holds contact details."""
+
+
+@dataclass(frozen=True)
+class GhlContact:
+    """What an agent job needs from a GHL contact: where to send, and what GHL itself blocks (DND, tags)."""
+
+    contact_id: str
+    phone: Optional[str]
+    email: Optional[str]
+    dnd_channels: frozenset[str]
+    tags: frozenset[str]
+
+
+def _contact_from(raw: dict[str, Any]) -> GhlContact:
+    if raw.get("dnd"):
+        dnd = frozenset(GHL_DND_CHANNELS)
+    else:
+        dnd = frozenset(channel for channel, entry in (raw.get("dndSettings") or {}).items()
+                        if isinstance(entry, dict) and (entry.get("status") or "").lower() == "active")
+    return GhlContact(contact_id=str(raw.get("id")), phone=normalize(raw.get("phone")),
+                      email=(raw.get("email") or "").strip().lower() or None, dnd_channels=dnd,
+                      tags=frozenset(str(tag) for tag in raw.get("tags") or ()))
 
 
 def _single_attempt(method: str, url: str, **kwargs: Any) -> requests.Response:
@@ -124,6 +150,41 @@ class GhlCrmWriter:
         note_id = (data.get("note") or {}).get("id") or data.get("id")
         logger.info("%s added a note to contact %s", self._log_prefix, contact_id)
         return str(note_id) if note_id else f"{contact_id}:note"
+
+    def read_contact(self, contact_id: str) -> Optional[GhlContact]:
+        """The contact in the Next Deal Lending sub-account, or None when GHL has no such contact there. Read only,
+        so it works while the emergency halt is on."""
+        try:
+            response = self._request("GET", f"{ghl_webhook._GHL_BASE}/contacts/{contact_id}",
+                                     headers=ghl_headers(self._account.api_key))
+        except Exception as exc:  # class only: the message can carry request detail
+            logger.warning("%s contact read request error: %s", self._log_prefix, type(exc).__name__)
+            raise GhlCrmError(f"GHL contact read request error ({type(exc).__name__})") from None
+        if response.status_code in (400, 404, 422):
+            return None
+        if response.status_code >= 400:
+            logger.warning("%s contact read failed: HTTP %s", self._log_prefix, response.status_code)
+            raise GhlCrmError(f"GHL contact read failed: HTTP {response.status_code}")
+        try:
+            raw = (response.json() or {}).get("contact") or {}
+        except ValueError:
+            raw = {}
+        if not raw or raw.get("locationId") != self._account.location_id:
+            return None
+        return _contact_from(raw)
+
+    def create_task(self, contact_id: str, title: str, due_at: datetime, assignee: Optional[str]) -> str:
+        """Create a task on the contact; returns the GHL task id, or ``<contact id>:task`` when GHL returns none."""
+        self._refuse_if_halted("task create")
+        body: dict[str, Any] = {"title": title.strip(),
+                                "dueDate": due_at.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                                "completed": False}
+        if assignee:
+            body["assignedTo"] = assignee
+        data = self._call("task create", "POST", f"/contacts/{contact_id}/tasks", json=body)
+        task_id = (data.get("task") or {}).get("id") or data.get("id")
+        logger.info("%s created a task on contact %s", self._log_prefix, contact_id)
+        return str(task_id) if task_id else f"{contact_id}:task"
 
 
 def get_crm_writer() -> Optional[GhlCrmWriter]:

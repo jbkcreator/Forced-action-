@@ -1,0 +1,15 @@
+{
+  "job_id": "3b8c6f0e-6a1d-4e39-9a3f-1d2c3b4a5e6f",
+  "lane": "NDL",
+  "created_by": "LendingFlow follow up",
+  "created_at": "2026-11-12T09:00:00-05:00",
+  "type": "send_sms",
+  "ghl_contact_id": "REPLACE_WITH_TEST_CONTACT_ID",
+  "contact_label": "Test lead, Tampa",
+  "template_version": "LF-D2-SMS-v1",
+  "body": "Hi, it's Next Deal Lending following up on your loan request. Any questions I can answer? Reply STOP to opt out.",
+  "reason": "Day 2 touch, no reply yet",
+  "requires_approval": true,
+  "not_before": "2026-11-12T09:00:00-05:00",
+  "expires_at": "2026-11-13T20:00:00-05:00"
+}

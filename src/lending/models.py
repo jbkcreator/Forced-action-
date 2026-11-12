@@ -1113,6 +1113,43 @@ class LendingCoraInboxItem(LendingBase):
     )
 
 
+class LendingAgentJob(LendingBase):
+    """One agent job file from Drive "NDL Jobs/inbox" (P1.1, ``src.lending.agent_jobs``), keyed by the agent's
+    ``job_id`` so a job is acted on at most once even when its file is re-dropped.
+
+    ``state``: held (waiting for not_before or the 8am-8pm window, re-checked at ``release_at``) -> carded (a
+    ``pending_actions`` draft exists: ``action_id``) -> done (``result_status`` is final). The receipt is written to
+    "NDL Jobs/done/{job_id}.json" from ``result``; ``result_written_at`` is set only once that write succeeded.
+    ``job`` holds the parsed file (no phone or email: the recipient is read from GHL). ``rail``: ghl | instantly."""
+
+    __tablename__ = "agent_jobs"
+
+    job_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    drive_file_id: Mapped[str] = mapped_column(String(128), nullable=False, unique=True)
+    file_name: Mapped[str] = mapped_column(Text, nullable=False)
+    created_by: Mapped[Optional[str]] = mapped_column(String(120))
+    job_type: Mapped[Optional[str]] = mapped_column(String(20))
+    template_version: Mapped[Optional[str]] = mapped_column(String(80))
+    ghl_contact_id: Mapped[Optional[str]] = mapped_column(String(64))
+    rail: Mapped[Optional[str]] = mapped_column(String(12))
+    job: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict, server_default=text("'{}'::jsonb"))
+    state: Mapped[str] = mapped_column(String(16), nullable=False)
+    held_reason: Mapped[Optional[str]] = mapped_column(String(20))
+    release_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    action_id: Mapped[Optional[int]] = mapped_column(BigInteger)
+    result_status: Mapped[Optional[str]] = mapped_column(String(20))
+    result: Mapped[Optional[dict]] = mapped_column(JSONB)
+    result_written_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    received_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_now, server_default=text("now()"))
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_now, server_default=text("now()"))
+
+    __table_args__ = (
+        CheckConstraint("state IN ('held', 'carded', 'done')", name="ck_agent_jobs_state"),
+        Index("ix_agent_jobs_state_release", "state", "release_at"),
+        Index("ix_agent_jobs_action", "action_id"),
+    )
+
+
 class LendingCoraMorningDigest(LendingBase):
     """One row per ET day Cora posted her 7:30 AM morning digest (``src.lending.cora_morning_digest``). The row
     is written in the same transaction as the Slack post, so a restart or second sweep never posts twice."""

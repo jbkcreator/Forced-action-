@@ -280,6 +280,9 @@ class SlackSession:
                     "yet. Nothing was sent.")
         if result.outcome is DispatchOutcome.FAILED:
             return ":warning: *Approved, send failed.* Nothing was retried; check the action before re-queuing."
+        if result.outcome is DispatchOutcome.DEFERRED:
+            return (f":hourglass_flowing_sand: *Approved, waiting to send*: {slack_safe(result.reason or 'not yet')}. "
+                    "It goes out automatically once allowed, unless the draft expires first; no need to redraft.")
         return "Already handled elsewhere; nothing more was sent."
 
     def expire_stale_actions(self) -> int:

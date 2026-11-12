@@ -541,9 +541,10 @@ def test_an_instantly_answer_to_an_address_opted_out_in_fa_is_blocked_at_send_ti
 def test_an_instantly_answer_to_a_clear_address_may_send_and_ghl_email_is_unchanged():
     from src.lending.cora_agent import make_send_check
 
-    assert make_send_check(ScriptedEngine(False, False))(_instantly_action()) is None
+    window_open = {"email_window": lambda phone: True}  # P1.1: every email waits for 8am-8pm; not under test here
+    assert make_send_check(ScriptedEngine(False, False), **window_open)(_instantly_action()) is None
     ghl = ScriptedEngine(False)
-    assert make_send_check(ghl)(_instantly_action("ghl_email")) is None
+    assert make_send_check(ghl, **window_open)(_instantly_action("ghl_email")) is None
     assert len(ghl.queries) == 1  # GHL email keeps its single suppression query
 
 

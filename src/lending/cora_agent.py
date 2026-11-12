@@ -21,13 +21,16 @@ import logging
 import signal
 import threading
 from collections.abc import Callable, Mapping
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Any, NamedTuple, Optional
+from zoneinfo import ZoneInfo
 
 from sqlalchemy import create_engine, text
 from sqlalchemy.engine import Engine
 from sqlalchemy.orm import Session
 
+from config.lending_agent_jobs import COLD_EMAIL_CHANNEL
+from config.lending_compliance import CALL_WINDOW_END, CALL_WINDOW_START, DEFAULT_TZ
 from config.settings import AppSettings, get_settings
 from packages.agent_core.agent_loop import AgentLoop, MessagesClient
 from packages.agent_core.chatport import ChatPort, SlackChatPort
@@ -42,6 +45,8 @@ from packages.agent_core.slack_session import InboundMessage, SlackSession, run_
 from packages.agent_core.store import AgentStore
 from packages.agent_core.thread_history import build_history
 from packages.agent_core.tools import ToolContext, ToolRegistry
+from src.lending.agent_jobs.drive import google_job_folders
+from src.lending.agent_jobs.worker import JobQueueWorker, make_check
 from src.lending.attempt_log import lending_ghl_readers
 from src.lending.compliance import text_window_open
 from src.lending.consent import has_text_consent
@@ -54,6 +59,7 @@ from src.lending.ghl_crm import GhlCrmWriter, get_crm_writer
 from src.lending.ghl_email import GhlEmailSender, get_email_sender
 from src.lending.ghl_sms import GhlSmsSender, get_sender
 from src.lending.instantly_client import InstantlyAccount, block_address, lending_instantly_account, send_reply
+from src.lending.instantly_email import NdlInstantlySender, get_ndl_instantly_sender
 from src.lending.instantly_replies import CHANNEL as INSTANTLY_CHANNEL, ReplyProcessor
 from src.lending.ops_alerts import post_ops_notice, post_replies_notice
 from src.lending.cora_morning_digest import post_morning_digest
@@ -73,10 +79,14 @@ PLACEHOLDER_TEXT = "Working on it…"
 
 # Channels that deliver a text message and therefore need live text consent.
 SMS_CHANNELS = frozenset({"ghl_sms"})
+# P1.3's thread replies (INSTANTLY_CHANNEL) and P1.1's cold emails (COLD_EMAIL_CHANNEL) both go through NDL's Instantly.
+EMAIL_CHANNELS = frozenset({"ghl_email", INSTANTLY_CHANNEL, COLD_EMAIL_CHANNEL})
+INSTANTLY_CHANNELS = frozenset({INSTANTLY_CHANNEL, COLD_EMAIL_CHANNEL})
 # What a revision may change, per draft channel. Recipient fields are never editable.
 EDITABLE_FIELDS: dict[str, tuple[str, ...]] = {"ghl_sms": ("body",), "ghl_email": ("subject", "body"),
                                                "ghl_stage": ("stage",), "ghl_tag": ("tag",), "ghl_note": ("body",),
-                                               INSTANTLY_CHANNEL: ("subject", "body")}
+                                               "ghl_task": ("title",), INSTANTLY_CHANNEL: ("subject", "body"),
+                                               COLD_EMAIL_CHANNEL: ("subject", "body")}
 
 # Same suppression rule the booking reminder worker applies before every send.
 _SUPPRESSED = text("""
@@ -99,6 +109,8 @@ class CoraServices(NamedTuple):
     inbox_digest: Optional[Callable[[], int]] = None  # posts new inbox items to Cora's channel; returns how many
     morning_digest: Optional[Callable[[], bool]] = None  # posts the 7:30 AM ET digest once a day; True when posted
     instantly_replies: Optional[Callable[[], Any]] = None  # P1.3: triages new Instantly replies
+    queue: Optional[PendingActionQueue] = None  # the drafts table the session, gate and relay share
+    agent_jobs: Optional[Callable[[], Any]] = None  # P1.1: one pass of the Drive job queue worker
 
 
 def lending_channel_ids(settings: AppSettings) -> dict[str, str]:
@@ -166,13 +178,23 @@ def build_config(settings: AppSettings) -> AgentCoreConfig:
     )
 
 
+def email_window_open(phone: Optional[str], *, now: Optional[datetime] = None) -> bool:
+    """8am-8pm for an email's recipient (brief section 7, "Hours", applies to every send): the borrower's own
+    window when the phone is known, else 8am-8pm Eastern."""
+    if phone:
+        return text_window_open(phone, now=now)
+    local = (now or datetime.now(timezone.utc)).astimezone(ZoneInfo(DEFAULT_TZ)).time()
+    return CALL_WINDOW_START <= local < CALL_WINDOW_END
+
+
 def make_send_check(engine: Engine, *, carrier_approved: bool = False,
-                    text_window: Callable[[str], bool] = text_window_open) -> SendCheck:
+                    text_window: Callable[[str], bool] = text_window_open,
+                    email_window: Callable[[Optional[str]], bool] = email_window_open) -> SendCheck:
     """Lending rule run by the relay right before a send. Returns a reason to block, or None.
 
     A text also waits for the carrier (10DLC) approval (LENDING_SMS_CARRIER_APPROVED) and for the borrower's
-    8am-8pm window: both are deferrals, so an approved text stays approved and sends on a later sweep once both
-    hold, or is blocked when the draft expires first."""
+    8am-8pm window, and an email (GHL or Instantly) for the recipient's 8am-8pm window: these are deferrals, so an
+    approved send stays approved and goes on a later sweep once they hold, or is blocked when the draft expires."""
 
     def check(action: PendingAction) -> Optional[str]:
         phone = normalize(action.recipient_phone) if action.recipient_phone else None
@@ -182,7 +204,7 @@ def make_send_check(engine: Engine, *, carrier_approved: bool = False,
         with engine.connect() as conn:
             if conn.execute(_SUPPRESSED, {"p": phone, "e": email}).scalar():
                 return "recipient is suppressed or marked do-not-contact"
-            if action.channel == INSTANTLY_CHANNEL and conn.execute(_EMAIL_OPTED_OUT, {"e": email}).scalar():
+            if action.channel in INSTANTLY_CHANNELS and conn.execute(_EMAIL_OPTED_OUT, {"e": email}).scalar():
                 return "recipient is suppressed or marked do-not-contact"
             if action.channel in SMS_CHANNELS and not (phone and has_text_consent(conn, phone)):
                 return "no text consent on record for this number"
@@ -191,6 +213,8 @@ def make_send_check(engine: Engine, *, carrier_approved: bool = False,
                 return SendDeferred("texting is not approved by the carrier yet (10DLC)")
             if not text_window(phone):
                 return SendDeferred("outside the borrower's 8am-8pm text window")
+        if action.channel in EMAIL_CHANNELS and not email_window(phone):
+            return SendDeferred("outside the recipient's 8am-8pm window")
         return None
 
     return check
@@ -234,7 +258,15 @@ def crm_executors(crm: GhlCrmWriter) -> dict[str, EgressExecutor]:
         "ghl_stage": lambda payload: crm.move_stage(payload["ghl_contact_id"], payload["stage"]),
         "ghl_tag": lambda payload: crm.add_tag(payload["ghl_contact_id"], payload["tag"]),
         "ghl_note": lambda payload: crm.add_note(payload["ghl_contact_id"], payload["body"]),
+        "ghl_task": lambda payload: crm.create_task(payload["ghl_contact_id"], payload["title"],
+                                                    datetime.fromisoformat(payload["due_at"]), payload.get("assignee")),
     }
+
+
+def cold_email_executor(sender: NdlInstantlySender) -> EgressExecutor:
+    """Hands an approved cold email to NDL's Instantly campaign exactly as approved (the sender adds the CAN-SPAM
+    footer); returns the Instantly lead id."""
+    return lambda payload: sender.send(payload["to_email"], payload["subject"], payload["body"])
 
 
 def build_egress_executors() -> dict[str, EgressExecutor]:
@@ -261,10 +293,31 @@ def build_egress_executors() -> dict[str, EgressExecutor]:
         executors[INSTANTLY_CHANNEL] = instantly_executor(instantly)
     crm = get_crm_writer()
     if crm is None:
-        logger.warning("[cora] GHL account not configured; approved stage moves, tags and notes will not apply")
+        logger.warning("[cora] GHL account not configured; approved stage moves, tags, notes and tasks will not apply")
     else:
         executors.update(crm_executors(crm))
+    cold = get_ndl_instantly_sender()
+    if cold is None:
+        logger.warning("[cora] NDL Instantly cold-email campaign not configured; approved cold emails will not be sent")
+    else:
+        executors[COLD_EMAIL_CHANNEL] = cold_email_executor(cold)
     return executors
+
+
+def build_agent_jobs(settings: AppSettings, *, engine: Engine, gate: SendGate, queue: PendingActionQueue,
+                     approval_channel: str) -> Optional[JobQueueWorker]:
+    """The P1.1 Drive job queue worker, or None (logged) while it is switched off or not configured."""
+    if not settings.lending_agent_jobs_enabled:
+        logger.info("[cora] agent job queue off (LENDING_AGENT_JOBS_ENABLED=false)")
+        return None
+    folders = google_job_folders()
+    crm = get_crm_writer()
+    if folders is None or crm is None:
+        logger.error("[cora] agent job queue enabled but not configured (Drive folders or the GHL account missing)")
+        return None
+    instantly_ready = get_ndl_instantly_sender() is not None
+    return JobQueueWorker(engine, folders, gate, queue, crm.read_contact, approval_channel=approval_channel,
+                          check=make_check(engine, instantly_ready=instantly_ready))
 
 
 def _ts_seconds(ts: Optional[str]) -> float:
@@ -409,7 +462,7 @@ def build_session(config: AgentCoreConfig, store: AgentStore, chat: ChatPort, bo
                            command_hook=EmergencyHalt(chat=chat, cora_halt=halt, approver_ids=config.approver_user_ids,
                                                       alert_channel=config.slack_channel_id),
                            extension=extension)
-    return CoraServices(session, relay, gate)
+    return CoraServices(session, relay, gate, queue=queue)
 
 
 def run_sweep(services: CoraServices) -> None:
@@ -431,6 +484,14 @@ def run_sweep(services: CoraServices) -> None:
     reposted = services.gate.retry_missing_cards()
     if reposted:
         logger.info("[cora] posted %s delayed approval card(s)", reposted)
+    if services.agent_jobs is not None:
+        try:
+            stats = services.agent_jobs()
+        except Exception as exc:  # class only: Drive or GHL trouble never skips the sends below
+            logger.error("[cora] agent job queue failed (%s); retrying next sweep", type(exc).__name__)
+        else:
+            if stats and any(stats):
+                logger.info("[cora] agent jobs %s", stats)
     if services.inbox_digest is not None:
         try:
             surfaced = services.inbox_digest()
@@ -515,10 +576,13 @@ def build_live_services(settings: AppSettings) -> Optional[CoraServices]:
                              toolkit_factory=toolkit_factory, inbox_context=make_inbox_context(engine),
                              executors=build_egress_executors(), extension=RoutingSlack(web))
     digest = make_inbox_digest(engine, chat, config.slack_channel_id, channel_ids)
+    worker = build_agent_jobs(settings, engine=engine, gate=services.gate, queue=services.queue,
+                              approval_channel=config.approval_channel_id or "")
     return services._replace(web_client=web, inbox_digest=digest,
                              morning_digest=make_morning_digest(engine, store, chat, config),
                              instantly_replies=make_instantly_replies(engine, store, config, messages_client,
-                                                                      services.gate))
+                                                                      services.gate),
+                             agent_jobs=worker.run_once if worker is not None else None)
 
 
 def make_instantly_replies(engine: Engine, store: AgentStore, config: AgentCoreConfig, messages_client: MessagesClient,

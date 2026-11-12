@@ -124,3 +124,80 @@ def test_a_halt_set_during_the_lookups_stops_the_stage_move(monkeypatch, halt_af
     with pytest.raises(GhlCrmError, match="halt"):
         GhlCrmWriter(ACCOUNT, ghl).move_stage("ghl-123", "Application")
     assert all(method == "GET" for method, _, _ in ghl.calls)
+
+
+# -- P1.1 agent jobs: read a contact, create a task ------------------------------------------------------------
+
+def _contact(**overrides) -> dict:
+    contact = {"id": "ghl-123", "locationId": "loc-1", "phone": "(813) 555-0142", "email": " Mark@Example.COM ",
+               "dnd": False, "dndSettings": {"SMS": {"status": "inactive"}, "Email": {"status": "active"}},
+               "tags": ["ndl-cold", "lendingflow"]}
+    contact.update(overrides)
+    return contact
+
+
+def test_read_contact_maps_fields() -> None:
+    ghl = FakeGhl({("GET", "/contacts/ghl-123"): (200, {"contact": _contact()})})
+    contact = GhlCrmWriter(ACCOUNT, ghl).read_contact("ghl-123")
+    assert contact == ghl_crm.GhlContact(contact_id="ghl-123", phone="+18135550142", email="mark@example.com",
+                                         dnd_channels=frozenset({"Email"}),
+                                         tags=frozenset({"ndl-cold", "lendingflow"}))
+
+
+def test_read_contact_404_is_none() -> None:
+    ghl = FakeGhl({("GET", "/contacts/gone"): (404, {})})
+    assert GhlCrmWriter(ACCOUNT, ghl).read_contact("gone") is None
+
+
+def test_read_contact_other_location_is_none() -> None:
+    ghl = FakeGhl({("GET", "/contacts/ghl-123"): (200, {"contact": _contact(locationId="backflip-loc")})})
+    assert GhlCrmWriter(ACCOUNT, ghl).read_contact("ghl-123") is None
+
+
+def test_read_contact_other_error_raises() -> None:
+    ghl = FakeGhl({("GET", "/contacts/ghl-123"): (500, {})})
+    with pytest.raises(GhlCrmError):
+        GhlCrmWriter(ACCOUNT, ghl).read_contact("ghl-123")
+
+
+def test_read_contact_dnd_true_blocks_all_channels() -> None:
+    ghl = FakeGhl({("GET", "/contacts/ghl-123"): (200, {"contact": _contact(dnd=True, dndSettings={})})})
+    contact = GhlCrmWriter(ACCOUNT, ghl).read_contact("ghl-123")
+    assert {"SMS", "Email"} <= contact.dnd_channels
+
+
+def test_read_contact_allowed_while_halted(monkeypatch) -> None:
+    monkeypatch.setattr(ghl_crm, "is_globally_halted", lambda: True)
+    ghl = FakeGhl({("GET", "/contacts/ghl-123"): (200, {"contact": _contact()})})
+    assert GhlCrmWriter(ACCOUNT, ghl).read_contact("ghl-123") is not None
+
+
+def test_create_task_posts_payload() -> None:
+    from datetime import datetime, timezone
+
+    ghl = FakeGhl({("POST", "/contacts/ghl-123/tasks"): (201, {"task": {"id": "task-9"}})})
+    ref = GhlCrmWriter(ACCOUNT, ghl).create_task("ghl-123", "Call Mark", datetime(2026, 11, 12, 22, tzinfo=timezone.utc),
+                                                  "user-david")
+    assert ref == "task-9"
+    _, _, kwargs = ghl.calls[-1]
+    assert kwargs["json"] == {"title": "Call Mark", "dueDate": "2026-11-12T22:00:00Z", "completed": False,
+                              "assignedTo": "user-david"}
+
+
+def test_create_task_without_assignee_or_id() -> None:
+    from datetime import datetime, timezone
+
+    ghl = FakeGhl({("POST", "/contacts/ghl-123/tasks"): (200, {})})
+    ref = GhlCrmWriter(ACCOUNT, ghl).create_task("ghl-123", "Call", datetime(2026, 11, 12, tzinfo=timezone.utc), None)
+    assert ref == "ghl-123:task"
+    assert "assignedTo" not in ghl.calls[-1][2]["json"]
+
+
+def test_create_task_refused_while_halted(monkeypatch) -> None:
+    from datetime import datetime, timezone
+
+    monkeypatch.setattr(ghl_crm, "is_globally_halted", lambda: True)
+    ghl = FakeGhl({})
+    with pytest.raises(GhlCrmError):
+        GhlCrmWriter(ACCOUNT, ghl).create_task("ghl-123", "Call", datetime(2026, 11, 12, tzinfo=timezone.utc), None)
+    assert ghl.calls == []
