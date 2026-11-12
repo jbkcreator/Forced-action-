@@ -165,7 +165,8 @@ def test_sms_draft_takes_the_recipient_from_the_database(monkeypatch) -> None:
     draft = _toolkit(monkeypatch, SAM).draft_sms(DraftSmsInput(lead_ref="web_lead:7", body="Hi Sam"), CONTEXT)
     assert isinstance(draft, EgressDraft)
     assert draft.channel == "ghl_sms"
-    assert draft.payload == {"lead_ref": "web_lead:7", "to_phone": "+17275550100", "body": "Hi Sam"}
+    assert draft.payload == {"lead_ref": "web_lead:7", "to_phone": "+17275550100", "body": "Hi Sam",
+                             "template_version": "CORA-SMS-v1"}
     assert (draft.recipient_phone, draft.recipient_email, draft.contact_ref) == ("+17275550100", "sam@example.com",
                                                                                  "web_lead:7")
     assert "…0100" in draft.summary and "+1727" not in draft.summary

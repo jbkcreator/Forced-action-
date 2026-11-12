@@ -32,6 +32,7 @@ from sqlalchemy.engine import Engine
 from sqlalchemy.orm import Session
 
 from config.lending_agent_jobs import COLD_EMAIL_CHANNEL, MAX_JOBS_PER_SWEEP, REQUESTED_BY, STUCK_SENDING_AFTER
+from config.lending_standing_sends import AUTO_GRADUATED_ACTOR
 from packages.agent_core.pending_actions import ActionStatus, PendingActionQueue
 from packages.agent_core.send_gate import SendGate
 from packages.agent_core.store import utc_now
@@ -248,7 +249,7 @@ class JobQueueWorker:
         queued = self._gate.submit(draft, tool_name=f"agent_job:{job.type}", context=context,
                                    ttl=job.expires_at - now)
         if not job.requires_approval and self._is_graduated(job.template_version):
-            self._queue.approve(queued.action_id, "auto:graduated")
+            self._queue.approve(queued.action_id, AUTO_GRADUATED_ACTOR)
         self._update(row["job_id"], ("held",), state="carded", action_id=queued.action_id, rail=verdict.rail,
                      release_at=None)
         self._count("carded")

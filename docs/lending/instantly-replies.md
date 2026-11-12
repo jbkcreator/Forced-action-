@@ -26,17 +26,31 @@ note to read it in Instantly and opt the lead out by hand if they asked to stop.
 
 ## Setup
 
+NDL runs as its own campaign, **NDL Cora Passthrough**, inside FA's Instantly workspace (not a separate workspace),
+with its own API key. Instantly sends webhook events for the whole workspace unless a webhook is limited to one
+campaign, so both NDL webhooks are limited to NDL Cora Passthrough: FA's campaign replies and unsubscribes never
+reach Cora. The workspace has one block list, so an address blocked by an NDL opt-out is also blocked for FA's
+Instantly campaigns, and the other way round.
+
 1. Run the migration before deploying:
    `PYTHONPATH=. python migrations/apply_lending_instantly_replies.py`
-2. Production `.env` (NDL's own Instantly workspace, not FA's `INSTANTLY_*`):
-   - `LENDING_INSTANTLY_WEBHOOK_SECRET`: any long random value. The route answers 503 while it is unset.
-   - `LENDING_INSTANTLY_API_KEY`: from Muhammad, through the secure channel. Without it, approved answers fail with
-     "no executor registered" and nothing is sent.
-3. Deploy (restarts `lending-api` and `fa-lending-cora`).
-4. Muhammad registers the webhook in NDL's Instantly workspace:
-   - URL: `https://<our host>/webhooks/lending/instantly`
-   - Events: `reply_received`, `lead_unsubscribed`
-   - Custom header: `X-Instantly-Webhook-Secret: <the same value as LENDING_INSTANTLY_WEBHOOK_SECRET>`
+2. Production `.env` (separate from FA's `INSTANTLY_*` settings):
+   - `LENDING_INSTANTLY_API_KEY`: an API key created in the workspace for NDL ("NDL cora"; scopes: campaigns, leads,
+     emails, block list entries). Without it, approved answers fail with "no executor registered" and nothing is
+     sent.
+   - `LENDING_INSTANTLY_WEBHOOK_SECRET`: a long random value we generate (`openssl rand -hex 32`), never FA's
+     `INSTANTLY_WEBHOOK_SECRET`. The route answers 503 while it is unset.
+   - `LENDING_INSTANTLY_CAMPAIGN_ID`: the NDL Cora Passthrough campaign id (P1.1's cold emails).
+3. Deploy, or restart `lending-api` and `fa-lending-cora` after a `.env` change.
+4. Register two webhooks in Instantly (Settings → Integrations → Webhooks), the same for both except the event:
+   - URL: `https://api.nextdeallending.com/webhooks/lending/instantly`
+   - Event type: **Reply Received** for one, **Lead Unsubscribed** for the other
+   - Campaign: **NDL Cora Passthrough** only, never "All campaigns"
+   - Header: `X-Instantly-Webhook-Secret`, value the same as `LENDING_INSTANTLY_WEBHOOK_SECRET`
+5. Check the route with a wrong secret; `403` means it is live and the secret is loaded:
+   `curl -s -o /dev/null -w "%{http_code}\n" -X POST https://api.nextdeallending.com/webhooks/lending/instantly -H "Content-Type: application/json" -H "X-Instantly-Webhook-Secret: wrong" -d '{}'`
+6. Instantly's own calls show in `journalctl -u lending-api | grep -i instantly`: `200` is accepted, `403` means the
+   webhook header does not match `.env`.
 
 ## Proof for Josh
 

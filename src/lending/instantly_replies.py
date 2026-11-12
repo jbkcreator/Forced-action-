@@ -33,6 +33,7 @@ from typing import Any, Optional
 from sqlalchemy import text
 
 from config.lending_compliance import OptOutChannel
+from config.lending_standing_sends import INSTANTLY_REPLY_TEMPLATE
 from packages.agent_core.redaction import mask_emails
 from src.lending.compliance import propagate_opt_out
 from src.lending.cora_inbox import add_to_inbox_safely, slack_safe
@@ -465,7 +466,8 @@ class ReplyProcessor:
         action_id = self._enqueue(
             tool_name=TOOL_NAME, channel=CHANNEL,
             payload={"to_email": row["lead_email"], "subject": triage.subject, "body": triage.body,
-                     "from_inbox": row["email_account"], "reply_to_uuid": row["reply_to_uuid"]},
+                     "from_inbox": row["email_account"], "reply_to_uuid": row["reply_to_uuid"],
+                     "template_version": INSTANTLY_REPLY_TEMPLATE},
             summary=f"Answer to {who}'s Instantly reply ({INTENT_LABELS[triage.intent]}): {triage.summary}"[:500],
             requested_by="instantly", recipient_email=row["lead_email"],
             contact_ref=f"instantly_reply:{row['id']}", idempotency_key=f"instantly_reply:{row['id']}",
