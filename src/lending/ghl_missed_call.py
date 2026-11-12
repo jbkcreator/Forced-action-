@@ -34,7 +34,7 @@ from typing import Any, Mapping, Optional
 
 from sqlalchemy import text
 
-from config.lending_dispositions import GHL_UNKNOWN_CALLER
+from config.lending_dispositions import GHL_UNKNOWN_CALLER, canonical_ghl_caller
 from config.lending_followup import CALL_SOURCE_GHL, GHL_CALL_ID_PREFIX, GHL_CALLER_SEAT, GHL_CAMPAIGN_TAG
 from config.lending_missed_call import (
     GHL_MISSED_CALL_KEY_PREFIX,
@@ -159,7 +159,7 @@ def parse_missed_call(body: Mapping[str, Any], received_at: datetime) -> Optiona
                               else received_at.replace(second=0, microsecond=0))
     return GhlMissedCall(
         dialer_call_id=key, phone=phone, status=status, started_at=started, ended_at=ended,
-        contact_id=_value(body, "contact_id"), caller_name=(_value(body, "user") or "")[:200] or None,
+        contact_id=_value(body, "contact_id"), caller_name=canonical_ghl_caller((_value(body, "user") or "")[:200] or None),
     )
 
 

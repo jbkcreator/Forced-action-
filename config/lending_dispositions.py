@@ -256,19 +256,31 @@ TEXT_CONSENT_YES = "yes"
 GATE_FAILED_FIELD = "gate_failed"
 GATE_FAILED_TRUE = frozenset({"yes", "true", "y", "1"})
 
-# GHL user id (call message ``userId``) -> caller name (GHL /users API, read 2026-11-03). Outbound GHL call messages
-# often carry no userId; the outcome webhook's {{user.name}} fills the name in when it matches the call.
+# GHL user id (call message ``userId``) -> caller name (GHL /users API, re-read 2026-11-12). Outbound GHL call messages
+# often carry no userId; the outcome webhook's {{user.name}} fills the name in when it matches the call. "Hari K" and
+# "Hari K." are two different GHL users.
 GHL_USER_NAMES: dict[str, str] = {
     "3W4lyuTpPSgBjgiJMzJk": "Josh Kantor",
-    "57m9LlZrO1rV2A5cTKxI": "David Willis",
+    "57m9LlZrO1rV2A5cTKxI": "David Willis",  # "david willis" in GHL
     "YoBwFUwHL1fylqvqjzA1": "Hari K",
-    "0mboWYLanQkMz4RG3IbL": "Hari K",
+    "0mboWYLanQkMz4RG3IbL": "Hari K.",
 }
 GHL_UNKNOWN_CALLER = "GHL (unknown)"
+_GHL_NAME_BY_FOLDED = {name.casefold(): name for name in GHL_USER_NAMES.values()}
 
 
 def ghl_caller_name(user_id: str | None) -> str:
     return GHL_USER_NAMES.get(user_id or "", GHL_UNKNOWN_CALLER)
+
+
+def canonical_ghl_caller(name: str | None) -> str | None:
+    """A GHL user name as a webhook sends it ({{user.name}}), spelled as GHL_USER_NAMES spells that user, so one caller
+    is one scoreboard row. Only an exact match ignoring case is mapped ("david willis" -> "David Willis"; "Hari K."
+    stays "Hari K."); any other name is kept as sent."""
+    if not name:
+        return name
+    stripped = name.strip()
+    return _GHL_NAME_BY_FOLDED.get(stripped.casefold(), stripped)
 
 
 # BatchDialer seats shared by several people: the scoreboard shows this label, never the login owner's name, so no

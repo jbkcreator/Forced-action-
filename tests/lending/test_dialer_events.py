@@ -178,13 +178,23 @@ def test_recording_status_follows_talk_time_and_the_dialer_flag(lending_db):
     assert _row(lending_db, "c3")["recording_status"] == "none"
 
 
-def test_rescan_keeps_the_view_url_and_upgrades_none_to_recorded(lending_db):
+def test_rescan_upgrades_none_to_recorded_and_builds_the_view_url_from_the_stored_contact(lending_db):
     d.record_dialer_event(lending_db, _ev(duration=0, contact_id="559662160"))
-    assert _row(lending_db)["recording_status"] == "none"
+    row = _row(lending_db)
+    assert row["recording_status"] == "none" and row["recording_view_url"] is None  # no recording, no link
     d.record_dialer_event(lending_db, _ev(duration=48, contact_id=None))
     row = _row(lending_db)
     assert row["recording_status"] == "recorded"
     assert row["recording_view_url"] == "https://app.batchdialer.com/contacts/view/559662160"
+
+
+def test_a_recorded_call_keeps_its_view_url_and_loses_it_when_it_turns_unrecorded(lending_db):
+    d.record_dialer_event(lending_db, _ev(duration=48, contact_id="559662160"))
+    d.record_dialer_event(lending_db, _ev(duration=None, contact_id=None))  # no talk time: status and link kept
+    assert _row(lending_db)["recording_view_url"] == "https://app.batchdialer.com/contacts/view/559662160"
+    d.record_dialer_event(lending_db, _ev(duration=0, contact_id="559662160"))
+    row = _row(lending_db)
+    assert row["recording_status"] == "none" and row["recording_view_url"] is None
 
 
 def test_campaign_id_is_stored_and_a_later_event_without_one_keeps_it(lending_db):

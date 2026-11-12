@@ -48,6 +48,7 @@ from config.lending_dispositions import (
     GHL_DISPOSITION_MATCH_WINDOW_MINUTES,
     GHL_DISPOSITION_PENDING_DAYS,
     GHL_DISPOSITION_REQUIRE_CALL_IDENTITY,
+    canonical_ghl_caller,
 )
 from config.lending_followup import CALL_SOURCE_GHL, GHL_CALL_ID_PREFIX
 from src.lending import ghl_outcome_hooks
@@ -153,7 +154,7 @@ def parse_event(body: Mapping[str, Any]) -> GhlDispositionEvent:
         raise InvalidDispositionEvent(REASON_NO_CALL_IDENTITY, reason=REASON_NO_CALL_IDENTITY)
     return GhlDispositionEvent(
         contact_id=_value(body, "contact_id"), phone=phone, disposition_raw=raw[:100], code=code,
-        ghl_call_id=call_id[:90] if call_id else None, caller_name=(_value(body, "user") or "")[:200] or None,
+        ghl_call_id=call_id[:90] if call_id else None, caller_name=canonical_ghl_caller((_value(body, "user") or "")[:200] or None),
         called_at=called_at, gate_failed=_gate_failed(_value(body, "gate_failed")),
         text_consent=_text_consent(_value(body, "text_consent")),
     )

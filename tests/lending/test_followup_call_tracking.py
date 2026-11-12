@@ -520,3 +520,80 @@ def test_a_failed_recent_callers_lookup_is_counted_and_the_leads_are_still_impor
     stats = import_calls(lending_db, lambda cid: [_msg(f"{contact}-out")] if cid == contact else [], now=NOW,
                          recent_callers=broken)
     assert stats.lookup_failures >= 1 and len(_ghl_rows(lending_db, phone)) == 1
+
+
+# ── recording links on GHL calls ─────────────────────────────────────────────
+
+APP, LOCATION = "https://app.gohighlevel.com", "loc-1"
+FUTURE = datetime(2099, 1, 5, 15, 0, tzinfo=timezone.utc)  # newer than every real call, so the batch is the test rows
+
+
+def test_the_conversation_url_needs_every_id():
+    from src.lending.ghl_call_import import ghl_conversation_url
+
+    assert ghl_conversation_url(APP + "/", LOCATION, "conv-9") == (
+        f"{APP}/v2/location/{LOCATION}/conversations/conversations/conv-9")
+    assert ghl_conversation_url(APP, LOCATION, None) is None and ghl_conversation_url(APP, None, "conv-9") is None
+
+
+def _ghl_call(db, *, ended_minutes_ago, talk, conversation=True) -> tuple[int, str]:
+    message_id = f"rec-{uuid.uuid4().hex}"
+    ended = FUTURE - timedelta(minutes=ended_minutes_ago)
+    raw = {"source": "ghl", "message_id": message_id, "contact_id": "contact-7",
+           "conversation_id": "conv-7" if conversation else None}
+    row_id = db.execute(text(
+        "INSERT INTO lending.call_dispositions (dialer_call_id, call_source, direction, phone, call_started_at, "
+        "call_ended_at, talk_duration_sec, raw_event) VALUES (:id, 'ghl', 'outbound', :p, :s, :e, :t, "
+        "CAST(:raw AS jsonb)) RETURNING id"),
+        {"id": f"ghl:{message_id}", "p": _phone(), "s": ended - timedelta(seconds=talk or 0), "e": ended, "t": talk,
+         "raw": json.dumps(raw)}).scalar()
+    return row_id, message_id
+
+
+def _recording(db, row_id):
+    return db.execute(text("SELECT recording_status, recording_ref, recording_view_url FROM lending.call_dispositions "
+                           "WHERE id = :id"), {"id": row_id}).one()
+
+
+def test_recorded_ghl_calls_get_links_and_unrecorded_ones_are_none_once_settled(lending_db):
+    from src.lending.attempt_log import MISSING, READABLE
+    from src.lending.ghl_call_import import record_recordings
+
+    recorded, rec_msg = _ghl_call(lending_db, ended_minutes_ago=10, talk=120)
+    no_conversation, noconv_msg = _ghl_call(lending_db, ended_minutes_ago=11, talk=60, conversation=False)
+    fresh_missing, fresh_msg = _ghl_call(lending_db, ended_minutes_ago=12, talk=30)  # GHL may still be processing
+    old_missing, old_msg = _ghl_call(lending_db, ended_minutes_ago=120, talk=0)
+    in_progress, progress_msg = _ghl_call(lending_db, ended_minutes_ago=5, talk=None)  # no talk time, too new
+    answers = {rec_msg: READABLE, noconv_msg: READABLE, fresh_msg: MISSING, old_msg: MISSING}
+    asked = []
+
+    def check(message_id):
+        asked.append(message_id)
+        return answers[message_id]
+
+    counts = record_recordings(lending_db, check, app_url=APP, location_id=LOCATION, now=FUTURE, limit=4)
+
+    contact = f"{APP}/v2/location/{LOCATION}/contacts/detail/contact-7"
+    assert tuple(_recording(lending_db, recorded)) == (
+        "recorded", contact, f"{APP}/v2/location/{LOCATION}/conversations/conversations/conv-7")
+    assert tuple(_recording(lending_db, no_conversation)) == ("recorded", contact, contact)
+    assert tuple(_recording(lending_db, fresh_missing)) == (None, None, None)  # checked again next run
+    assert tuple(_recording(lending_db, old_missing)) == ("none", None, None)
+    assert tuple(_recording(lending_db, in_progress)) == (None, None, None) and progress_msg not in asked
+    assert counts == {"recorded": 2, "none": 1, "pending": 1}
+
+    again = record_recordings(lending_db, check, app_url=APP, location_id=LOCATION, now=FUTURE, limit=4)
+    assert again["recorded"] == 0 and asked.count(rec_msg) == 1  # a checked call is never asked again
+
+
+def test_a_refused_key_stops_the_recording_batch(lending_db):
+    from src.lending.attempt_log import FORBIDDEN
+    from src.lending.ghl_call_import import record_recordings
+
+    first, _ = _ghl_call(lending_db, ended_minutes_ago=10, talk=60)
+    second, _ = _ghl_call(lending_db, ended_minutes_ago=20, talk=60)
+    asked = []
+    counts = record_recordings(lending_db, lambda m: asked.append(m) or FORBIDDEN, app_url=APP,
+                               location_id=LOCATION, now=FUTURE, limit=2)
+    assert counts == {"forbidden": 1} and len(asked) == 1
+    assert _recording(lending_db, first)[0] is None and _recording(lending_db, second)[0] is None
