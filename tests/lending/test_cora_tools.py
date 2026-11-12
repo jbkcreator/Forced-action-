@@ -148,7 +148,8 @@ SAM = _Lead("web_lead:7", "Sam Smith", "+17275550100", "sam@example.com", "ghl-1
 
 def test_tool_set_and_safety_levels() -> None:
     tools = {tool.name: tool for tool in CoraToolkit(engine=None, memory=None).tools()}  # type: ignore[arg-type]
-    assert len(tools) == 21
+    assert len(tools) == 22
+    assert tools["get_ledger_export_status"].safety is SafetyLevel.READ_ONLY
     egress = {name for name, tool in tools.items() if tool.safety is SafetyLevel.EXTERNAL_EGRESS}
     assert egress == {"draft_sms", "draft_email", "draft_pipeline_move", "draft_add_tag", "draft_add_note"}
     assert {name for name, tool in tools.items() if tool.approver_only} == {
@@ -164,7 +165,8 @@ def test_sms_draft_takes_the_recipient_from_the_database(monkeypatch) -> None:
     draft = _toolkit(monkeypatch, SAM).draft_sms(DraftSmsInput(lead_ref="web_lead:7", body="Hi Sam"), CONTEXT)
     assert isinstance(draft, EgressDraft)
     assert draft.channel == "ghl_sms"
-    assert draft.payload == {"lead_ref": "web_lead:7", "to_phone": "+17275550100", "body": "Hi Sam"}
+    assert draft.payload == {"lead_ref": "web_lead:7", "to_phone": "+17275550100", "body": "Hi Sam",
+                             "template_version": "CORA-SMS-v1"}
     assert (draft.recipient_phone, draft.recipient_email, draft.contact_ref) == ("+17275550100", "sam@example.com",
                                                                                  "web_lead:7")
     assert "…0100" in draft.summary and "+1727" not in draft.summary

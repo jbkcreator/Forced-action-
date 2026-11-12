@@ -336,6 +336,12 @@ def test_slack_post_links_the_recording_when_recorded():
     assert f"<{VIEW}|Open in BatchDialer>" in text and "(call at 9:34 AM ET)" in text
 
 
+def test_slack_post_links_a_ghl_recording_to_ghl():
+    url = "https://app.gohighlevel.com/v2/location/loc-1/conversations/conversations/conv-7"
+    text = _section_text(_row(call_source="ghl", recording_status="recorded", recording_view_url=url))
+    assert f"<{url}|Open in GHL>" in text
+
+
 def test_slack_post_has_no_recording_line_without_talk_time():
     assert "Recording" not in _section_text(_row(recording_status="none", recording_view_url=VIEW, talk_duration_sec=0))
 

@@ -300,6 +300,7 @@ def record_dialer_event(db, ev: DialerCallEvent) -> RecordedCall:
         {"id": ev.call_id},
     ).first()
 
+    rec_status = recording_status_for(ev.duration, ev.recording_enabled)
     row = db.execute(
         text(
             "INSERT INTO lending.call_dispositions (dialer_call_id, direction, phone, caller_seat, caller_name, "
@@ -322,7 +323,12 @@ def record_dialer_event(db, ev: DialerCallEvent) -> RecordedCall:
             "recording_ref = COALESCE(EXCLUDED.recording_ref, lending.call_dispositions.recording_ref), "
             "recording_status = CASE WHEN EXCLUDED.talk_duration_sec IS NOT NULL THEN EXCLUDED.recording_status "
             "ELSE lending.call_dispositions.recording_status END, "
-            "recording_view_url = COALESCE(EXCLUDED.recording_view_url, lending.call_dispositions.recording_view_url), "
+            # the contact page only while the call's final status is recorded; an event without a contact id
+            # builds it from the stored one
+            "recording_view_url = CASE WHEN (CASE WHEN EXCLUDED.talk_duration_sec IS NOT NULL "
+            "THEN EXCLUDED.recording_status ELSE lending.call_dispositions.recording_status END) = :recorded "
+            "THEN COALESCE(EXCLUDED.recording_view_url, lending.call_dispositions.recording_view_url, "
+            ":view_prefix || lending.call_dispositions.dialer_contact_id) END, "
             "dialer_campaign_id = COALESCE(EXCLUDED.dialer_campaign_id, lending.call_dispositions.dialer_campaign_id), "
             "raw_event = EXCLUDED.raw_event, updated_at = now() "
             "RETURNING id, phone, caller_seat, disposition, campaign_tag, queue, dialer_contact_id, talk_duration_sec, "
@@ -334,8 +340,10 @@ def record_dialer_event(db, ev: DialerCallEvent) -> RecordedCall:
             "contact_id": ev.contact_id, "group": seat_group_for(ev.seat_id),
             "duration": ev.duration, "started": ev.started_at, "ended": ended_at, "real_end": ev.ended_at is not None,
             "recording": ev.recording_ref, "campaign_id": ev.campaign_id,
-            "rec_status": recording_status_for(ev.duration, ev.recording_enabled),
-            "view_url": contact_view_url(ev.contact_id), "raw": json.dumps(ev.raw, default=str),
+            "rec_status": rec_status,
+            "view_url": contact_view_url(ev.contact_id) if rec_status == RECORDING_RECORDED else None,
+            "recorded": RECORDING_RECORDED, "view_prefix": DIALER_CONTACT_VIEW_URL.format(contact_id=""),
+            "raw": json.dumps(ev.raw, default=str),
         },
     ).mappings().one()
 

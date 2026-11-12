@@ -183,3 +183,12 @@ def test_egress_handler_returning_the_wrong_type_is_an_error(queue: PendingActio
     registry = ToolRegistry([Tool("bad", "x", SmsInput, SafetyLevel.EXTERNAL_EGRESS, lambda a, c: "sent!")], gate)
     outcome = registry.execute("bad", {"body": "x"}, _context())
     assert outcome.is_error and queue.approved_ids() == []
+
+
+def test_submit_passes_ttl_to_queue(queue: PendingActionQueue, clock) -> None:
+    from datetime import timedelta
+
+    gate = SendGate(queue, FakeChatPort(), "C_CORA")
+    queued = gate.submit(EgressDraft(channel="ghl_sms", payload={"body": "Hi"}, summary="s"), tool_name="agent_job",
+                         context=_context(tool_use_id="agent_job:1"), ttl=timedelta(hours=5))
+    assert queue.get(queued.action_id).expires_at == clock.now + timedelta(hours=5)

@@ -19,6 +19,11 @@ window and stores each one once. When more contacts are in the window than one r
   POST /webhooks/lending/ghl-disposition) and is attached by src.lending.ghl_disposition_match, which every run
   calls after storing the calls; matched calls are then delivered to the Sheet and Slack
 * ``raw_event`` holds ids, the outcome and the time only: no message body, names or numbers
+* ``recording_status`` / ``recording_view_url`` / ``recording_ref`` are set by :func:`record_recordings` after the
+  calls are stored: GHL is asked whether the call message has a recording (the audio needs our API key, so it is
+  never linked). ``recorded`` stores the GHL conversation page (where the recording plays, opened by a logged-in
+  GHL user) as the view URL and the contact page as the ref; ``none`` stores no links. Earlier GHL rows are filled
+  in the same way, newest first, a batch per run
 
 Sheet/Slack delivery (and its retry) and the missing-disposition alert cover GHL calls (G3, 2026-11-03: outbound,
 connected, no outcome after GHL_MISSING_DISPOSITION_GRACE_MINUTES); only soft approval cards skip
@@ -40,6 +45,7 @@ from __future__ import annotations
 import json
 import logging
 import math
+from collections import Counter
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -56,12 +62,22 @@ from config.lending_followup import (
     INBOUND_LOOKBACK_HOURS,
     IMPORT_RUN_INTERVAL_MINUTES,
     IMPORT_WINDOW_DAYS,
+    RECORDING_CHECK_LIMIT,
+    RECORDING_SETTLE_MINUTES,
 )
-from config.lending_dispositions import GHL_CONNECTED_STATES, GHL_UNKNOWN_CALLER, ghl_caller_name
+from config.lending_dispositions import (
+    GHL_CONNECTED_STATES,
+    GHL_UNKNOWN_CALLER,
+    RECORDING_NONE,
+    RECORDING_RECORDED,
+    ghl_caller_name,
+)
 from config.lending_queues import LENDINGFLOW_POOL, WEBSITE_POOL
+from src.lending.attempt_log import FORBIDDEN, MISSING, READABLE, RecordingCheck, ghl_recording_checker
 from src.lending.first_contact import snapshot_reached_call
 from src.lending.ghl_calls import call_duration_seconds, call_state, message_time
 from src.lending.ghl_missed_call import adopt_missed_call
+from src.lending.lead_arrival_alert import ghl_contact_url
 from src.services.phone_utils import normalize
 
 logger = logging.getLogger(__name__)
@@ -261,6 +277,79 @@ def import_calls(db, read_calls: CallReader, *, now: Optional[datetime] = None,
     return stats
 
 
+_UNCHECKED_RECORDINGS = text("""
+    SELECT id, raw_event->>'message_id' AS message_id, raw_event->>'conversation_id' AS conversation_id,
+           raw_event->>'contact_id' AS contact_id, coalesce(call_ended_at, call_started_at) < :settled AS settled
+      FROM lending.call_dispositions
+     WHERE call_source = :source AND recording_status IS NULL AND raw_event->>'message_id' IS NOT NULL
+       AND (talk_duration_sec IS NOT NULL OR call_started_at < :settled)
+     ORDER BY call_started_at DESC
+     LIMIT :limit
+""")
+_SET_RECORDING = text("""
+    UPDATE lending.call_dispositions SET recording_status = :status, recording_ref = :ref, recording_view_url = :url
+     WHERE id = :id AND recording_status IS NULL
+""")
+
+
+def ghl_conversation_url(app_url: str, location_id: Optional[str], conversation_id: Optional[str]) -> Optional[str]:
+    """The conversation's page in the GHL web app (where its call recordings play), or None when an id is missing."""
+    if not (app_url and location_id and conversation_id):
+        return None
+    return f"{app_url.rstrip('/')}/v2/location/{location_id}/conversations/conversations/{conversation_id}"
+
+
+def record_recordings(db, check: RecordingCheck, *, app_url: str, location_id: str,
+                      now: Optional[datetime] = None, limit: int = RECORDING_CHECK_LIMIT) -> Counter:
+    """Set the recording status and links of up to ``limit`` GHL calls not yet checked, newest first (this also
+    fills in the calls stored before recordings were tracked). A call GHL holds a recording for is ``recorded``
+    with its conversation page (else contact page) as the view URL and the contact page as the ref; a call with no
+    recording is ``none`` once it is RECORDING_SETTLE_MINUTES old; anything else is checked again next run. A
+    refused key or a failed request stops the batch. Returns counts by result. Does not commit."""
+    now = now or datetime.now(timezone.utc)
+    counts: Counter = Counter()
+    settled = now - timedelta(minutes=RECORDING_SETTLE_MINUTES)
+    updates: list[dict[str, Any]] = []
+    try:
+        with db.begin_nested():  # a failed read must not abort the run's transaction (the imported calls)
+            rows = db.execute(_UNCHECKED_RECORDINGS, {"source": CALL_SOURCE_GHL, "settled": settled,
+                                                      "limit": limit}).all()
+    except Exception as exc:  # class only: SQL errors embed bound parameters
+        logger.error("[ghl-call-import] recording check: unchecked calls not read (%s)", type(exc).__name__)
+        return counts
+    for row in rows:
+        try:
+            result = check(row.message_id)
+        except Exception as exc:  # class only: GHL errors can echo request detail
+            counts["failed"] += 1
+            logger.warning("[ghl-call-import] call row %s: recording check failed (%s); batch stopped", row.id,
+                           type(exc).__name__)
+            break
+        if result == FORBIDDEN:
+            counts["forbidden"] += 1
+            logger.error("[ghl-call-import] GHL refused the recording check (API key access); batch stopped")
+            break
+        if result == READABLE:
+            contact_url = ghl_contact_url(app_url, location_id, row.contact_id)
+            updates.append({"id": row.id, "status": RECORDING_RECORDED, "ref": contact_url,
+                            "url": ghl_conversation_url(app_url, location_id, row.conversation_id) or contact_url})
+        elif result == MISSING and row.settled:
+            updates.append({"id": row.id, "status": RECORDING_NONE, "ref": None, "url": None})
+        else:
+            counts["pending"] += 1
+    if not updates:
+        return counts
+    try:
+        with db.begin_nested():
+            db.execute(_SET_RECORDING, updates)
+    except Exception as exc:  # class only
+        logger.error("[ghl-call-import] recording status not stored for %d calls (%s)", len(updates),
+                     type(exc).__name__)
+        return counts
+    counts.update(u["status"] for u in updates)
+    return counts
+
+
 def main() -> int:
     from config.settings import get_settings
     from src.lending.db import lending_session
@@ -280,11 +369,15 @@ def main() -> int:
 
     with lending_session() as db:
         stats = import_calls(db, call_messages_reader(account), recent_callers=recent_callers_reader(account))
+        # before matching, so a call delivered in this run carries its recording link
+        recordings = record_recordings(db, ghl_recording_checker(account),
+                                       app_url=get_settings().lending_ghl_app_url, location_id=account.location_id)
         matched = ghl_disposition_match.attach_pending(db, datetime.now(timezone.utc))
     ghl_disposition_match.deliver_matched(matched)  # after the session's commit: delivery reads the stored outcome
     logger.info("[ghl-call-import] eligible=%d offset=%d contacts=%d other_callers=%d imported=%d updated=%d "
-                "already_recorded=%d lookup_failures=%d", stats.eligible, stats.offset, stats.contacts,
-                stats.other_callers, stats.imported, stats.updated, stats.already_recorded, stats.lookup_failures)
+                "already_recorded=%d lookup_failures=%d recordings=%s", stats.eligible, stats.offset, stats.contacts,
+                stats.other_callers, stats.imported, stats.updated, stats.already_recorded, stats.lookup_failures,
+                dict(recordings))
     return 0
 
 

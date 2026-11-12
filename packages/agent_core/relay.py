@@ -15,7 +15,7 @@ from typing import Any
 
 from .halt import HaltSwitch
 from .lane_guard import lane_block_reason, lane_violation
-from .pending_actions import ActionStatus, PendingAction, PendingActionQueue
+from .pending_actions import ActionStatus, PendingAction, PendingActionQueue, payload_deadline
 
 logger = logging.getLogger(__name__)
 
@@ -95,7 +95,9 @@ class Relay:
             return DispatchResult(DispatchOutcome.NOT_ENABLED, reason)
 
         # An expired draft never sends, whatever the send check says (a deferred send may clear only after it).
-        if action.expires_at is not None and action.expires_at <= self._queue.now():
+        now = self._queue.now()
+        deadline = payload_deadline(action)
+        if (action.expires_at is not None and action.expires_at <= now) or (deadline is not None and deadline <= now):
             reason: str | None = "the draft expired before it could be sent"
         else:
             reason = self._blocking_reason(action)

@@ -51,12 +51,14 @@ def _clock_et(dt: Optional[datetime]) -> str:
 
 
 def _recording_line(row: dict) -> Optional[str]:
-    """The BatchDialer contact link for a recorded call, with the call time (a contact page lists all its calls)."""
+    """The link to where a recorded call plays (BatchDialer contact page or GHL conversation), with the call time
+    (the page lists all the contact's calls)."""
     url = row.get("recording_view_url")
     if row.get("recording_status") != RECORDING_RECORDED or not url:
         return None
     at = _clock_et(row.get("call_started_at") or row.get("call_ended_at"))
-    return f"*Recording:* <{url}|Open in BatchDialer>" + (f" (call at {at})" if at else "")
+    app = "GHL" if row.get("call_source") == "ghl" else "BatchDialer"
+    return f"*Recording:* <{url}|Open in {app}>" + (f" (call at {at})" if at else "")
 
 
 def _campaign_name(row: Mapping[str, Any]) -> Optional[str]:

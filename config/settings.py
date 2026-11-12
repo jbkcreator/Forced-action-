@@ -1020,6 +1020,12 @@ class AppSettings(BaseSettings):
 	lending_call_window_et_end: str = Field(default="19:15", env="LENDING_CALL_WINDOW_ET_END")
 	lending_ops_channel: str = Field(default="", env="LENDING_OPS_CHANNEL")  # #lead-alerts channel ID: call-now alert, 5-minute flags, returning-borrower alert
 	lending_ops_notice_channel: str = Field(default="", env="LENDING_OPS_NOTICE_CHANNEL")  # opt-out mailbox and webhook-failure alerts; channel ID, unset = not posted
+	# P1.3 Instantly replies (src/lending/instantly_replies.py): NDL's own Instantly workspace, separate from FA's
+	# INSTANTLY_* settings. POST /webhooks/lending/instantly is closed (503) while the secret is unset; approved answers
+	# go back in the Instantly thread only when the API key is set.
+	lending_instantly_webhook_secret: Optional[SecretStr] = Field(default=None, env="LENDING_INSTANTLY_WEBHOOK_SECRET")
+	lending_instantly_api_key: Optional[SecretStr] = Field(default=None, env="LENDING_INSTANTLY_API_KEY")
+	lending_instantly_base_url: str = Field(default="https://api.instantly.ai", env="LENDING_INSTANTLY_BASE_URL")
 	# 14-day follow-up (src/lending/ghl_call_import.py): record calls made in GoHighLevel in lending.call_dispositions
 	lending_ghl_call_import_enabled: bool = Field(default=False, env="LENDING_GHL_CALL_IMPORT_ENABLED")
 	# G3: GHL calls ended at/after this (ISO time) are flagged by the missing-disposition alert; unset = GHL calls are not
@@ -1041,6 +1047,12 @@ class AppSettings(BaseSettings):
 	# Retargeting audience export (src/tasks/lending_audience_export.py): nightly hashed files, written only when both are set
 	lending_audience_export_enabled: bool = Field(default=False, env="LENDING_AUDIENCE_EXPORT_ENABLED")
 	lending_audience_export_dir: Optional[str] = Field(default=None, env="LENDING_AUDIENCE_EXPORT_DIR")
+	# Nightly ledger export to Drive (src/tasks/lending_ledger_export.py, Cora brief P1.2): off until both are set; uses
+	# LENDING_DRIVE_SERVICE_ACCOUNT_KEY_PATH (else the Sheets key) with the drive scope; the folder is "NDL Ledger Exports", shared with that account
+	lending_ledger_export_enabled: bool = Field(default=False, env="LENDING_LEDGER_EXPORT_ENABLED")
+	lending_ledger_export_folder_id: str = Field(default="", env="LENDING_LEDGER_EXPORT_FOLDER_ID")
+	# Drive service account (shared with the P1.1 job queue); blank = LENDING_SHEETS_SERVICE_ACCOUNT_KEY_PATH
+	lending_drive_service_account_key_path: str = Field(default="", env="LENDING_DRIVE_SERVICE_ACCOUNT_KEY_PATH")
 	# Opt-out mailbox listener (src/lending/email_opt_out.py): reads mail sent to LENDING_OPTOUT_ADDRESS over IMAP.
 	# The mailbox is either a dedicated optout@ mailbox or the one optout@ forwards into; off while user or password is unset.
 	lending_optout_imap_host: str = Field(default="imap.porkbun.com", env="LENDING_OPTOUT_IMAP_HOST")
@@ -1073,6 +1085,22 @@ class AppSettings(BaseSettings):
 	lending_cora_pending_action_ttl_hours: int = Field(default=72, env="LENDING_CORA_PENDING_ACTION_TTL_HOURS")  # unapproved drafts expire after this
 	lending_cora_calendar_id: str = Field(default="", env="LENDING_CORA_CALENDAR_ID")
 	lending_cora_calendar_service_account_key_path: str = Field(default="", env="LENDING_CORA_CALENDAR_SERVICE_ACCOUNT_KEY_PATH")
+	# P1.1 agent job queue (src/lending/agent_jobs): agents drop job files in Drive "NDL Jobs/inbox", Cora cards them
+	# and writes receipts to "NDL Jobs/done". Off until enabled; the folders must sit in a Shared Drive (a service
+	# account cannot create files in a personal My Drive). The key may be the same file as the Sheets one.
+	lending_agent_jobs_enabled: bool = Field(default=False, env="LENDING_AGENT_JOBS_ENABLED")
+	lending_drive_service_account_key_path: str = Field(default="", env="LENDING_DRIVE_SERVICE_ACCOUNT_KEY_PATH")
+	lending_jobs_inbox_folder_id: str = Field(default="", env="LENDING_JOBS_INBOX_FOLDER_ID")
+	lending_jobs_processed_folder_id: str = Field(default="", env="LENDING_JOBS_PROCESSED_FOLDER_ID")
+	lending_jobs_done_folder_id: str = Field(default="", env="LENDING_JOBS_DONE_FOLDER_ID")
+	# P1.1 cold email through NDL's Instantly workspace, with the same LENDING_INSTANTLY_API_KEY / _BASE_URL as P1.3
+	# (defined above). Cold email stays off until the key, the passthrough campaign id and the footer postal address
+	# (CAN-SPAM) are all set.
+	lending_instantly_campaign_id: str = Field(default="", env="LENDING_INSTANTLY_CAMPAIGN_ID")
+	lending_instantly_sender_email: str = Field(default="", env="LENDING_INSTANTLY_SENDER_EMAIL")
+	lending_email_footer_brand: str = Field(default="Next Deal Lending", env="LENDING_EMAIL_FOOTER_BRAND")
+	lending_email_footer_postal_address: str = Field(default="", env="LENDING_EMAIL_FOOTER_POSTAL_ADDRESS")
+	lending_email_footer_phone: str = Field(default="(656) 221-1100", env="LENDING_EMAIL_FOOTER_PHONE")
 	# ── Meta Conversions API (CAPI) — S2 ────────────────────────────────────
 	# Server-side Purchase reporting for closed-loop Meta ad attribution.
 	# Feature-gated and OFF by default — when disabled, or when pixel_id /

@@ -59,8 +59,23 @@ def _message(text_value: str, user: str = JOSH) -> InboundMessage:
     return InboundMessage(channel="C_CORA", user_id=user, text=text_value, ts="1.0", thread_ts=None, is_direct=False)
 
 
-def _command(chat: FakeChatPort, cora_halt: CoraHalt, alert_channel: str | None = "C_NDL") -> EmergencyHalt:
-    return EmergencyHalt(chat=chat, cora_halt=cora_halt, approver_ids={JOSH}, alert_channel=alert_channel)
+def _command(chat: FakeChatPort, cora_halt: CoraHalt, alert_channel: str | None = "C_NDL",
+             instantly=None) -> EmergencyHalt:
+    return EmergencyHalt(chat=chat, cora_halt=cora_halt, approver_ids={JOSH}, alert_channel=alert_channel,
+                         instantly_sender=lambda: instantly)
+
+
+class FakeInstantlyCampaign:
+    def __init__(self, ok: bool = True) -> None:
+        self.ok, self.calls = ok, []
+
+    def pause_campaign(self) -> bool:
+        self.calls.append("pause")
+        return self.ok
+
+    def resume_campaign(self) -> bool:
+        self.calls.append("resume")
+        return self.ok
 
 
 @pytest.mark.parametrize("message,command", [
@@ -240,3 +255,47 @@ def test_typed_in_coras_channel_the_alert_is_posted_once(halt_db) -> None:
     alerts = [post for post in chat.posts if "Lending emergency halt" in post["text"]]
     assert len(alerts) == 1 and alerts[0]["channel"] == "C_CORA"
     assert ":white_square: Pause the lending campaigns in BatchDialer" in alerts[0]["text"]
+
+
+def test_halt_pauses_ndl_instantly_campaign(halt_db) -> None:
+    chat, campaign = FakeChatPort(default_channel="C_CORA"), FakeInstantlyCampaign()
+    _command(chat, CoraHalt(), instantly=campaign)(_message("emergency halt"))
+    assert campaign.calls == ["pause"]
+    alert = next(post for post in chat.posts if post["channel"] == "C_NDL")
+    assert "Instantly cold-email campaign (paused)" in alert["text"]
+
+
+def test_resume_reactivates_campaign(halt_db) -> None:
+    chat, campaign = FakeChatPort(default_channel="C_CORA"), FakeInstantlyCampaign()
+    command = _command(chat, CoraHalt(), instantly=campaign)
+    command(_message("emergency halt"))
+    command(_message("emergency resume"))
+    assert campaign.calls == ["pause", "resume"]
+
+
+def test_halt_pause_failure_alerts(halt_db) -> None:
+    chat, campaign = FakeChatPort(default_channel="C_CORA"), FakeInstantlyCampaign(ok=False)
+    _command(chat, CoraHalt(), instantly=campaign)(_message("emergency halt"))
+    assert is_globally_halted()
+    alert = next(post for post in chat.posts if post["channel"] == "C_NDL")
+    assert "Instantly cold-email campaign could NOT be paused" in alert["text"]
+
+
+def test_halt_without_instantly_config_still_halts(halt_db) -> None:
+    chat = FakeChatPort(default_channel="C_CORA")
+    _command(chat, CoraHalt(), instantly=None)(_message("emergency halt"))
+    assert is_globally_halted()
+    alert = next(post for post in chat.posts if post["channel"] == "C_NDL")
+    assert "Instantly" not in alert["text"]
+
+
+def test_halt_survives_an_instantly_exception(halt_db) -> None:
+    class Broken:
+        def pause_campaign(self):
+            raise RuntimeError("network")
+
+    chat = FakeChatPort(default_channel="C_CORA")
+    _command(chat, CoraHalt(), instantly=Broken())(_message("emergency halt"))
+    assert is_globally_halted()
+    alert = next(post for post in chat.posts if post["channel"] == "C_NDL")
+    assert "could NOT be paused" in alert["text"]

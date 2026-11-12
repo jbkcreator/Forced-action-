@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+from config.lending_standing_sends import CORA_EMAIL_TEMPLATE, CORA_SMS_TEMPLATE
 from collections.abc import Callable, Iterator, Mapping
 from contextlib import AbstractContextManager, contextmanager
 from dataclasses import dataclass
@@ -96,7 +97,7 @@ CONSENT_TEXT_HIDDEN = "[consent text not shown]"
 # (G4; docs/lending/ghl-conversation-ai.md hard rule 1). Enforced on the draft text itself, not just
 # asked of the model: the GL-10 reply-agent patterns (money, %, points, "rate ... N") plus ratios,
 # fees/payments, "400k" amounts and loan terms in months or years.
-BORROWER_MESSAGE_CHANNELS = frozenset({"ghl_sms", "ghl_email"})
+BORROWER_MESSAGE_CHANNELS = frozenset({"ghl_sms", "ghl_email", "instantly_email", "instantly_cold_email"})
 _DRAFT_NUMBER_PATTERNS = (
     *QUOTED_NUMBER_PATTERNS,
     r"\b\d+(?:\.\d+)?\s?k\b",                                                    # 400k
@@ -400,7 +401,8 @@ class CoraToolkit:
                  channels: Optional[ChannelDirectory] = None,
                  inbox_session: Optional[Callable[[], AbstractContextManager[Session]]] = None,
                  attempt_messages: Optional[MessageReader] = None,
-                 attempt_recordings: Optional[RecordingCheck] = None) -> None:
+                 attempt_recordings: Optional[RecordingCheck] = None,
+                 ledger_manifest: Optional[Callable[[], Optional[dict]]] = None) -> None:
         """``channels`` is the channels Cora's bot is in: listed, read and routed to. ``inbox_session``
         overrides where the inbox tools read and write; tests pass their rolled-back session.
         ``attempt_messages`` reads a lead's GHL messages for the attempt log (None: calls only);
@@ -412,6 +414,7 @@ class CoraToolkit:
         self._inbox_session = inbox_session
         self._attempt_messages = attempt_messages
         self._attempt_recordings = attempt_recordings
+        self._ledger_manifest = ledger_manifest
 
     @contextmanager
     def _inbox(self) -> Iterator[Session]:
@@ -735,7 +738,8 @@ class CoraToolkit:
         lead = self._lead(args.lead_ref)
         if not lead.phone:
             raise ToolInputError(f"{lead.ref} has no phone number on record")
-        return EgressDraft(channel="ghl_sms", payload={"lead_ref": lead.ref, "to_phone": lead.phone, "body": args.body},
+        return EgressDraft(channel="ghl_sms", payload={"lead_ref": lead.ref, "to_phone": lead.phone, "body": args.body,
+                                                       "template_version": CORA_SMS_TEMPLATE},
                            summary=f"Text to {_who(lead)} ({_last4(lead.phone)})",
                            recipient_phone=lead.phone, recipient_email=lead.email, contact_ref=lead.ref)
 
@@ -747,7 +751,8 @@ class CoraToolkit:
             raise ToolInputError(f"{lead.ref} has no email address on record")
         return EgressDraft(channel="ghl_email",
                            payload={"lead_ref": lead.ref, "to_email": lead.email, "to_phone": lead.phone,
-                                    "subject": args.subject, "body": args.body},
+                                    "subject": args.subject, "body": args.body,
+                                    "template_version": CORA_EMAIL_TEMPLATE},
                            summary=f"Email to {_who(lead)} <{lead.email}>: {args.subject}",
                            recipient_phone=lead.phone, recipient_email=lead.email, contact_ref=lead.ref)
 
@@ -768,6 +773,17 @@ class CoraToolkit:
     def draft_add_note(self, args: DraftAddNoteInput, _: ToolContext) -> EgressDraft:
         lead = self._lead_in_ghl(args.lead_ref)
         return _crm_draft(lead, "ghl_note", {"body": args.body.strip()}, f"Add a note to {_who(lead)} in GoHighLevel")
+
+    def ledger_export_status(self, _: NoInput, __: ToolContext) -> dict[str, Any]:
+        """The newest nightly ledger export in Drive (P1.2): its day and the row count of each file."""
+        if self._ledger_manifest is None:
+            return {"status": "not configured"}
+        try:
+            found = self._ledger_manifest()
+        except Exception as exc:  # Drive errors can embed ids; the class is enough to diagnose
+            logger.warning("[cora] ledger manifest read failed (%s)", type(exc).__name__)
+            return {"status": "unreadable", "error": type(exc).__name__}
+        return {"status": "found", **found} if found else {"status": "no export yet"}
 
     def tools(self) -> list[Tool]:
         read, write, egress = SafetyLevel.READ_ONLY, SafetyLevel.INTERNAL_WRITE, SafetyLevel.EXTERNAL_EGRESS
@@ -794,6 +810,9 @@ class CoraToolkit:
                  "SELECT over lending.* tables.", QueryInput, read, self.query_lending_data),
             Tool("save_standing_rule", "Save a standing rule an approver stated, so it applies to every future "
                  "conversation.", SaveRuleInput, write, self.save_rule, approver_only=True),
+            Tool("get_ledger_export_status", "The newest nightly ledger export the agents read from Drive (NDL "
+                 "Ledger Exports): which day it covers and how many rows each CSV holds.", NoInput, read,
+                 self.ledger_export_status),
             Tool("list_standing_rules", "List the standing rules currently in force.", NoInput, read, self.list_rules),
             Tool("deactivate_standing_rule", "Stop applying a standing rule (by memory_id from list_standing_rules).",
                  DeactivateRuleInput, write, self.deactivate_rule, approver_only=True),

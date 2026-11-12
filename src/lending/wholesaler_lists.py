@@ -82,7 +82,7 @@ def parse_wholesaler_csv(text: str) -> ParsedList:
 
 
 class GhlTagSink(Protocol):
-    def push(self, record: Mapping[str, Any], tags: list[str]) -> None: ...
+    def push(self, record: Mapping[str, Any], tags: list[str]) -> Optional[str]: ...  # the GHL contact id
 
 
 class GhlWholesalerSink:
@@ -108,7 +108,8 @@ class GhlWholesalerSink:
         except ValueError:
             return {}
 
-    def push(self, record: Mapping[str, Any], tags: list[str]) -> None:
+    def push(self, record: Mapping[str, Any], tags: list[str]) -> str:
+        """Returns the GHL contact id."""
         first, _, last = str(record.get("borrower_name") or "").partition(" ")
         body: dict[str, Any] = {"locationId": self._account.location_id, "phone": record["phone"],
                                 "firstName": first, "lastName": last.strip()}
@@ -123,6 +124,7 @@ class GhlWholesalerSink:
         if not contact_id:
             raise RuntimeError("contact upsert: no contact id in response")
         self._call("add tags", "POST", f"/contacts/{contact_id}/tags", json={"tags": tags})
+        return contact_id
 
 
 def ghl_sink() -> Optional[GhlWholesalerSink]:

@@ -29,6 +29,13 @@ IMPORT_RUN_INTERVAL_MINUTES = 15
 # search page of at most RECENT_CALLERS_LIMIT conversations per run, looking back INBOUND_LOOKBACK_HOURS.
 INBOUND_LOOKBACK_HOURS = 48
 RECENT_CALLERS_LIMIT = 100
+# Recording links on GHL calls: each run asks GHL whether a stored call has a recording (one request per call,
+# newest first, at most RECORDING_CHECK_LIMIT per run; older rows are filled in by later runs). A call with no
+# reported talk time is checked, and a "no recording" answer is final, only once the call is
+# RECORDING_SETTLE_MINUTES old, so a call still in progress or a recording GHL is still processing is not
+# marked "none" too early.
+RECORDING_CHECK_LIMIT = 100
+RECORDING_SETTLE_MINUTES = 60
 
 # Runbook § 4.1: "leads with 5+ attempts over 5+ days are eligible for replacement credit".
 REPLACEMENT_MIN_ATTEMPTS = 5

@@ -195,6 +195,7 @@ class LendingDialerLoadRecord(LendingBase):
     ghl_sync_attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default=text("0"))
     ghl_synced_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
     ghl_sync_error: Mapped[Optional[str]] = mapped_column(String(200))
+    ghl_contact_id: Mapped[Optional[str]] = mapped_column(String(64))  # GHL contact the sync upserted (P1.1 jobs / P1.2 export key)
 
     __table_args__ = (
         Index("uq_lending_dialer_load_records_active_phone", "phone", unique=True,
@@ -283,7 +284,7 @@ class LendingCallDisposition(LendingBase):
     # recorded | none (BatchDialer, set on ingest). Rows from before 2026-11 may still hold pending/readable/forbidden/missing.
     recording_status: Mapped[Optional[str]] = mapped_column(String(12))
     recording_checked_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))  # unused since 2026-11 (recording check removed)
-    recording_view_url: Mapped[Optional[str]] = mapped_column(String(500))  # BatchDialer contact page, where recordings play
+    recording_view_url: Mapped[Optional[str]] = mapped_column(String(500))  # where the recording plays (BatchDialer contact / GHL conversation page); recorded calls only
     dialer_campaign_id: Mapped[Optional[str]] = mapped_column(String(64))  # BatchDialer campaign (scoreboard)
     # batchdialer (CDR poller) | ghl (calls made in GoHighLevel, imported for the 14-day follow-up). Dialer-only
     # jobs (delivery, missing-disposition alert, soft approval cards) act on batchdialer rows only.
@@ -1112,6 +1113,43 @@ class LendingCoraInboxItem(LendingBase):
     )
 
 
+class LendingAgentJob(LendingBase):
+    """One agent job file from Drive "NDL Jobs/inbox" (P1.1, ``src.lending.agent_jobs``), keyed by the agent's
+    ``job_id`` so a job is acted on at most once even when its file is re-dropped.
+
+    ``state``: held (waiting for not_before or the 8am-8pm window, re-checked at ``release_at``) -> carded (a
+    ``pending_actions`` draft exists: ``action_id``) -> done (``result_status`` is final). The receipt is written to
+    "NDL Jobs/done/{job_id}.json" from ``result``; ``result_written_at`` is set only once that write succeeded.
+    ``job`` holds the parsed file (no phone or email: the recipient is read from GHL). ``rail``: ghl | instantly."""
+
+    __tablename__ = "agent_jobs"
+
+    job_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    drive_file_id: Mapped[str] = mapped_column(String(128), nullable=False, unique=True)
+    file_name: Mapped[str] = mapped_column(Text, nullable=False)
+    created_by: Mapped[Optional[str]] = mapped_column(String(120))
+    job_type: Mapped[Optional[str]] = mapped_column(String(20))
+    template_version: Mapped[Optional[str]] = mapped_column(String(80))
+    ghl_contact_id: Mapped[Optional[str]] = mapped_column(String(64))
+    rail: Mapped[Optional[str]] = mapped_column(String(12))
+    job: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict, server_default=text("'{}'::jsonb"))
+    state: Mapped[str] = mapped_column(String(16), nullable=False)
+    held_reason: Mapped[Optional[str]] = mapped_column(String(20))
+    release_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    action_id: Mapped[Optional[int]] = mapped_column(BigInteger)
+    result_status: Mapped[Optional[str]] = mapped_column(String(20))
+    result: Mapped[Optional[dict]] = mapped_column(JSONB)
+    result_written_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    received_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_now, server_default=text("now()"))
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_now, server_default=text("now()"))
+
+    __table_args__ = (
+        CheckConstraint("state IN ('held', 'carded', 'done')", name="ck_agent_jobs_state"),
+        Index("ix_agent_jobs_state_release", "state", "release_at"),
+        Index("ix_agent_jobs_action", "action_id"),
+    )
+
+
 class LendingCoraMorningDigest(LendingBase):
     """One row per ET day Cora posted her 7:30 AM morning digest (``src.lending.cora_morning_digest``). The row
     is written in the same transaction as the Slack post, so a restart or second sweep never posts twice."""
@@ -1394,3 +1432,96 @@ class LendingPartnerFileUpload(LendingBase):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_now, server_default=text("now()"))
 
     __table_args__ = (Index("idx_lending_partner_file_uploads_file", "file_id"),)
+
+
+
+class LendingInstantlyReply(LendingBase):
+    """One reply to an NDL Instantly cold email (P1.3), from ``POST /webhooks/lending/instantly``.
+
+    ``status``: new (waiting for Cora's sweep to classify it, draft an answer and post the triage) -> done, or
+    suppressed (a STOP or unsubscribe: no answer is ever drafted; ``suppressed_at`` is set once the opt-out is
+    recorded, and the sweep retries one that failed) or failed (gave up after ``attempts``). ``reply_text`` is kept
+    so the answer can be drafted; it is never logged or put in the inbox payload. ``action_id`` is the approval card
+    in ``pending_actions``; ``triage_posted_at`` the post in the replies channel."""
+
+    __tablename__ = "instantly_replies"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    dedup_key: Mapped[str] = mapped_column(String(200), nullable=False)
+    event_type: Mapped[str] = mapped_column(String(40), nullable=False)
+    lead_email: Mapped[str] = mapped_column(String(320), nullable=False)  # lower-cased
+    first_name: Mapped[Optional[str]] = mapped_column(String(100))
+    campaign_id: Mapped[Optional[str]] = mapped_column(String(100))
+    campaign_name: Mapped[Optional[str]] = mapped_column(String(200))
+    email_account: Mapped[Optional[str]] = mapped_column(String(320))  # our Instantly inbox that received the reply
+    reply_to_uuid: Mapped[Optional[str]] = mapped_column(String(100))  # Instantly's id of the reply email
+    reply_subject: Mapped[Optional[str]] = mapped_column(String(500))
+    reply_text: Mapped[str] = mapped_column(Text, nullable=False, default="", server_default=text("''"))
+    stop_request: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default=text("false"))
+    status: Mapped[str] = mapped_column(String(16), nullable=False, default="new", server_default=text("'new'"))
+    intent: Mapped[Optional[str]] = mapped_column(String(16))
+    summary: Mapped[Optional[str]] = mapped_column(String(300))  # one line, no numbers, no contact details
+    action_id: Mapped[Optional[int]] = mapped_column(BigInteger)
+    opt_out_event_id: Mapped[Optional[int]] = mapped_column(BigInteger)
+    suppressed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    triage_posted_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default=text("0"))
+    last_error: Mapped[Optional[str]] = mapped_column(String(200))  # exception class or a fixed reason only
+    received_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_now, server_default=text("now()"))
+    processed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+
+    __table_args__ = (
+        CheckConstraint("status IN ('new', 'suppressed', 'done', 'failed')", name="ck_instantly_replies_status"),
+        CheckConstraint("intent IS NULL OR intent IN ('deal', 'objection', 'dead', 'unsubscribe', 'unclassified')",
+                        name="ck_instantly_replies_intent"),
+        Index("uq_instantly_replies_dedup", "dedup_key", unique=True),
+        Index("ix_instantly_replies_open", "received_at",
+              postgresql_where=text("status = 'new' OR (status = 'suppressed' AND suppressed_at IS NULL)")),
+    )
+
+
+class LendingCardEdit(LendingBase):
+    """P1.4: one Revise on an approval card, as before and after states plus a line diff.
+
+    Written by ``src.lending.standing_sends.record_card_edit`` from Cora's revise handler. ``revision_no`` is the
+    revision's position in ``pending_actions.revisions`` (1 = first edit). ``before`` / ``after`` hold only the
+    editable message fields (subject, body, stage, tag, title), never recipient details. ``template_version`` is set
+    for agent-job drafts and drives the Standing Sends Tracker; other cards are recorded with it NULL."""
+
+    __tablename__ = "card_edits"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    action_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    revision_no: Mapped[int] = mapped_column(Integer, nullable=False)
+    template_version: Mapped[Optional[str]] = mapped_column(String(80))
+    channel: Mapped[str] = mapped_column(String(64), nullable=False)
+    tool_name: Mapped[str] = mapped_column(String(100), nullable=False)
+    before: Mapped[dict] = mapped_column(JSONB, nullable=False)
+    after: Mapped[dict] = mapped_column(JSONB, nullable=False)
+    diff: Mapped[str] = mapped_column(Text, nullable=False, default="", server_default=text("''"))
+    instruction: Mapped[Optional[str]] = mapped_column(Text)  # what the approver asked Cora to change
+    edited_by: Mapped[Optional[str]] = mapped_column(String(32))  # Slack user id
+    edited_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_now, server_default=text("now()"))
+
+    __table_args__ = (
+        Index("uq_card_edits_action_revision", "action_id", "revision_no", unique=True),
+        Index("ix_card_edits_template", "template_version", postgresql_where=text("template_version IS NOT NULL")),
+    )
+
+
+class LendingTemplateGraduation(LendingBase):
+    """P1.4: a template version that graduated to standing auto-send (``config/lending_standing_sends.py``).
+
+    Written once by Cora's sweep the first time the template meets the rule; the counts are the evidence at that
+    moment. ``revoked_at`` set = it needs approval cards again (and is never re-graduated automatically)."""
+
+    __tablename__ = "template_graduations"
+
+    template_version: Mapped[str] = mapped_column(String(80), primary_key=True)
+    graduated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_now, server_default=text("now()"))
+    approvals: Mapped[int] = mapped_column(Integer, nullable=False)
+    edited: Mapped[int] = mapped_column(Integer, nullable=False)
+    rejected: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default=text("0"))
+    edit_rate: Mapped[float] = mapped_column(Numeric(5, 4), nullable=False)
+    revoked_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    revoked_by: Mapped[Optional[str]] = mapped_column(String(64))

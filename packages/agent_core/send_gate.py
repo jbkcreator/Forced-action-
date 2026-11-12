@@ -13,6 +13,7 @@ card; the model is told it was refused.
 from __future__ import annotations
 
 import logging
+from datetime import timedelta
 
 from .approval import render_action_card
 from .chatport import ChatPort
@@ -32,12 +33,14 @@ class SendGate:
         self._chat = chat
         self._card_channel = card_channel
 
-    def submit(self, draft: EgressDraft, *, tool_name: str, context: ToolContext) -> QueuedDraft:
+    def submit(self, draft: EgressDraft, *, tool_name: str, context: ToolContext,
+               ttl: timedelta | None = None) -> QueuedDraft:
+        """``ttl`` overrides the queue's default expiry (a host's job may carry its own deadline)."""
         action_id = self._queue.enqueue(
             tool_name=tool_name, channel=draft.channel, payload=draft.payload, summary=draft.summary,
             requested_by=context.user_id, source_channel=context.channel, source_thread_ts=context.thread_ts,
             recipient_phone=draft.recipient_phone, recipient_email=draft.recipient_email,
-            contact_ref=draft.contact_ref, deal_ref=draft.deal_ref, idempotency_key=context.tool_use_id,
+            contact_ref=draft.contact_ref, deal_ref=draft.deal_ref, idempotency_key=context.tool_use_id, ttl=ttl,
         )
         rule = lane_violation(draft.payload)
         if rule is not None:

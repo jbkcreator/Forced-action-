@@ -1,7 +1,9 @@
 """The GHL call import attaches waiting GHL outcomes once the calls are stored, then delivers them (G3). Pure."""
 from __future__ import annotations
 
+from collections import Counter
 from contextlib import contextmanager
+from types import SimpleNamespace
 
 from src.lending import ghl_call_import as imp
 
@@ -12,7 +14,9 @@ def test_main_matches_after_the_import_and_delivers_after_the_commit(monkeypatch
 
     order = []
     monkeypatch.setattr(get_settings(), "lending_ghl_call_import_enabled", True, raising=False)
-    monkeypatch.setattr(ghl_account, "lending_ghl_account", lambda: object())
+    monkeypatch.setattr(ghl_account, "lending_ghl_account", lambda: SimpleNamespace(location_id="loc-1"))
+    monkeypatch.setattr(imp, "ghl_recording_checker", lambda acct: None)
+    monkeypatch.setattr(imp, "record_recordings", lambda db, check, **k: order.append("recordings") or Counter())
 
     @contextmanager
     def session():
@@ -26,4 +30,4 @@ def test_main_matches_after_the_import_and_delivers_after_the_commit(monkeypatch
     monkeypatch.setattr("src.lending.ghl_calls.recent_callers_reader", lambda acct: None)
 
     assert imp.main() == 0
-    assert order == ["import", "match", "commit", ("deliver", [5, 6])]
+    assert order == ["import", "recordings", "match", "commit", ("deliver", [5, 6])]

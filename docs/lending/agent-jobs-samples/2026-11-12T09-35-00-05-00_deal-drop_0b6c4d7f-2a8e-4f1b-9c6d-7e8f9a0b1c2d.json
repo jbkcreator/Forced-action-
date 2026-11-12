@@ -1,0 +1,15 @@
+{
+  "job_id": "0b6c4d7f-2a8e-4f1b-9c6d-7e8f9a0b1c2d",
+  "lane": "NDL",
+  "created_by": "Deal Drop",
+  "created_at": "2026-11-12T09:35:00-05:00",
+  "type": "send_email",
+  "ghl_contact_id": "REPLACE_WITH_PARTNER_TEST_CONTACT_ID",
+  "contact_label": "Test partner",
+  "template_version": "DEAL-DROP-v1",
+  "subject": "This week's Deal Drop from Next Deal Lending",
+  "body": "Hi,\n\nHere are this week's deals we're looking to fund. Reply if any fit your buyers and Josh will reach out.\n\nNext Deal Lending",
+  "reason": "Weekly Deal Drop to partners",
+  "requires_approval": true,
+  "expires_at": "2026-11-14T20:00:00-05:00"
+}

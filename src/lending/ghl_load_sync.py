@@ -109,9 +109,10 @@ _MARK = text("""
        SET ghl_sync_status = v.status,
            ghl_sync_attempts = d.ghl_sync_attempts + v.attempted,
            ghl_synced_at = CASE WHEN v.status = :pushed THEN now() ELSE d.ghl_synced_at END,
-           ghl_sync_error = v.error
+           ghl_sync_error = v.error,
+           ghl_contact_id = COALESCE(v.ghl_contact_id, d.ghl_contact_id)
       FROM unnest(CAST(:ids AS bigint[]), CAST(:statuses AS text[]), CAST(:attempted AS int[]),
-                  CAST(:errors AS text[])) AS v(id, status, attempted, error)
+                  CAST(:errors AS text[]), CAST(:ghl_ids AS text[])) AS v(id, status, attempted, error, ghl_contact_id)
      WHERE d.id = v.id AND d.ghl_sync_status IS NULL
 """)
 
@@ -175,6 +176,7 @@ class Outcome:
     status: Optional[SyncStatus]
     attempted: int = 0
     error: Optional[str] = None
+    ghl_contact_id: Optional[str] = None
 
 
 @dataclass
@@ -208,14 +210,14 @@ def process(rows: Sequence[Mapping[str, Any]], sink: Optional[GhlTagSink], *,
             outcomes.append(Outcome(row["id"], SyncStatus.PUSHED))
             continue
         try:
-            sink.push(row, [*decision.tags, *extra_tags])
+            contact_id = sink.push(row, [*decision.tags, *extra_tags])
         except Exception as exc:
             error = safe_error(exc)
             logger.warning("[ghl-load-sync] push failed for load record %s (%s): %s", row["id"], row["pool"], error)
             final = row["ghl_sync_attempts"] + 1 >= GHL_LOAD_SYNC_MAX_ATTEMPTS
             outcomes.append(Outcome(row["id"], SyncStatus.FAILED if final else None, attempted=1, error=error))
         else:
-            outcomes.append(Outcome(row["id"], SyncStatus.PUSHED, attempted=1))
+            outcomes.append(Outcome(row["id"], SyncStatus.PUSHED, attempted=1, ghl_contact_id=contact_id))
     return outcomes
 
 
@@ -243,6 +245,7 @@ def record(db, outcomes: Sequence[Outcome]) -> None:
         "statuses": [o.status.value if o.status else None for o in outcomes],
         "attempted": [o.attempted for o in outcomes],
         "errors": [o.error for o in outcomes],
+        "ghl_ids": [o.ghl_contact_id for o in outcomes],
     })
 
 

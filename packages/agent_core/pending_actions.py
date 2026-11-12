@@ -128,6 +128,18 @@ def _row_to_action(row: Mapping[str, Any]) -> PendingAction:
     )
 
 
+def payload_deadline(action: PendingAction) -> datetime | None:
+    """The host's absolute deadline for this action: ``payload["not_after"]`` (ISO 8601 with a time zone), or None.
+    No revision extends past it, and the relay never sends after it."""
+    raw = action.payload.get("not_after")
+    return datetime.fromisoformat(raw) if isinstance(raw, str) and raw else None
+
+
+def _capped(expires_at: datetime, action: PendingAction) -> datetime:
+    deadline = payload_deadline(action)
+    return min(expires_at, deadline) if deadline is not None else expires_at
+
+
 def is_expired(action: PendingAction, now: datetime) -> bool:
     return action.status is ActionStatus.EXPIRED or (
         action.status in _OPEN_STATUSES and action.expires_at is not None and action.expires_at <= now
@@ -204,6 +216,11 @@ class PendingActionQueue:
                 ).scalar_one()
         return int(action_id)
 
+    def find_by_idempotency_key(self, key: str) -> PendingAction | None:
+        """The action queued under ``key``, whatever its status (a host's own retry looks it up)."""
+        with self._store.transaction() as conn:
+            return self._select_one(conn, "idempotency_key = :key", {"key": key})
+
     def get(self, action_id: int) -> PendingAction | None:
         with self._store.transaction() as conn:
             return self._select_one(conn, "action_id = :action_id", {"action_id": action_id})
@@ -259,7 +276,8 @@ class PendingActionQueue:
                        ttl: timedelta | None = None) -> bool:
         """Replace the frozen payload with the redraft; the replaced version goes into ``revisions``.
 
-        The redraft is a new draft: it needs a fresh approval and gets a fresh expiry.
+        The redraft is a new draft: it needs a fresh approval and gets a fresh expiry, never later than the
+        payload's ``not_after`` (a host's absolute deadline, see :func:`payload_deadline`).
         """
         now = self._clock()
         with self._store.transaction() as conn:
@@ -280,7 +298,7 @@ class PendingActionQueue:
                 ),
                 {"pending": ActionStatus.PENDING.value, "revising": ActionStatus.REVISING.value,
                  "payload": _dump_json(dict(payload)), "summary": summary, "note": note,
-                 "revisions": _dump_json(history), "expires_at": now + (ttl or self._default_ttl),
+                 "revisions": _dump_json(history), "expires_at": _capped(now + (ttl or self._default_ttl), current),
                  "now": now, "action_id": action_id},
             )
         return result.rowcount == 1

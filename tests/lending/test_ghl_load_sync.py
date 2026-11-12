@@ -27,6 +27,7 @@ class Sink:
         if record["id"] in self.fail:
             raise self.error
         self.pushed.append((record["id"], tags))
+        return f"ghl-{record['id']}"
 
 
 def test_every_dialer_pool_has_a_ghl_call_list_tag():
@@ -190,3 +191,9 @@ def test_every_status_fits_the_status_column():
 
     width = LendingDialerLoadRecord.__table__.c.ghl_sync_status.type.length
     assert max(len(s.value) for s in SyncStatus) <= width
+
+
+
+def test_a_pushed_row_records_the_ghl_contact_id_and_a_failed_one_does_not():
+    by_id = {o.id: o for o in sync.process([_row(1), _row(2)], Sink(fail={2}))}
+    assert by_id[1].ghl_contact_id == "ghl-1" and by_id[2].ghl_contact_id is None

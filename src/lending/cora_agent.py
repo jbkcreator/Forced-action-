@@ -6,8 +6,9 @@ is answered by the native Messages API loop (``agent_core.agent_loop``) with the
 far as history, the standing rules from ``lending.agent_memory`` in the system prompt, and Cora's
 lending tools. Draft tools only queue approval cards.
 
-Alongside the session, a sweep runs once a minute: it expires stale drafts, re-posts approval
-cards Slack refused, and sends approved actions that were not sent at click time. Every send first
+Alongside the session, a sweep runs once a minute: it expires stale drafts, triages new Instantly
+replies (P1.3: classify, draft an answer card, post the triage), re-posts approval cards Slack
+refused, and sends approved actions that were not sent at click time. Every send first
 passes the lending send-time check (suppressed / do-not-contact / text consent). Run exactly one
 instance.
 
@@ -20,13 +21,16 @@ import logging
 import signal
 import threading
 from collections.abc import Callable, Mapping
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Any, NamedTuple, Optional
+from zoneinfo import ZoneInfo
 
 from sqlalchemy import create_engine, text
 from sqlalchemy.engine import Engine
 from sqlalchemy.orm import Session
 
+from config.lending_agent_jobs import COLD_EMAIL_CHANNEL
+from config.lending_compliance import CALL_WINDOW_END, CALL_WINDOW_START, DEFAULT_TZ
 from config.settings import AppSettings, get_settings
 from packages.agent_core.agent_loop import AgentLoop, MessagesClient
 from packages.agent_core.chatport import ChatPort, SlackChatPort
@@ -41,6 +45,8 @@ from packages.agent_core.slack_session import InboundMessage, SlackSession, run_
 from packages.agent_core.store import AgentStore
 from packages.agent_core.thread_history import build_history
 from packages.agent_core.tools import ToolContext, ToolRegistry
+from src.lending.agent_jobs.drive import google_job_folders
+from src.lending.agent_jobs.worker import JobQueueWorker, make_check
 from src.lending.attempt_log import lending_ghl_readers
 from src.lending.compliance import text_window_open
 from src.lending.consent import has_text_consent
@@ -52,6 +58,16 @@ from src.lending.global_halt import EmergencyHalt
 from src.lending.ghl_crm import GhlCrmWriter, get_crm_writer
 from src.lending.ghl_email import GhlEmailSender, get_email_sender
 from src.lending.ghl_sms import GhlSmsSender, get_sender
+from src.lending.instantly_client import InstantlyAccount, block_address, lending_instantly_account, send_reply
+from src.lending.instantly_email import NdlInstantlySender, get_ndl_instantly_sender
+from src.lending.instantly_replies import CHANNEL as INSTANTLY_CHANNEL, ReplyProcessor
+from src.lending.standing_sends import (
+    StandingSendsStep,
+    auto_approval_lapsed,
+    make_edit_recorder,
+    make_is_graduated,
+)
+from src.lending.ops_alerts import post_ops_notice, post_replies_notice
 from src.lending.cora_morning_digest import post_morning_digest
 from src.lending.models import LENDING_SCHEMA
 from src.lending.routing.slack_extension import RoutingSlack
@@ -69,9 +85,14 @@ PLACEHOLDER_TEXT = "Working on it…"
 
 # Channels that deliver a text message and therefore need live text consent.
 SMS_CHANNELS = frozenset({"ghl_sms"})
+# P1.3's thread replies (INSTANTLY_CHANNEL) and P1.1's cold emails (COLD_EMAIL_CHANNEL) both go through NDL's Instantly.
+EMAIL_CHANNELS = frozenset({"ghl_email", INSTANTLY_CHANNEL, COLD_EMAIL_CHANNEL})
+INSTANTLY_CHANNELS = frozenset({INSTANTLY_CHANNEL, COLD_EMAIL_CHANNEL})
 # What a revision may change, per draft channel. Recipient fields are never editable.
 EDITABLE_FIELDS: dict[str, tuple[str, ...]] = {"ghl_sms": ("body",), "ghl_email": ("subject", "body"),
-                                               "ghl_stage": ("stage",), "ghl_tag": ("tag",), "ghl_note": ("body",)}
+                                               "ghl_stage": ("stage",), "ghl_tag": ("tag",), "ghl_note": ("body",),
+                                               "ghl_task": ("title",), INSTANTLY_CHANNEL: ("subject", "body"),
+                                               COLD_EMAIL_CHANNEL: ("subject", "body")}
 
 # Same suppression rule the booking reminder worker applies before every send.
 _SUPPRESSED = text("""
@@ -79,6 +100,9 @@ _SUPPRESSED = text("""
                                                               OR (email = :e AND :e IS NOT NULL))
         OR EXISTS (SELECT 1 FROM lending.contacts WHERE phone = :p AND :p IS NOT NULL AND do_not_contact)
 """)
+# An Instantly answer also honours FA's email opt-outs (an unsubscribe Instantly reported to FA's webhook reaches the
+# lending list only on the opt-out poller's next pass).
+_EMAIL_OPTED_OUT = text("SELECT EXISTS (SELECT 1 FROM email_opt_outs WHERE lower(email) = :e)")
 
 _MODEL_UNAVAILABLE = "I couldn't reach my language model just now. Nothing was sent; please try again in a minute."
 
@@ -90,6 +114,10 @@ class CoraServices(NamedTuple):
     web_client: Any = None  # the Slack WebClient Socket Mode replies through; None in tests
     inbox_digest: Optional[Callable[[], int]] = None  # posts new inbox items to Cora's channel; returns how many
     morning_digest: Optional[Callable[[], bool]] = None  # posts the 7:30 AM ET digest once a day; True when posted
+    instantly_replies: Optional[Callable[[], Any]] = None  # P1.3: triages new Instantly replies
+    queue: Optional[PendingActionQueue] = None  # the drafts table the session, gate and relay share
+    agent_jobs: Optional[Callable[[], Any]] = None  # P1.1: one pass of the Drive job queue worker
+    standing_sends: Optional[Callable[[], Any]] = None  # P1.4: graduates templates that meet the rule
 
 
 def lending_channel_ids(settings: AppSettings) -> dict[str, str]:
@@ -157,13 +185,25 @@ def build_config(settings: AppSettings) -> AgentCoreConfig:
     )
 
 
+def email_window_open(phone: Optional[str], *, now: Optional[datetime] = None) -> bool:
+    """8am-8pm for an email's recipient (brief section 7, "Hours", applies to every send): the borrower's own
+    window when the phone is known, else 8am-8pm Eastern."""
+    if phone:
+        return text_window_open(phone, now=now)
+    local = (now or datetime.now(timezone.utc)).astimezone(ZoneInfo(DEFAULT_TZ)).time()
+    return CALL_WINDOW_START <= local < CALL_WINDOW_END
+
+
 def make_send_check(engine: Engine, *, carrier_approved: bool = False,
-                    text_window: Callable[[str], bool] = text_window_open) -> SendCheck:
+                    text_window: Callable[[str], bool] = text_window_open,
+                    email_window: Callable[[Optional[str]], bool] = email_window_open) -> SendCheck:
     """Lending rule run by the relay right before a send. Returns a reason to block, or None.
 
     A text also waits for the carrier (10DLC) approval (LENDING_SMS_CARRIER_APPROVED) and for the borrower's
-    8am-8pm window: both are deferrals, so an approved text stays approved and sends on a later sweep once both
-    hold, or is blocked when the draft expires first."""
+    8am-8pm window, and an email (GHL or Instantly) for the recipient's 8am-8pm window: these are deferrals, so an
+    approved send stays approved and goes on a later sweep once they hold, or is blocked when the draft expires. An
+    action approved automatically (P1.4 graduation) whose template has since been revoked is held too, and the next
+    sweep sends it back for a person's approval."""
 
     def check(action: PendingAction) -> Optional[str]:
         phone = normalize(action.recipient_phone) if action.recipient_phone else None
@@ -173,13 +213,21 @@ def make_send_check(engine: Engine, *, carrier_approved: bool = False,
         with engine.connect() as conn:
             if conn.execute(_SUPPRESSED, {"p": phone, "e": email}).scalar():
                 return "recipient is suppressed or marked do-not-contact"
+            if action.channel in INSTANTLY_CHANNELS and conn.execute(_EMAIL_OPTED_OUT, {"e": email}).scalar():
+                return "recipient is suppressed or marked do-not-contact"
             if action.channel in SMS_CHANNELS and not (phone and has_text_consent(conn, phone)):
                 return "no text consent on record for this number"
+            if auto_approval_lapsed(conn, action.decided_by, action.payload.get("template_version")):
+                # P1.4: its template was revoked after the automatic approval. Held, never sent; the next sweep
+                # sends it back for a person's approval (standing_sends.return_ungraduated_auto_approvals).
+                return SendDeferred("its message type no longer auto-sends; going back for approval")
         if action.channel in SMS_CHANNELS:
             if not carrier_approved:
                 return SendDeferred("texting is not approved by the carrier yet (10DLC)")
             if not text_window(phone):
                 return SendDeferred("outside the borrower's 8am-8pm text window")
+        if action.channel in EMAIL_CHANNELS and not email_window(phone):
+            return SendDeferred("outside the recipient's 8am-8pm window")
         return None
 
     return check
@@ -206,17 +254,37 @@ def sms_executor(sender: GhlSmsSender) -> EgressExecutor:
     return send
 
 
+def instantly_executor(account: InstantlyAccount) -> EgressExecutor:
+    """Sends an approved Instantly answer exactly as approved, inside the lead's thread from the inbox the reply
+    reached; returns Instantly's email id. Never retried (the relay records a failure instead of sending twice)."""
+
+    def send(payload: Mapping[str, Any]) -> Optional[str]:
+        return send_reply(account, eaccount=payload["from_inbox"], reply_to_uuid=payload["reply_to_uuid"],
+                          subject=payload["subject"], body=payload["body"])
+
+    return send
+
+
 def crm_executors(crm: GhlCrmWriter) -> dict[str, EgressExecutor]:
     """Approved CRM drafts, applied exactly as approved to the GHL contact the draft carries."""
     return {
         "ghl_stage": lambda payload: crm.move_stage(payload["ghl_contact_id"], payload["stage"]),
         "ghl_tag": lambda payload: crm.add_tag(payload["ghl_contact_id"], payload["tag"]),
         "ghl_note": lambda payload: crm.add_note(payload["ghl_contact_id"], payload["body"]),
+        "ghl_task": lambda payload: crm.create_task(payload["ghl_contact_id"], payload["title"],
+                                                    datetime.fromisoformat(payload["due_at"]), payload.get("assignee")),
     }
 
 
+def cold_email_executor(sender: NdlInstantlySender) -> EgressExecutor:
+    """Hands an approved cold email to NDL's Instantly campaign exactly as approved (the sender adds the CAN-SPAM
+    footer); returns the Instantly lead id."""
+    return lambda payload: sender.send(payload["to_email"], payload["subject"], payload["body"])
+
+
 def build_egress_executors() -> dict[str, EgressExecutor]:
-    """Channels Cora may send through once approved: ``ghl_email`` (needs the GHL account and
+    """Channels Cora may send through once approved: ``instantly_email`` (needs ``LENDING_INSTANTLY_API_KEY``),
+    ``ghl_email`` (needs the GHL account and
     ``LENDING_GHL_EMAIL_FROM``) and ``ghl_sms`` (needs the GHL account and ``LENDING_GHL_SMS_FROM_NUMBER``; texts
     also wait for LENDING_SMS_CARRIER_APPROVED in the send check), and the CRM writes ``ghl_stage``, ``ghl_tag``
     and ``ghl_note`` (need the GHL account; a stage move also needs LENDING_GHL_PIPELINE_ID)."""
@@ -231,12 +299,39 @@ def build_egress_executors() -> dict[str, EgressExecutor]:
         logger.warning("[cora] GHL SMS sender not configured; approved texts will not be sent")
     else:
         executors["ghl_sms"] = sms_executor(sms_sender)
+    instantly = lending_instantly_account()
+    if instantly is None:
+        logger.warning("[cora] NDL Instantly account not configured; approved Instantly answers will not be sent")
+    else:
+        executors[INSTANTLY_CHANNEL] = instantly_executor(instantly)
     crm = get_crm_writer()
     if crm is None:
-        logger.warning("[cora] GHL account not configured; approved stage moves, tags and notes will not apply")
+        logger.warning("[cora] GHL account not configured; approved stage moves, tags, notes and tasks will not apply")
     else:
         executors.update(crm_executors(crm))
+    cold = get_ndl_instantly_sender()
+    if cold is None:
+        logger.warning("[cora] NDL Instantly cold-email campaign not configured; approved cold emails will not be sent")
+    else:
+        executors[COLD_EMAIL_CHANNEL] = cold_email_executor(cold)
     return executors
+
+
+def build_agent_jobs(settings: AppSettings, *, engine: Engine, gate: SendGate, queue: PendingActionQueue,
+                     approval_channel: str,
+                     is_graduated: Callable[[str], bool] = lambda _: False) -> Optional[JobQueueWorker]:
+    """The P1.1 Drive job queue worker, or None (logged) while it is switched off or not configured."""
+    if not settings.lending_agent_jobs_enabled:
+        logger.info("[cora] agent job queue off (LENDING_AGENT_JOBS_ENABLED=false)")
+        return None
+    folders = google_job_folders()
+    crm = get_crm_writer()
+    if folders is None or crm is None:
+        logger.error("[cora] agent job queue enabled but not configured (Drive folders or the GHL account missing)")
+        return None
+    instantly_ready = get_ndl_instantly_sender() is not None
+    return JobQueueWorker(engine, folders, gate, queue, crm.read_contact, approval_channel=approval_channel,
+                          check=make_check(engine, instantly_ready=instantly_ready), is_graduated=is_graduated)
 
 
 def _ts_seconds(ts: Optional[str]) -> float:
@@ -260,8 +355,10 @@ class CoraConversation:
     """Turns one Slack message (or revise reply) into an answer in the same thread."""
 
     def __init__(self, *, config: AgentCoreConfig, chat: ChatPort, loop: AgentLoop, reviser: DraftReviser,
-                 bot_user_id: str, inbox_context: Optional[Callable[[str, str], str]] = None) -> None:
+                 bot_user_id: str, inbox_context: Optional[Callable[[str, str], str]] = None,
+                 on_edit: Optional[Callable[[int], None]] = None) -> None:
         self._config = config
+        self._on_edit = on_edit  # P1.4: records the card's before and after; never raises
         self._chat = chat
         self._loop = loop
         self._reviser = reviser
@@ -331,6 +428,8 @@ class CoraConversation:
     def on_revision(self, action: PendingAction, message: InboundMessage) -> None:
         try:
             queued = self._reviser.revise(action, message.text, message.user_id)
+            if self._on_edit is not None:
+                self._on_edit(action.action_id)
             answer = (f"Revised action #{action.action_id}. A fresh approval card is posted; nothing has been sent."
                       if queued.card_posted else
                       f"Revised action #{action.action_id}, but Slack refused the new approval card; it will be "
@@ -352,12 +451,13 @@ def build_session(config: AgentCoreConfig, store: AgentStore, chat: ChatPort, bo
                   toolkit_factory: Callable[[Engine, AgentMemory], Any] = CoraToolkit,
                   inbox_context: Optional[Callable[[str, str], str]] = None,
                   executors: Optional[Mapping[str, EgressExecutor]] = None,
-                  extension: Any = None) -> CoraServices:
+                  extension: Any = None, record_edits: bool = False) -> CoraServices:
     """Wire Cora. ``toolkit_factory(engine, memory)`` builds the tool set; tests swap the lead lookups.
     ``inbox_context(channel, thread_ts)`` returns the inbox items a digest thread lists (empty when none).
     ``executors`` defaults to none, so nothing sends unless the caller registers a channel.
     ``extension`` is the session's hook for host-owned Slack traffic (``SlackSession``).
-    The "@Cora emergency halt" alert goes to Cora's own channel (client answer 12)."""
+    The "@Cora emergency halt" alert goes to Cora's own channel (client answer 12).
+    ``record_edits`` stores each card Revise in ``lending.card_edits`` (P1.4)."""
     queue = PendingActionQueue(store, default_ttl=timedelta(hours=config.pending_action_ttl_hours))
     halt = HaltSwitch(store, config.agent_name)
     relay = Relay(queue, halt, executors or {}, send_check=send_check)
@@ -374,26 +474,54 @@ def build_session(config: AgentCoreConfig, store: AgentStore, chat: ChatPort, bo
                            base_prompt=REVISION_PROMPT, rules_provider=rules, editable_fields=EDITABLE_FIELDS,
                            content_check=draft_content_check)
     conversation = CoraConversation(config=config, chat=chat, loop=loop, reviser=reviser, bot_user_id=bot_user_id,
-                                    inbox_context=inbox_context)
+                                    inbox_context=inbox_context,
+                                    on_edit=make_edit_recorder(store.engine, queue.get) if record_edits else None)
     session = SlackSession(config=config, chat=chat, queue=queue, halt=halt, relay=relay,
                            on_message=conversation.on_message, on_revision=conversation.on_revision,
                            bot_user_id=bot_user_id,
                            command_hook=EmergencyHalt(chat=chat, cora_halt=halt, approver_ids=config.approver_user_ids,
                                                       alert_channel=config.slack_channel_id),
                            extension=extension)
-    return CoraServices(session, relay, gate)
+    return CoraServices(session, relay, gate, queue=queue)
 
 
 def run_sweep(services: CoraServices) -> None:
-    """One pass: expire stale drafts, retry missing approval cards, post the inbox digest and the 7:30 AM
+    """One pass: expire stale drafts, triage new Instantly replies, retry missing approval cards, run the agent job
+    queue, graduate templates (P1.4), post the inbox digest and the 7:30 AM
     morning digest (always, even while halted: the halt stops sends to borrowers, not Cora's own channel), then
     send approved actions."""
     expired = services.session.expire_stale_actions()
     if expired:
         logger.info("[cora] expired %s stale draft(s)", expired)
+    if services.instantly_replies is not None:
+        try:
+            replies = services.instantly_replies()
+        except Exception as exc:  # class only; the replies stay new and are retried next sweep
+            logger.error("[cora] Instantly reply triage failed (%s); retrying next sweep", type(exc).__name__)
+        else:
+            if replies and (replies.triaged or replies.suppressed or replies.failed):
+                logger.info("[cora] Instantly replies triaged=%s drafted=%s suppressed=%s failed=%s", replies.triaged,
+                            replies.drafted, replies.suppressed, replies.failed)
     reposted = services.gate.retry_missing_cards()
     if reposted:
         logger.info("[cora] posted %s delayed approval card(s)", reposted)
+    if services.agent_jobs is not None:
+        try:
+            stats = services.agent_jobs()
+        except Exception as exc:  # class only: Drive or GHL trouble never skips the sends below
+            logger.error("[cora] agent job queue failed (%s); retrying next sweep", type(exc).__name__)
+        else:
+            if stats and any(stats):
+                logger.info("[cora] agent jobs %s", stats)
+    if services.standing_sends is not None:
+        try:
+            graduated = services.standing_sends()
+        except Exception as exc:  # class only; retried next sweep, nothing graduates meanwhile
+            logger.error("[cora] standing sends check failed (%s); retrying next sweep", type(exc).__name__)
+        else:
+            if graduated:
+                logger.info("[cora] graduated to standing auto-send: %s",
+                            ", ".join(t.template_version for t in graduated))
     if services.inbox_digest is not None:
         try:
             surfaced = services.inbox_digest()
@@ -456,19 +584,59 @@ def build_live_services(settings: AppSettings) -> Optional[CoraServices]:
 
     attempt_messages, attempt_recordings = lending_ghl_readers()
 
+    ledger_manifest = None
+    from src.lending.drive_upload import key_path
+
+    if settings.lending_ledger_export_folder_id and key_path():
+        from src.lending.drive_upload import latest_manifest
+
+        folder_id = settings.lending_ledger_export_folder_id
+
+        def ledger_manifest():
+            return latest_manifest(folder_id)
+
     def toolkit_factory(toolkit_engine: Engine, memory: AgentMemory) -> CoraToolkit:
         return CoraToolkit(toolkit_engine, memory, channels=channels, attempt_messages=attempt_messages,
-                           attempt_recordings=attempt_recordings)
+                           attempt_recordings=attempt_recordings, ledger_manifest=ledger_manifest)
 
     store = AgentStore(engine, config.db_schema)
     services = build_session(config, store, chat,
                              bot_user_id, messages_client=messages_client, send_check=make_send_check(
                                  engine, carrier_approved=settings.lending_sms_carrier_approved),
                              toolkit_factory=toolkit_factory, inbox_context=make_inbox_context(engine),
-                             executors=build_egress_executors(), extension=RoutingSlack(web))
+                             executors=build_egress_executors(), extension=RoutingSlack(web),
+                             record_edits=True)
     digest = make_inbox_digest(engine, chat, config.slack_channel_id, channel_ids)
+    worker = build_agent_jobs(settings, engine=engine, gate=services.gate, queue=services.queue,
+                              approval_channel=config.approval_channel_id or "",
+                              is_graduated=make_is_graduated(engine))
     return services._replace(web_client=web, inbox_digest=digest,
-                             morning_digest=make_morning_digest(engine, store, chat, config))
+                             morning_digest=make_morning_digest(engine, store, chat, config),
+                             instantly_replies=make_instantly_replies(engine, store, config, messages_client,
+                                                                      services.gate),
+                             agent_jobs=worker.run_once if worker is not None else None,
+                             standing_sends=make_standing_sends_step(engine))
+
+
+def make_standing_sends_step(engine: Engine) -> Callable[[], Any]:
+    """P1.4 sweep step: record any card edit the revise handler missed, then graduate templates that meet the rule.
+    Incremental (only drafts decided or revised since the last run), with a full pass at start and once a day."""
+    return StandingSendsStep(engine)
+
+
+def make_instantly_replies(engine: Engine, store: AgentStore, config: AgentCoreConfig, messages_client: MessagesClient,
+                           gate: SendGate) -> Callable[[], Any]:
+    """P1.3: the sweep step that classifies new Instantly replies, queues the drafted answer as an approval card
+    (posted at once; a refused card is re-posted by ``retry_missing_cards``) and posts the triage."""
+    queue = PendingActionQueue(store, default_ttl=timedelta(hours=config.pending_action_ttl_hours))
+    memory = AgentMemory(store)
+    instantly = lending_instantly_account()
+    processor = ReplyProcessor(
+        session_factory=lambda: Session(engine), client=messages_client, model=config.model, enqueue=queue.enqueue,
+        post_card=gate.post_card, post_triage=post_replies_notice, post_notice=post_ops_notice,
+        rules=lambda: [rule.rule_text for rule in memory.active_rules()],
+        block_address=(lambda email: block_address(instantly, email)) if instantly else (lambda email: False))
+    return processor.run
 
 
 def _adopt_open_cards(services: CoraServices) -> None:

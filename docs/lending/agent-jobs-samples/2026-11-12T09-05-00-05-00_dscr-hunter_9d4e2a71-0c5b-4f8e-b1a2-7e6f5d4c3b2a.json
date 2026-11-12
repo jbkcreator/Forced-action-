@@ -1,0 +1,15 @@
+{
+  "job_id": "9d4e2a71-0c5b-4f8e-b1a2-7e6f5d4c3b2a",
+  "lane": "NDL",
+  "created_by": "DSCR refinance hunter",
+  "created_at": "2026-11-12T09:05:00-05:00",
+  "type": "send_email",
+  "ghl_contact_id": "REPLACE_WITH_COLD_TEST_CONTACT_ID",
+  "contact_label": "Cold test contact, St. Petersburg",
+  "template_version": "DSCR-COLD-EMAIL-v1",
+  "subject": "Your rental property loan",
+  "body": "Hi,\n\nI work with investors refinancing rental properties in Florida. If your loan comes due in the next few months, I'd be glad to walk you through your options.\n\nJosh\nNext Deal Lending",
+  "reason": "Loan maturing in 5 months (Forced Action signal)",
+  "requires_approval": true,
+  "expires_at": "2026-11-14T20:00:00-05:00"
+}

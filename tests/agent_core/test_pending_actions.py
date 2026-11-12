@@ -160,3 +160,31 @@ def test_approved_ids_lists_only_approved(queue: PendingActionQueue) -> None:
     queue.approve(approved, APPROVER)
     assert queue.approved_ids() == [approved]
     assert pending not in queue.approved_ids()
+
+
+def test_find_by_idempotency_key(queue) -> None:
+    action_id = queue.enqueue(tool_name="t", channel="ghl_sms", payload={"body": "Hi"}, summary="s",
+                              idempotency_key="agent_job:abc")
+    assert queue.find_by_idempotency_key("agent_job:abc").action_id == action_id
+    assert queue.find_by_idempotency_key("agent_job:missing") is None
+
+
+def test_revision_never_extends_past_the_payload_deadline(queue: PendingActionQueue, clock: Clock) -> None:
+    """A host deadline (``not_after`` in the payload) is absolute: a revision's fresh expiry is capped by it."""
+    deadline = clock.now + timedelta(minutes=10)
+    action_id = queue.enqueue(tool_name="agent_job", channel="ghl_sms", summary="s", ttl=timedelta(minutes=10),
+                              payload={"body": "Hi", "not_after": deadline.isoformat()})
+    assert queue.request_revision(action_id, APPROVER)
+    assert queue.apply_revision(action_id, payload={"body": "Hi there", "not_after": deadline.isoformat()},
+                                summary="s", note="shorter")
+    assert queue.get(action_id).expires_at == deadline
+    clock.advance(timedelta(minutes=11))
+    assert not queue.approve(action_id, APPROVER)
+
+
+def test_revision_without_a_deadline_gets_a_fresh_expiry(queue: PendingActionQueue, clock: Clock) -> None:
+    action_id = queue.enqueue(tool_name="draft_sms", channel="ghl_sms", payload={"body": "Hi"}, summary="s",
+                              ttl=timedelta(minutes=10))
+    assert queue.request_revision(action_id, APPROVER)
+    assert queue.apply_revision(action_id, payload={"body": "Hi there"}, summary="s", note="n")
+    assert queue.get(action_id).expires_at == clock.now + DEFAULT_TTL
