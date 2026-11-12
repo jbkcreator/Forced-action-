@@ -143,7 +143,7 @@ def test_ghl_contact_is_pushed_with_every_messaging_channel_do_not_disturb_and_c
 
     monkeypatch.setattr(ghl_webhook, "_ghl_request", record_request)
     record = parse_wholesaler_csv(CSV).records[0]
-    GhlWholesalerSink(GhlAccount("k", "loc")).push(record, ["ndl-wholesaler", "ndl-cold"])
+    assert GhlWholesalerSink(GhlAccount("k", "loc")).push(record, ["ndl-wholesaler", "ndl-cold"]) == "ct1"
     (upsert_url, upsert), (tags_url, tags) = calls
     assert upsert_url.endswith("/contacts/upsert") and tags_url.endswith("/contacts/ct1/tags")
     dnd = upsert["dndSettings"]

@@ -456,9 +456,20 @@ def build_live_services(settings: AppSettings) -> Optional[CoraServices]:
 
     attempt_messages, attempt_recordings = lending_ghl_readers()
 
+    ledger_manifest = None
+    from src.lending.drive_upload import key_path
+
+    if settings.lending_ledger_export_folder_id and key_path():
+        from src.lending.drive_upload import latest_manifest
+
+        folder_id = settings.lending_ledger_export_folder_id
+
+        def ledger_manifest():
+            return latest_manifest(folder_id)
+
     def toolkit_factory(toolkit_engine: Engine, memory: AgentMemory) -> CoraToolkit:
         return CoraToolkit(toolkit_engine, memory, channels=channels, attempt_messages=attempt_messages,
-                           attempt_recordings=attempt_recordings)
+                           attempt_recordings=attempt_recordings, ledger_manifest=ledger_manifest)
 
     store = AgentStore(engine, config.db_schema)
     services = build_session(config, store, chat,
