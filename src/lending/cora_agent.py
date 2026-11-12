@@ -53,7 +53,7 @@ from src.lending.global_halt import EmergencyHalt
 from src.lending.ghl_crm import GhlCrmWriter, get_crm_writer
 from src.lending.ghl_email import GhlEmailSender, get_email_sender
 from src.lending.ghl_sms import GhlSmsSender, get_sender
-from src.lending.instantly_client import InstantlyAccount, lending_instantly_account, send_reply
+from src.lending.instantly_client import InstantlyAccount, block_address, lending_instantly_account, send_reply
 from src.lending.instantly_replies import CHANNEL as INSTANTLY_CHANNEL, ReplyProcessor
 from src.lending.ops_alerts import post_ops_notice, post_replies_notice
 from src.lending.cora_morning_digest import post_morning_digest
@@ -516,10 +516,12 @@ def make_instantly_replies(engine: Engine, store: AgentStore, config: AgentCoreC
     (posted at once; a refused card is re-posted by ``retry_missing_cards``) and posts the triage."""
     queue = PendingActionQueue(store, default_ttl=timedelta(hours=config.pending_action_ttl_hours))
     memory = AgentMemory(store)
+    instantly = lending_instantly_account()
     processor = ReplyProcessor(
         session_factory=lambda: Session(engine), client=messages_client, model=config.model, enqueue=queue.enqueue,
         post_card=gate.post_card, post_triage=post_replies_notice, post_notice=post_ops_notice,
-        rules=lambda: [rule.rule_text for rule in memory.active_rules()])
+        rules=lambda: [rule.rule_text for rule in memory.active_rules()],
+        block_address=(lambda email: block_address(instantly, email)) if instantly else (lambda email: False))
     return processor.run
 
 
