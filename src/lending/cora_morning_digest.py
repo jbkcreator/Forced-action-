@@ -10,6 +10,7 @@ overdue actions, new high-score leads, and today's calling queues". Cora's minut
     classification that exists today; the Chunk 2 A0 1-10 intake score replaces it when built), plus web leads.
   * Today's calls: calls booked for today. Dialer lists ready: active dialer contacts per campaign.
   * Loan files with no lender yet: the routing hold queue.
+  * Standing sends (P1.4): per agent message type, approvals, % edited, and whether it is ready or graduated.
 
 The digest is written for the client, not for a developer: first names, plain labels, how long something has waited
 and where to act. Row ids, tool names and booking references never appear.
@@ -38,6 +39,7 @@ from sqlalchemy.orm import Session
 from packages.agent_core.briefing import BriefSection, render_brief_blocks
 from packages.agent_core.chatport import ChatPort
 from src.lending.cora_inbox import slack_safe
+from src.lending.standing_sends import morning_card_lines, template_stats
 
 logger = logging.getLogger(__name__)
 
@@ -140,6 +142,7 @@ class DigestData:
     inbox_items: list[dict[str, Any]] = field(default_factory=list)
     held_files: int = 0
     exhausted_files: int = 0
+    standing_sends: list[Any] = field(default_factory=list)  # P1.4 tracker rows (TemplateStats)
 
 
 def _rows(db: Session, statement, params: dict[str, Any]) -> list[dict[str, Any]]:
@@ -210,6 +213,7 @@ def gather(db: Session, day: date, now: datetime, *, halted: bool, halt_reason: 
     queues = _section(db, "dialer queues", lambda: _rows(db, _DIALER_QUEUES, {}), [], missing)
     hold = _section(db, "loan files without a lender",
                     lambda: dict(db.execute(_HOLD_QUEUE).mappings().one()), no_hold, missing)
+    standing = _section(db, "standing sends tracker", lambda: template_stats(db), [], missing)
     return DigestData(
         halted=halted, halt_reason=halt_reason,
         pending_drafts=drafts, pending_total=_total(drafts),
@@ -218,6 +222,7 @@ def gather(db: Session, day: date, now: datetime, *, halted: bool, halt_reason: 
         web_leads=int(web["total"]), web_leads_not_in_ghl=int(web["not_in_ghl"]),
         todays_calls=calls, dialer_queues=queues, unavailable=tuple(missing), inbox_items=inbox,
         held_files=int(hold["held"] or 0), exhausted_files=int(hold["exhausted"] or 0),
+        standing_sends=standing,
     )
 
 
@@ -350,6 +355,8 @@ def render(day: date, data: DigestData, *, now: Optional[datetime] = None,
         BriefSection("Dialer lists ready", queues, "No contacts loaded."),
         BriefSection(f"Loan files with no lender yet: {data.held_files}", _hold_lines(data),
                      "All loan files are routed."),
+        BriefSection("Standing sends (auto-send after 25 approvals, under 10% edited)",
+                     morning_card_lines(data.standing_sends), "No agent message types yet."),
     ]
     header = f"Next Deal Lending morning update: {day:%A}, {day:%B} {day.day}"
     return header, render_brief_blocks(header, sections)

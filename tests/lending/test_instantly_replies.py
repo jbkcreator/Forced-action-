@@ -228,6 +228,7 @@ def test_a_deal_reply_is_drafted_onto_an_approval_card_and_triaged():
     assert draft["channel"] == "instantly_email" and draft["tool_name"] == "draft_instantly_reply"
     assert draft["payload"]["from_inbox"] == "josh@ndl-mail.com" and draft["payload"]["reply_to_uuid"] == "em-1"
     assert draft["recipient_email"] == LEAD and draft["idempotency_key"] == "instantly_reply:7"
+    assert draft["payload"]["template_version"] == "INSTANTLY-REPLY-v1"
     assert calls.cards == [99] and "action 99" in calls.triage[0]
     done = session.params("SET status = 'done'")[0]
     assert done["intent"] == "deal" and done["action_id"] == 99 and done["posted"] is True
@@ -449,16 +450,18 @@ def test_an_instantly_answer_to_an_address_opted_out_in_fa_is_blocked_at_send_ti
     from src.lending.cora_agent import make_send_check
 
     engine = ScriptedEngine(False, True)  # not on the lending list yet, but in FA's email_opt_outs
-    assert make_send_check(engine)(_instantly_action()) == "recipient is suppressed or marked do-not-contact"
+    assert make_send_check(engine, email_window=lambda *_: True)(_instantly_action()) == (
+        "recipient is suppressed or marked do-not-contact")
     assert "email_opt_outs" in engine.queries[1][0] and engine.queries[1][1]["e"] == LEAD
 
 
 def test_an_instantly_answer_to_a_clear_address_may_send_and_ghl_email_is_unchanged():
     from src.lending.cora_agent import make_send_check
 
-    assert make_send_check(ScriptedEngine(False, False))(_instantly_action()) is None
+    open_window = {"email_window": lambda *_: True}  # independent of the time the test runs
+    assert make_send_check(ScriptedEngine(False, False), **open_window)(_instantly_action()) is None
     ghl = ScriptedEngine(False)
-    assert make_send_check(ghl)(_instantly_action("ghl_email")) is None
+    assert make_send_check(ghl, **open_window)(_instantly_action("ghl_email")) is None
     assert len(ghl.queries) == 1  # GHL email keeps its single suppression query
 
 

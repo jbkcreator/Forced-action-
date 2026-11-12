@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+from config.lending_standing_sends import CORA_EMAIL_TEMPLATE, CORA_SMS_TEMPLATE
 from collections.abc import Callable, Iterator, Mapping
 from contextlib import AbstractContextManager, contextmanager
 from dataclasses import dataclass
@@ -735,7 +736,8 @@ class CoraToolkit:
         lead = self._lead(args.lead_ref)
         if not lead.phone:
             raise ToolInputError(f"{lead.ref} has no phone number on record")
-        return EgressDraft(channel="ghl_sms", payload={"lead_ref": lead.ref, "to_phone": lead.phone, "body": args.body},
+        return EgressDraft(channel="ghl_sms", payload={"lead_ref": lead.ref, "to_phone": lead.phone, "body": args.body,
+                                                       "template_version": CORA_SMS_TEMPLATE},
                            summary=f"Text to {_who(lead)} ({_last4(lead.phone)})",
                            recipient_phone=lead.phone, recipient_email=lead.email, contact_ref=lead.ref)
 
@@ -747,7 +749,8 @@ class CoraToolkit:
             raise ToolInputError(f"{lead.ref} has no email address on record")
         return EgressDraft(channel="ghl_email",
                            payload={"lead_ref": lead.ref, "to_email": lead.email, "to_phone": lead.phone,
-                                    "subject": args.subject, "body": args.body},
+                                    "subject": args.subject, "body": args.body,
+                                    "template_version": CORA_EMAIL_TEMPLATE},
                            summary=f"Email to {_who(lead)} <{lead.email}>: {args.subject}",
                            recipient_phone=lead.phone, recipient_email=lead.email, contact_ref=lead.ref)
 

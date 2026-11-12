@@ -1477,3 +1477,50 @@ class LendingInstantlyReply(LendingBase):
         Index("ix_instantly_replies_open", "received_at",
               postgresql_where=text("status = 'new' OR (status = 'suppressed' AND suppressed_at IS NULL)")),
     )
+
+
+class LendingCardEdit(LendingBase):
+    """P1.4: one Revise on an approval card, as before and after states plus a line diff.
+
+    Written by ``src.lending.standing_sends.record_card_edit`` from Cora's revise handler. ``revision_no`` is the
+    revision's position in ``pending_actions.revisions`` (1 = first edit). ``before`` / ``after`` hold only the
+    editable message fields (subject, body, stage, tag, title), never recipient details. ``template_version`` is set
+    for agent-job drafts and drives the Standing Sends Tracker; other cards are recorded with it NULL."""
+
+    __tablename__ = "card_edits"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    action_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    revision_no: Mapped[int] = mapped_column(Integer, nullable=False)
+    template_version: Mapped[Optional[str]] = mapped_column(String(80))
+    channel: Mapped[str] = mapped_column(String(64), nullable=False)
+    tool_name: Mapped[str] = mapped_column(String(100), nullable=False)
+    before: Mapped[dict] = mapped_column(JSONB, nullable=False)
+    after: Mapped[dict] = mapped_column(JSONB, nullable=False)
+    diff: Mapped[str] = mapped_column(Text, nullable=False, default="", server_default=text("''"))
+    instruction: Mapped[Optional[str]] = mapped_column(Text)  # what the approver asked Cora to change
+    edited_by: Mapped[Optional[str]] = mapped_column(String(32))  # Slack user id
+    edited_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_now, server_default=text("now()"))
+
+    __table_args__ = (
+        Index("uq_card_edits_action_revision", "action_id", "revision_no", unique=True),
+        Index("ix_card_edits_template", "template_version", postgresql_where=text("template_version IS NOT NULL")),
+    )
+
+
+class LendingTemplateGraduation(LendingBase):
+    """P1.4: a template version that graduated to standing auto-send (``config/lending_standing_sends.py``).
+
+    Written once by Cora's sweep the first time the template meets the rule; the counts are the evidence at that
+    moment. ``revoked_at`` set = it needs approval cards again (and is never re-graduated automatically)."""
+
+    __tablename__ = "template_graduations"
+
+    template_version: Mapped[str] = mapped_column(String(80), primary_key=True)
+    graduated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_now, server_default=text("now()"))
+    approvals: Mapped[int] = mapped_column(Integer, nullable=False)
+    edited: Mapped[int] = mapped_column(Integer, nullable=False)
+    rejected: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default=text("0"))
+    edit_rate: Mapped[float] = mapped_column(Numeric(5, 4), nullable=False)
+    revoked_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    revoked_by: Mapped[Optional[str]] = mapped_column(String(64))
