@@ -45,7 +45,7 @@ A folder id is the last part of the folder's Drive URL (`.../folders/<id>`).
    - Give the agents' Google account access too.
    - Turn on the **Google Drive API** in the service account's Google Cloud project.
 2. **Table.** `PYTHONPATH=. python migrations/apply_lending_agent_jobs.py`
-3. **Check the sample files parse.** `PYTHONPATH=. python -m src.lending.agent_jobs.worker --dry-run --from-dir docs/lending/agent-jobs-samples` prints `received=2 carded=0 invalid=0`.
+3. **Check the sample files parse.** `PYTHONPATH=. python -m src.lending.agent_jobs.worker --dry-run --from-dir docs/lending/agent-jobs-samples` prints `received=8 carded=0 invalid=0` (one sample per job type, a warm and a cold email, and a partner Deal Drop).
 4. **Cold email (once Muhammad gives the key and sending inbox, and the client gives the postal address).**
    - Set `LENDING_INSTANTLY_API_KEY` and `LENDING_INSTANTLY_SENDER_EMAIL`.
    - Run `PYTHONPATH=. python -m src.lending.instantly_email --setup-campaign`. It finds or creates the "NDL Cora Passthrough" campaign (one step: `{{ra_subject}}` / `{{ra_body}}`, sending 09:00–20:00 America/Detroit) and prints `LENDING_INSTANTLY_CAMPAIGN_ID`.
@@ -69,7 +69,9 @@ The brief's section 6 format, plus three fields agreed in the plan:
 | `requires_approval` | `false` sends without a card only once the template has graduated (P1.4); until then every job gets a card |
 | `not_before`, `expires_at` | With time zone. The card expires at `expires_at` |
 
-Samples: `docs/lending/agent-jobs-samples/`.
+Samples: `docs/lending/agent-jobs-samples/` (replace the `REPLACE_WITH_…` contact ids with test contacts before dropping them in the inbox).
+
+**Deal Drop:** a job whose `template_version` starts with `DEAL-DROP` (any case) is the weekly Deal Drop; see the partner limit below.
 
 ## What Cora checks (first failure wins)
 
@@ -83,6 +85,7 @@ Samples: `docs/lending/agent-jobs-samples/`.
    - the contact has the phone or email the job needs (`error`)
    - no rates, fees or amounts in the text (`error`)
    - cold email at most once every 3 days and 4 times in 14 days (`blocked_cap`)
+   - partners (GHL tag `ndl-partner`) at most twice in 7 days, plus the Deal Drop, which neither counts nor is stopped (`blocked_cap`)
 5. `not_before` in the future → held until then.
 6. Texts and emails outside 8am–8pm recipient time → held, re-checked every 15 minutes. `blocked_hours` if the job expires first.
 
@@ -123,4 +126,4 @@ SELECT job_id, result_status FROM lending.agent_jobs WHERE state = 'done' AND re
 - **A file stays in `inbox`.** The log shows `[agent-jobs] file … could not be taken` (usually Drive permissions).
 - **A file has no readable `job_id`.** It is moved to `processed` without a receipt, and the log shows `could not be read as a job`.
 - **An action stays `sending` for more than 15 minutes.** The outcome is unknown, and it is never retried (a duplicate send is worse than a missing one). Check GHL or Instantly by hand; the log line `has been sending for` names the action.
-- **Instantly lead lookup is unverified.** A repeat cold email first removes the address's previous lead from the campaign; the lookup's `search` filter is not verified against Instantly's docs. If a repeat send fails as a duplicate, the receipt says `error`.
+- **A repeat cold email** first removes the address's previous lead from the campaign (exact-email lookup), then adds the new one. An address on the Instantly block list is refused and the receipt says `error`.

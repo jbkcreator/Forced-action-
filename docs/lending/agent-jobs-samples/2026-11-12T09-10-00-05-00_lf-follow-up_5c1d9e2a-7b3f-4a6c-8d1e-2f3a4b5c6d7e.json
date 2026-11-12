@@ -1,0 +1,15 @@
+{
+  "job_id": "5c1d9e2a-7b3f-4a6c-8d1e-2f3a4b5c6d7e",
+  "lane": "NDL",
+  "created_by": "LendingFlow follow up",
+  "created_at": "2026-11-12T09:10:00-05:00",
+  "type": "send_email",
+  "ghl_contact_id": "REPLACE_WITH_TEST_CONTACT_ID",
+  "contact_label": "Test lead, Tampa",
+  "template_version": "LF-D3-EMAIL-v1",
+  "subject": "Your loan request with Next Deal Lending",
+  "body": "Hi,\n\nThanks again for your request. Is there a good time this week for a quick call with Josh to go over your deal?\n\nNext Deal Lending",
+  "reason": "Day 3 touch by email, no reply to the text",
+  "requires_approval": true,
+  "expires_at": "2026-11-13T20:00:00-05:00"
+}

@@ -1,0 +1,14 @@
+{
+  "job_id": "8f4a2b5d-0e6c-4d9f-9a4b-5c6d7e8f9a0b",
+  "lane": "NDL",
+  "created_by": "Call summarizer",
+  "created_at": "2026-11-12T09:25:00-05:00",
+  "type": "add_note",
+  "ghl_contact_id": "REPLACE_WITH_TEST_CONTACT_ID",
+  "contact_label": "Test lead, Tampa",
+  "template_version": "NOTE-CALL-v1",
+  "body": "Call summary: owns 3 rentals in Tampa, refinance due in spring, prefers email.",
+  "reason": "Summary of yesterday's call",
+  "requires_approval": true,
+  "expires_at": "2026-11-13T20:00:00-05:00"
+}

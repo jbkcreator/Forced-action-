@@ -31,6 +31,14 @@ COLD_EMAIL_MIN_GAP = timedelta(days=3)
 COLD_EMAIL_WINDOW = timedelta(days=14)
 COLD_EMAIL_MAX_IN_WINDOW = 4
 
+# Brief section 7, Caps: "partners at most twice a week plus the Deal Drop". A partner is a GHL contact tagged
+# PARTNER_TAG (the same tag as Josh's partner call list); a job is the Deal Drop when its template_version starts
+# with DEAL_DROP_TEMPLATE_PREFIX (any case), and Deal Drops neither count toward nor are stopped by the cap.
+PARTNER_TAG = "ndl-partner"
+PARTNER_WINDOW = timedelta(days=7)
+PARTNER_MAX_IN_WINDOW = 2
+DEAL_DROP_TEMPLATE_PREFIX = "deal-drop"
+
 # pending_actions.requested_by for drafts filed by an agent job (varchar(32)).
 REQUESTED_BY = "agent_job"
 # A held message job is re-checked this often until its window opens.
