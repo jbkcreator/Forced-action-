@@ -96,7 +96,7 @@ CONSENT_TEXT_HIDDEN = "[consent text not shown]"
 # (G4; docs/lending/ghl-conversation-ai.md hard rule 1). Enforced on the draft text itself, not just
 # asked of the model: the GL-10 reply-agent patterns (money, %, points, "rate ... N") plus ratios,
 # fees/payments, "400k" amounts and loan terms in months or years.
-BORROWER_MESSAGE_CHANNELS = frozenset({"ghl_sms", "ghl_email"})
+BORROWER_MESSAGE_CHANNELS = frozenset({"ghl_sms", "ghl_email", "instantly_email"})
 _DRAFT_NUMBER_PATTERNS = (
     *QUOTED_NUMBER_PATTERNS,
     r"\b\d+(?:\.\d+)?\s?k\b",                                                    # 400k

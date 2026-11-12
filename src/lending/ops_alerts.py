@@ -1,5 +1,6 @@
-"""Short operational alerts with the lending bot: lead alerts to ``LENDING_OPS_CHANNEL`` (#lead-alerts) and
-housekeeping notices (opt-out mailbox, webhook failures) to ``LENDING_OPS_NOTICE_CHANNEL``.
+"""Short operational alerts with the lending bot: lead alerts to ``LENDING_OPS_CHANNEL`` (#lead-alerts),
+housekeeping notices (opt-out mailbox, webhook failures) to ``LENDING_OPS_NOTICE_CHANNEL``, and Instantly reply
+triage to ``LENDING_REPLIES_CHANNEL``.
 
 Best effort and independent of the database, so an alert still goes out when the database is the
 problem. Callers must keep phone numbers and message text out of the alert: ids, masked emails and
@@ -25,10 +26,19 @@ def post_ops_notice(message: str) -> bool:
     return _post(get_settings().lending_ops_notice_channel, "LENDING_OPS_NOTICE_CHANNEL", message)
 
 
+def post_replies_notice(message: str) -> bool:
+    """Post ``message`` to the replies channel (``LENDING_REPLIES_CHANNEL``, #lead-alerts), where the reply handoffs
+    go. False (logged) when unconfigured or Slack refuses; never raises."""
+    return _post(get_settings().lending_replies_channel, "LENDING_REPLIES_CHANNEL", message)
+
+
+_POST_NAMES = {"LENDING_OPS_CHANNEL": "ops alert", "LENDING_REPLIES_CHANNEL": "reply triage"}
+
+
 def _post(channel: str, setting: str, message: str) -> bool:
     settings = get_settings()
     if not (channel and settings.lending_slack_bot_token):
-        report_unset("ops alert" if setting == "LENDING_OPS_CHANNEL" else "ops notice", (setting, BOT_TOKEN))
+        report_unset(_POST_NAMES.get(setting, "ops notice"), (setting, BOT_TOKEN))
         return False
     try:
         from slack_sdk import WebClient
