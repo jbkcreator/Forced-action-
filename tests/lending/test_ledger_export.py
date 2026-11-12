@@ -146,7 +146,9 @@ class FakeFiles:
                               "folder": media_body is None, "data": media_body and media_body.getbytes(0, 10**6)}
         return _Req({"id": new_id})
 
-    def update(self, fileId, media_body, **_):
+    def update(self, fileId, media_body=None, body=None, **_):
+        if body and body.get("trashed"):  # trashed files leave every listing
+            return _Req(self.items.pop(fileId))
         self.updates += 1
         self.items[fileId]["data"] = media_body.getbytes(0, 10**6)
         return _Req({"id": fileId})
@@ -297,7 +299,6 @@ def test_partial_rerun_leaves_no_manifest_so_retry_redoes_the_day(monkeypatch):
 
     monkeypatch.setattr(le, "collect", lambda db, day: le.LedgerData())
     drive = FakeDrive()
-    drive.f.delete = lambda fileId, **_: _Req(drive.f.items.pop(fileId))
     up = DriveUploader(drive)
     task.run(None, day=DAY, folder_id="F", upload=up, now=AT, remove=up.remove)
     assert up.has_file("F", DAY.isoformat(), "manifest.json")

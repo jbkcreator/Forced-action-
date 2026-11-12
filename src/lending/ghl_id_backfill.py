@@ -99,9 +99,16 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if account is None:
         logger.error("[ghl-id-backfill] no Next Deal Lending GHL account configured")
         return 1
-    found, counts = look_up(phones, LendingGhlNoteWriter(account).find_contact_id)  # no transaction held meanwhile
-    with lending_session() as db:
-        updated = write(db, found)
+    find = LendingGhlNoteWriter(account).find_contact_id
+    counts: Counter = Counter()
+    updated = 0
+    for start in range(0, len(phones), WRITE_BATCH):  # saved per batch: a stopped run keeps what it found
+        found, batch_counts = look_up(phones[start:start + WRITE_BATCH], find)  # no transaction held meanwhile
+        counts.update(batch_counts)
+        with lending_session() as db:
+            updated += write(db, found)
+        logger.info("[ghl-id-backfill] %d/%d phones done, rows_updated=%d", min(start + WRITE_BATCH, len(phones)),
+                    len(phones), updated)
     logger.info("[ghl-id-backfill] phones=%d found=%d not_in_ghl=%d failed=%d rows_updated=%d", len(phones),
                 counts["found"], counts["not_in_ghl"], counts["failed"], updated)
     return 0
