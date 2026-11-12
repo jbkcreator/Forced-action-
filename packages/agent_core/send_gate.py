@@ -6,6 +6,9 @@ Sending happens later, in the relay, and only after an approver's click.
 A draft whose card could not be posted is reported as such (never as "awaiting approval") and is
 picked up again by :meth:`SendGate.retry_missing_cards`, which the host runs on its sweep, until
 the card posts or the draft expires.
+
+A draft that breaks the lane deny list (:mod:`.lane_guard`) is stored as ``blocked`` and gets no
+card; the model is told it was refused.
 """
 from __future__ import annotations
 
@@ -14,6 +17,7 @@ from datetime import timedelta
 
 from .approval import render_action_card
 from .chatport import ChatPort
+from .lane_guard import LaneViolation, lane_block_reason, lane_violation
 from .pending_actions import PendingActionQueue
 from .tools import EgressDraft, QueuedDraft, ToolContext
 
@@ -38,6 +42,14 @@ class SendGate:
             recipient_phone=draft.recipient_phone, recipient_email=draft.recipient_email,
             contact_ref=draft.contact_ref, deal_ref=draft.deal_ref, idempotency_key=context.tool_use_id, ttl=ttl,
         )
+        rule = lane_violation(draft.payload)
+        if rule is not None:
+            self._queue.block_pending(action_id, lane_block_reason(rule))
+            logger.error("send gate SECURITY: action %s (%s) blocked by lane deny rule %s; no card posted",
+                         action_id, tool_name, rule)
+            raise LaneViolation(f"Action #{action_id} was blocked: it names Backflip (a Backflip name, number or "
+                                "domain). Cora sends for Next Deal Lending only. Nothing was sent and no card was "
+                                "posted; redraft without it.")
         return QueuedDraft(action_id, self.post_card(action_id))
 
     def post_card(self, action_id: int) -> bool:

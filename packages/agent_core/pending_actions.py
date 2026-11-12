@@ -7,7 +7,8 @@ Lifecycle of one row::
        │  └──revise (new payload)── revising
        ├──revise request──────────▶ revising ──reject──▶ rejected
        ├──reject──────────────────▶ rejected
-       └──expires_at passes (pending or revising)──▶ expired
+       ├──expires_at passes (pending or revising)──▶ expired
+       └──lane deny list, at submit (no card)──▶ blocked
 
 Every transition is a single conditional UPDATE, so a double click, a retried Slack payload or
 two relay processes can move a row at most once. ``sending`` is only ever left by the process
@@ -341,6 +342,12 @@ class PendingActionQueue:
     def mark_blocked(self, action_id: int, reason: str) -> bool:
         """The send-time check refused it (opt-out, no consent). Nothing was sent."""
         return self._close_unsent(action_id, ActionStatus.BLOCKED, reason)
+
+    def block_pending(self, action_id: int, reason: str) -> bool:
+        """The send gate refused a new draft before its card was posted (lane deny list). Nothing was sent."""
+        return self._transition(action_id, (ActionStatus.PENDING,), "status = :status, error = :error",
+                                {"status": ActionStatus.BLOCKED.value,
+                                 "error": mask_long_digit_runs(reason)[:_ERROR_TEXT_LIMIT]})
 
     def awaiting_card(self, limit: int = 50) -> list[int]:
         """Open, unexpired drafts with no approval card in Slack, oldest first."""
