@@ -15,6 +15,7 @@ from typing import Any
 
 from .agent_loop import MessagesClient
 from .governance import compile_system_prompt
+from .lane_guard import lane_violation
 from .pending_actions import PendingAction, PendingActionQueue
 from .send_gate import SendGate
 from .tools import QueuedDraft
@@ -73,6 +74,11 @@ class DraftReviser:
         problem = self.content_check(action.channel, revised) if self.content_check else None
         if problem:
             raise RevisionFailed(problem)
+        rule = lane_violation(revised)
+        if rule is not None:
+            logger.error("revision SECURITY: redraft of action %s refused by lane deny rule %s", action.action_id, rule)
+            raise RevisionFailed("the redraft names Backflip (a Backflip name, number or domain); Cora sends for "
+                                 "Next Deal Lending only")
 
         payload = {**action.payload, **{name: revised[name].strip() for name in fields}}
         if not self.queue.apply_revision(action.action_id, payload=payload, summary=action.summary,
