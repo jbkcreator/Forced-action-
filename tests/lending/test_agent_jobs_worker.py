@@ -413,3 +413,18 @@ def test_stuck_sending_raises_one_inbox_alert(h: Harness) -> None:
     assert alerts[0]["event_type"] == "agent_job_send_unknown"
     assert alerts[0]["dedup_key"] == str(action_id)
     assert alerts[0]["payload"] == {"action_id": action_id, "job_id": JOB_ID}
+
+
+def test_revised_job_cannot_run_past_its_deadline(h: Harness) -> None:
+    h.drop(expires_at=(START + timedelta(minutes=10)).isoformat())
+    h.worker.run_once()
+    action_id = h.row()["action_id"]
+    assert h.queue.get(action_id).payload["not_after"] == (START + timedelta(minutes=10)).isoformat()
+    assert h.queue.request_revision(action_id, "U_JOSH")
+    assert h.queue.apply_revision(action_id, payload={**h.queue.get(action_id).payload, "body": "Hi, call me?"},
+                                  summary="s", note="shorter")
+    h.clock.now = START + timedelta(hours=1)
+    assert not h.queue.approve(action_id, "U_JOSH")
+    h.queue.expire_stale()
+    h.worker.run_once()
+    assert h.folders.results[JOB_ID]["status"] == "expired"

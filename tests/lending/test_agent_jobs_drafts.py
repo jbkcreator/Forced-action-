@@ -26,6 +26,7 @@ def test_sms_payload_matches_existing_executor_keys() -> None:
     draft = build_draft(_job(), CONTACT, "ghl")
     assert draft.channel == "ghl_sms"
     assert draft.payload == {"job_id": JOB_ID, "ghl_contact_id": "ghl-123", "template_version": "LF-D2-SMS-v1",
+                             "not_after": (NOW + timedelta(days=1)).isoformat(),
                              "to_phone": "+18135550142", "body": "Hi Mark, any questions?"}
     assert (draft.recipient_phone, draft.recipient_email, draft.contact_ref) == (
         "+18135550142", "mark@example.com", "ghl:ghl-123")

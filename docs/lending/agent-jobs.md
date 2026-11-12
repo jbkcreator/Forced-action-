@@ -67,7 +67,7 @@ The brief's section 6 format, plus three fields agreed in the plan:
 | `subject` | **Required for `send_email`** |
 | `task_due_at`, `task_assignee` | Optional, `create_task` only (default due: 5 PM Eastern on the day the job was filed; unassigned) |
 | `requires_approval` | `false` sends without a card only once the template has graduated (P1.4); until then every job gets a card |
-| `not_before`, `expires_at` | With time zone. The card expires at `expires_at` |
+| `not_before`, `expires_at` | With time zone. The card expires at `expires_at`, and a revised draft keeps that deadline (it is never extended; nothing is sent after it) |
 
 Samples: `docs/lending/agent-jobs-samples/` (replace the `REPLACE_WITH_…` contact ids with test contacts before dropping them in the inbox).
 
