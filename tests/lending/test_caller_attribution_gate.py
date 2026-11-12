@@ -25,7 +25,9 @@ JOSH, DAVID = "3W4lyuTpPSgBjgiJMzJk", "57m9LlZrO1rV2A5cTKxI"
 
 def test_ghl_user_ids_map_to_people():
     assert cfg.GHL_USER_NAMES[JOSH] == "Josh Kantor" and cfg.GHL_USER_NAMES[DAVID] == "David Willis"
-    assert cfg.GHL_USER_NAMES["YoBwFUwHL1fylqvqjzA1"] == cfg.GHL_USER_NAMES["0mboWYLanQkMz4RG3IbL"] == "Hari K"
+    # two different GHL users (GHL /users, 2026-11-12)
+    assert cfg.GHL_USER_NAMES["YoBwFUwHL1fylqvqjzA1"] == "Hari K"
+    assert cfg.GHL_USER_NAMES["0mboWYLanQkMz4RG3IbL"] == "Hari K."
 
 
 def test_ghl_caller_name_falls_back_to_unknown():
@@ -198,3 +200,23 @@ def test_bd_without_gate_field_leaves_the_column():
     db = _PipeDb()
     cp.capture_gate_flag(db, 5, {"gate_failed": "no"})
     assert not [s for s, _ in db.sql if "gate_failed" in s]
+
+
+def test_a_webhook_user_name_takes_the_known_spelling_only_on_an_exact_match_ignoring_case():
+    assert cfg.canonical_ghl_caller("david willis") == "David Willis"
+    assert cfg.canonical_ghl_caller(" DAVID WILLIS ") == "David Willis"
+    assert cfg.canonical_ghl_caller("Hari K.") == "Hari K." and cfg.canonical_ghl_caller("hari k") == "Hari K"
+    assert cfg.canonical_ghl_caller("Someone New") == "Someone New"
+    assert cfg.canonical_ghl_caller(None) is None
+
+
+def test_both_ghl_webhooks_store_the_known_spelling():
+    from src.lending import ghl_disposition_match, ghl_missed_call
+
+    outcome = ghl_disposition_match.parse_event({"disposition": "Requested Appointment", "phone": "(813) 555-0142",
+                                                 "user": "david willis"})
+    assert outcome.caller_name == "David Willis"
+    missed = ghl_missed_call.parse_missed_call({"phone": "(813) 555-0142", "call_status": "no-answer",
+                                                "user": "david willis", "called_at": "2026-11-04T14:59:20.000Z"},
+                                               datetime(2026, 11, 4, 15, 0, tzinfo=timezone.utc))
+    assert missed.caller_name == "David Willis"
