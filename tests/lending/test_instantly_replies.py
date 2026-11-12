@@ -1,6 +1,7 @@
 """P1.3: Instantly replies -> triage post + drafted answer card; STOP / unsubscribe -> suppressed everywhere."""
 from __future__ import annotations
 
+import time
 from contextlib import contextmanager
 from types import SimpleNamespace
 
@@ -44,6 +45,7 @@ def reply_body(text="Yes, I have a fix and flip in Tampa. What do you need from 
     "Do not send me any more emails", "No thanks, stop",
     "Stop sending these", "No more emails please", "I don't want any more emails", "Remove us",
     "Please take us off the mailing list", "stop please", "No thank you. Stop!",
+    "Thank you, stop", "Stop, please", "Nope. Remove",
 ])
 def test_a_stop_request_is_recognised(reply):
     assert is_stop_request(reply) is True
@@ -55,9 +57,25 @@ def test_a_stop_request_is_recognised(reply):
     "Please send more info", "Send me the term sheet", "Don't call me before 10, email is fine",
     "Can Josh stop by the property Friday?", "What's the end date on the bridge loan?",
     "We have a list of 4 properties", "Don't send it to my office address, use this one",
+    "No thanks", "Thank you", "Stop?", "You stop", "thank stop", "Stop the presses, I have a deal",
+    "no thanks " * 40 + "I already have a lender",
 ])
 def test_ordinary_replies_are_not_stop_requests(reply):
     assert is_stop_request(reply) is False
+
+
+@pytest.mark.parametrize("reply", [
+    "no thanks " * 40 + "I already have a lender",  # PR #428 re-review: backtracked for minutes with the old regex
+    "no thanks " * 5000 + "x",
+    "stop all " * 50_000,
+    "do not " * 50_000,
+    "On " + "x " * 100_000,
+    "no thanks no\n" * 20_000,
+], ids=["no-thanks-x40", "no-thanks-x5000", "stop-all", "do-not", "quote-line", "many-lines"])
+def test_stop_detection_stays_fast_on_hostile_replies(reply):
+    started = time.perf_counter()
+    is_stop_request(reply)
+    assert time.perf_counter() - started < 2.0
 
 
 def test_stop_words_in_the_quoted_email_do_not_count():

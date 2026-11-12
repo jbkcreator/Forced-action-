@@ -68,12 +68,15 @@ _STOP_PHRASES = re.compile(
     re.IGNORECASE,
 )
 # A line that is only a stop word, with at most a short lead-in or tail ("STOP", "Please stop", "No thanks, stop",
-# "Remove"), so "can't stop thinking about it" is not one.
-_STOP_LINE = re.compile(
-    r"^\s*(?:(?:no(?:pe)?|no thanks?|no thank you|thanks|please|pls|ok(?:ay)?)[\s,.!-]*)*"
-    r"(?:stop|unsubscribe|remove|cancel|quit|end)(?:\s+(?:please|now|it|this|that))?\s*[.!]*\s*$",
-    re.IGNORECASE,
-)
+# "Remove"), so "can't stop thinking about it" is not one. Checked word by word, not with a regex: the reply is text
+# anyone can send, and a nested-quantifier pattern here backtracks exponentially (PR #428 re-review).
+_STOP_WORDS = frozenset({"stop", "unsubscribe", "remove", "cancel", "quit", "end"})
+_STOP_LEAD_INS = frozenset({"no", "nope", "thanks", "thank", "you", "please", "pls", "ok", "okay"})
+_STOP_TAILS = frozenset({"please", "now", "it", "this", "that"})
+_STOP_LINE_MAX_CHARS = 80
+_STOP_LINE_MAX_WORDS = 8
+_STOP_LINE_CHARS = re.compile(r"[a-z\s,.!-]+")
+_WORDS = re.compile(r"[a-z]+")
 # Where the quoted earlier email starts in a reply.
 _QUOTE_START = re.compile(r"^\s*(?:>|On .+wrote:\s*$|-{2,}\s*Original Message|From:\s)", re.IGNORECASE)
 
@@ -120,9 +123,29 @@ def new_reply_text(reply: str) -> str:
     return "\n".join(lines).strip()
 
 
+def is_stop_line(line: str) -> bool:
+    """True for a line that is only a stop word, optionally after a lead-in ("no thanks", "please") and before one
+    tail word ("please", "now"). Linear in the line length, and lines over 80 characters are never one."""
+    lowered = line.strip().lower()
+    if not lowered or len(lowered) > _STOP_LINE_MAX_CHARS or not _STOP_LINE_CHARS.fullmatch(lowered):
+        return False
+    words = _WORDS.findall(lowered)
+    if len(words) > _STOP_LINE_MAX_WORDS:
+        return False
+    i = 0
+    while i < len(words) and words[i] in _STOP_LEAD_INS:
+        if (words[i] == "you") != (i > 0 and words[i - 1] == "thank"):  # "you" only in "thank you"
+            return False
+        i += 1
+    if i == len(words) or words[i] not in _STOP_WORDS or (i > 0 and words[i - 1] == "thank"):
+        return False
+    tail = words[i + 1:]
+    return not tail or (len(tail) == 1 and tail[0] in _STOP_TAILS)
+
+
 def is_stop_request(reply: str) -> bool:
     own = new_reply_text(reply)
-    return bool(_STOP_PHRASES.search(own) or any(_STOP_LINE.match(line) for line in own.splitlines()))
+    return bool(_STOP_PHRASES.search(own) or any(is_stop_line(line) for line in own.splitlines()))
 
 
 def parse_event(body: Mapping[str, Any]) -> Optional[InstantlyEvent]:
