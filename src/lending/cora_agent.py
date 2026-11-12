@@ -61,7 +61,12 @@ from src.lending.ghl_sms import GhlSmsSender, get_sender
 from src.lending.instantly_client import InstantlyAccount, block_address, lending_instantly_account, send_reply
 from src.lending.instantly_email import NdlInstantlySender, get_ndl_instantly_sender
 from src.lending.instantly_replies import CHANNEL as INSTANTLY_CHANNEL, ReplyProcessor
-from src.lending.standing_sends import StandingSendsStep, make_edit_recorder, make_is_graduated
+from src.lending.standing_sends import (
+    StandingSendsStep,
+    auto_approval_lapsed,
+    make_edit_recorder,
+    make_is_graduated,
+)
 from src.lending.ops_alerts import post_ops_notice, post_replies_notice
 from src.lending.cora_morning_digest import post_morning_digest
 from src.lending.models import LENDING_SCHEMA
@@ -196,7 +201,9 @@ def make_send_check(engine: Engine, *, carrier_approved: bool = False,
 
     A text also waits for the carrier (10DLC) approval (LENDING_SMS_CARRIER_APPROVED) and for the borrower's
     8am-8pm window, and an email (GHL or Instantly) for the recipient's 8am-8pm window: these are deferrals, so an
-    approved send stays approved and goes on a later sweep once they hold, or is blocked when the draft expires."""
+    approved send stays approved and goes on a later sweep once they hold, or is blocked when the draft expires. An
+    action approved automatically (P1.4 graduation) whose template has since been revoked is held too, and the next
+    sweep sends it back for a person's approval."""
 
     def check(action: PendingAction) -> Optional[str]:
         phone = normalize(action.recipient_phone) if action.recipient_phone else None
@@ -210,6 +217,10 @@ def make_send_check(engine: Engine, *, carrier_approved: bool = False,
                 return "recipient is suppressed or marked do-not-contact"
             if action.channel in SMS_CHANNELS and not (phone and has_text_consent(conn, phone)):
                 return "no text consent on record for this number"
+            if auto_approval_lapsed(conn, action.decided_by, action.payload.get("template_version")):
+                # P1.4: its template was revoked after the automatic approval. Held, never sent; the next sweep
+                # sends it back for a person's approval (standing_sends.return_ungraduated_auto_approvals).
+                return SendDeferred("its message type no longer auto-sends; going back for approval")
         if action.channel in SMS_CHANNELS:
             if not carrier_approved:
                 return SendDeferred("texting is not approved by the carrier yet (10DLC)")

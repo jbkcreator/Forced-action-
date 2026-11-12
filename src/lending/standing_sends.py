@@ -15,7 +15,10 @@
   ``CORA-EMAIL-v1``, ``INSTANTLY-REPLY-v1``. They are counted but never graduate: each is a message Josh asked for or
   an answer to one person's reply, so it always gets a card.
 * **Undo.** ``python -m src.lending.standing_sends --revoke <template_version>``; a revoked template needs cards
-  again and is never re-graduated automatically (``--restore`` lifts the revoke).
+  again and is never re-graduated automatically (``--restore`` lifts the revoke). Its messages already approved
+  automatically but not sent yet (waiting for the window, the carrier or the halt) go back to Josh for approval, at
+  three points so none can send unapproved: the revoke itself, every sweep before the relay
+  (``return_ungraduated_auto_approvals``), and Cora's send-time check (``auto_approval_lapsed``).
 
 Usage:
     PYTHONPATH=. python -m src.lending.standing_sends --list
@@ -327,6 +330,8 @@ class StandingSendsStep:
         now = self._clock()
         full = self._last_full is None or now - self._last_full >= FULL_PASS_EVERY
         since = None if full else self._last_run - INCREMENTAL_OVERLAP
+        with self._engine.begin() as conn:  # every run, before the relay: a revoke must never be outrun
+            return_ungraduated_auto_approvals(conn)
         backfill_card_edits(self._engine, since=since)
         graduated = evaluate_graduations(self._engine, since=since)
         self._last_run = now
@@ -358,6 +363,43 @@ def make_is_graduated(engine: Engine) -> Callable[[str], bool]:
     return is_graduated
 
 
+# An action approved automatically (graduation) that has not been claimed for sending yet, whose template no longer
+# has an active graduation (revoked, or the row is gone): back to pending with no decision and no card, so the
+# card retry posts a fresh "Approval needed" card and only a person can approve it. ``template_version`` narrows it to
+# one template (the revoke).
+_RETURN_FOR_APPROVAL = text("""
+    UPDATE lending.pending_actions p
+       SET status = 'pending', decided_by = NULL, decided_at = NULL, card_channel = NULL, card_ts = NULL,
+           updated_at = now()
+     WHERE p.status = 'approved' AND p.decided_by = :auto_actor
+       AND (CAST(:template_version AS text) IS NULL OR p.payload->>'template_version' = :template_version)
+       AND NOT EXISTS (SELECT 1 FROM lending.template_graduations g
+                        WHERE g.template_version = p.payload->>'template_version' AND g.revoked_at IS NULL)
+    RETURNING p.action_id
+""")
+
+
+def return_ungraduated_auto_approvals(conn: Any, template_version: Optional[str] = None) -> list[int]:
+    """Send automatically approved, still unsent actions of a template that no longer auto-sends back for a
+    person's approval. Returns their action ids. Runs in the caller's transaction."""
+    returned = [int(row[0]) for row in conn.execute(_RETURN_FOR_APPROVAL, {
+        "auto_actor": AUTO_GRADUATED_ACTOR, "template_version": template_version})]
+    if returned:
+        logger.warning("[standing-sends] %d automatically approved action(s) sent back for approval "
+                       "(template no longer auto-sends): %s", len(returned), returned)
+    return returned
+
+
+def auto_approval_lapsed(conn: Any, decided_by: Optional[str], template_version: Optional[str]) -> bool:
+    """For the relay's send-time check: True when the action was approved automatically but its template no
+    longer auto-sends, so it must not be sent without a person's approval."""
+    if decided_by != AUTO_GRADUATED_ACTOR:
+        return False
+    if not template_version:
+        return True
+    return not conn.execute(_IS_GRADUATED, {"template_version": template_version}).scalar()
+
+
 _REVOKE = text("""
     UPDATE lending.template_graduations SET revoked_at = now(), revoked_by = :by
      WHERE template_version = :template_version AND revoked_at IS NULL
@@ -369,10 +411,15 @@ _RESTORE = text("""
 
 
 def set_revoked(engine: Engine, template_version: str, *, revoked: bool, by: str) -> bool:
+    """Revoke (or restore) a graduation. A revoke also sends the template's automatically approved, unsent actions
+    back for approval in the same transaction; a restore never re-approves them."""
     with engine.begin() as conn:
         statement, params = (_REVOKE, {"template_version": template_version, "by": by[:64]}) if revoked else (
             _RESTORE, {"template_version": template_version})
-        return conn.execute(statement, params).rowcount == 1
+        changed = conn.execute(statement, params).rowcount == 1
+        if changed and revoked:
+            return_ungraduated_auto_approvals(conn, template_version)
+        return changed
 
 
 def main(argv: Optional[list[str]] = None) -> int:

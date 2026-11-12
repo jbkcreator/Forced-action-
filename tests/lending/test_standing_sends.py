@@ -55,6 +55,27 @@ def test_an_edit_is_stored_as_before_and_after_with_a_diff():
     assert row["instruction"] == "make it shorter 0" and row["edited_by"] == "U_JOSH"
 
 
+def test_job_keys_like_the_agent_deadline_never_show_in_an_edit():
+    """P1.1 (#429): every job payload carries ``not_after`` (and ``job_id``); only the message fields are copied, and
+    the diff skips a field that did not change."""
+    engine = CaptureEngine()
+    edited = action(not_after="2026-11-14T20:00:00+00:00", subject="Your Tampa flip")
+    record_card_edit(engine, edited)
+    stored = engine.params[0]
+    assert set(json.loads(stored["before"])) == {"body", "subject"}
+    assert "not_after" not in stored["diff"] and "job_id" not in stored["diff"]
+    assert "subject" not in stored["diff"]  # unchanged field: no diff block
+
+
+def test_a_cold_email_edit_is_recorded_under_its_own_channel():
+    """P1.1 (#429): cold email is ``instantly_cold_email``; P1.3's ``instantly_email`` is the reply in a thread."""
+    engine = CaptureEngine()
+    cold = action(subject="Bridge loans in Tampa")
+    cold.channel = "instantly_cold_email"
+    record_card_edit(engine, cold)
+    assert engine.params[0]["channel"] == "instantly_cold_email"
+
+
 def test_recipient_details_are_never_copied_into_the_edit():
     engine = CaptureEngine()
     record_card_edit(engine, action())
@@ -274,20 +295,22 @@ def test_the_sweep_step_runs_full_first_then_incremental_then_full_once_a_day(mo
     monkeypatch.setattr(standing_sends, "backfill_card_edits", lambda engine, since=None: calls.append(("edits", since)))
     monkeypatch.setattr(standing_sends, "evaluate_graduations",
                         lambda engine, since=None: calls.append(("graduate", since)) or [])
+    monkeypatch.setattr(standing_sends, "return_ungraduated_auto_approvals",
+                        lambda conn, template_version=None: calls.append(("return", template_version)) or [])
     now = [datetime(2026, 11, 12, 12, 0, tzinfo=timezone.utc)]
-    step = standing_sends.StandingSendsStep(engine=None, clock=lambda: now[0])
+    step = standing_sends.StandingSendsStep(engine=CaptureEngine(), clock=lambda: now[0])
 
     step()  # first run after a start: full
-    assert calls == [("edits", None), ("graduate", None)]
+    assert calls == [("return", None), ("edits", None), ("graduate", None)]
     now[0] += timedelta(minutes=1)
     calls.clear()
-    step()  # next minute: only what changed since the last run, with the overlap
+    step()  # next minute: only what changed since the last run, with the overlap; the return check runs every time
     expected_since = datetime(2026, 11, 12, 12, 0, tzinfo=timezone.utc) - standing_sends.INCREMENTAL_OVERLAP
-    assert calls == [("edits", expected_since), ("graduate", expected_since)]
+    assert calls == [("return", None), ("edits", expected_since), ("graduate", expected_since)]
     now[0] += standing_sends.FULL_PASS_EVERY
     calls.clear()
     step()  # a day later: full again
-    assert calls == [("edits", None), ("graduate", None)]
+    assert calls == [("return", None), ("edits", None), ("graduate", None)]
 
 
 def test_an_incremental_check_with_no_new_decisions_counts_nothing():
@@ -307,3 +330,156 @@ def test_the_migration_adds_the_lookup_indexes_only_when_missing():
     names = [name for name, _ in migration._PENDING_ACTION_INDEXES]
     assert names == ["ix_pending_actions_decided_at", "ix_pending_actions_updated_at",
                      "ix_pending_actions_template_version"]
+
+
+# ── a revoke stops automatic sends that are approved but not sent yet (PR #430 review) ──
+
+class RecordingConn:
+    """Answers set_revoked's statements: the revoke/restore changes ``changed`` rows; the return query yields
+    ``returned`` action ids."""
+
+    def __init__(self, changed=1, returned=(41, 42)):
+        self.changed, self.returned, self.sql = changed, returned, []
+
+    @contextmanager
+    def begin(self):
+        yield self
+
+    def execute(self, statement, params=None):
+        sql = str(statement)
+        self.sql.append((sql, params))
+        if "RETURNING p.action_id" in sql:
+            return iter([(i,) for i in self.returned])
+        return SimpleNamespace(rowcount=self.changed)
+
+
+def test_a_revoke_sends_the_templates_queued_automatic_sends_back_for_approval():
+    conn = RecordingConn()
+    assert standing_sends.set_revoked(conn, "LF-D2-SMS-v1", revoked=True, by="josh") is True
+    (_, returned_params), = [(s, p) for s, p in conn.sql if "RETURNING p.action_id" in s]
+    assert returned_params == {"auto_actor": "auto:graduated", "template_version": "LF-D2-SMS-v1"}
+    sql = conn.sql[-1][0]
+    assert "status = 'pending'" in sql and "decided_by = NULL" in sql and "card_ts = NULL" in sql
+    assert "p.status = 'approved'" in sql  # never a claimed ('sending') or finished action
+
+
+def test_a_restore_or_a_revoke_that_changed_nothing_returns_nothing():
+    restore = RecordingConn()
+    standing_sends.set_revoked(restore, "LF-D2-SMS-v1", revoked=False, by="josh")
+    unchanged = RecordingConn(changed=0)
+    assert standing_sends.set_revoked(unchanged, "LF-D2-SMS-v1", revoked=True, by="josh") is False
+    for conn in (restore, unchanged):
+        assert not [s for s, _ in conn.sql if "RETURNING p.action_id" in s]
+
+
+def test_an_automatic_approval_lapses_once_its_template_no_longer_auto_sends():
+    graduated, revoked = CaptureEngine(returning=True), CaptureEngine(returning=False)
+    assert standing_sends.auto_approval_lapsed(revoked, "U_JOSH", "LF-D2-SMS-v1") is False
+    assert revoked.params == []  # a person's approval is never re-checked
+    assert standing_sends.auto_approval_lapsed(graduated, "auto:graduated", "LF-D2-SMS-v1") is False
+    assert standing_sends.auto_approval_lapsed(revoked, "auto:graduated", "LF-D2-SMS-v1") is True
+    assert standing_sends.auto_approval_lapsed(CaptureEngine(), "auto:graduated", None) is True
+
+
+def _approved_action(decided_by):
+    from packages.agent_core.pending_actions import ActionStatus, PendingAction
+
+    return PendingAction(
+        action_id=7, tool_name="agent_job:followup", channel="ghl_email",
+        payload={"template_version": "LF-D2-EMAIL-v1", "to_email": "mark@example.com", "subject": "Hi", "body": "Hi"},
+        summary="", status=ActionStatus.SENDING, requested_by="agent_jobs", source_channel=None,
+        source_thread_ts=None, card_channel=None, card_ts=None, decided_by=decided_by, revised_by=None,
+        revision_note=None, revisions=(), recipient_phone=None, recipient_email="mark@example.com", contact_ref=None,
+        deal_ref=None, idempotency_key=None, expires_at=None, provider_ref=None, error=None)
+
+
+class Answers:
+    """The send check's queries answered in order."""
+
+    def __init__(self, *answers):
+        self.answers, self.queries = list(answers), []
+
+    @contextmanager
+    def connect(self):
+        yield self
+
+    def execute(self, statement, params=None):
+        self.queries.append(str(statement))
+        return SimpleNamespace(scalar=lambda: self.answers.pop(0))
+
+
+def test_the_send_check_holds_an_automatic_send_whose_template_was_revoked():
+    from packages.agent_core.relay import SendDeferred
+    from src.lending.cora_agent import make_send_check
+
+    window = {"email_window": lambda *_: True}
+    revoked = Answers(False, False)  # not suppressed; no active graduation
+    reason = make_send_check(revoked, **window)(_approved_action("auto:graduated"))
+    assert isinstance(reason, SendDeferred) and "back for approval" in reason
+    assert make_send_check(Answers(False, True), **window)(_approved_action("auto:graduated")) is None
+    person = Answers(False)
+    assert make_send_check(person, **window)(_approved_action("U_JOSH")) is None
+    assert len(person.queries) == 1  # only the suppression check
+
+
+def test_a_revoke_between_automatic_approval_and_send_never_sends_unapproved_on_postgres(lending_db):
+    """Automatic approval -> send held (carrier) -> revoke -> hold lifted: nothing sends until a person approves."""
+    from datetime import timedelta
+
+    from sqlalchemy import text as sql_text
+
+    from migrations.apply_lending_cora_agent_core import apply_to as apply_core
+    from migrations.apply_lending_cora_inbox import apply_to as apply_inbox
+    from migrations.apply_lending_pending_action_safeguards import apply_to as apply_safeguards
+    from migrations.apply_lending_standing_sends import apply_to
+    from packages.agent_core.halt import HaltSwitch
+    from packages.agent_core.pending_actions import ActionStatus, PendingActionQueue
+    from packages.agent_core.relay import Relay, SendDeferred
+    from packages.agent_core.store import AgentStore
+
+    conn = lending_db.connection()
+    for migrate in (apply_core, apply_safeguards, apply_inbox, apply_to):
+        migrate(conn)
+    engine = SimpleNamespace(begin=lambda: _same(conn), connect=lambda: _same(conn))
+    for _ in range(25):
+        _approve(lending_db, "P14-REVOKE-v1")
+    assert "P14-REVOKE-v1" in [s.template_version for s in standing_sends.evaluate_graduations(engine)]
+
+    store = AgentStore(engine, "lending")
+    queue = PendingActionQueue(store, default_ttl=timedelta(hours=24))
+    carrier_pending, sent = [True], []
+
+    def send_check(action):  # Cora's order: the lapsed-approval hold, then the carrier (10DLC) hold
+        if standing_sends.auto_approval_lapsed(conn, action.decided_by, action.payload.get("template_version")):
+            return SendDeferred("its message type no longer auto-sends; going back for approval")
+        return SendDeferred("texting is not approved by the carrier yet (10DLC)") if carrier_pending[0] else None
+
+    relay = Relay(queue, HaltSwitch(store, "cora"), {"ghl_sms": lambda payload: sent.append(payload) or "m1"},
+                  send_check)
+
+    def auto_job():
+        action_id = queue.enqueue(tool_name="agent_job:followup", channel="ghl_sms", summary="x",
+                                  payload={"template_version": "P14-REVOKE-v1", "to_phone": "+18135550100",
+                                           "body": "Hi"}, recipient_phone="+18135550100")
+        assert queue.approve(action_id, "auto:graduated")  # what the P1.1 worker does for a graduated type
+        return action_id
+
+    held = auto_job()
+    assert relay.run().deferred == (held,) and sent == []  # waiting for the carrier
+    assert standing_sends.set_revoked(engine, "P14-REVOKE-v1", revoked=True, by="test") is True
+    back = queue.get(held)
+    assert back.status is ActionStatus.PENDING and back.decided_by is None and back.card_ts is None
+    carrier_pending[0] = False
+    assert relay.run().sent == () and sent == []  # the hold lifted, but nothing is approved any more
+
+    # a revoke that lands after the sweep's check but before the send: held at send time, sent back next sweep
+    assert standing_sends.set_revoked(engine, "P14-REVOKE-v1", revoked=False, by="test") is True
+    raced = auto_job()
+    conn.execute(sql_text("UPDATE lending.template_graduations SET revoked_at = now() "
+                          "WHERE template_version = 'P14-REVOKE-v1'"))
+    assert relay.run().deferred == (raced,) and sent == []
+    assert standing_sends.return_ungraduated_auto_approvals(conn) == [raced]
+    assert queue.get(raced).status is ActionStatus.PENDING
+
+    assert queue.approve(held, "U_JOSH")  # only a person's approval sends it
+    assert relay.run().sent == (held,) and len(sent) == 1

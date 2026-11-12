@@ -50,6 +50,12 @@ PYTHONPATH=. python -m src.lending.standing_sends --restore LF-D2-SMS-v1  # lift
 ```
 A revoked type is never re-graduated automatically. The emergency halt still stops every send.
 
+A revoke also covers messages of that type that were already approved automatically but not sent yet (waiting for
+the 8am-8pm window, carrier approval or the emergency halt): they go back to "waiting for approval" and a fresh
+approval card is posted, so none is sent without a person approving it. This is checked at three points: the revoke
+itself, every Cora sweep before the relay sends anything, and the relay's send-time check. `--restore` does not
+re-approve them; they stay on their cards.
+
 ## Setup
 
 Run `PYTHONPATH=. python migrations/apply_lending_standing_sends.py` before deploying.
