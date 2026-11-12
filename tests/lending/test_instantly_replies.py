@@ -1,6 +1,7 @@
 """P1.3: Instantly replies -> triage post + drafted answer card; STOP / unsubscribe -> suppressed everywhere."""
 from __future__ import annotations
 
+import time
 from contextlib import contextmanager
 from types import SimpleNamespace
 
@@ -39,6 +40,12 @@ def reply_body(text="Yes, I have a fix and flip in Tampa. What do you need from 
     "STOP", "stop.", "Unsubscribe", "Please remove me from your list", "take me off this list",
     "Stop emailing me", "do not contact me again", "Don't email me", "opt out", "Opt-out please",
     "Thanks\nSTOP\nSent from my iPhone",
+    # PR #428 review: wordings the first phrase list missed
+    "Please remove us from your list", "Take us off your list", "Please stop", "Stop all emails",
+    "Do not send me any more emails", "No thanks, stop",
+    "Stop sending these", "No more emails please", "I don't want any more emails", "Remove us",
+    "Please take us off the mailing list", "stop please", "No thank you. Stop!",
+    "Thank you, stop", "Stop, please", "Nope. Remove",
 ])
 def test_a_stop_request_is_recognised(reply):
     assert is_stop_request(reply) is True
@@ -47,9 +54,28 @@ def test_a_stop_request_is_recognised(reply):
 @pytest.mark.parametrize("reply", [
     "I can't stop thinking about this deal, call me", "Yes, interested", "Not now, maybe next quarter",
     "Who is this?", "",
+    "Please send more info", "Send me the term sheet", "Don't call me before 10, email is fine",
+    "Can Josh stop by the property Friday?", "What's the end date on the bridge loan?",
+    "We have a list of 4 properties", "Don't send it to my office address, use this one",
+    "No thanks", "Thank you", "Stop?", "You stop", "thank stop", "Stop the presses, I have a deal",
+    "no thanks " * 40 + "I already have a lender",
 ])
 def test_ordinary_replies_are_not_stop_requests(reply):
     assert is_stop_request(reply) is False
+
+
+@pytest.mark.parametrize("reply", [
+    "no thanks " * 40 + "I already have a lender",  # PR #428 re-review: backtracked for minutes with the old regex
+    "no thanks " * 5000 + "x",
+    "stop all " * 50_000,
+    "do not " * 50_000,
+    "On " + "x " * 100_000,
+    "no thanks no\n" * 20_000,
+], ids=["no-thanks-x40", "no-thanks-x5000", "stop-all", "do-not", "quote-line", "many-lines"])
+def test_stop_detection_stays_fast_on_hostile_replies(reply):
+    started = time.perf_counter()
+    is_stop_request(reply)
+    assert time.perf_counter() - started < 2.0
 
 
 def test_stop_words_in_the_quoted_email_do_not_count():
@@ -206,7 +232,7 @@ def row(**overrides):
 
 
 def processor(session, model, *, posted=True):
-    calls = SimpleNamespace(enqueued=[], cards=[], triage=[], notices=[])
+    calls = SimpleNamespace(enqueued=[], cards=[], triage=[], notices=[], blocked=[])
 
     def enqueue(**kwargs):
         calls.enqueued.append(kwargs)
@@ -215,7 +241,8 @@ def processor(session, model, *, posted=True):
     proc = ReplyProcessor(session_factory=lambda: session, client=model, model="m", enqueue=enqueue,
                           post_card=lambda action_id: calls.cards.append(action_id) or True,
                           post_triage=lambda text: calls.triage.append(text) or posted,
-                          post_notice=lambda text: calls.notices.append(text) or posted)
+                          post_notice=lambda text: calls.notices.append(text) or posted,
+                          block_address=lambda email: calls.blocked.append(email) or True)
     return proc, calls
 
 
@@ -261,6 +288,63 @@ def test_a_model_failure_is_retried_and_then_posted_unclassified():
     assert "*Unclassified*" in calls.triage[0]
 
 
+def test_an_unclassified_reply_asks_a_person_to_check_for_a_stop_request():
+    last = FakeSession([row(attempts=instantly_replies.MAX_ATTEMPTS - 1)])
+    proc, calls = processor(last, FakeModel("not json"))
+    proc.run()
+    assert "If they asked to stop, opt them out by hand" in calls.triage[0]
+
+
+def test_a_stop_request_the_phrases_miss_is_suppressed_when_the_model_reads_it(monkeypatch):
+    recorded = []
+    monkeypatch.setattr(instantly_replies, "suppress_reply", lambda db, reply_id: recorded.append(reply_id) or 5)
+    session = FakeSession([row(reply_text="We are all set, kindly refrain from reaching out")])
+    proc, calls = processor(session, FakeModel('{"intent": "stop", "summary": "Asked not to be contacted"}'))
+    result = proc.run()
+    assert result.suppressed == 1 and recorded == [7]
+    assert session.params("SET status = 'suppressed', stop_request = true")[0]["id"] == 7
+    assert calls.enqueued == [] and calls.triage == [] and "Suppressed everywhere" in calls.notices[0]
+    assert not session.params("SET status = 'done'")
+    assert session.params("INSERT INTO lending.cora_inbox")[0]["event_type"] == "instantly_opt_out"
+    assert calls.blocked == [LEAD]  # NDL's Instantly campaigns stop too
+
+
+def test_a_model_stop_whose_opt_out_fails_is_left_for_the_sweep_to_retry(monkeypatch):
+    def broken(db, reply_id):
+        raise RuntimeError("db down")
+
+    monkeypatch.setattr(instantly_replies, "suppress_reply", broken)
+    session = FakeSession([row()])
+    proc, calls = processor(session, FakeModel('{"intent": "stop", "summary": "Asked to stop"}'))
+    assert proc.run().failed == 1
+    assert session.params("SET status = 'suppressed', stop_request = true")
+    failed = session.params("SET attempts = attempts + 1")[0]
+    assert "opt-out not recorded" in failed["error"] and calls.enqueued == [] and calls.triage == []
+    assert calls.blocked == []
+
+
+def test_a_block_list_failure_never_undoes_the_opt_out(monkeypatch):
+    monkeypatch.setattr(instantly_replies, "suppress_reply", lambda db, reply_id: 5)
+    session = FakeSession([row(status="suppressed", stop_request=True, intent="unsubscribe")])
+    proc, calls = processor(session, FakeModel())
+
+    def refuse(email):
+        raise RuntimeError("instantly down")
+
+    proc._block_address = refuse
+    assert proc.run().suppressed == 1 and "Suppressed everywhere" in calls.notices[0] and session.commits == 1
+
+
+def test_a_stop_answer_from_the_model_needs_no_draft():
+    triage = classify_reply(FakeModel('{"intent": "stop", "summary": "Asked to stop"}'), "m", subject=None,
+                            reply="please quit reaching out")
+    assert triage.intent == "stop" and triage.body == ""
+
+
+def test_the_classifier_prompt_has_a_stop_intent():
+    assert '"stop"' in instantly_replies.CLASSIFY_PROMPT and "stop" in instantly_replies.MODEL_INTENTS
+
+
 def test_an_unposted_triage_still_reaches_coras_inbox():
     session = FakeSession([row()])
     proc, _ = processor(session, FakeModel(DEAL), posted=False)
@@ -276,6 +360,7 @@ def test_the_sweep_retries_a_stop_whose_opt_out_was_not_recorded(monkeypatch):
     proc, calls = processor(session, FakeModel())
     assert proc.run().suppressed == 1
     assert recorded == [7] and calls.enqueued == [] and "Suppressed everywhere" in calls.notices[0]
+    assert calls.blocked == [LEAD]
     assert LEAD not in calls.notices[0]
 
 

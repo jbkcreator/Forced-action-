@@ -47,6 +47,15 @@ def _not_halted(monkeypatch):
     monkeypatch.setattr(instantly_email, "is_globally_halted", lambda: False)
 
 
+@pytest.fixture(autouse=True)
+def _unsubscribe_link(monkeypatch):
+    """The real link is signed with SUBSCRIBER_JWT_SECRET, which CI does not set; the footer only needs a link."""
+    from src.services.relay import channels_email
+
+    monkeypatch.setattr(channels_email, "unsubscribe_url",
+                        lambda email: "https://app.example.test/api/email/unsubscribe?token=test-token")
+
+
 def test_send_adds_lead_with_footer_and_unsubscribe() -> None:
     fake = FakeInstantly(_routes())
     NdlInstantlySender(ACCOUNT, fake).send("mark@example.com", "Your refinance", "Hi Mark,\nquick question")
