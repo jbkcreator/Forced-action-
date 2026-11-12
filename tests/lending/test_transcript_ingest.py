@@ -321,3 +321,21 @@ def test_deferred_calls_outlive_the_wait_window_and_stop_after_the_attempt_cap(t
         "SELECT transcript_status, transcript_attempts FROM lending.call_dispositions "
         "WHERE dialer_call_id = 't12-deferred'")).one()
     assert (status, attempts) == (cfg.TRANSCRIPT_FAILED, cfg.TRANSCRIPT_MAX_EXTRACT_ATTEMPTS)
+
+
+def test_ghl_calls_are_never_fetched_or_marked_missing(transcript_db):
+    """Transcripts come from BatchDialer; a GHL call has none there, so the worker leaves it alone."""
+    lending_db = transcript_db
+    from sqlalchemy import text
+    from src.lending.transcript_ingest import expire_stale, fetch_pending
+
+    for call_id, ended_minutes_ago in (("ghl:t12-fresh", 1), ("ghl:t12-old", 600)):
+        lending_db.execute(text(
+            "INSERT INTO lending.call_dispositions (dialer_call_id, call_source, phone, talk_duration_sec, "
+            "call_ended_at, raw_event) VALUES (:id, 'ghl', '8135550101', 60, :ended, '{}'::jsonb)"),
+            {"id": call_id, "ended": NOW - timedelta(minutes=ended_minutes_ago)})
+    expire_stale(lending_db, now=NOW)
+    assert not [c for c in fetch_pending(lending_db, now=NOW, limit=50) if c.dialer_call_id.startswith("ghl:t12-")]
+    statuses = lending_db.execute(text(
+        "SELECT transcript_status FROM lending.call_dispositions WHERE dialer_call_id LIKE 'ghl:t12-%'")).scalars().all()
+    assert statuses == [None, None]

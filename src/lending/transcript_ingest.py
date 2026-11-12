@@ -101,6 +101,11 @@ def extraction_paused(db) -> bool:
     return bool(target and get_active_pause(db, "claude", target))
 
 
+# Transcripts come from BatchDialer (/cdrs/{id}/transcription): a GHL call has none there, so it is never fetched or
+# marked missing.
+_BATCHDIALER_ONLY = "call_source = 'batchdialer'"
+
+
 def _cutoff(now: datetime) -> datetime:
     return now - timedelta(seconds=TRANSCRIPT_MAX_WAIT_SECONDS)
 
@@ -109,7 +114,7 @@ def expire_stale(db, *, now: datetime) -> int:
     """Mark answered calls past the wait cap as missing, in one statement."""
     result = db.execute(text(
         f"UPDATE {_TABLE} SET transcript_status = :missing, updated_at = now() "
-        f"WHERE {TRANSCRIPT_PENDING_PREDICATE} AND call_ended_at < :cutoff"
+        f"WHERE {TRANSCRIPT_PENDING_PREDICATE} AND {_BATCHDIALER_ONLY} AND call_ended_at < :cutoff"
     ), {"missing": TRANSCRIPT_MISSING, "cutoff": _cutoff(now)})
     return int(result.rowcount or 0)
 
@@ -122,6 +127,7 @@ def fetch_pending(db, *, now: datetime, limit: int, include_deferred: bool = Tru
         f"WHERE (({TRANSCRIPT_PENDING_PREDICATE} AND call_ended_at IS NOT NULL AND call_ended_at >= :cutoff) "
         "OR (:include_deferred AND transcript_status = :deferred)) "
         "AND (transcript_attempted_at IS NULL OR transcript_attempted_at < :retry_before) "
+        f"AND {_BATCHDIALER_ONLY} "
         "ORDER BY transcript_attempted_at NULLS FIRST, call_ended_at LIMIT :limit"
     ), {"cutoff": _cutoff(now), "retry_before": now - timedelta(seconds=TRANSCRIPT_RETRY_SECONDS),
         "deferred": TRANSCRIPT_DEFERRED, "include_deferred": include_deferred, "limit": limit}).all()
