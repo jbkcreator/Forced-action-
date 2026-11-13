@@ -8,16 +8,21 @@ follow-up; website: the delivery itself) ``start`` runs every gate and adds the 
   is copied here for the report. A website lead gets ``web-intro-ready`` when the text box was ticked and the number
   still has text consent (``consent.has_text_consent``: consent row, no opt-out), the switch
   ``LENDING_INTRO_SMS_ENABLED`` is on and it is 8am-8pm for the borrower. Outside the window the text is held and the
-  web-lead sweep releases it (``release_held_web_intro``).
-* **Call cascade** (``LENDING_SPEED_TO_LEAD_ENABLED``). Only for a lead that reached GHL within CASCADE_MAX_LEAD_AGE
+  web-lead sweep releases it (``release_held_web_intro``), up to TEXT_LAST_CHANCE after the form.
+* **Targets and last chances** (``config/lending_speed_to_lead.py``). Each step has the client's target (a miss is
+  logged and shown on the timing report) and a last chance, after which the step is skipped: text 5 s / 24 h, Josh
+  and David 60 s / 5 min, Voice AI 2 min / 5 min. A lead too late for calls gets a "late lead, call now" post in the
+  lead-alerts channel and goes to the normal call queue.
+* **Call cascade** (``LENDING_SPEED_TO_LEAD_ENABLED``). Only for a lead that reached GHL within CALL_LAST_CHANCE
   and that may be called now under the same rules as Josh's GHL call lists (``ghl_call_gate.blocked_reasons``:
   suppression, DNC, already reached, attempt caps, the 8am-8pm calling window, emergency halt). A website lead also
   needs the call-consent box and a fresh DNC scrub (one Tracerfy credit, run here; LendingFlow leads are exempt,
   client decision). Then ``ndl-ai-voice-ok`` is set or cleared, and ``ndl-speed-to-lead`` is removed and re-added so
   GHL's tag trigger fires again for a returning contact.
 * **Voice AI** (brief section 7: only on consented leads, discloses it is an AI assistant for Next Deal Lending). Our
-  code only marks who may get it: a website lead whose call-consent box was ticked with the exact consent text. A
-  LendingFlow lead has no recorded call consent, so it never gets the tag (open question for Josh).
+  code only marks who may get it: a website lead whose call-consent box was ticked with the exact consent text, and
+  only when the Josh/David step ran early enough that the AI call starts inside AI_LAST_CHANCE. A LendingFlow lead has
+  no recorded call consent, so it never gets the tag (open question for Josh).
 
 The lending emergency halt withholds every tag. Nothing here ever fails a delivery: errors are logged by lead id and
 the lead still reaches BatchDialer as usual (no hold: team decision, Nov 13). Logs carry lead ids only, never a phone number.
@@ -45,7 +50,10 @@ from config.lending_speed_to_lead import (
     CALL_OFF,
     CALL_STALE,
     CALL_TAGGED,
-    CASCADE_MAX_LEAD_AGE,
+    AI_LAST_CHANCE,
+    AI_VOICE_AFTER_SECONDS,
+    CALL_LAST_CHANCE,
+    CALL_TARGET,
     GHL_TAG_AI_VOICE_OK,
     GHL_TAG_SPEED_TO_LEAD,
     GHL_TAG_WEB_INTRO_READY,
@@ -59,8 +67,10 @@ from config.lending_speed_to_lead import (
     TEXT_HELD,
     TEXT_NOT_ALLOWED,
     TEXT_OFF,
+    TEXT_LAST_CHANCE,
     TEXT_TAGGED,
-    WEB_INTRO_HOLD_MAX_HOURS,
+    TEXT_TARGET,
+    TEXT_TOO_LATE,
     WEB_INTRO_RELEASE_BATCH,
 )
 from config.settings import get_settings
@@ -70,6 +80,7 @@ from src.lending.global_halt import is_globally_halted
 
 logger = logging.getLogger(__name__)
 
+SOURCE_LABELS = {SOURCE_LENDINGFLOW: "LendingFlow", SOURCE_WEB: "Website"}
 NO_CALL_CONSENT = "NO_CALL_CONSENT"
 NO_PHONE = "NO_PHONE"
 EMERGENCY_STOP = "EMERGENCY_STOP"
@@ -127,6 +138,11 @@ def intro_sms_on() -> bool:
                 and settings.lending_sms_carrier_approved)
 
 
+def voice_in_time(received_at: datetime, now: datetime) -> bool:
+    """The Voice AI step starts AI_VOICE_AFTER_SECONDS after the cascade; it only makes sense inside AI_LAST_CHANCE."""
+    return now - received_at + timedelta(seconds=AI_VOICE_AFTER_SECONDS) <= AI_LAST_CHANCE
+
+
 def voice_eligible(lead: Mapping[str, Any]) -> bool:
     """A recorded, unrevoked call consent: the website call box ticked with the exact consent text, on a number that
     is not suppressed. LendingFlow leads have no call-consent record, so never."""
@@ -136,6 +152,8 @@ def voice_eligible(lead: Mapping[str, Any]) -> bool:
 def _web_text(db, lead: Mapping[str, Any], tags: TagClient, *, halted: bool, now: datetime) -> tuple[str, Optional[datetime]]:
     if not intro_sms_on():
         return TEXT_OFF, None
+    if now - lead["received_at"] > TEXT_LAST_CHANCE:
+        return TEXT_TOO_LATE, None
     if halted or not lead["sms_consent"] or lead["suppressed"] or not has_text_consent(db, lead["phone"]):
         return TEXT_NOT_ALLOWED, None
     if not text_window_open(lead["phone"], property_state=lead["property_state"], now=now):
@@ -186,13 +204,13 @@ def _call(db, source: str, lead: Mapping[str, Any], tags: TagClient, *, halted: 
           scrubber: Optional[Scrubber]) -> tuple[str, Optional[str], Optional[datetime], bool]:
     if not get_settings().lending_speed_to_lead_enabled:
         return CALL_OFF, None, None, False
-    if now - lead["received_at"] > CASCADE_MAX_LEAD_AGE:
+    if now - lead["received_at"] > CALL_LAST_CHANCE:
         return CALL_STALE, None, None, False
     reason = _call_block_reason(db, source, lead, halted=halted, now=now, scrubber=scrubber)
     if reason:
         logger.info("[speed-to-lead] no call cascade lead=%s:%s reason=%s", source, lead["id"], reason)
         return CALL_BLOCKED, reason, None, False
-    voice = voice_eligible(lead)
+    voice = voice_eligible(lead) and voice_in_time(lead["received_at"], now)
     try:
         _start_cascade(lead, tags, voice=voice)
     except Exception as exc:  # class only
@@ -220,10 +238,45 @@ def _stop_cascade(lead: Mapping[str, Any], tags: TagClient) -> None:
     tags.remove_tag(lead["ghl_contact_id"], GHL_TAG_SPEED_TO_LEAD)
 
 
+Notifier = Callable[[str], bool]  # posts to the lead-alerts channel (ops_alerts.post_ops_alert)
+
+
+def late_lead_text(source: str, lead: Mapping[str, Any], now: datetime, contact_url: Optional[str]) -> str:
+    minutes = int((now - lead["received_at"]).total_seconds() // 60)
+    link = f"<{contact_url}|Open in GHL to call>" if contact_url else "Open it in GHL to call."
+    return (f":hourglass_flowing_sand: *Late lead, call now:* {SOURCE_LABELS[source]} lead {lead['id']} reached GHL "
+            f"{minutes} min after the form, so no instant call was made (last chance is "
+            f"{int(CALL_LAST_CHANCE.total_seconds() // 60)} min). {link}")
+
+
+def _log_target_misses(source: str, lead: Mapping[str, Any], text_at: Optional[datetime],
+                       call_at: Optional[datetime]) -> None:
+    for step, at, target in (("text", text_at, TEXT_TARGET), ("call", call_at, CALL_TARGET)):
+        if at is not None and at - lead["received_at"] > target:
+            logger.warning("[speed-to-lead] %s missed its %ss target lead=%s:%s (+%.0fs)", step,
+                           int(target.total_seconds()), source, lead["id"], (at - lead["received_at"]).total_seconds())
+
+
+def _post_late_lead(notify: Notifier, contact_url: Optional[Callable[[str], Optional[str]]], source: str,
+                    lead: Mapping[str, Any], now: datetime) -> None:
+    """Best effort and never raises: a failed post must not roll back this lead's record (the next sweep would then
+    treat the lead as new and post it again)."""
+    try:
+        url = contact_url(lead["ghl_contact_id"]) if contact_url is not None else None
+        posted = notify(late_lead_text(source, lead, now, url))
+    except Exception as exc:  # class only
+        logger.error("[speed-to-lead] late-lead post failed lead=%s:%s: %s", source, lead["id"], type(exc).__name__)
+        return
+    if not posted:
+        logger.error("[speed-to-lead] late-lead post not sent lead=%s:%s", source, lead["id"])
+
+
 def start(db, source: str, lead_id: int, *, tags: TagClient, scrubber: Optional[Scrubber] = None,
+          notify: Optional[Notifier] = None, contact_url: Optional[Callable[[str], Optional[str]]] = None,
           now: Optional[datetime] = None) -> Optional[Outcome]:
     """Run the speed-to-lead step once for a lead that has just reached GHL. Returns None when the lead is unknown,
-    has no GHL contact yet, or was already handled (a retried delivery). Does not commit."""
+    has no GHL contact yet, or was already handled (a retried delivery). A lead past the call last chance is posted
+    once through ``notify`` as a late lead. Does not commit."""
     if source not in SOURCES:
         raise ValueError(f"unknown speed-to-lead source {source!r}")
     now = now or datetime.now(timezone.utc)
@@ -246,17 +299,21 @@ def start(db, source: str, lead_id: int, *, tags: TagClient, scrubber: Optional[
     call_status, reason, call_at, voice = _call(db, source, lead, tags, halted=halted, now=now, scrubber=scrubber)
     db.execute(_RECORD, {"id": row_id, "text_status": text_status, "text_tagged_at": text_at, "call_status": call_status,
                          "call_block_reason": reason, "call_tagged_at": call_at, "voice": voice})
+    _log_target_misses(source, lead, text_at, call_at)
+    if call_status == CALL_STALE and notify is not None:
+        _post_late_lead(notify, contact_url, source, lead, now)
     return Outcome(source, lead_id, text_status, call_status, reason, voice)
 
 
-def start_safely(db, source: str, lead_id: int, *, tags: Optional[TagClient],
-                 scrubber: Optional[Scrubber] = None) -> Optional[Outcome]:
+def start_safely(db, source: str, lead_id: int, *, tags: Optional[TagClient], scrubber: Optional[Scrubber] = None,
+                 notify: Optional[Notifier] = None,
+                 contact_url: Optional[Callable[[str], Optional[str]]] = None) -> Optional[Outcome]:
     """``start`` inside a savepoint; never raises, so the lead's delivery is never affected."""
     if tags is None:
         return None
     try:
         with db.begin_nested():
-            return start(db, source, lead_id, tags=tags, scrubber=scrubber)
+            return start(db, source, lead_id, tags=tags, scrubber=scrubber, notify=notify, contact_url=contact_url)
     except Exception as exc:  # class only
         logger.error("[speed-to-lead] step failed lead=%s:%s: %s", source, lead_id, type(exc).__name__)
         return None
@@ -294,9 +351,15 @@ def live_step(source: str) -> Optional[AfterDelivery]:
     if tags is None:
         return None
     scrubber = live_scrubber() if source == SOURCE_WEB else None
+    from src.lending.lead_arrival_alert import ghl_contact_url
+    from src.lending.ops_alerts import post_ops_alert
+
+    def contact_url(contact_id: str) -> Optional[str]:
+        return ghl_contact_url(settings.lending_ghl_app_url, settings.lending_ghl_location_id, contact_id)
 
     def step(db: Any, lead_id: int) -> None:
-        start_safely(db, source, lead_id, tags=tags, scrubber=scrubber)
+        start_safely(db, source, lead_id, tags=tags, scrubber=scrubber,
+                     notify=post_ops_alert if settings.lending_speed_to_lead_enabled else None, contact_url=contact_url)
 
     return step
 
@@ -320,7 +383,7 @@ def release_held_web_intro(db, tags: Optional[TagClient], *, now: Optional[datet
     now = now or datetime.now(timezone.utc)
     tagged = 0
     rows = db.execute(_HELD_WEB, {"held": TEXT_HELD, "limit": WEB_INTRO_RELEASE_BATCH,
-                                  "cutoff": now - timedelta(hours=WEB_INTRO_HOLD_MAX_HOURS)}).mappings().all()
+                                  "cutoff": now - TEXT_LAST_CHANCE}).mappings().all()
     for lead in rows:
         if lead["suppressed"] or not lead["sms_consent"] or not has_text_consent(db, lead["phone"]):
             db.execute(_TEXT_DONE, {"status": TEXT_NOT_ALLOWED, "at": None, "id": lead["row_id"]})
@@ -415,6 +478,10 @@ def _seconds(start: datetime, at: Optional[datetime]) -> str:
     return f"+{(at - start).total_seconds():.0f}s" if at is not None else "-"
 
 
+def _target(start: datetime, at: Optional[datetime], target: timedelta) -> str:
+    return f" (target {int(target.total_seconds())}s missed)" if at is not None and at - start > target else ""
+
+
 def _live_call_lines(read_calls: CallReader, contact_id: str, start_at: datetime, end_at: datetime) -> list[str]:
     from src.lending.ghl_calls import call_duration_seconds, call_state, message_time
 
@@ -447,9 +514,11 @@ def report_lines(db, *, source: Optional[str] = None, lead_id: Optional[int] = N
         end_at = start_at + timedelta(minutes=REPORT_CALL_WINDOW_MINUTES)
         lines.append(
             f"{row['source']}:{row['lead_id']} arrived {start_at:%Y-%m-%d %H:%M:%S %Z} | text {row['text_status']} "
-            f"{_seconds(start_at, row['text_tagged_at'])} | call cascade {row['call_status']}"
+            f"{_seconds(start_at, row['text_tagged_at'])}{_target(start_at, row['text_tagged_at'], TEXT_TARGET)} "
+            f"| call cascade {row['call_status']}"
             f"{' (' + row['call_block_reason'] + ')' if row['call_block_reason'] else ''} "
-            f"{_seconds(start_at, row['call_tagged_at'])} | Voice AI allowed: {'yes' if row['voice_eligible'] else 'no'}")
+            f"{_seconds(start_at, row['call_tagged_at'])}{_target(start_at, row['call_tagged_at'], CALL_TARGET)} "
+            f"| Voice AI allowed: {'yes' if row['voice_eligible'] else 'no'}")
         if read_calls is not None and row["ghl_contact_id"]:
             try:
                 lines.extend(_live_call_lines(read_calls, row["ghl_contact_id"], start_at, end_at))

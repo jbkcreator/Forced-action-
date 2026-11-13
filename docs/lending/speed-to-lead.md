@@ -20,6 +20,22 @@ shows.
 | missed | David's phone rings, then the lead is connected | GHL "Call" action |
 | 2 min | Nobody connected and the contact has `ndl-ai-voice-ok`: Voice AI calls the lead | GHL "Voice AI Outbound Call" |
 
+## Targets and last chances
+
+Each step has the client's **target** (what we aim for and report against; a miss is logged and marked on the timing
+report) and a **last chance** (the latest point the step still makes sense; after it the step is skipped). The last
+chances are our suggestion, waiting for Josh's approval; all six numbers are in `config/lending_speed_to_lead.py`.
+
+| Step | Target | Last chance | After the last chance |
+|---|---|---|---|
+| Text to the lead | 5 s | 24 h (the same limit held texts already use) | No text |
+| Ring Josh, then David | 60 s | 5 min | No call: a "Late lead, call now" post in the lead-alerts channel (`LENDING_OPS_CHANNEL`), and the lead goes to the normal call queue |
+| Voice AI | 2 min | 5 min, and only if the Josh/David step ran | No AI call; the AI is never the first contact on an old lead |
+
+The 8am-8pm window still applies to every step. Examples: on time, text, Josh, David, then the AI at 2 minutes; 3 minutes
+late, text, Josh and David, no AI (it would start after 5 minutes); 10 minutes late, text only plus the late-lead post;
+2 days late, nothing automatic, only the late-lead post.
+
 ## Gates (all in our code)
 
 * **Intro text, website** (`LENDING_INTRO_SMS_ENABLED` + `LENDING_GHL_CF_INTRO_NAME`, the same switch as T-09, and
@@ -27,7 +43,7 @@ shows.
   text box was ticked, `consent.has_text_consent` (consent row, no opt-out, not do-not-contact), not halted, and
   8am-8pm for the borrower. Outside the window the text is held; the web-lead sweep (every 5 minutes) sends it once the
   window opens, for up to 24 hours. LendingFlow leads keep T-09's own rules.
-* **Call cascade** (`LENDING_SPEED_TO_LEAD_ENABLED`): the lead reached GHL at most 100 seconds after it arrived (later: no call, BatchDialer as usual; the intro text is not affected), and
+* **Call cascade** (`LENDING_SPEED_TO_LEAD_ENABLED`): the lead reached GHL inside the call last chance (5 minutes, below), and
   `ghl_call_gate.blocked_reasons` allows the number now (suppression, DNC result, already reached, attempt caps, the
   8am-8pm calling window, emergency halt). Website leads also need the call-consent box, and get a fresh DNC scrub
   first (1 Tracerfy credit); a failed scrub means no call. LendingFlow leads need no scrub (client decision).

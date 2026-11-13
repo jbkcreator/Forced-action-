@@ -219,16 +219,76 @@ def test_no_website_intro_text_before_carrier_approval(gates):
 
 
 def test_a_lead_that_reaches_ghl_late_gets_no_cascade(gates):
-    outcome, tags, _ = run(web_lead(received_at=NOW - timedelta(minutes=5)))
+    outcome, tags, _ = run(web_lead(received_at=NOW - timedelta(minutes=6)))
     assert outcome.call_status == CALL_STALE and not [c for c in tags.calls if c[2] == GHL_TAG_SPEED_TO_LEAD]
 
 
-def test_a_lead_exactly_100_seconds_old_still_gets_the_cascade_one_second_later_does_not(gates):
-    on_the_edge, _, _ = run(web_lead(received_at=NOW - timedelta(seconds=100)))
-    past_it, tags, _ = run(web_lead(received_at=NOW - timedelta(seconds=101)))
+def test_the_calls_last_chance_is_five_minutes_and_the_text_does_not_use_it(gates):
+    on_the_edge, _, _ = run(web_lead(received_at=NOW - timedelta(minutes=5)))
+    past_it, tags, _ = run(web_lead(received_at=NOW - timedelta(minutes=5, seconds=1)))
     assert (on_the_edge.call_status, past_it.call_status) == (CALL_TAGGED, CALL_STALE)
-    assert past_it.text_status == TEXT_TAGGED  # the intro text does not use the limit
+    assert past_it.text_status == TEXT_TAGGED
     assert ("add", "c-7", GHL_TAG_WEB_INTRO_READY) in tags.calls
+
+
+def test_voice_ai_only_when_it_can_still_start_inside_five_minutes(gates):
+    # the AI step runs 2 minutes after the cascade starts, so the cascade must start by minute 3
+    in_time, tags_in, _ = run(web_lead(received_at=NOW - timedelta(minutes=3)))
+    too_late, tags_late, _ = run(web_lead(received_at=NOW - timedelta(minutes=3, seconds=1)))
+    assert (in_time.voice_eligible, too_late.voice_eligible) == (True, False)
+    assert too_late.call_status == CALL_TAGGED  # Josh and David are still rung
+    assert ("remove", "c-7", GHL_TAG_AI_VOICE_OK) in tags_late.calls
+
+
+def test_the_texts_last_chance_is_24_hours(gates):
+    on_the_edge, _, _ = run(web_lead(received_at=NOW - timedelta(hours=24)))
+    past_it, tags, _ = run(web_lead(received_at=NOW - timedelta(hours=24, seconds=1)))
+    assert (on_the_edge.text_status, past_it.text_status) == (TEXT_TAGGED, "too_late")
+    assert ("add", "c-7", GHL_TAG_WEB_INTRO_READY) not in tags.calls
+
+
+def test_a_lead_too_late_for_calls_is_posted_once_as_a_late_lead(gates):
+    posts = []
+    lead = web_lead(received_at=NOW - timedelta(minutes=7))
+    outcome = speed_to_lead.start(FakeDb(lead), "web", 7, tags=FakeTags(), scrubber=lambda p: [], now=NOW,
+                                  notify=lambda text: posts.append(text) or True,
+                                  contact_url=lambda contact: f"https://ghl/{contact}")
+    assert outcome.call_status == CALL_STALE and len(posts) == 1
+    assert "Late lead, call now" in posts[0] and "Website lead 7" in posts[0] and "7 min" in posts[0]
+    assert "https://ghl/c-7" in posts[0] and PHONE not in posts[0]
+
+
+def test_a_failing_late_lead_post_never_undoes_the_record(gates):
+    def broken(text):
+        raise RuntimeError("slack down")
+
+    db = FakeDb(web_lead(received_at=NOW - timedelta(minutes=7)))
+    outcome = speed_to_lead.start(db, "web", 7, tags=FakeTags(), scrubber=lambda p: [], now=NOW, notify=broken)
+    assert outcome.call_status == CALL_STALE and db.records[0]["call_status"] == CALL_STALE
+
+
+def test_an_on_time_lead_is_not_posted_as_late(gates):
+    posts = []
+    speed_to_lead.start(FakeDb(web_lead()), "web", 7, tags=FakeTags(), scrubber=lambda p: [], now=NOW,
+                        notify=lambda text: posts.append(text) or True)
+    assert posts == []
+
+
+def test_a_missed_target_is_logged(gates, caplog):
+    run(web_lead(received_at=NOW - timedelta(seconds=90)))  # inside the last chance, past the 60 s target
+    assert any("call missed its 60s target" in r.getMessage() for r in caplog.records)
+    assert any("text missed its 5s target" in r.getMessage() for r in caplog.records)
+
+
+def test_lendingflow_s_own_intro_text_also_stops_after_24_hours(monkeypatch):
+    from src.lending import lendingflow
+
+    monkeypatch.setattr(lendingflow, "_intro_sms_on", lambda: True)
+    monkeypatch.setattr(lendingflow, "text_window_open", lambda *a, **k: True)
+    monkeypatch.setattr(lendingflow, "_sms_clear", lambda db, lead: True)
+    lead = {"id": 5, "phone": PHONE, "property_state": "FL", "property_zip": None}
+    assert lendingflow._may_text_now(None, {**lead, "received_at": NOW - timedelta(hours=24)}, NOW) is True
+    assert lendingflow._may_text_now(None, {**lead, "received_at": NOW - timedelta(hours=25)}, NOW) is False
 
 
 # ── the intro text gates ─────────────────────────────────────────────────────
@@ -435,6 +495,7 @@ def test_the_report_reads_the_lead_s_calls_live_from_ghl():
              {"dateAdded": (NOW + timedelta(minutes=20)).isoformat(), "direction": "outbound", "status": "no-answer"}]
     lines = speed_to_lead.report_lines(ReportDb(), source="web", lead_id=7, read_calls=lambda contact: calls)
     assert "text tagged +2s" in lines[0] and "call cascade tagged +3s" in lines[0]
+    assert "target 5s missed" not in lines[0] and "target 60s missed" not in lines[0]
     assert lines[1:] == ["    GHL call +21s outbound completed talk 95s"]  # the 20-minute call is outside the window
     assert PHONE not in "".join(lines)
 

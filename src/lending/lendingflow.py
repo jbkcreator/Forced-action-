@@ -529,6 +529,9 @@ def _may_text_now(db, lead: Mapping[str, Any], now: datetime) -> bool:
     held: ``release_held_intro_sms`` tags it once the window opens."""
     if not _intro_sms_on():
         return False
+    if lead.get("received_at") and now - lead["received_at"] > timedelta(hours=INTRO_SMS_HOLD_MAX_HOURS):
+        logger.info("[lendingflow] intro SMS skipped, past its last chance lead=%s", lead["id"])
+        return False
     if not text_window_open(lead["phone"], property_state=lead.get("property_state"),
                             property_zip=lead.get("property_zip"), now=now):
         logger.info("[lendingflow] intro SMS held for the send window lead=%s", lead["id"])
