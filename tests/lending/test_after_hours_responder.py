@@ -208,7 +208,8 @@ def test_the_real_pass_does_nothing_while_off_or_during_the_emergency_halt(monke
         raise AssertionError("no database session may be opened")
 
     monkeypatch.setattr("src.lending.db.lending_session", no_session)
-    assert run_send_cycle() == {}  # off by default
+    monkeypatch.setattr(get_settings(), "lending_after_hours_conversation_enabled", False, raising=False)
+    assert run_send_cycle() == {}
     monkeypatch.setattr(get_settings(), "lending_after_hours_conversation_enabled", True, raising=False)
     monkeypatch.setattr(after_hours_responder, "is_globally_halted", lambda: True)
     assert run_send_cycle() == {}

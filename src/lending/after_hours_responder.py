@@ -447,12 +447,15 @@ def run_send_cycle(*, now: Optional[datetime] = None) -> dict[str, int]:
     from src.lending.ghl_email import get_email_sender
     from src.lending.ghl_sms import get_sender
 
-    # No calendar is passed yet, so a lead who answers all three questions is closed as no_slots and stays on the
-    # morning call list. The existing booking service cannot serve a night inquiry as it stands: it books only
-    # after a caller-completed booking gate, needs an email address, and offers nothing inside 24 hours.
+    from src.lending.after_hours_calendar import calendar_hooks
+
+    # With no morning calendar configured both hooks are None: a lead who answers all three questions is closed
+    # as no_slots and stays on the morning call list.
     with lending_session() as db:
+        slot_finder, booker = calendar_hooks(db)
         return process_due(db, text_sender=get_sender(), email_sender=get_email_sender(),
-                           carrier_approved=bool(get_settings().lending_sms_carrier_approved), now=now)
+                           carrier_approved=bool(get_settings().lending_sms_carrier_approved),
+                           slot_finder=slot_finder, booker=booker, now=now)
 
 
 def run_send_cycle_now() -> None:

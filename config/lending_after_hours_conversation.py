@@ -69,6 +69,7 @@ TEMPLATE_VERSIONS = {
 SLOT_TIMEZONE = "America/New_York"
 MORNING_START_HOUR = 9
 MORNING_END_HOUR = 12
+SLOT_DURATION_MINUTES = 30  # also the grid the slot starts sit on: 9:00, 9:30, ...
 # A pass follows a booking with its confirmation, and an answer with the next message, without waiting a minute.
 SEND_ROUNDS_PER_PASS = 2
 

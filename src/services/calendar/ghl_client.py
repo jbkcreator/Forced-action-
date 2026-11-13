@@ -187,7 +187,13 @@ class GHLCalendarClient:
         summary: str,
         attendee_email: str,
         description: str = "",
+        contact_id: Optional[str] = None,
     ) -> CalendarEvent:
+        # A live call with contactEmail alone was refused (HTTP 422 "Invalid
+        # contact details"): GHL books against an existing contact. A caller
+        # that knows the contact passes its id; without one the email is
+        # still sent, as before.
+        contact = {"contactId": contact_id} if contact_id else {"contactEmail": attendee_email}
         resp = self._request(
             "POST",
             "/calendars/events/appointments",
@@ -199,10 +205,7 @@ class GHLCalendarClient:
                 "startTime": start.isoformat(),
                 "endTime": end.isoformat(),
                 "appointmentStatus": "confirmed",
-                # GHL resolves/creates the contact by email on this endpoint
-                # per the v2 docs; confirm against a live call before trusting
-                # this creates vs. requires an existing contactId.
-                "contactEmail": attendee_email,
+                **contact,
                 "notes": description,
             },
         )
@@ -211,7 +214,25 @@ class GHLCalendarClient:
                 f"GHL create appointment failed: HTTP {resp.status_code} {resp.text[:300]}"
             )
         raw = resp.json()
-        return self._to_event(raw.get("appointment") or raw)
+        raw = raw.get("appointment") or raw
+        # A live create answered 2xx without the startTime a read returns, so
+        # only the id is required of this response; the times are the ones
+        # just requested. No id means the appointment exists but cannot be
+        # named: unknown, never retried.
+        event_id = raw.get("id")
+        if not event_id:
+            raise CalendarOutcomeUnknown(
+                f"GHL accepted the appointment but returned no id (keys: {sorted(raw)})"
+            )
+        return CalendarEvent(
+            event_id=event_id,
+            start=_parse_timestamp(raw["startTime"]) if raw.get("startTime") else start,
+            end=_parse_timestamp(raw["endTime"]) if raw.get("endTime") else end,
+            summary=raw.get("title") or summary,
+            attendee_email=raw.get("contactEmail") or raw.get("email") or attendee_email or None,
+            html_link=None,
+            status="confirmed",
+        )
 
     def cancel_event(self, *, calendar_id: str, event_id: str) -> None:
         resp = self._request(

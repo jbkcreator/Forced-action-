@@ -210,6 +210,11 @@ def night_responder_send_passes(monkeypatch):
     """A webhook that makes a night responder message due starts a send pass on its own session with the real GHL
     senders: in tests the pass is recorded, never run. Tests of the pass call ``process_due`` directly."""
     passes: list[str] = []
+    # A developer's own .env may switch the night responder on: every test starts with it off and no calendar.
+    from config.settings import get_settings
+
+    monkeypatch.setattr(get_settings(), "lending_after_hours_conversation_enabled", False, raising=False)
+    monkeypatch.setattr(get_settings(), "lending_after_hours_calendar_id", None, raising=False)
     monkeypatch.setattr("src.lending.reply_webhook.run_send_cycle_now", lambda: passes.append("reply"))
     monkeypatch.setattr("src.api.lending_ghl_router.run_send_cycle_now", lambda: passes.append("intake"))
     return passes
