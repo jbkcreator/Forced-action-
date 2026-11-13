@@ -29,6 +29,7 @@ from sqlalchemy import text
 from config.settings import get_settings
 from src.api.deps import get_db
 from src.lending.after_hours_intake import record_intake
+from src.lending.closing.blockers import upsert_current_stage
 from src.lending.ghl_disposition_match import (
     InvalidDispositionEvent,
     attach_pending,
@@ -111,6 +112,19 @@ def _resolved(body: dict[str, Any], name: str) -> Optional[str]:
     return None if value is None or value.strip().lower() in _UNRESOLVED_VALUES else value
 
 
+def _now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _record_current_stage(db: Session, opportunity_id: str, stage: str, phone: Optional[str]) -> None:
+    """P2.4 current stage, in a savepoint: a failure is logged and never loses the scoreboard's stage event."""
+    try:
+        with db.begin_nested():
+            upsert_current_stage(db, opportunity_id=opportunity_id, stage_name=stage, phone=phone, now=_now())
+    except Exception as exc:  # class only: SQL errors embed bound parameters
+        logger.error("[lending-ghl] current stage not recorded (%s)", type(exc).__name__)
+
+
 @router.post("/ghl-stage")
 def ghl_stage(
     body: dict[str, Any],
@@ -127,13 +141,15 @@ def ghl_stage(
         logger.warning("[lending-ghl] stage webhook refused: a merge field did not resolve (opportunity_id/stage_name)")
         raise HTTPException(status_code=422, detail="stage_name or opportunity_id did not resolve: check the GHL merge fields")
     try:
+        phone = normalize(_resolved(body, "phone"))
         inserted = db.execute(
             text("INSERT INTO lending.ghl_stage_events (ghl_opportunity_id, pipeline_id, stage_name, stage_key, phone, "
                  "booked_by, raw_event) VALUES (:opp, :pipe, :stage, :key, :phone, :by, CAST(:raw AS jsonb)) "
                  "ON CONFLICT (ghl_opportunity_id, stage_key) DO NOTHING"),
             {"opp": opportunity_id, "pipe": _field(body, "pipeline_id"), "stage": stage, "key": stage.strip().lower(),
-             "phone": normalize(_resolved(body, "phone")), "by": _resolved(body, "booked_by"), "raw": json.dumps(body)},
+             "phone": phone, "by": _resolved(body, "booked_by"), "raw": json.dumps(body)},
         ).rowcount
+        _record_current_stage(db, opportunity_id, stage, phone)
         db.commit()
     except Exception as exc:
         db.rollback()

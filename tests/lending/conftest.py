@@ -17,6 +17,7 @@ from migrations.apply_lending_call_dispositions_dialer import apply_to
 from migrations.apply_lending_ghl_stage_events import apply_to as apply_to_stage_events
 from migrations.apply_lending_pr319_client_feedback import apply_to as apply_to_feedback
 from migrations.apply_lending_followup_call_tracking import apply_to as apply_to_followup
+from migrations.apply_lending_doc_chase import apply_to as apply_to_doc_chase
 from src.lending.models import LENDING_SCHEMA, LendingCallDisposition
 
 
@@ -45,6 +46,7 @@ def lending_db():
     apply_to_feedback(conn)
     apply_to_stage_events(conn)
     apply_to_followup(conn)  # call_source column (checked first, so no lock on the live table)
+    apply_to_doc_chase(conn)  # P2.4 ghl_opportunity_stage, written by the stage webhook
     session = Session(bind=conn, join_transaction_mode="create_savepoint")
     yield session
     session.close()
