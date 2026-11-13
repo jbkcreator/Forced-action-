@@ -113,6 +113,15 @@ What happens next:
   decision, Nov 13: David works the BatchDialer list). A call Josh or David connects marks the lead handled in GHL, so
   BatchDialer removes or never loads it; a lead BatchDialer reached is not released from the queue.
 
+**Checked at the real start time:** the DNC scrub can take up to about 30 seconds, so after it (and after the lock)
+the fresh limit, the callers' hours and the call gate (the lead's own 8am-8pm window included) are checked again
+with the real time. The cascade starts only when David's call (60 s after the start) still falls inside the hours;
+`ndl-ai-voice-ok` is set only when the Voice AI call (2 minutes after the start) does too. A lead too close to the
+cutoff waits in the queue for the next morning.
+
+**Intro text for a returning borrower:** `web-intro-ready` is removed and added again for every new inquiry, because
+GHL starts the workflow only when the tag is newly added and the contact still carries it from the last inquiry.
+
 **Never rung twice:** before any cascade tag is sent, the lead's claim and a "starting" mark (with the start time)
 are committed in their own short transaction, apart from the delivery. If the delivery then fails to commit, a
 retried delivery sees the lead as already started and skips it; the unfinished start is reported as an interrupted
@@ -135,7 +144,9 @@ Nothing here can fail a lead's delivery: an error is logged by lead id and the l
    5. *Assign to user*: David → *Call* (same whisper and timeout).
    6. *If/Else* on the call status: answered → end.
    7. *Wait* until 2 minutes after the trigger.
-   8. *If/Else*: contact has tags `ndl-speed-to-lead` and `ndl-ai-voice-ok`, and DND for calls is off → *Voice AI
+   8. *If/Else*: contact has tags `ndl-speed-to-lead` and `ndl-ai-voice-ok`, DND for calls is off, and the current
+      time is inside the callers' hours (Mon-Fri 9:00-19:15 ET; a second guard, our code already withholds
+      `ndl-ai-voice-ok` when the AI call would fall after the cutoff) → *Voice AI
       Outbound Call* (agent below).
    9. *Remove tag* `ndl-speed-to-lead` (so a later inquiry starts it again; our code also removes and re-adds it).
 5. **Voice AI agent "NDL Speed to Lead"**: outbound calling enabled for the location (HighLevel may require its

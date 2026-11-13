@@ -117,7 +117,8 @@ def gates(monkeypatch):
     """Everything allowed: switches on, consent, window open, call gate clear, not halted. Tests flip one."""
     state = SimpleNamespace(speed=True, intro=True, intro_field="cf-intro", carrier=True, halted=False, consent=True,
                             window=True, block=None, scrubbed=[], scrub_fail=False, hours=True)
-    monkeypatch.setattr(speed_to_lead, "callers_hours_open", lambda now: state.hours)
+    monkeypatch.setattr(speed_to_lead, "callers_hours_open",
+                        lambda now: state.hours(now) if callable(state.hours) else state.hours)
     monkeypatch.setattr(speed_to_lead, "get_settings", lambda: SimpleNamespace(
         lending_speed_to_lead_enabled=state.speed, lending_intro_sms_enabled=state.intro,
         lending_ghl_cf_intro_name=state.intro_field, lending_sms_carrier_approved=state.carrier))
@@ -150,6 +151,7 @@ def run(lead, source="web", tags=None, **kw):
 def test_a_consented_website_lead_gets_the_text_then_the_cascade_with_voice_ai(gates):
     outcome, tags, db = run(web_lead())
     assert tags.calls == [
+        ("remove", "c-7", GHL_TAG_WEB_INTRO_READY),  # re-armed: a returning contact still carries it
         ("add", "c-7", GHL_TAG_WEB_INTRO_READY),
         ("add", "c-7", GHL_TAG_AI_VOICE_OK),        # before the cascade tag: the workflow reads it at 2 minutes
         ("remove", "c-7", GHL_TAG_SPEED_TO_LEAD),    # removed then added, so GHL's tag trigger fires again
@@ -278,7 +280,7 @@ def test_outside_the_callers_hours_the_call_is_queued_and_the_text_still_goes(ga
     gates.hours = False
     outcome, tags, _ = run(web_lead())
     assert (outcome.call_status, outcome.queue_reason, outcome.text_status) == (CALL_QUEUED, "outside_hours", TEXT_TAGGED)
-    assert tags.calls == [("add", "c-7", GHL_TAG_WEB_INTRO_READY)]
+    assert tags.calls == [("remove", "c-7", GHL_TAG_WEB_INTRO_READY), ("add", "c-7", GHL_TAG_WEB_INTRO_READY)]
 
 
 def test_a_fresh_lead_waits_its_turn_while_another_cascade_runs(gates):
@@ -641,7 +643,7 @@ def test_a_website_lead_end_to_end_on_postgres(lending_db, monkeypatch):
     monkeypatch.setattr(speed_to_lead, "text_window_open", lambda *a, **k: True)  # 8am: the sweep releases it
     released = FakeTags()
     assert speed_to_lead.release_held_web_intro(lending_db, released, now=now) == 1
-    assert released.calls == [("add", "c-pg", GHL_TAG_WEB_INTRO_READY)]
+    assert released.calls == [("remove", "c-pg", GHL_TAG_WEB_INTRO_READY), ("add", "c-pg", GHL_TAG_WEB_INTRO_READY)]
     assert speed_to_lead.release_held_web_intro(lending_db, FakeTags(), now=now) == 0
 
     lines = speed_to_lead.report_lines(lending_db, source="web", lead_id=lead_id)
@@ -709,3 +711,55 @@ def test_the_live_step_claims_in_its_own_committed_session(gates, monkeypatch):
     monkeypatch.setattr(speed_to_lead, "start_safely", lambda db, source, lead_id, **kw: seen.update(kw))
     speed_to_lead.live_step("lendingflow")(object(), 5)
     assert isinstance(seen["claims"], speed_to_lead.OwnSessionClaims)
+
+
+
+# ── review fixes: real start time, whole cascade inside the hours, intro re-armed ──
+
+def test_a_returning_borrower_s_new_inquiry_gets_the_intro_text_again(gates):
+    first, tags, _ = run(web_lead(id=7))
+    second, _, _ = run(web_lead(id=8), tags=tags)  # same GHL contact, a new lead after the dedup window
+    intro = [c for c in tags.calls if c[2] == GHL_TAG_WEB_INTRO_READY]
+    assert intro == [("remove", "c-7", GHL_TAG_WEB_INTRO_READY), ("add", "c-7", GHL_TAG_WEB_INTRO_READY)] * 2
+    assert first.text_status == second.text_status == TEXT_TAGGED
+
+
+def test_no_voice_ai_when_its_call_would_fall_after_the_cutoff(gates):
+    gates.hours = lambda at: at < NOW + timedelta(seconds=90)  # cutoff 90 s after the start
+    outcome, tags, _ = run(web_lead())
+    assert outcome.call_status == CALL_TAGGED and outcome.voice_eligible is False  # Josh and David still fit
+    assert ("remove", "c-7", GHL_TAG_AI_VOICE_OK) in tags.calls and ("add", "c-7", GHL_TAG_AI_VOICE_OK) not in tags.calls
+
+
+def test_no_cascade_when_david_s_call_would_fall_after_the_cutoff(gates):
+    gates.hours = lambda at: at < NOW + timedelta(seconds=30)
+    outcome, tags, _ = run(web_lead())
+    assert (outcome.call_status, outcome.queue_reason) == (CALL_QUEUED, "outside_hours")
+    assert not [c for c in tags.calls if c[2] == GHL_TAG_SPEED_TO_LEAD]
+
+
+def test_the_lead_s_own_window_is_checked_at_the_real_start_time(gates, monkeypatch):
+    def window(db, phones, *, now, halted):  # the lead's 8pm closes 20 s after the arrival check
+        return {phones[0]: "OUTSIDE_CALL_WINDOW"} if now >= NOW + timedelta(seconds=20) else {}
+
+    monkeypatch.setattr("src.lending.ghl_call_gate.blocked_reasons", window)
+    times = iter([NOW, NOW + timedelta(seconds=30)])  # the DNC scrub took 30 s
+    outcome = speed_to_lead.start(FakeDb(web_lead()), "web", 7, tags=FakeTags(), scrubber=lambda p: [],
+                                  clock=lambda: next(times))
+    assert (outcome.call_status, outcome.queue_reason) == (CALL_QUEUED, "OUTSIDE_CALL_WINDOW")
+
+
+def test_a_scrub_that_crosses_the_fresh_limit_queues_the_lead(gates):
+    lead = web_lead(received_at=NOW - timedelta(minutes=4, seconds=50))
+    times = iter([NOW, NOW + timedelta(seconds=30)])  # 4:50 at the check, 5:20 after the scrub
+    outcome = speed_to_lead.start(FakeDb(lead), "web", 7, tags=FakeTags(), scrubber=lambda p: [],
+                                  clock=lambda: next(times))
+    assert (outcome.call_status, outcome.queue_reason) == (CALL_QUEUED, "delayed")
+
+
+def test_a_scrub_that_crosses_the_cutoff_queues_the_lead(gates):
+    gates.hours = lambda at: at < NOW + timedelta(seconds=10)  # open at the check, closed after the scrub
+    times = iter([NOW, NOW + timedelta(seconds=30)])
+    outcome = speed_to_lead.start(FakeDb(web_lead()), "web", 7, tags=FakeTags(), scrubber=lambda p: [],
+                                  clock=lambda: next(times))
+    assert (outcome.call_status, outcome.queue_reason) == (CALL_QUEUED, "outside_hours")

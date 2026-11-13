@@ -53,7 +53,8 @@ def rules(monkeypatch):
     monkeypatch.setattr(speed_to_lead, "get_settings", lambda: SimpleNamespace(
         lending_speed_to_lead_enabled=state.enabled, lending_intro_sms_enabled=False, lending_ghl_cf_intro_name=None,
         lending_sms_carrier_approved=False))
-    monkeypatch.setattr(speed_to_lead, "callers_hours_open", lambda now: state.hours)
+    monkeypatch.setattr(speed_to_lead, "callers_hours_open",
+                        lambda now: state.hours(now) if callable(state.hours) else state.hours)
     monkeypatch.setattr(speed_to_lead, "callers_hours_start", lambda now: now - timedelta(hours=1))
     monkeypatch.setattr(speed_to_lead, "is_globally_halted", lambda: state.halted)
     monkeypatch.setattr("src.lending.ghl_call_gate.blocked_reasons",
@@ -509,3 +510,17 @@ def test_a_delivery_that_fails_to_commit_never_starts_a_second_cascade(committed
     with Session(engine) as db:
         kept = row(db, lead_id)
     assert (kept["call_status"], kept["call_tagged_at"]) == ("releasing", now)  # reported as interrupted later
+
+
+
+def test_a_release_near_the_cutoff_gets_no_voice_ai_and_one_too_late_waits(web_leads_db, rules):
+    db = web_leads_db
+    lead_id, _, contact = queued(db, received=NOW - timedelta(hours=3))
+    rules.hours = lambda at: at < NOW + timedelta(seconds=90)
+    tags = FakeTags()
+    assert release(db, tags=tags).released == 1
+    assert ("add", contact, GHL_TAG_AI_VOICE_OK) not in tags.calls and row(db, lead_id)["voice_eligible"] is False
+    late_id, _, _ = queued(db, received=NOW - timedelta(hours=2))
+    rules.hours = lambda at: at < NOW + timedelta(minutes=3, seconds=30)  # David's call would land after it
+    assert release(db, tags=tags, now=NOW + timedelta(minutes=3)).released == 0
+    assert row(db, late_id)["call_status"] == CALL_QUEUED

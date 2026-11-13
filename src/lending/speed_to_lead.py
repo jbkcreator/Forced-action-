@@ -53,6 +53,7 @@ from config.lending_compliance import REACHED_CODES, REACHED_GHL_STATUSES, REACH
 from config.lending_followup import CALL_SOURCE_GHL
 from config.lending_speed_to_lead import (
     ACTIVE_CASCADE_MINUTES,
+    AI_VOICE_AFTER_SECONDS,
     CALL_BLOCKED,
     CALL_EXPIRED,
     CALL_FAILED,
@@ -256,8 +257,15 @@ def _web_text(db, lead: Mapping[str, Any], tags: TagClient, *, halted: bool, now
     if not text_window_open(lead["phone"], property_state=lead["property_state"], now=now):
         logger.info("[speed-to-lead] web intro text held for the send window lead=%s", lead["id"])
         return TEXT_HELD, None
-    tags.add_tag(lead["ghl_contact_id"], GHL_TAG_WEB_INTRO_READY)
+    _arm_intro(tags, lead["ghl_contact_id"])
     return TEXT_TAGGED, now
+
+
+def _arm_intro(tags: TagClient, contact_id: str) -> None:
+    """Remove, then add: GHL starts the intro workflow only when the tag is newly added, and a returning borrower's
+    contact still carries it from the last inquiry. Once per lead: the lead's speed_to_lead row is claimed first."""
+    tags.remove_tag(contact_id, GHL_TAG_WEB_INTRO_READY)
+    tags.add_tag(contact_id, GHL_TAG_WEB_INTRO_READY)
 
 
 def _call_block_reason(db, source: str, lead: Mapping[str, Any], *, halted: bool, now: datetime,
@@ -349,6 +357,35 @@ def _gate(db, source: str, lead: Mapping[str, Any], *, halted: bool, now: dateti
     return CallStep(CALL_BLOCKED, block_reason=reason)
 
 
+def _callable_at(db, lead: Mapping[str, Any], at: datetime) -> Optional[str]:
+    """None when a call to the lead at ``at`` is inside the callers' hours and passes the call gate (the lead's own
+    8am-8pm window, attempt caps, suppression ...); else why not. No scrub: used for re-checks with the real time."""
+    from src.lending.ghl_call_gate import blocked_reasons
+
+    if not callers_hours_open(at):
+        return QUEUE_OUTSIDE_HOURS
+    return blocked_reasons(db, [lead["phone"]], now=at, halted=False).get(lead["phone"])
+
+
+def _as_step(reason: str) -> CallStep:
+    if reason == QUEUE_OUTSIDE_HOURS or reason in QUEUE_TEMPORARY_REASONS:
+        return CallStep(CALL_QUEUED, queue_reason=reason)
+    return CallStep(CALL_BLOCKED, block_reason=reason)
+
+
+def _admit(db, lead: Mapping[str, Any], at: datetime) -> tuple[Optional[CallStep], bool]:
+    """With the real start time ``at`` (read after the scrub and the lock): (a step that stops the cascade, or None;
+    whether the Voice AI may follow). The cascade starts only when David's call (CALL_TARGET after the start) still
+    falls inside the hours and the gate; the Voice AI only when its call (AI_VOICE_AFTER_SECONDS after the start)
+    does too, so no call of the cascade is placed after the cutoff."""
+    for when in (at, at + CALL_TARGET):
+        reason = _callable_at(db, lead, when)
+        if reason:
+            return _as_step(reason), False
+    voice = voice_eligible(lead) and _callable_at(db, lead, at + timedelta(seconds=AI_VOICE_AFTER_SECONDS)) is None
+    return None, voice
+
+
 def _call(db, source: str, lead: Mapping[str, Any], tags: TagClient, *, halted: bool, now: datetime,
           scrubber: Optional[Scrubber], clock: Clock, before_tags: Callable[[datetime], None]) -> CallStep:
     """A fresh lead: start the cascade now when every rule allows it and no other cascade is due first; otherwise
@@ -364,17 +401,21 @@ def _call(db, source: str, lead: Mapping[str, Any], tags: TagClient, *, halted: 
         return CallStep(CALL_QUEUED, queue_reason=QUEUE_OUTSIDE_HOURS)
     if not try_queue_lock(db):
         return CallStep(CALL_QUEUED, queue_reason=QUEUE_WAITING_TURN)
-    at = clock()  # after the scrub and the lock: the spacing is measured from now, not from the arrival
+    at = clock()  # after the scrub and the lock: every timing check below uses the real start time
+    if at - lead["received_at"] > FRESH_LEAD_WINDOW:
+        return CallStep(CALL_QUEUED, queue_reason=QUEUE_DELAYED)
+    stop, voice = _admit(db, lead, at)
+    if stop is not None:
+        return stop
     if db.execute(_MUST_WAIT, {"spacing_since": at - CASCADE_SPACING,
                                "fresh_since": at - FRESH_LEAD_WINDOW}).scalar():
         return CallStep(CALL_QUEUED, queue_reason=QUEUE_WAITING_TURN)
     before_tags(at)  # durable before any tag: a failed commit of the delivery can never lead to a second cascade
-    return _begin(source, lead, tags, now=at)
+    return _begin(source, lead, tags, now=at, voice=voice)
 
 
-def _begin(source: str, lead: Mapping[str, Any], tags: TagClient, *, now: datetime) -> CallStep:
+def _begin(source: str, lead: Mapping[str, Any], tags: TagClient, *, now: datetime, voice: bool) -> CallStep:
     """Add the tags that start the GHL cascade, then undo them if the emergency halt landed meanwhile."""
-    voice = voice_eligible(lead)
     try:
         _start_cascade(lead, tags, voice=voice)
     except Exception as exc:  # class only
@@ -561,7 +602,7 @@ def release_held_web_intro(db, tags: Optional[TagClient], *, now: Optional[datet
         if not text_window_open(lead["phone"], property_state=lead["property_state"], now=now):
             continue
         try:
-            tags.add_tag(lead["ghl_contact_id"], GHL_TAG_WEB_INTRO_READY)
+            _arm_intro(tags, lead["ghl_contact_id"])
         except Exception as exc:  # class only; retried next sweep
             logger.error("[speed-to-lead] held web intro tag failed lead=%s: %s", lead["id"], type(exc).__name__)
             continue
@@ -850,9 +891,16 @@ def _try_release(db, row: Mapping[str, Any], *, tags: TagClient, scrubber: Optio
     if is_globally_halted() or db.execute(_CASCADE_RUNNING, {"spacing_since": at - CASCADE_SPACING}).scalar():
         db.commit()
         return STOP
+    stop, voice = _admit(db, lead, at)
+    if stop is not None and stop.status == CALL_BLOCKED:
+        _end(db, row["row_id"], stop.block_reason or "", at, run, ref)
+        return NEXT
+    if stop is not None:
+        _later(db, row["row_id"], stop.queue_reason or "", at + QUEUE_RECHECK_AFTER, run)
+        return NEXT
     db.execute(_CLAIM_RELEASE, {"releasing": CALL_RELEASING, "now": at, "id": row["row_id"]})
     db.commit()
-    step = _begin(source, lead, tags, now=at)
+    step = _begin(source, lead, tags, now=at, voice=voice)
     if step.status == CALL_TAGGED:
         db.execute(_RELEASE, {"status": CALL_TAGGED, "tagged_at": step.tagged_at, "voice": step.voice,
                               "releasing": CALL_RELEASING, "id": row["row_id"]})
