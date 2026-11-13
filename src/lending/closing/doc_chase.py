@@ -9,14 +9,16 @@ from __future__ import annotations
 import logging
 import secrets
 from dataclasses import dataclass
-from datetime import datetime, timezone
-from typing import Any, Optional
+from datetime import datetime, timedelta, timezone
+from typing import Any, Callable, Optional
 
 from sqlalchemy import text
 
-from config.lending_closing import TOKEN_TTL, UPLOAD_LINK_PATH
-from src.lending.closing.drafts import Recipient
-from src.lending.closing.rules import build_checklist
+from config.lending_closing import CLOSED_STAGE_KEYS, TOKEN_TTL, UPLOAD_LINK_PATH
+from packages.agent_core.send_gate import SendGate
+from src.lending.closing.drafts import Recipient, chase_draft, submit_draft
+from src.lending.closing.rules import build_checklist, due_chase_day
+from src.lending.cora_inbox import add_to_inbox_safely
 from src.lending.partner_service import PartnerLinkNotConfigured, link_base_url
 from src.lending.partners import hash_token
 
@@ -124,3 +126,83 @@ def chase_for_token(db, token: str, now: datetime) -> Optional[dict[str, Any]]:
         return None
     row = db.execute(_CHASE_FOR_TOKEN, {"hash": hash_token(token), "now": now}).mappings().first()
     return dict(row) if row else None
+
+
+# ---- the sweep -----------------------------------------------------------------------------------------------------
+
+DRAFT_TTL = timedelta(hours=24)
+_OPEN_CHASES = text("""
+    SELECT c.id, c.first_name, c.phone, c.email, c.ghl_contact_id, c.accepted_at, s.stage_key,
+           COALESCE((SELECT array_agg(t.chase_day) FROM lending.doc_chase_touches t WHERE t.chase_id = c.id),
+                    '{}') AS sent_days
+      FROM lending.doc_chases c
+      LEFT JOIN lending.ghl_opportunity_stage s ON s.ghl_opportunity_id = c.ghl_opportunity_id
+     WHERE c.status = 'open'
+     ORDER BY c.id
+       FOR UPDATE OF c SKIP LOCKED
+""")
+_CLOSE = text("UPDATE lending.doc_chases SET status = :status, status_reason = :reason, updated_at = :now WHERE id = :c")
+_REVOKE_LINKS = text("UPDATE lending.doc_chase_links SET revoked_at = :now WHERE chase_id = :c AND revoked_at IS NULL")
+_INSERT_TOUCH = text("INSERT INTO lending.doc_chase_touches (chase_id, chase_day, action_id, created_at) "
+                     "VALUES (:c, :day, :action, :now) ON CONFLICT DO NOTHING")
+
+
+def _who(chase: dict[str, Any]) -> str:
+    last4 = f" (…{chase['phone'][-4:]})" if chase["phone"] else ""
+    return f"{chase['first_name'] or 'Borrower'}{last4}"
+
+
+def _close(db, chase: dict[str, Any], status: str, reason: str, now: datetime, summary: str) -> None:
+    db.execute(_CLOSE, {"status": status, "reason": reason, "now": now, "c": chase["id"]})
+    db.execute(_REVOKE_LINKS, {"now": now, "c": chase["id"]})
+    add_to_inbox_safely(db, event_type=f"doc_chase_{status}", dedup_key=str(chase["id"]), summary=summary,
+                        payload={"chase_id": chase["id"], "reason": reason})
+    logger.info("[doc-chase] chase %s %s (%s)", chase["id"], status, reason)
+
+
+def _chase_step(db, gate: SendGate, chase: dict[str, Any], day: int, missing: tuple[str, ...], *,
+                approvals_channel: str, now: datetime, text_consent: Callable[[str], bool]) -> bool:
+    """Queue the day's message; True when a draft went to the gate. No usable channel raises one inbox item."""
+    text_ok = bool(chase["phone"]) and text_consent(chase["phone"])
+    if not text_ok and not chase["email"]:
+        db.execute(_INSERT_TOUCH, {"c": chase["id"], "day": day, "action": None, "now": now})
+        add_to_inbox_safely(db, event_type="doc_chase_no_channel", dedup_key=str(chase["id"]),
+                            summary=f"{_who(chase)}: documents still missing and no text consent or email on file. "
+                                    "Call them.", payload={"chase_id": chase["id"]})
+        return False
+    recipient = Recipient(chase["first_name"], chase["phone"], chase["email"], chase["ghl_contact_id"])
+    draft = chase_draft("request" if day == 0 else f"d{day}", recipient, link=issue_link(db, chase["id"], now),
+                        missing=missing, text_ok=text_ok,
+                        contact_ref=f"ghl:{chase['ghl_contact_id']}" if chase["ghl_contact_id"] else f"doc_chase:{chase['id']}",
+                        deal_ref=f"doc_chase:{chase['id']}")
+    action_id = submit_draft(gate, draft, key=f"doc_chase:{chase['id']}:d{day}", channel=approvals_channel,
+                             ttl=DRAFT_TTL)
+    db.execute(_INSERT_TOUCH, {"c": chase["id"], "day": day, "action": action_id, "now": now})
+    return True
+
+
+def run_chase_sweep(db, gate: SendGate, *, approvals_channel: str, now: Optional[datetime] = None,
+                    text_consent: Callable[[str], bool]) -> int:
+    """One pass over the open chases: close finished or lost ones, queue the due step. Returns drafts queued.
+    Each chase runs in its own savepoint, so one failure never stops the others; the caller commits."""
+    now = now or datetime.now(timezone.utc)
+    queued = 0
+    for chase in [dict(row) for row in db.execute(_OPEN_CHASES).mappings()]:
+        try:
+            with db.begin_nested():
+                missing = _missing(db, chase["id"])
+                if chase["stage_key"] in CLOSED_STAGE_KEYS:
+                    _close(db, chase, "cancelled", f"stage:{chase['stage_key']}", now,
+                           f"{_who(chase)}: document chase stopped, the deal moved to {chase['stage_key']}.")
+                elif not missing:
+                    _close(db, chase, "complete", "all received", now,
+                           f"{_who(chase)}: all documents received.")
+                else:
+                    day = due_chase_day(chase["accepted_at"], now, frozenset(chase["sent_days"] or ()))
+                    if day is not None and _chase_step(db, gate, chase, day, missing,
+                                                       approvals_channel=approvals_channel, now=now,
+                                                       text_consent=text_consent):
+                        queued += 1
+        except Exception as exc:  # class only: SQL errors embed bound parameters
+            logger.error("[doc-chase] chase %s skipped this sweep (%s)", chase["id"], type(exc).__name__)
+    return queued
