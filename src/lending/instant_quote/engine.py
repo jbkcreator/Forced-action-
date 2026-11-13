@@ -10,7 +10,22 @@ from decimal import Decimal
 from typing import Literal, Optional
 
 from config.lender_matrix import LENDER_MATRIX, LenderRules, effective_rules, fully_confirmed
-from config.lending_instant_quote import CALCULATION_REJECTION_CODES, DISCLAIMER, QUOTE_LENDER_KEY, QUOTE_UNAVAILABLE
+from config.lender_matrix import field_status_of
+from config.lending_instant_quote import (
+    CALCULATION_REJECTION_CODES,
+    DISCLAIMER,
+    ENTITY_ONLY_STATES,
+    FICO_BELOW_FLOOR,
+    INTEREST_RESERVE_CONDITION,
+    INTEREST_RESERVE_FICO_THRESHOLD,
+    INTEREST_RESERVE_RATE,
+    INTEREST_RESERVE_TERM_MONTHS,
+    NEEDS_LLC_FORMATION,
+    QUOTE_LENDER_KEY,
+    QUOTE_UNAVAILABLE,
+    STATE_NOT_ELIGIBLE,
+)
+from src.lending.contracts import FieldStatus
 from config.lending_soft_approval import SOFT_APPROVAL_PARAMS, resolve_params
 from src.lending.borrower_score import BorrowerFacts, score_borrower
 from src.lending.soft_approval.calc import CalculationUnavailable, LenderTerms, calculate_figures
@@ -86,6 +101,29 @@ def _rejected(reason: str, borrower_score: int, unconfirmed: bool) -> QuoteResul
     )
 
 
+def _ineligible_reason(request: QuoteRequest, credit_box: LenderRules, lender: LenderRules,
+                      pricing_fico: int) -> Optional[str]:
+    if request.borrower_type == "individual" and request.state in ENTITY_ONLY_STATES:
+        return NEEDS_LLC_FORMATION
+    if credit_box.approved_states and request.state not in credit_box.approved_states:
+        return STATE_NOT_ELIGIBLE
+    # A placeholder floor never rejects: Central's placeholder 680 would block every quote the 660
+    # interest-reserve rule exists for (client Q2). The quote is flagged unconfirmed instead.
+    floor_confirmed = field_status_of(lender, "credit_floor") is FieldStatus.CONFIRMED
+    if floor_confirmed and credit_box.credit_floor is not None and pricing_fico < credit_box.credit_floor:
+        return FICO_BELOW_FLOOR
+    return None
+
+
+def _conditions(pricing_fico: int, loan: Decimal) -> tuple[Condition, ...]:
+    if pricing_fico >= INTEREST_RESERVE_FICO_THRESHOLD:
+        return ()
+    amount = None
+    if INTEREST_RESERVE_RATE is not None and INTEREST_RESERVE_TERM_MONTHS is not None:
+        amount = (loan * INTEREST_RESERVE_RATE * INTEREST_RESERVE_TERM_MONTHS / 12).quantize(Decimal("1"))
+    return (Condition(code=INTEREST_RESERVE_CONDITION, amount=amount),)
+
+
 def quote(request: QuoteRequest) -> QuoteResult:
     lender = _quote_lender()
     credit_box = effective_rules(lender)
@@ -101,12 +139,17 @@ def quote(request: QuoteRequest) -> QuoteResult:
     )
     unconfirmed = not (fully_confirmed(lender) and shares_confirmed)
     experience = max(g.completed_deals for g in request.guarantors)
+    pricing_fico = min(g.fico for g in request.guarantors)
+    ineligible = _ineligible_reason(request, credit_box, lender, pricing_fico)
+    if ineligible is not None:
+        return _rejected(ineligible, _score(request, experience, None), unconfirmed)
     try:
         figures = calculate_figures(request.purchase_price, request.rehab, request.arv, terms)
     except CalculationUnavailable as exc:
         reason = CALCULATION_REJECTION_CODES.get(exc.reason, QUOTE_UNAVAILABLE)
         return _rejected(reason, _score(request, experience, None), unconfirmed)
     score = _score(request, experience, figures.net_loan)
+    conditions = _conditions(pricing_fico, figures.net_loan)
     return QuoteResult(
         status="indicative",
         reason=None,
@@ -117,4 +160,6 @@ def quote(request: QuoteRequest) -> QuoteResult:
         fee_surcharge_pct=Decimal("0"),
         borrower_score=score,
         unconfirmed=unconfirmed,
+        conditions=conditions,
+        rules_fired=tuple(c.code for c in conditions),
     )
