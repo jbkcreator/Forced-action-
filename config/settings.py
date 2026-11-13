@@ -922,6 +922,10 @@ class AppSettings(BaseSettings):
 	# Backflip borrower conflict check on the lending load. Off for launch: there is no
 	# Backflip export, and a missing or stale feed blocks every record when it is on.
 	lending_backflip_check_enabled: bool = Field(default=False, env="LENDING_BACKFLIP_CHECK_ENABLED")
+	# Cora P2.2 instant quote endpoint (POST /api/lending/instant-quote on lending-api). Off until Josh's go;
+	# callers send the key in X-Api-Key. Unset key = every caller refused.
+	lending_instant_quote_enabled: bool = Field(default=False, env="LENDING_INSTANT_QUOTE_ENABLED")
+	lending_instant_quote_api_key: Optional[SecretStr] = Field(default=None, env="LENDING_INSTANT_QUOTE_API_KEY")
 	# T-07 Minute-5 pre-qualification PDF. Off until Josh + compliance review the template.
 	lending_prequal_pdf_enabled: bool = Field(default=False, env="LENDING_PREQUAL_PDF_ENABLED")
 	# Placeholder range: +/- this percent around the requested amount, clamped to fitting lenders' limits.
