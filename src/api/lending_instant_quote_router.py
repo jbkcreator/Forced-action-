@@ -14,7 +14,7 @@ from decimal import Decimal
 from typing import Any, Optional
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Request
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field
 
 from config.lending_instant_quote import (
     API_KEY_HEADER,
@@ -50,11 +50,6 @@ class QuoteIn(BaseModel):
     arv: Decimal = Field(gt=0)
     existing_debt: Optional[Decimal] = Field(default=None, ge=0)
 
-    @model_validator(mode="after")
-    def _refinance_needs_debt(self) -> "QuoteIn":
-        if self.purpose == "refinance" and self.existing_debt is None:
-            raise ValueError("existing_debt is required for a refinance")
-        return self
 
 
 class CutOut(BaseModel):
@@ -81,6 +76,17 @@ class QuoteOut(BaseModel):
     borrower_score: int
     unconfirmed: bool
     disclaimer: str
+
+
+def _gate(request: Request, api_key: Optional[str] = Header(default=None, alias=API_KEY_HEADER)) -> str:
+    """Switch, key and rate limit, as a dependency so they run before the body is validated:
+    a switched-off endpoint or a keyless caller never gets a 422 describing the request schema."""
+    if not get_settings().lending_instant_quote_enabled:
+        raise HTTPException(status_code=404, detail="Not found")
+    key_bucket = _require_key(api_key)
+    enforce_or_429(request, scope=f"{RATE_LIMIT_SCOPE}:{key_bucket}", limit=RATE_LIMIT_PER_WINDOW,
+                   window_seconds=RATE_LIMIT_WINDOW_SECONDS)
+    return key_bucket
 
 
 def _require_key(supplied: Optional[str]) -> str:
@@ -142,7 +148,7 @@ def _record(body: QuoteIn, result: QuoteResult, key_bucket: str) -> QuoteRecord:
     return QuoteRecord(
         status=result.status,
         reason=result.reason,
-        request=_json_safe(body.model_dump()),
+        request=body.model_dump(mode="json"),
         result=_json_safe(asdict(result)),
         rules_fired=list(result.rules_fired),
         unconfirmed=result.unconfirmed,
@@ -153,15 +159,9 @@ def _record(body: QuoteIn, result: QuoteResult, key_bucket: str) -> QuoteRecord:
 @router.post("/instant-quote", response_model=QuoteOut)
 def instant_quote(
     body: QuoteIn,
-    request: Request,
-    api_key: Optional[str] = Header(default=None, alias=API_KEY_HEADER),
+    key_bucket: str = Depends(_gate),
     store: QuoteStore = Depends(get_quote_store),
 ) -> QuoteOut:
-    if not get_settings().lending_instant_quote_enabled:
-        raise HTTPException(status_code=404, detail="Not found")
-    key_bucket = _require_key(api_key)
-    enforce_or_429(request, scope=f"{RATE_LIMIT_SCOPE}:{key_bucket}", limit=RATE_LIMIT_PER_WINDOW,
-                   window_seconds=RATE_LIMIT_WINDOW_SECONDS)
     result = quote(_to_request(body))
     try:
         quote_id = store.save(_record(body, result, key_bucket))

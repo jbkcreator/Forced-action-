@@ -22,6 +22,9 @@ ENTITY_ONLY_STATES = frozenset({"FL"})
 NEEDS_LLC_FORMATION = "NEEDS_LLC_FORMATION"
 STATE_NOT_ELIGIBLE = "STATE_NOT_ELIGIBLE"
 FICO_BELOW_FLOOR = "FICO_BELOW_FLOOR"
+ZIP_STATE_MISMATCH = "ZIP_STATE_MISMATCH"
+LEVERAGE_EXHAUSTED = "LEVERAGE_EXHAUSTED"  # stacked cuts took the LTC cap to zero
+STATE_FIPS: dict[str, str] = {"FL": "12", "GA": "13", "TX": "48"}  # states the ZIP crosswalk covers
 
 # Interest reserve (ticket 04): a pricing FICO below the threshold requires a full-term reserve.
 # Rate and term are unconfirmed (client Q5): while either is None the condition carries no amount.
@@ -60,7 +63,8 @@ GRID_CUT_REASON = "PRICING_GRID"
 
 # CFPB rural + refinance (ticket 07). County list = CFPB rural/underserved 2026 (refresh yearly);
 # ZIP -> county = Census 2020 ZCTA-county relationship, largest land share, FL/GA/TX only.
-# Cut sizes and the refinance debt rule are PLACEHOLDERS (client Q8).
+# Cut sizes are PLACEHOLDERS; the refinance cut is flat until the debt-balance rule arrives (client Q8).
+# existing_debt is optional and kept on the audit row for that rule.
 _DATA_DIR = Path(__file__).resolve().parent / "lending_quote_data"
 CFPB_RURAL_COUNTIES_FILE = _DATA_DIR / "cfpb_rural_underserved_2026.csv"
 ZIP_COUNTY_FILE = _DATA_DIR / "zip_county_fl_ga_tx.csv"

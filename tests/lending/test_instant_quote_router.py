@@ -88,10 +88,20 @@ def test_a_rejected_quote_names_no_lender_and_carries_no_figures(enabled, client
     assert "central" not in resp.text.lower() and "backflip" not in resp.text.lower()
 
 
-def test_refinance_without_existing_debt_is_invalid(enabled, client):
+def test_refinance_without_existing_debt_is_quoted(enabled, client):
     body = {**BODY, "purpose": "refinance"}
 
-    assert client.post(URL, json=body, headers={"X-Api-Key": KEY}).status_code == 422
+    assert client.post(URL, json=body, headers={"X-Api-Key": KEY}).json()["status"] == "indicative"
+
+
+def test_switched_off_endpoint_reveals_nothing_even_for_a_bad_body(client, monkeypatch):
+    monkeypatch.setattr(get_settings(), "lending_instant_quote_enabled", False)
+
+    assert client.post(URL, json={"junk": 1}, headers={"X-Api-Key": KEY}).status_code == 404
+
+
+def test_keyless_caller_gets_401_even_for_a_bad_body(enabled, client):
+    assert client.post(URL, json={"junk": 1}).status_code == 401
 
 
 def test_off_by_default_is_not_found(client, monkeypatch):

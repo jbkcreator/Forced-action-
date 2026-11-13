@@ -20,9 +20,14 @@ def _rural_counties() -> frozenset[str]:
         return frozenset(row["FIPS Code"] for row in csv.DictReader(f))
 
 
+def county_of(zip_code: str) -> Optional[str]:
+    """The ZIP's county FIPS, or None when the ZIP is not in the crosswalk."""
+    return _zip_counties().get(zip_code)
+
+
 def is_rural(zip_code: str) -> Optional[bool]:
     """True/False for a known ZIP; None when the ZIP is not in the crosswalk."""
-    county = _zip_counties().get(zip_code)
+    county = county_of(zip_code)
     if county is None:
         return None
     return county in _rural_counties()

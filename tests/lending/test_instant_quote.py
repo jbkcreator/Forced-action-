@@ -73,11 +73,11 @@ def test_individual_borrower_on_a_florida_deal_needs_an_llc():
 
 
 def test_individual_borrower_outside_florida_is_quoted():
-    assert quote(_request(state="GA", borrower_type="individual")).status == "indicative"
+    assert quote(_request(state="GA", zip_code="30303", borrower_type="individual")).status == "indicative"
 
 
 def test_state_outside_the_lending_footprint_is_rejected():
-    result = quote(_request(state="NY"))
+    result = quote(_request(state="NY", zip_code="10001"))
 
     assert result.status == "rejected"
     assert result.reason == "STATE_NOT_ELIGIBLE"
@@ -148,7 +148,7 @@ def test_stacked_cuts_never_take_the_ltc_below_zero(monkeypatch):
     result = quote(_request())
 
     assert result.status == "rejected"
-    assert result.reason == "LOAN_TOO_SMALL"
+    assert result.reason == "LEVERAGE_EXHAUSTED"
 
 
 # --- 07 CFPB rural + refinance ---
@@ -217,3 +217,11 @@ def test_new_construction_needs_an_exit_once_the_rule_is_switched_on(monkeypatch
     assert no_exit.status == "rejected"
     assert no_exit.reason == "NEW_CONSTRUCTION_NEEDS_EXIT"
     assert one_exit.status == "indicative"
+
+
+def test_zip_in_another_state_is_rejected():
+    # 30303 is Atlanta, GA
+    result = quote(_request(state="FL", zip_code="30303"))
+
+    assert result.status == "rejected"
+    assert result.reason == "ZIP_STATE_MISMATCH"

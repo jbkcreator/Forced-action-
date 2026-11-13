@@ -30,7 +30,8 @@ MULTI_GUARANTOR_CASE = ProofCase(
         guarantors=(Guarantor(fico=720, completed_deals=5, exits=5), Guarantor(fico=640)),
         purpose="purchase", purchase_price=Decimal("200000"), rehab=Decimal("50000"), arv=Decimal("400000"),
     ),
-    expected_loan=None,
+    # Worked by hand: priced at 640 (lowest grid tier, placeholder -15%): 70% x (200K + 50K) = 175K.
+    expected_loan=Decimal("175000"),
 )
 
 DOC_CASES: tuple[ProofCase, ...] = tuple(

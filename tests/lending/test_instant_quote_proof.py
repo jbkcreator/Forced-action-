@@ -13,7 +13,7 @@ def test_multi_guarantor_case_prices_off_the_lowest_fico_with_the_reserve():
     # 720 + 640 -> priced at 640: 85% - 15% = 70% x 250K = 175K; below 660 -> full-term reserve
     result = quote(MULTI_GUARANTOR_CASE.request)
 
-    assert result.loan_amount == Decimal("175000")
+    assert result.loan_amount == Decimal("175000") == MULTI_GUARANTOR_CASE.expected_loan
     assert result.fee_surcharge_pct == Decimal("0.04")
     assert [c.code for c in result.conditions] == ["INTEREST_RESERVE_FULL_TERM"]
 
@@ -29,5 +29,5 @@ def test_proof_table_lists_every_case_and_marks_pending_ones():
     table = render_markdown()
 
     assert "| Multi-guarantor (720 + 640) |" in table
-    assert "175,000" in table
+    assert "| 175,000 | 175,000 |" in table
     assert table.count("awaiting Instant-Quote-Rules.md") == len(DOC_CASES)

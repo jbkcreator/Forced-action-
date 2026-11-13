@@ -24,6 +24,7 @@ from config.lending_instant_quote import (
     INTEREST_RESERVE_FICO_THRESHOLD,
     INTEREST_RESERVE_RATE,
     INTEREST_RESERVE_TERM_MONTHS,
+    LEVERAGE_EXHAUSTED,
     LEVERAGE_ADJUSTMENTS_CONFIRMED,
     NEEDS_LLC_FORMATION,
     NEW_CONSTRUCTION_EXIT_RULE_ENABLED,
@@ -38,10 +39,12 @@ from config.lending_instant_quote import (
     RURAL_CUT,
     RURAL_CUT_REASON,
     RURAL_UNKNOWN_NOTE,
+    STATE_FIPS,
     STATE_NOT_ELIGIBLE,
+    ZIP_STATE_MISMATCH,
 )
 from src.lending.contracts import FieldStatus
-from src.lending.instant_quote.rural import is_rural
+from src.lending.instant_quote.rural import county_of, is_rural
 from config.lending_soft_approval import SOFT_APPROVAL_PARAMS, resolve_params
 from src.lending.borrower_score import BorrowerFacts, score_borrower
 from src.lending.soft_approval.calc import CalculationUnavailable, LenderTerms, calculate_figures
@@ -100,8 +103,14 @@ class QuoteResult:
     disclaimer: str = DISCLAIMER
 
 
-def _quote_lender() -> LenderRules:
-    return next(rules for rules in LENDER_MATRIX if rules.key == QUOTE_LENDER_KEY)
+def _find_quote_lender() -> LenderRules:
+    for rules in LENDER_MATRIX:
+        if rules.key == QUOTE_LENDER_KEY:
+            return rules
+    raise RuntimeError(f"lender matrix has no {QUOTE_LENDER_KEY!r} entry")
+
+
+_QUOTE_LENDER = _find_quote_lender()  # fails at import, never per request
 
 
 def _score(request: QuoteRequest, experience: int, loan: Optional[Decimal]) -> int:
@@ -117,12 +126,41 @@ def _rejected(reason: str, borrower_score: int, unconfirmed: bool) -> QuoteResul
     )
 
 
+@dataclass(frozen=True)
+class _Sponsor:
+    """What the rules read from the guarantors: pricing on the weakest credit, experience on the strongest."""
+
+    pricing_fico: int
+    completed_deals: int
+    exits: int
+
+
+def _sponsor(guarantors: tuple[Guarantor, ...]) -> _Sponsor:
+    return _Sponsor(
+        pricing_fico=min(g.fico for g in guarantors),
+        completed_deals=max(g.completed_deals for g in guarantors),
+        exits=max(g.exits for g in guarantors),
+    )
+
+
+def _zip_outside_state(request: QuoteRequest) -> bool:
+    """True when the crosswalk places the ZIP in a different state than the one given."""
+    county = county_of(request.zip_code)
+    if county is None:
+        return False
+    state_fips = STATE_FIPS.get(request.state)
+    return state_fips is None or not county.startswith(state_fips)
+
+
 def _ineligible_reason(request: QuoteRequest, credit_box: LenderRules, lender: LenderRules,
-                      pricing_fico: int) -> Optional[str]:
+                      sponsor: _Sponsor) -> Optional[str]:
+    pricing_fico = sponsor.pricing_fico
     if request.borrower_type == "individual" and request.state in ENTITY_ONLY_STATES:
         return NEEDS_LLC_FORMATION
+    if _zip_outside_state(request):
+        return ZIP_STATE_MISMATCH
     if (NEW_CONSTRUCTION_EXIT_RULE_ENABLED and request.purpose == "new_construction"
-            and max(g.exits for g in request.guarantors) < NEW_CONSTRUCTION_MIN_EXITS):
+            and sponsor.exits < NEW_CONSTRUCTION_MIN_EXITS):
         return NEW_CONSTRUCTION_NEEDS_EXIT
     if credit_box.approved_states and request.state not in credit_box.approved_states:
         return STATE_NOT_ELIGIBLE
@@ -143,11 +181,11 @@ def _conditions(pricing_fico: int, loan: Decimal) -> tuple[Condition, ...]:
     return (Condition(code=INTEREST_RESERVE_CONDITION, amount=amount),)
 
 
-def _leverage(request: QuoteRequest, pricing_fico: int) -> tuple[tuple[Cut, ...], Decimal, tuple[str, ...]]:
+def _leverage(request: QuoteRequest, sponsor: _Sponsor) -> tuple[tuple[Cut, ...], Decimal, tuple[str, ...]]:
     """The LTC cuts that apply (each with its reason), the fee surcharge, and notes for the audit row."""
-    tier = next(t for t in PRICING_GRID if pricing_fico >= t.min_fico)
+    tier = next(t for t in PRICING_GRID if sponsor.pricing_fico >= t.min_fico)
     cuts = [Cut(reason=GRID_CUT_REASON, pct=tier.ltc_cut)]
-    if max(g.completed_deals for g in request.guarantors) in EXPERIENCE_HAIRCUT_DEALS:
+    if sponsor.completed_deals in EXPERIENCE_HAIRCUT_DEALS:
         cuts.append(Cut(reason=EXPERIENCE_CUT_REASON, pct=EXPERIENCE_HAIRCUT))
     notes: list[str] = []
     rural = is_rural(request.zip_code)
@@ -161,22 +199,22 @@ def _leverage(request: QuoteRequest, pricing_fico: int) -> tuple[tuple[Cut, ...]
 
 
 def quote(request: QuoteRequest) -> QuoteResult:
-    lender = _quote_lender()
+    lender = _QUOTE_LENDER
     credit_box = effective_rules(lender)
     shares, shares_confirmed = resolve_params(SOFT_APPROVAL_PARAMS.get(QUOTE_LENDER_KEY))
     unconfirmed = not (fully_confirmed(lender) and shares_confirmed
                        and PRICING_GRID_CONFIRMED and LEVERAGE_ADJUSTMENTS_CONFIRMED)
-    experience = max(g.completed_deals for g in request.guarantors)
-    pricing_fico = min(g.fico for g in request.guarantors)
+    sponsor = _sponsor(request.guarantors)
+    unsized_score = _score(request, sponsor.completed_deals, None)
 
-    ineligible = _ineligible_reason(request, credit_box, lender, pricing_fico)
+    ineligible = _ineligible_reason(request, credit_box, lender, sponsor)
     if ineligible is not None:
-        return _rejected(ineligible, _score(request, experience, None), unconfirmed)
+        return _rejected(ineligible, unsized_score, unconfirmed)
 
-    cuts, fee_surcharge, notes = _leverage(request, pricing_fico)
+    cuts, fee_surcharge, notes = _leverage(request, sponsor)
     ltc = max(credit_box.max_ltc + sum(c.pct for c in cuts), Decimal("0"))
     if ltc == 0:
-        return _rejected(CALCULATION_REJECTION_CODES["loan_too_small"], _score(request, experience, None), unconfirmed)
+        return _rejected(LEVERAGE_EXHAUSTED, unsized_score, unconfirmed)
     terms = LenderTerms(
         rehab_funding_pct=shares.rehab_funding_pct,
         purchase_advance_pct=shares.purchase_advance_pct,
@@ -189,9 +227,9 @@ def quote(request: QuoteRequest) -> QuoteResult:
         figures = calculate_figures(request.purchase_price, request.rehab, request.arv, terms)
     except CalculationUnavailable as exc:
         reason = CALCULATION_REJECTION_CODES.get(exc.reason, QUOTE_UNAVAILABLE)
-        return _rejected(reason, _score(request, experience, None), unconfirmed)
+        return _rejected(reason, unsized_score, unconfirmed)
 
-    conditions = _conditions(pricing_fico, figures.net_loan)
+    conditions = _conditions(sponsor.pricing_fico, figures.net_loan)
     return QuoteResult(
         status="indicative",
         reason=None,
@@ -200,7 +238,7 @@ def quote(request: QuoteRequest) -> QuoteResult:
         purchase_advance=figures.purchase_advance,
         effective_ltc=ltc,
         fee_surcharge_pct=fee_surcharge,
-        borrower_score=_score(request, experience, figures.net_loan),
+        borrower_score=_score(request, sponsor.completed_deals, figures.net_loan),
         unconfirmed=unconfirmed,
         cuts=cuts,
         conditions=conditions,
