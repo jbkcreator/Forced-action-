@@ -627,7 +627,7 @@ def release_held_intro_sms(db, sink: Optional[Any], *, now: Optional[datetime] =
         if not _sms_clear(db, lead):
             continue
         try:
-            sink.add_intro_ready_tag(lead["ghl_contact_id"])
+            sink.add_intro_ready_tag(lead["ghl_contact_id"], rearm=True)  # the push did not add it: re-arm for a returning contact
         except Exception as exc:
             logger.warning("[lendingflow] release of held intro SMS failed lead=%s: %s", lead["id"], type(exc).__name__)
             continue
