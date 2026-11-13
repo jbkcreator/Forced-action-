@@ -1546,8 +1546,8 @@ class LendingGhlOpportunityStage(LendingBase):
 
 
 class LendingDocChase(LendingBase):
-    """P2.4: one document chase, started when an approver says the borrower accepted the term sheet. Only the
-    SHA-256 of the upload-link token is stored. One open chase per phone."""
+    """P2.4: one document chase, started when an approver says the borrower accepted the term sheet. One open chase
+    per phone. Its upload links are in ``doc_chase_links``."""
 
     __tablename__ = "doc_chases"
 
@@ -1563,9 +1563,6 @@ class LendingDocChase(LendingBase):
     quote_id: Mapped[Optional[uuid.UUID]] = mapped_column(UUID(as_uuid=True))
     accepted_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     accepted_by: Mapped[str] = mapped_column(String(64), nullable=False)
-    token_hash: Mapped[str] = mapped_column(String(64), nullable=False, unique=True)
-    token_expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
-    token_revoked_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
     status: Mapped[str] = mapped_column(String(12), nullable=False, default="open", server_default=text("'open'"))
     status_reason: Mapped[Optional[str]] = mapped_column(String(120))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_now, server_default=text("now()"))
@@ -1576,6 +1573,22 @@ class LendingDocChase(LendingBase):
         Index("uq_lending_doc_chases_open_phone", "phone", unique=True, postgresql_where=text("status = 'open'")),
         Index("idx_lending_doc_chases_opportunity", "ghl_opportunity_id"),
     )
+
+
+class LendingDocChaseLink(LendingBase):
+    """P2.4: one upload link sent in a chase message. Only the SHA-256 of the token is stored. Every link of a chase
+    works until it expires or the chase closes, so an older message's link still opens the page."""
+
+    __tablename__ = "doc_chase_links"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    chase_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("lending.doc_chases.id"), nullable=False)
+    token_hash: Mapped[str] = mapped_column(String(64), nullable=False, unique=True)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    revoked_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_now, server_default=text("now()"))
+
+    __table_args__ = (Index("idx_lending_doc_chase_links_chase", "chase_id"),)
 
 
 class LendingDocChaseItem(LendingBase):

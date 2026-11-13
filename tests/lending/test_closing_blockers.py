@@ -37,9 +37,8 @@ def _stage(db, opp, stage, days_ago, phone="+18135550101"):
 
 def _chase(db, phone="+18135550101", missing=("Photo ID", "LLC documents"), received=("Valuation",)):
     db.execute(text(
-        "INSERT INTO lending.doc_chases (lead_ref, first_name, phone, email, lender_key, accepted_at, accepted_by, "
-        "token_hash, token_expires_at) VALUES ('web_lead:1', 'Mark', :p, 'mark@example.com', 'central_lending', "
-        ":at, 'slack:U1', md5(random()::text) || md5(random()::text), :at)"),
+        "INSERT INTO lending.doc_chases (lead_ref, first_name, phone, email, lender_key, accepted_at, accepted_by) "
+        "VALUES ('web_lead:1', 'Mark', :p, 'mark@example.com', 'central_lending', :at, 'slack:U1')"),
         {"p": phone, "at": AT_7_00 - timedelta(days=5)})
     chase_id = db.execute(text("SELECT max(id) FROM lending.doc_chases")).scalar()
     for i, label in enumerate(missing + received):

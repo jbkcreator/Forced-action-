@@ -1,5 +1,5 @@
 """P2.4 closing blocker card and document chase tables: ``lending.ghl_opportunity_stage`` (each GHL opportunity's
-current stage and since when, backfilled once from ``lending.ghl_stage_events``), ``doc_chases``, ``doc_chase_items``,
+current stage and since when, backfilled once from ``lending.ghl_stage_events``), ``doc_chases``, ``doc_chase_links``, ``doc_chase_items``,
 ``doc_chase_uploads``, ``doc_chase_touches`` and ``closing_blocker_cards``.
 
 Idempotent; run after apply_lending_ghl_stage_events.py. RUN BEFORE deploying the code: the stage webhook writes
@@ -21,6 +21,7 @@ from src.lending.models import (
     LendingClosingBlockerCard,
     LendingDocChase,
     LendingDocChaseItem,
+    LendingDocChaseLink,
     LendingDocChaseTouch,
     LendingDocChaseUpload,
     LendingGhlOpportunityStage,
@@ -29,7 +30,7 @@ from src.lending.models import (
 logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
 
-TABLES = (LendingGhlOpportunityStage, LendingDocChase, LendingDocChaseItem, LendingDocChaseUpload,
+TABLES = (LendingGhlOpportunityStage, LendingDocChase, LendingDocChaseLink, LendingDocChaseItem, LendingDocChaseUpload,
           LendingDocChaseTouch, LendingClosingBlockerCard)
 
 

@@ -9,9 +9,8 @@ from migrations.apply_lending_doc_chase import apply_to
 
 
 def _insert_chase(db, phone: str, status: str = "open") -> None:
-    db.execute(text("INSERT INTO lending.doc_chases (lead_ref, phone, lender_key, accepted_at, accepted_by, token_hash, "
-                    "token_expires_at, status) VALUES ('web_lead:1', :phone, 'central_lending', now(), 'slack:U1', "
-                    "md5(random()::text) || md5(random()::text), now() + interval '30 days', :status)"),
+    db.execute(text("INSERT INTO lending.doc_chases (lead_ref, phone, lender_key, accepted_at, accepted_by, status) "
+                    "VALUES ('web_lead:1', :phone, 'central_lending', now(), 'slack:U1', :status)"),
                {"phone": phone, "status": status})
 
 
