@@ -15,6 +15,9 @@ from config.lending_instant_quote import (
     CALCULATION_REJECTION_CODES,
     DISCLAIMER,
     ENTITY_ONLY_STATES,
+    EXPERIENCE_CUT_REASON,
+    EXPERIENCE_HAIRCUT,
+    EXPERIENCE_HAIRCUT_DEALS,
     FICO_BELOW_FLOOR,
     GRID_CUT_REASON,
     INTEREST_RESERVE_CONDITION,
@@ -23,6 +26,9 @@ from config.lending_instant_quote import (
     INTEREST_RESERVE_TERM_MONTHS,
     LEVERAGE_ADJUSTMENTS_CONFIRMED,
     NEEDS_LLC_FORMATION,
+    NEW_CONSTRUCTION_EXIT_RULE_ENABLED,
+    NEW_CONSTRUCTION_MIN_EXITS,
+    NEW_CONSTRUCTION_NEEDS_EXIT,
     PRICING_GRID,
     PRICING_GRID_CONFIRMED,
     QUOTE_LENDER_KEY,
@@ -115,6 +121,9 @@ def _ineligible_reason(request: QuoteRequest, credit_box: LenderRules, lender: L
                       pricing_fico: int) -> Optional[str]:
     if request.borrower_type == "individual" and request.state in ENTITY_ONLY_STATES:
         return NEEDS_LLC_FORMATION
+    if (NEW_CONSTRUCTION_EXIT_RULE_ENABLED and request.purpose == "new_construction"
+            and max(g.exits for g in request.guarantors) < NEW_CONSTRUCTION_MIN_EXITS):
+        return NEW_CONSTRUCTION_NEEDS_EXIT
     if credit_box.approved_states and request.state not in credit_box.approved_states:
         return STATE_NOT_ELIGIBLE
     # A placeholder floor never rejects: Central's placeholder 680 would block every quote the 660
@@ -138,6 +147,8 @@ def _leverage(request: QuoteRequest, pricing_fico: int) -> tuple[tuple[Cut, ...]
     """The LTC cuts that apply (each with its reason), the fee surcharge, and notes for the audit row."""
     tier = next(t for t in PRICING_GRID if pricing_fico >= t.min_fico)
     cuts = [Cut(reason=GRID_CUT_REASON, pct=tier.ltc_cut)]
+    if max(g.completed_deals for g in request.guarantors) in EXPERIENCE_HAIRCUT_DEALS:
+        cuts.append(Cut(reason=EXPERIENCE_CUT_REASON, pct=EXPERIENCE_HAIRCUT))
     notes: list[str] = []
     rural = is_rural(request.zip_code)
     if rural is None:

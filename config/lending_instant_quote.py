@@ -70,3 +70,15 @@ RURAL_UNKNOWN_NOTE = "RURAL_STATUS_UNKNOWN"
 REFINANCE_CUT = Decimal("-0.05")
 REFINANCE_CUT_REASON = "REFINANCE"
 LEVERAGE_ADJUSTMENTS_CONFIRMED = False
+
+# Experience (ticket 06). Central's 1-2 completed-deal haircut is from the brief; 0 deals has no stated rule
+# (client Q11) and takes no cut. Experience = the most experienced guarantor.
+EXPERIENCE_HAIRCUT_DEALS = range(1, 3)
+EXPERIENCE_HAIRCUT = Decimal("-0.025")
+EXPERIENCE_CUT_REASON = "EXPERIENCE"
+
+# Second-program new-construction rule (1 exit required). OFF: that program stays blocked until Josh approves
+# in writing (brief: NDL lane only). Neutral code name; the response never names a lender.
+NEW_CONSTRUCTION_EXIT_RULE_ENABLED = False
+NEW_CONSTRUCTION_MIN_EXITS = 1
+NEW_CONSTRUCTION_NEEDS_EXIT = "NEW_CONSTRUCTION_NEEDS_EXIT"

@@ -183,3 +183,37 @@ def test_refinance_takes_the_refinance_cut():
 
 def test_purchase_takes_no_refinance_cut():
     assert "REFINANCE" not in [c.reason for c in quote(_request()).cuts]
+
+
+# --- 06 experience + Backflip new-construction rule (off) ---
+
+def test_one_to_two_deals_takes_the_experience_haircut():
+    # 85% - 7.5% grid - 2.5% experience = 75% x 250K = 187.5K
+    result = quote(_request(guarantors=(Guarantor(fico=720, completed_deals=2, exits=2),)))
+
+    assert ("EXPERIENCE", Decimal("-0.025")) in [(c.reason, c.pct) for c in result.cuts]
+    assert result.loan_amount == Decimal("187000")
+
+
+def test_experience_comes_from_the_most_experienced_guarantor():
+    result = quote(_request(guarantors=(Guarantor(fico=720, completed_deals=1), Guarantor(fico=730, completed_deals=4))))
+
+    assert "EXPERIENCE" not in [c.reason for c in result.cuts]
+
+
+def test_new_construction_without_an_exit_is_quoted_while_the_rule_is_off():
+    result = quote(_request(purpose="new_construction", guarantors=(Guarantor(fico=720, completed_deals=3, exits=0),)))
+
+    assert result.status == "indicative"
+    assert "NEW_CONSTRUCTION_NEEDS_EXIT" not in result.rules_fired
+
+
+def test_new_construction_needs_an_exit_once_the_rule_is_switched_on(monkeypatch):
+    monkeypatch.setattr("src.lending.instant_quote.engine.NEW_CONSTRUCTION_EXIT_RULE_ENABLED", True)
+
+    no_exit = quote(_request(purpose="new_construction", guarantors=(Guarantor(fico=720, completed_deals=3, exits=0),)))
+    one_exit = quote(_request(purpose="new_construction", guarantors=(Guarantor(fico=720, completed_deals=3, exits=1),)))
+
+    assert no_exit.status == "rejected"
+    assert no_exit.reason == "NEW_CONSTRUCTION_NEEDS_EXIT"
+    assert one_exit.status == "indicative"
