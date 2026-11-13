@@ -120,6 +120,27 @@ class TestCreateEvent:
         assert sent_json["locationId"] == LOCATION_ID
         assert sent_json["calendarId"] == CALENDAR_ID
 
+    def test_a_known_contact_is_booked_by_id_and_a_response_with_only_an_id_is_enough(self):
+        """A live create was refused with contactEmail alone, and answered without the times a read returns."""
+        client, end = _client(), START + timedelta(minutes=30)
+        with patch("requests.request", return_value=_response(status_code=201, json_body={"id": "appt_2"})) as mock_req:
+            event = client.create_event(calendar_id=CALENDAR_ID, start=START, end=end, summary="Intro call",
+                                        attendee_email="", contact_id="contact_9")
+
+        sent_json = mock_req.call_args.kwargs["json"]
+        assert sent_json["contactId"] == "contact_9" and "contactEmail" not in sent_json
+        assert (event.event_id, event.start, event.end, event.summary) == ("appt_2", START, end, "Intro call")
+        assert event.attendee_email is None
+
+    def test_a_created_appointment_with_no_id_is_an_unknown_outcome(self):
+        from src.services.calendar.client import CalendarOutcomeUnknown
+
+        client = _client()
+        with patch("requests.request", return_value=_response(status_code=201, json_body={"traceId": "t-1"})):
+            with pytest.raises(CalendarOutcomeUnknown):
+                client.create_event(calendar_id=CALENDAR_ID, start=START, end=START + timedelta(minutes=30),
+                                    summary="Intro call", attendee_email="borrower@example.invalid")
+
     def test_failed_create_raises(self):
         client = _client()
         with patch("requests.request", return_value=_response(status_code=422, text="bad request")):

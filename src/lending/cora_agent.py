@@ -60,6 +60,7 @@ from src.lending.ghl_email import GhlEmailSender, get_email_sender
 from src.lending.ghl_sms import GhlSmsSender, get_sender
 from src.lending.instantly_client import InstantlyAccount, block_address, lending_instantly_account, send_reply
 from src.lending.instantly_email import NdlInstantlySender, get_ndl_instantly_sender
+from src.lending.after_hours_responder import run_send_cycle
 from src.lending.instantly_replies import CHANNEL as INSTANTLY_CHANNEL, ReplyProcessor
 from src.lending.standing_sends import (
     StandingSendsStep,
@@ -118,6 +119,7 @@ class CoraServices(NamedTuple):
     queue: Optional[PendingActionQueue] = None  # the drafts table the session, gate and relay share
     agent_jobs: Optional[Callable[[], Any]] = None  # P1.1: one pass of the Drive job queue worker
     standing_sends: Optional[Callable[[], Any]] = None  # P1.4: graduates templates that meet the rule
+    after_hours_responder: Optional[Callable[[], Any]] = None  # sends the night responder's due messages
 
 
 def lending_channel_ids(settings: AppSettings) -> dict[str, str]:
@@ -522,6 +524,14 @@ def run_sweep(services: CoraServices) -> None:
             if graduated:
                 logger.info("[cora] graduated to standing auto-send: %s",
                             ", ".join(t.template_version for t in graduated))
+    if services.after_hours_responder is not None:
+        try:
+            night_sends = services.after_hours_responder()
+        except Exception as exc:  # class only; a due message stays due and is retried next sweep
+            logger.error("[cora] night responder pass failed (%s); retrying next sweep", type(exc).__name__)
+        else:
+            if night_sends:
+                logger.info("[cora] night responder %s", night_sends)
     if services.inbox_digest is not None:
         try:
             surfaced = services.inbox_digest()
@@ -615,7 +625,8 @@ def build_live_services(settings: AppSettings) -> Optional[CoraServices]:
                              instantly_replies=make_instantly_replies(engine, store, config, messages_client,
                                                                       services.gate),
                              agent_jobs=worker.run_once if worker is not None else None,
-                             standing_sends=make_standing_sends_step(engine))
+                             standing_sends=make_standing_sends_step(engine),
+                             after_hours_responder=run_send_cycle)
 
 
 def make_standing_sends_step(engine: Engine) -> Callable[[], Any]:

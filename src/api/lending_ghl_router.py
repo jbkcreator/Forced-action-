@@ -28,7 +28,9 @@ from sqlalchemy import text
 
 from config.settings import get_settings
 from src.api.deps import get_db
+from src.lending.after_hours_conversation import conversations_enabled
 from src.lending.after_hours_intake import record_intake
+from src.lending.after_hours_responder import run_send_cycle_now
 from src.lending.ghl_disposition_match import (
     InvalidDispositionEvent,
     attach_pending,
@@ -207,6 +209,7 @@ def ghl_missed_call(
 @router.post("/after-hours-intake")
 def after_hours_intake(
     body: dict[str, Any],
+    background: BackgroundTasks,
     x_webhook_secret: Optional[str] = Header(default=None),
     db: Session = Depends(get_db),
 ) -> dict[str, Any]:
@@ -227,4 +230,6 @@ def after_hours_intake(
         logger.error("[lending-ghl] after-hours intake failed: %s", type(exc).__name__)
         report_webhook_failure(AFTER_HOURS_INTAKE, body, exc)
         raise HTTPException(status_code=500, detail="Intake could not be recorded") from exc
+    if recorded and conversations_enabled():
+        background.add_task(run_send_cycle_now)  # the night responder's first message, right after the response
     return {"recorded": recorded}
