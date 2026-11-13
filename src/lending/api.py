@@ -22,6 +22,7 @@ from src.lending.lead_arrival_alert import alert_josh
 from src.lending.enrichment.service import on_lead_created as enrich_on_lead_created
 from src.lending.enrichment.webhook import router as lending_enrichment_router
 from src.api.lending_partner_router import router as lending_partner_router
+from src.api.lending_instant_quote_router import router as lending_instant_quote_router
 
 app = FastAPI(title="Lending API", docs_url=None, redoc_url=None)
 # The website form posts cross-origin when the site is served from another host; the allowed
@@ -45,6 +46,7 @@ lendingflow_events.subscribe(enrich_on_lead_created)
 # T-05: alert Josh's phone (Slack @-mention) the moment a LendingFlow lead arrives.
 lendingflow_events.subscribe(alert_josh)
 app.include_router(lending_partner_router)
+app.include_router(lending_instant_quote_router)
 
 
 @app.get("/health")
