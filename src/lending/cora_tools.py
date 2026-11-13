@@ -15,7 +15,7 @@ from config.lending_standing_sends import CORA_EMAIL_TEMPLATE, CORA_SMS_TEMPLATE
 from collections.abc import Callable, Iterator, Mapping
 from contextlib import AbstractContextManager, contextmanager
 from dataclasses import dataclass
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from typing import Any, Literal, Optional
 from zoneinfo import ZoneInfo
 
@@ -26,6 +26,7 @@ from sqlalchemy.orm import Session
 
 from config.lending_compliance import DEFAULT_TZ
 from config.lending_reply_agent import QUOTED_NUMBER_PATTERNS
+from config.settings import get_settings
 from packages.agent_core.governance import SafetyLevel
 from packages.agent_core.memory import AgentMemory, MemoryFull
 from packages.agent_core.tools import EgressDraft, Tool, ToolContext, ToolInputError
@@ -40,6 +41,8 @@ from src.lending.attempt_log import (
     summary,
     to_csv,
 )
+from src.lending.closing.doc_chase import open_chase_summaries, start_chase
+from src.lending.closing.drafts import Recipient
 from src.lending.contracts import BorrowerProfile, LoanRequest
 from src.lending.cora_channels import (
     MAX_READ_HOURS,
@@ -50,6 +53,7 @@ from src.lending.cora_channels import (
 )
 from src.lending.cora_inbox import OPEN_STATUSES, close_item, get_item, open_items, slack_safe
 from src.lending.lender_fit import evaluate_lender_fit
+from src.lending.partner_service import PartnerLinkNotConfigured
 from src.lending.scoreboard import build_scoreboard
 from src.lending.slack_names import name_and_ref, names_by_phone, readable_ref
 from src.services.phone_utils import normalize
@@ -239,6 +243,12 @@ class DraftAddNoteInput(_Input):
     lead_ref: str = Field(..., pattern=r"^web_lead:\d+$", description="Only website leads are in GHL today.")
     body: str = Field(..., min_length=1, max_length=CRM_FIELD_LIMITS["ghl_note"][1], pattern=r"\S",
                       description="Internal note text.")
+
+
+class StartChaseInput(_Input):
+    lead_ref: str = Field(..., pattern=_LEAD_REF.pattern, description="From find_lead, e.g. web_lead:12.")
+    quote_id: Optional[str] = Field(default=None, pattern=r"^[0-9a-fA-F-]{36}$",
+                                    description="The borrower's instant quote id, when there is one.")
 
 
 class InboxListInput(_Input):
@@ -656,6 +666,27 @@ class CoraToolkit:
             raise ToolInputError(f"#{item_id} is already {item['status']}{by}; nothing changed")
         return item
 
+    def start_document_chase(self, args: StartChaseInput, context: ToolContext) -> dict[str, Any]:
+        if not get_settings().lending_doc_chase_enabled:
+            raise ToolInputError("the document chase is switched off (LENDING_DOC_CHASE_ENABLED)")
+        lead = self._lead(args.lead_ref)
+        first_name = (lead.name or "").split()[0] if (lead.name or "").strip() else None
+        recipient = Recipient(first_name, lead.phone, lead.email, lead.ghl_contact_id)
+        try:
+            with self._inbox() as session:
+                started = start_chase(session, recipient, lead_ref=lead.ref, accepted_by=f"slack:{context.user_id}",
+                                      quote_id=args.quote_id)
+        except (PartnerLinkNotConfigured, ValueError) as error:
+            raise ToolInputError(str(error)) from error
+        note = ("a chase was already open for this borrower; it carries on" if started.reused else
+                "the document request goes to #approvals as a card within a minute; confirm it to the user")
+        return {"chase": started.chase_id, "reused": started.reused,
+                "documents_requested": list(started.missing), "note": note}
+
+    def document_chases(self, _: NoInput, __: ToolContext) -> dict[str, Any]:
+        with self._read_only() as session:
+            return {"open_chases": open_chase_summaries(session, datetime.now(timezone.utc))}
+
     def dismiss_inbox(self, args: InboxDismissInput, context: ToolContext) -> dict[str, Any]:
         with self._inbox() as session:
             self._open_item(session, args.item_id)
@@ -824,6 +855,12 @@ class CoraToolkit:
             Tool("route_inbox_item", "Post a digest item to a team channel I am in (see list_channels) and close it. "
                  "The approver's request is the approval.", InboxRouteInput, write, self.route_inbox,
                  approver_only=True),
+            Tool("start_document_chase", "When an approver says a borrower accepted the term sheet: open the document "
+                 "chase (the lender's checklist, an upload link, reminders on day 2, 5 and 8, each held for "
+                 "approval). The approver's request is the approval.", StartChaseInput, write,
+                 self.start_document_chase, approver_only=True),
+            Tool("get_document_chases", "Open document chases: what each borrower has uploaded, what is missing, "
+                 "and which reminder went last and goes next.", NoInput, read, self.document_chases),
             Tool("list_channels", "The Slack channels I am in, with their purpose. Someone has to invite me to a "
                  "channel before I can read or post there.", NoInput, read, self.list_channels),
             Tool("read_channel", f"Recent top-level messages in a channel I am in, bot alerts included, oldest "

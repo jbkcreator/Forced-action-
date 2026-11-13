@@ -16,7 +16,7 @@ from typing import Any, Callable, Optional
 
 from sqlalchemy import text
 
-from config.lending_closing import CLOSED_STAGE_KEYS, TOKEN_TTL, UPLOAD_LINK_PATH
+from config.lending_closing import CHASE_DAYS, CLOSED_STAGE_KEYS, TOKEN_TTL, UPLOAD_LINK_PATH
 from packages.agent_core.send_gate import SendGate
 from src.lending.closing.drafts import Recipient, chase_draft, submit_draft
 from src.lending.closing.rules import build_checklist, due_chase_day
@@ -262,3 +262,34 @@ def record_upload(db, chase: dict[str, Any], item_code: str, upload: Upload, *, 
                         summary=f"{_who(chase)} uploaded {items[item_code]['label']}: {received} of {len(items)} "
                                 "documents received.", payload={"chase_id": chase["id"], "item_code": item_code})
     logger.info("[doc-chase] chase %s: %s uploaded (%s/%s)", chase["id"], item_code, received, len(items))
+
+
+# ---- what Cora answers about open chases ---------------------------------------------------------------------------
+
+_SUMMARIES = text("""
+    SELECT c.id, c.first_name, c.phone, c.accepted_at,
+           count(i.id) AS required, count(i.received_at) AS received,
+           COALESCE(array_agg(i.label ORDER BY i.id) FILTER (WHERE i.received_at IS NULL), '{}') AS missing,
+           (SELECT max(t.chase_day) FROM lending.doc_chase_touches t WHERE t.chase_id = c.id) AS last_day
+      FROM lending.doc_chases c JOIN lending.doc_chase_items i ON i.chase_id = c.id
+     WHERE c.status = 'open'
+     GROUP BY c.id ORDER BY c.accepted_at
+""")
+
+
+def _step_name(day: Optional[int]) -> Optional[str]:
+    if day is None:
+        return None
+    return "document request" if day == 0 else f"day {day} reminder"
+
+
+def open_chase_summaries(db, now: datetime) -> list[dict[str, Any]]:
+    """Open chases for Cora's answers: first name and last 4 digits only, no links."""
+    summaries = []
+    for row in db.execute(_SUMMARIES).mappings():
+        later = [day for day in CHASE_DAYS if row["last_day"] is None or day > row["last_day"]]
+        summaries.append({"chase": row["id"], "borrower": _who(dict(row)),
+                          "days_since_acceptance": (now - row["accepted_at"]).days, "received": row["received"],
+                          "required": row["required"], "missing": list(row["missing"]),
+                          "last_step": _step_name(row["last_day"]), "next_step": _step_name(later[0] if later else None)})
+    return summaries

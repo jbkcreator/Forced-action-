@@ -49,6 +49,8 @@ from src.lending.agent_jobs.drive import google_job_folders
 from src.lending.agent_jobs.worker import JobQueueWorker, make_check
 from src.lending.attempt_log import lending_ghl_readers
 from src.lending.compliance import text_window_open
+from src.lending.closing.blockers import post_blocker_card
+from src.lending.closing.doc_chase import run_chase_sweep
 from src.lending.consent import has_text_consent
 from src.lending.cora_channels import ChannelDirectory
 from src.lending.cora_inbox import format_inbox_context, items_on_post, surface_new_items
@@ -118,6 +120,8 @@ class CoraServices(NamedTuple):
     queue: Optional[PendingActionQueue] = None  # the drafts table the session, gate and relay share
     agent_jobs: Optional[Callable[[], Any]] = None  # P1.1: one pass of the Drive job queue worker
     standing_sends: Optional[Callable[[], Any]] = None  # P1.4: graduates templates that meet the rule
+    closing_blockers: Optional[Callable[[], bool]] = None  # P2.4: the 7 AM stuck-deal card; True when posted
+    doc_chase: Optional[Callable[[], int]] = None  # P2.4: queues due document requests and reminders
 
 
 def lending_channel_ids(settings: AppSettings) -> dict[str, str]:
@@ -487,7 +491,8 @@ def build_session(config: AgentCoreConfig, store: AgentStore, chat: ChatPort, bo
 
 def run_sweep(services: CoraServices) -> None:
     """One pass: expire stale drafts, triage new Instantly replies, retry missing approval cards, run the agent job
-    queue, graduate templates (P1.4), post the inbox digest and the 7:30 AM
+    queue, graduate templates (P1.4), post the 7 AM closing blocker card and queue document chase steps (P2.4),
+    post the inbox digest and the 7:30 AM
     morning digest (always, even while halted: the halt stops sends to borrowers, not Cora's own channel), then
     send approved actions."""
     expired = services.session.expire_stale_actions()
@@ -522,6 +527,13 @@ def run_sweep(services: CoraServices) -> None:
             if graduated:
                 logger.info("[cora] graduated to standing auto-send: %s",
                             ", ".join(t.template_version for t in graduated))
+    for name, step in (("closing blocker card", services.closing_blockers), ("document chase", services.doc_chase)):
+        if step is None:
+            continue
+        try:
+            step()
+        except Exception as exc:  # class only: SQL errors embed bound parameters; never skip the sends below
+            logger.error("[cora] %s failed (%s); retrying next sweep", name, type(exc).__name__)
     if services.inbox_digest is not None:
         try:
             surfaced = services.inbox_digest()
@@ -610,12 +622,35 @@ def build_live_services(settings: AppSettings) -> Optional[CoraServices]:
     worker = build_agent_jobs(settings, engine=engine, gate=services.gate, queue=services.queue,
                               approval_channel=config.approval_channel_id or "",
                               is_graduated=make_is_graduated(engine))
+    closing_blockers, doc_chase = build_closing_steps(settings, engine=engine, chat=chat, gate=services.gate,
+                                                      config=config)
     return services._replace(web_client=web, inbox_digest=digest,
                              morning_digest=make_morning_digest(engine, store, chat, config),
                              instantly_replies=make_instantly_replies(engine, store, config, messages_client,
                                                                       services.gate),
                              agent_jobs=worker.run_once if worker is not None else None,
-                             standing_sends=make_standing_sends_step(engine))
+                             standing_sends=make_standing_sends_step(engine),
+                             closing_blockers=closing_blockers, doc_chase=doc_chase)
+
+
+def build_closing_steps(settings: AppSettings, *, engine: Engine, chat: ChatPort, gate: SendGate,
+                        config: AgentCoreConfig) -> tuple[Optional[Callable[[], bool]], Optional[Callable[[], int]]]:
+    """P2.4 sweep steps, each on its own transaction; None while its flag is off. The card goes to Cora's channel
+    and every draft to #approvals, with the borrower's text consent read in the same transaction."""
+    approvals = (config.approval_channel_id or "") if config is not None else ""
+
+    def blocker_card() -> bool:
+        with Session(engine) as db, db.begin():
+            return post_blocker_card(db, chat, gate, channel=config.slack_channel_id, approvals_channel=approvals,
+                                     text_consent=lambda phone: has_text_consent(db, phone))
+
+    def chase_sweep() -> int:
+        with Session(engine) as db, db.begin():
+            return run_chase_sweep(db, gate, approvals_channel=approvals,
+                                   text_consent=lambda phone: has_text_consent(db, phone))
+
+    return (blocker_card if settings.lending_closing_blockers_enabled else None,
+            chase_sweep if settings.lending_doc_chase_enabled else None)
 
 
 def make_standing_sends_step(engine: Engine) -> Callable[[], Any]:
