@@ -203,3 +203,26 @@ def no_cold_leads(monkeypatch):
     """The cold-lead check reads Postgres before every GHL text and email; tests see no cold leads by default.
     Tests of the check itself swap in their own session factory."""
     monkeypatch.setattr("src.lending.cold_leads._session_factory", _NotHalted)
+
+
+@pytest.fixture(autouse=True)
+def night_responder_send_passes(monkeypatch):
+    """A webhook that makes a night responder message due starts a send pass on its own session with the real GHL
+    senders: in tests the pass is recorded, never run. Tests of the pass call ``process_due`` directly."""
+    passes: list[str] = []
+    monkeypatch.setattr("src.lending.reply_webhook.run_send_cycle_now", lambda: passes.append("reply"))
+    monkeypatch.setattr("src.api.lending_ghl_router.run_send_cycle_now", lambda: passes.append("intake"))
+    return passes
+
+
+@pytest.fixture
+def conversations_db(lending_db, monkeypatch):
+    """lending_db plus lending.after_hours_conversations (rolled back with the test). A stop reply's opt-out is
+    recorded here instead of written: the opt-out lists live in tables these tests do not create."""
+    from migrations.apply_lending_after_hours_conversations import apply_to as apply_conversations
+
+    apply_conversations(lending_db.get_bind())
+    lending_db.opt_outs = []
+    monkeypatch.setattr("src.lending.after_hours_conversation.propagate_opt_out",
+                        lambda db, **fields: lending_db.opt_outs.append(fields))
+    return lending_db

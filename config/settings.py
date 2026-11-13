@@ -977,6 +977,8 @@ class AppSettings(BaseSettings):
 	lending_intro_sms_enabled: bool = Field(default=False, env="LENDING_INTRO_SMS_ENABLED")
 	# After-hours voicemail / answering-service intake (POST /webhooks/lending/after-hours-intake); closed (503) while off
 	lending_after_hours_intake_enabled: bool = Field(default=False, env="LENDING_AFTER_HOURS_INTAKE_ENABLED")
+	# Night responder: an after-hours inquiry opens a three-question conversation and inbound replies advance it. Off: no conversation is opened or advanced
+	lending_after_hours_conversation_enabled: bool = Field(default=False, env="LENDING_AFTER_HOURS_CONVERSATION_ENABLED")
 	# Carrier (10DLC) approval for lending texts Cora sends after Approve; until true an approved text waits (then blocks at expiry)
 	lending_sms_carrier_approved: bool = Field(default=False, env="LENDING_SMS_CARRIER_APPROVED")
 	lending_ghl_cf_intro_name: Optional[str] = Field(default=None, env="LENDING_GHL_CF_INTRO_NAME")

@@ -32,6 +32,9 @@ from sqlalchemy import (
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
+from config.lending_after_hours_conversation import (CHANNELS as CONVERSATION_CHANNELS,
+                                                     OPEN_STATES as CONVERSATION_OPEN_STATES, QUESTION_STATES,
+                                                     STATES as CONVERSATION_STATES)
 from config.lending_cohorts import REPLACEMENT_REQUESTED, REPLACEMENT_STATUSES
 from config.lending_text_back import SLOT_HOLDING_SQL
 
@@ -1525,3 +1528,60 @@ class LendingTemplateGraduation(LendingBase):
     edit_rate: Mapped[float] = mapped_column(Numeric(5, 4), nullable=False)
     revoked_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
     revoked_by: Mapped[Optional[str]] = mapped_column(String(64))
+
+
+class LendingAfterHoursConversation(LendingBase):
+    """One after-hours inquiry answered by the night responder (``src/lending/after_hours_conversation.py``): the
+    three qualifying questions, then a call slot for the next business morning.
+
+    ``state`` is what the lead is being asked now; ``prompted_state`` is the state whose message has gone out, so a
+    message is due while the two differ and a reply counts only once they match. ``contact_key`` is the phone, or
+    the lower-cased email for a lead reached by email: one open conversation per contact. ``offered_slots`` and
+    ``chosen_slot_start`` are slot start times; ``handled_message_ids`` are the inbound messages already applied (a
+    redelivered webhook changes nothing). ``sending_claimed_at`` is set while one worker is sending the due message;
+    ``sent_messages`` holds a receipt per send (state, template version, provider message id, status, time).
+    Answers are free text from the lead: never logged or posted."""
+
+    __tablename__ = "after_hours_conversations"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    inquiry_key: Mapped[str] = mapped_column(String(200), nullable=False)
+    source: Mapped[str] = mapped_column(String(40), nullable=False)
+    channel: Mapped[str] = mapped_column(String(8), nullable=False)
+    contact_key: Mapped[str] = mapped_column(String(320), nullable=False)
+    phone: Mapped[Optional[str]] = mapped_column(String(20))  # phone_utils.normalize
+    email: Mapped[Optional[str]] = mapped_column(String(320))  # lower-cased
+    ghl_contact_id: Mapped[Optional[str]] = mapped_column(String(64))
+    first_name: Mapped[Optional[str]] = mapped_column(String(100))
+    state: Mapped[str] = mapped_column(String(16), nullable=False, default=QUESTION_STATES[0],
+                                       server_default=text(f"'{QUESTION_STATES[0]}'"))
+    prompted_state: Mapped[Optional[str]] = mapped_column(String(16))
+    answers: Mapped[list] = mapped_column(JSONB, nullable=False, default=list, server_default=text("'[]'::jsonb"))
+    offered_slots: Mapped[list] = mapped_column(JSONB, nullable=False, default=list, server_default=text("'[]'::jsonb"))
+    chosen_slot_start: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    slot_reprompts: Mapped[int] = mapped_column(SmallInteger, nullable=False, default=0, server_default=text("0"))
+    booking_ref: Mapped[Optional[str]] = mapped_column(String(64))
+    closed_reason: Mapped[Optional[str]] = mapped_column(String(16))
+    handled_message_ids: Mapped[list] = mapped_column(JSONB, nullable=False, default=list,
+                                                      server_default=text("'[]'::jsonb"))
+    sending_claimed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    send_attempts: Mapped[int] = mapped_column(SmallInteger, nullable=False, default=0, server_default=text("0"))
+    sent_messages: Mapped[list] = mapped_column(JSONB, nullable=False, default=list, server_default=text("'[]'::jsonb"))
+    opened_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_now, server_default=text("now()"))
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_now, server_default=text("now()"))
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    closed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+
+    __table_args__ = (
+        CheckConstraint(f"state IN ({', '.join(repr(s) for s in CONVERSATION_STATES)})",
+                        name="ck_after_hours_conversations_state"),
+        CheckConstraint(f"channel IN ({', '.join(repr(c) for c in CONVERSATION_CHANNELS)})",
+                        name="ck_after_hours_conversations_channel"),
+        Index("uq_after_hours_conversations_inquiry", "inquiry_key", unique=True),
+        Index("uq_after_hours_conversations_open_contact", "contact_key", unique=True,
+              postgresql_where=text(f"state IN ({', '.join(repr(s) for s in CONVERSATION_OPEN_STATES)})")),
+        Index("ix_after_hours_conversations_ghl_contact", "ghl_contact_id",
+              postgresql_where=text("ghl_contact_id IS NOT NULL")),
+        Index("ix_after_hours_conversations_open", "updated_at",
+              postgresql_where=text(f"state IN ({', '.join(repr(s) for s in CONVERSATION_OPEN_STATES)})")),
+    )

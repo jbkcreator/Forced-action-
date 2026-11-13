@@ -13,6 +13,9 @@ text when there is none or the model's draft is unusable), frozen in ``lending.p
 minute sweep posts the card. A voicemail that already has a draft is not drafted again. One without consent is listed
 as call-only. Nothing is sent here; GHL's instant missed-call text is untouched.
 
+With ``LENDING_AFTER_HOURS_CONVERSATION_ENABLED`` on, a new voicemail from a caller with text consent also opens
+the night responder's conversation (``src/lending/after_hours_conversation.py``).
+
 Body fields (top level or under ``contact``): ``phone`` (required), ``first_name`` / ``name``, ``message`` /
 ``transcription`` / ``transcript``, ``received_at`` (ISO 8601), ``source`` (default ``ghl_voicemail``),
 ``call_id`` / ``message_id``.
@@ -28,9 +31,11 @@ from typing import Any, Callable, Mapping, Optional, Protocol
 
 from sqlalchemy import text
 
+from config.lending_after_hours_conversation import CHANNEL_SMS
 from config.lending_after_hours import (BUSINESS_DAYS, DEFAULT_SOURCE, DRAFT_FORBIDDEN, DRAFT_MAX_CHARS, DRAFT_PROMPT,
                                         DRAFT_TOOL_NAME, FALLBACK_REPLY, INTAKE_MARKER, MORNING_POST_ET, PIN_UNTIL_ET)
 from config.lending_reminders import TIMEZONE
+from src.lending.after_hours_conversation import conversations_enabled, open_conversation
 from src.lending.consent import has_text_consent
 from src.lending.cora_tools import borrower_draft_problem
 from src.lending.ghl_consent_events import InvalidEvent
@@ -75,7 +80,8 @@ class PinnedCall:
 @dataclass(frozen=True)
 class MorningReply:
     pin: PinnedCall
-    action_id: Optional[int]  # None: no text consent, call only
+    action_id: Optional[int]  # None: no reply draft (no text consent, or the night responder already texted)
+    night_responder_texted: bool = False
 
 
 class DraftQueue(Protocol):
@@ -164,7 +170,15 @@ def record_intake(db, body: Mapping[str, Any], *, now: Optional[datetime] = None
                                     "now": now}).rowcount
     if logged:
         db.execute(_PIN, {"id": contact_id, "now": now, "until": pin_until(now)})
+        _open_conversation_with_consent(db, event, now)
     return bool(logged)
+
+
+def _open_conversation_with_consent(db, event: IntakeEvent, now: datetime) -> None:
+    """A voicemail leaves a phone only, so the conversation is by text and needs the caller's text consent."""
+    if conversations_enabled() and has_text_consent(db, event.phone):
+        open_conversation(db, inquiry_key=event.call_key, source=event.source, channel=CHANNEL_SMS,
+                          phone=event.phone, first_name=event.first_name, now=now)
 
 
 _PINS = text("""
@@ -178,6 +192,8 @@ _PINS = text("""
      ORDER BY c.id, d.call_ended_at DESC
 """)
 _DRAFTED = text("SELECT idempotency_key, action_id FROM lending.pending_actions WHERE idempotency_key = ANY(:keys)")
+_NIGHT_RESPONDER_TEXTED = text("SELECT inquiry_key FROM lending.after_hours_conversations "
+                               "WHERE inquiry_key = ANY(:keys) AND prompted_state IS NOT NULL")
 
 
 def pins_to_call(db, now: datetime) -> list[PinnedCall]:
@@ -236,13 +252,19 @@ def _queue_reply(queue: DraftQueue, pin: PinnedCall, drafter: Drafter, full_name
 
 def draft_morning_replies(db, pins: list[PinnedCall], queue: DraftQueue, drafter: Drafter) -> list[MorningReply]:
     """Queue a reply for Approve for each pin with text consent; a voicemail already drafted keeps its draft (no
-    second model call). The rest are call-only."""
-    drafted = dict(db.execute(_DRAFTED, {"keys": [pin.event.call_key for pin in pins]}).all())
+    second model call). A caller the night responder already texted gets no draft: a second message saying their
+    voicemail arrived would follow the questions they were sent overnight. The rest are call-only."""
+    keys = [pin.event.call_key for pin in pins]
+    drafted = dict(db.execute(_DRAFTED, {"keys": keys}).all())
+    texted = (set(db.execute(_NIGHT_RESPONDER_TEXTED, {"keys": keys}).scalars())
+              if conversations_enabled() else set())
     names = names_by_phone(db, [pin.event.phone for pin in pins if pin.event.call_key not in drafted])
     replies = []
     for pin in pins:
         if pin.event.call_key in drafted:
             replies.append(MorningReply(pin, drafted[pin.event.call_key]))
+        elif pin.event.call_key in texted:
+            replies.append(MorningReply(pin, None, night_responder_texted=True))
         elif has_text_consent(db, pin.event.phone):
             replies.append(MorningReply(pin, _queue_reply(queue, pin, drafter, names.get(pin.event.phone))))
         else:
