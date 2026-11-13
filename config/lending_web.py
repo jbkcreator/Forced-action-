@@ -32,6 +32,15 @@ CALL_CONSENT_TEXT = (
     "To stop calls, tell us on any call or email optout@nextdeallending.com."
 )
 
+# Box 4 (P2.1): calls from the AI voice assistant only. DRAFT wording, waiting for Josh's approval (UI PR #10); the
+# Voice AI runs only for a lead who ticked this box with exactly this text. Change this and the page together.
+AI_CALL_CONSENT_TEXT = (
+    "I agree that Next Deal Lending (operated by HEU AI LLC) may call me at the number above about my inquiry "
+    "using an AI voice assistant, which will tell me at the start of the call that it is an AI. Calls are recorded. "
+    "Consent is not a condition of any financing. "
+    "To stop these calls, say so on the call or email optout@nextdeallending.com."
+)
+
 # A typed loan amount above this is a typo, not a deal (whole dollars).
 MAX_LOAN_AMOUNT = 100_000_000
 
@@ -78,6 +87,7 @@ FIELD_MAX_LENGTHS = {
     "credit_band": 20,  # the column's width
     "consent_text": 2000,
     "call_consent_text": 2000,
+    "ai_call_consent_text": 2000,
     "page_url": 300,
     "user_agent": 300,
 }

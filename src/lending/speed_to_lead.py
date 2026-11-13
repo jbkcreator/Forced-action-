@@ -20,7 +20,7 @@ follow-up; website: the delivery itself) ``start`` runs every gate and adds the 
   client decision). Then ``ndl-ai-voice-ok`` is set or cleared, and ``ndl-speed-to-lead`` is removed and re-added so
   GHL's tag trigger fires again for a returning contact.
 * **Voice AI** (brief section 7: only on consented leads, discloses it is an AI assistant for Next Deal Lending). Our
-  code only marks who may get it: a website lead whose call-consent box was ticked with the exact consent text, and
+  code only marks who may get it: a website lead whose AI-call consent box was ticked with the exact wording, and
   only when the Josh/David step ran early enough that the AI call starts inside AI_LAST_CHANCE. A LendingFlow lead has
   no recorded call consent, so it never gets the tag (open question for Josh).
 
@@ -107,12 +107,12 @@ class Outcome:
 _LEAD = {
     SOURCE_LENDINGFLOW: text(
         "SELECT id, phone, email, property_state, property_zip, received_at, ghl_contact_id, suppressed, "
-        "intro_sms_tagged_at, false AS sms_consent, false AS call_consent, false AS call_consent_text_matches "
-        "FROM lending.lendingflow_leads WHERE id = :id"),
+        "intro_sms_tagged_at, false AS sms_consent, false AS call_consent, false AS ai_call_consent, "
+        "false AS ai_call_consent_text_matches FROM lending.lendingflow_leads WHERE id = :id"),
     SOURCE_WEB: text(
         "SELECT id, phone, email, property_state, NULL AS property_zip, received_at, ghl_contact_id, suppressed, "
-        "NULL AS intro_sms_tagged_at, sms_consent, call_consent, "
-        "COALESCE(call_consent_text_matches, false) AS call_consent_text_matches "
+        "NULL AS intro_sms_tagged_at, sms_consent, call_consent, ai_call_consent, "
+        "COALESCE(ai_call_consent_text_matches, false) AS ai_call_consent_text_matches "
         "FROM lending.web_leads WHERE id = :id"),
 }
 _CLAIM = text("""
@@ -144,9 +144,10 @@ def voice_in_time(received_at: datetime, now: datetime) -> bool:
 
 
 def voice_eligible(lead: Mapping[str, Any]) -> bool:
-    """A recorded, unrevoked call consent: the website call box ticked with the exact consent text, on a number that
-    is not suppressed. LendingFlow leads have no call-consent record, so never."""
-    return bool(lead["call_consent"] and lead["call_consent_text_matches"] and not lead["suppressed"])
+    """A recorded, unrevoked AI-call consent: the website form's AI call box ticked with exactly the approved wording
+    (``config/lending_web.AI_CALL_CONSENT_TEXT``), on a number that is not suppressed. LendingFlow leads have no
+    AI-call consent record, so never. The Voice AI only follows the Josh/David cascade, which needs the call box."""
+    return bool(lead["ai_call_consent"] and lead["ai_call_consent_text_matches"] and not lead["suppressed"])
 
 
 def _web_text(db, lead: Mapping[str, Any], tags: TagClient, *, halted: bool, now: datetime) -> tuple[str, Optional[datetime]]:

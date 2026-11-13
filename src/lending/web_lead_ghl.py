@@ -113,6 +113,9 @@ def _note(lead: Mapping[str, Any]) -> str:
         + (" (number was already suppressed: no consent applied)" if lead["suppressed"] and lead["sms_consent"] else "") + ".",
         f"Call consent box: {'ticked' if lead['call_consent'] else 'not ticked'}"
         + (" (number was already suppressed: no consent applied)" if lead["suppressed"] and lead["call_consent"] else "") + ".",
+        f"AI call consent box: {'ticked' if lead.get('ai_call_consent') else 'not ticked'}"
+        + (" (number was already suppressed: no consent applied)" if lead["suppressed"] and lead.get("ai_call_consent")
+           else "") + ".",
         f"Deal Drop (weekly email) opt-in box: {'ticked' if lead['deal_drop_optin'] else 'not ticked'}.",
         f"Doing: {lead['deal_type'] or 'n/a'}. Projects finished, last 3 years: {lead['completed_projects_3y'] or 'n/a'}. "
         f"Property city: {lead['property_city'] or 'n/a'}.",

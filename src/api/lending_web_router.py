@@ -56,6 +56,8 @@ def create_web_lead(
     deal_drop_optin: Optional[str] = Form(default=None),  # box 3: the weekly Deal Drop by email
     consent_text: Optional[str] = Form(default=None),
     call_consent_text: Optional[str] = Form(default=None),
+    ai_call_consent: Optional[str] = Form(default=None),  # box 4 (P2.1): calls from the AI voice assistant only
+    ai_call_consent_text: Optional[str] = Form(default=None),
     page_url: Optional[str] = Form(default=None),
     company_website: Optional[str] = Form(default=None),  # honeypot: hidden on the page, bots fill it
     db: Session = Depends(get_db),
@@ -73,6 +75,7 @@ def create_web_lead(
                 "property_state": property_state, "credit_band": credit_band, "occupancy": occupancy,
                 "sms_consent": sms_consent, "call_consent": call_consent, "deal_drop_optin": deal_drop_optin,
                 "consent_text": consent_text, "call_consent_text": call_consent_text, "page_url": page_url,
+                "ai_call_consent": ai_call_consent, "ai_call_consent_text": ai_call_consent_text,
             },
             ip_address=client_ip(request),
             user_agent=request.headers.get("user-agent"),

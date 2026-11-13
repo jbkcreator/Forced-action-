@@ -47,8 +47,10 @@ late, text, Josh and David, no AI (it would start after 5 minutes); 10 minutes l
   `ghl_call_gate.blocked_reasons` allows the number now (suppression, DNC result, already reached, attempt caps, the
   8am-8pm calling window, emergency halt). Website leads also need the call-consent box, and get a fresh DNC scrub
   first (1 Tracerfy credit); a failed scrub means no call. LendingFlow leads need no scrub (client decision).
-* **Voice AI** (brief section 7: "only on consented leads"): `ndl-ai-voice-ok` only for a website lead whose call box
-  was ticked with the exact consent text (`config/lending_web.CALL_CONSENT_TEXT`) and is not suppressed. LendingFlow
+* **Voice AI** (brief section 7: "only on consented leads"): `ndl-ai-voice-ok` only for a website lead who ticked the
+  form's separate **AI call consent box** with exactly the approved wording (`config/lending_web.AI_CALL_CONSENT_TEXT`,
+  a draft until Josh approves it; UI PR forced-action-ui #10) and is not suppressed. The call box alone is not
+  consent to the AI call, and the AI box alone starts no calls (the AI only follows the Josh/David cascade). LendingFlow
   leads have no recorded call consent, so they never get it (open question for Josh). The tag is removed from a
   returning contact that no longer qualifies.
 * **Emergency halt**: no tag at all while it is set. `@Cora emergency halt` also removes `ndl-speed-to-lead` and

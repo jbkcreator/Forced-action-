@@ -460,6 +460,10 @@ class LendingWebLead(LendingBase):
     consent_text_matches: Mapped[Optional[bool]] = mapped_column(Boolean)  # equals config.lending_web.SMS_CONSENT_TEXT
     call_consent_text: Mapped[Optional[str]] = mapped_column(Text)  # the call box's label the visitor saw, verbatim
     call_consent_text_matches: Mapped[Optional[bool]] = mapped_column(Boolean)  # equals config.lending_web.CALL_CONSENT_TEXT
+    # P2.1 box 4: calls from the AI voice assistant only (the Voice AI gate)
+    ai_call_consent: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default=text("false"))
+    ai_call_consent_text: Mapped[Optional[str]] = mapped_column(Text)  # the AI box's label the visitor saw, verbatim
+    ai_call_consent_text_matches: Mapped[Optional[bool]] = mapped_column(Boolean)  # equals AI_CALL_CONSENT_TEXT
     page_url: Mapped[Optional[str]] = mapped_column(String(300))
     ip_address: Mapped[Optional[str]] = mapped_column(String(45))
     user_agent: Mapped[Optional[str]] = mapped_column(String(300))

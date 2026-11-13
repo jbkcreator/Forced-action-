@@ -86,13 +86,15 @@ class FakeDb:
 def web_lead(**over):
     lead = {"id": 7, "phone": PHONE, "email": "lead@example.com", "property_state": "FL", "property_zip": None,
             "received_at": NOW - timedelta(seconds=3), "ghl_contact_id": "c-7", "suppressed": False,
-            "intro_sms_tagged_at": None, "sms_consent": True, "call_consent": True, "call_consent_text_matches": True}
+            "intro_sms_tagged_at": None, "sms_consent": True, "call_consent": True, "ai_call_consent": True,
+            "ai_call_consent_text_matches": True}
     lead.update(over)
     return lead
 
 
 def lendingflow_lead(**over):
-    lead = web_lead(id=5, ghl_contact_id="c-5", sms_consent=False, call_consent=False, call_consent_text_matches=False,
+    lead = web_lead(id=5, ghl_contact_id="c-5", sms_consent=False, call_consent=False, ai_call_consent=False,
+                    ai_call_consent_text_matches=False,
                     intro_sms_tagged_at=NOW - timedelta(seconds=1))
     lead.update(over)
     return lead
@@ -157,13 +159,26 @@ def test_a_lendingflow_lead_gets_the_cascade_but_never_voice_ai_and_no_scrub(gat
 
 # ── Voice AI only on a recorded call consent ─────────────────────────────────
 
-@pytest.mark.parametrize("over", [{"call_consent_text_matches": False}, {"suppressed": True}])
+@pytest.mark.parametrize("over", [{"ai_call_consent_text_matches": False}, {"suppressed": True},
+                                  {"ai_call_consent": False}])
 def test_voice_ai_needs_the_exact_consent_text_and_no_opt_out(gates, over):
     assert speed_to_lead.voice_eligible(web_lead(**over)) is False
 
 
+def test_the_call_box_alone_is_not_consent_to_the_ai_call(gates):
+    outcome, tags, _ = run(web_lead(ai_call_consent=False, ai_call_consent_text_matches=False))
+    assert outcome.call_status == CALL_TAGGED and outcome.voice_eligible is False  # Josh and David still rung
+    assert ("add", "c-7", GHL_TAG_AI_VOICE_OK) not in tags.calls
+
+
+def test_the_ai_box_alone_starts_no_calls_at_all(gates):
+    outcome, tags, _ = run(web_lead(call_consent=False))
+    assert (outcome.call_status, outcome.call_block_reason) == (CALL_BLOCKED, "NO_CALL_CONSENT")
+    assert not [c for c in tags.calls if c[2] in (GHL_TAG_SPEED_TO_LEAD, GHL_TAG_AI_VOICE_OK)]
+
+
 def test_a_contact_without_call_consent_text_match_is_called_but_its_old_voice_tag_is_removed(gates):
-    outcome, tags, _ = run(web_lead(call_consent_text_matches=False))
+    outcome, tags, _ = run(web_lead(ai_call_consent_text_matches=False))
     assert ("remove", "c-7", GHL_TAG_AI_VOICE_OK) in tags.calls and ("add", "c-7", GHL_TAG_AI_VOICE_OK) not in tags.calls
     assert outcome.call_status == CALL_TAGGED and outcome.voice_eligible is False
 
@@ -556,8 +571,15 @@ def test_a_website_lead_end_to_end_on_postgres(lending_db, monkeypatch):
     conn = lending_db.connection()
     LendingBase.metadata.create_all(conn, checkfirst=True)
     apply_web(conn)
+    # an existing table from before P2.1: the migration adds the AI-call columns, and a re-run changes nothing
+    conn.execute(text("ALTER TABLE lending.web_leads DROP COLUMN IF EXISTS ai_call_consent, "
+                      "DROP COLUMN IF EXISTS ai_call_consent_text, DROP COLUMN IF EXISTS ai_call_consent_text_matches"))
     apply_to(conn)
     apply_to(conn)  # idempotent
+    added = {r[0] for r in conn.execute(text(
+        "SELECT column_name FROM information_schema.columns WHERE table_schema = 'lending' AND table_name = 'web_leads' "
+        "AND column_name LIKE 'ai_call_consent%'"))}
+    assert added == {"ai_call_consent", "ai_call_consent_text", "ai_call_consent_text_matches"}
     monkeypatch.setattr(speed_to_lead, "get_settings", lambda: SimpleNamespace(
         lending_speed_to_lead_enabled=True, lending_intro_sms_enabled=True, lending_ghl_cf_intro_name="cf",
         lending_sms_carrier_approved=True))
@@ -568,7 +590,8 @@ def test_a_website_lead_end_to_end_on_postgres(lending_db, monkeypatch):
     now = datetime.now(timezone.utc)
     lead_id = lending_db.execute(text(
         "INSERT INTO lending.web_leads (received_at, name, phone, ghl_contact_id, sms_consent, call_consent, "
-        "call_consent_text_matches) VALUES (:r, 'Test Lead', :p, 'c-pg', true, true, true) RETURNING id"),
+        "ai_call_consent, ai_call_consent_text_matches) VALUES (:r, 'Test Lead', :p, 'c-pg', true, true, true, true) "
+        "RETURNING id"),
         {"r": now - timedelta(seconds=2), "p": phone}).scalar()
     lending_db.execute(text("INSERT INTO lending.text_consents (phone, source, captured_at) VALUES (:p, 'web_form', :r)"),
                        {"p": phone, "r": now})
