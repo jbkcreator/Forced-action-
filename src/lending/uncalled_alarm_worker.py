@@ -196,12 +196,23 @@ SENT, RETRY, SENDING, UNKNOWN, FAILED = "sent", "retry", "sending", "send_unknow
 SUPERSEDED, NOT_CONFIGURED = "superseded", "not_configured"
 TEST_SKIPPED = "test_skipped"  # Slack post not made: a test lead while LENDING_SLACK_TEST_ENABLED is off
 
+# A lead waiting in the P2.1 speed-to-lead call queue is not due yet (the queue rings it); once the queue releases,
+# expires or ends it, the alarm clock runs from that moment (speed_to_lead.released_at) instead of the arrival. Leads
+# the queue never held keep the arrival time, so nothing changes for them. The table must exist: run
+# migrations/apply_lending_speed_to_lead.py before deploying this worker.
+_SPEED_TO_LEAD_JOIN = """
+      LEFT JOIN lending.speed_to_lead s
+             ON s.source = CASE WHEN a.web_lead_id IS NOT NULL THEN 'web' ELSE 'lendingflow' END
+            AND s.lead_id = COALESCE(a.web_lead_id, a.lendingflow_lead_id)"""
 _DUE = text(f"""
-    SELECT a.id, a.lead_uuid, a.phone, a.arrived_at, a.fired_120_at,{_LEAD_FIELDS}
-      FROM lending.uncalled_alarms a{_LEAD_JOINS}
-     WHERE a.resolved_at IS NULL AND a.fired_300_at IS NULL AND a.arrived_at <= :first_due
-       AND (a.fired_120_at IS NULL OR a.arrived_at <= :escalation_due)
-     ORDER BY a.arrived_at LIMIT :limit
+    SELECT a.id, a.lead_uuid, a.phone, COALESCE(s.released_at, a.arrived_at) AS arrived_at, a.fired_120_at,{_LEAD_FIELDS}
+      FROM lending.uncalled_alarms a{_LEAD_JOINS}{_SPEED_TO_LEAD_JOIN}
+     WHERE a.resolved_at IS NULL AND a.fired_300_at IS NULL
+       AND a.arrived_at <= :first_due
+       AND s.call_status IS DISTINCT FROM 'queued'
+       AND COALESCE(s.released_at, a.arrived_at) <= :first_due
+       AND (a.fired_120_at IS NULL OR COALESCE(s.released_at, a.arrived_at) <= :escalation_due)
+     ORDER BY 4 LIMIT :limit
 """)
 
 _RESOLVE_CONNECTED = text("""
@@ -469,12 +480,14 @@ def _retry_row(db, row: Mapping[str, Any], *, tick: Clock, sms, slack, ghl_statu
     return outcomes
 
 
-# Leads closed 'after_hours' that arrived since the previous business morning's list and have had no connected
-# outbound call since they arrived.
+# Leads closed 'after_hours' that arrived (or left the P2.1 call queue) since the previous business morning's list and
+# have had no connected outbound call since they arrived. A lead still in the call queue is left out: the queue rings it.
 _AFTER_HOURS_LEADS = text(f"""
     SELECT a.id, a.lead_uuid, a.phone, a.arrived_at,{_LEAD_FIELDS}
-      FROM lending.uncalled_alarms a{_LEAD_JOINS}
-     WHERE a.resolved_reason = 'after_hours' AND a.arrived_at >= :since AND a.arrived_at < :until
+      FROM lending.uncalled_alarms a{_LEAD_JOINS}{_SPEED_TO_LEAD_JOIN}
+     WHERE a.resolved_reason = 'after_hours'
+       AND COALESCE(s.released_at, a.arrived_at) >= :since AND COALESCE(s.released_at, a.arrived_at) < :until
+       AND (s.call_status IS NULL OR s.call_status NOT IN ('queued', 'releasing'))
        AND NOT EXISTS (
            SELECT 1 FROM lending.call_dispositions c
             WHERE c.phone = a.phone AND c.direction = 'outbound'

@@ -1553,10 +1553,31 @@ class LendingSpeedToLead(LendingBase):
     call_block_reason: Mapped[Optional[str]] = mapped_column(String(60))
     call_tagged_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
     voice_eligible: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default=text("false"))
+    # The call queue: when the lead was queued and why (outside_hours / delayed / waiting_turn / a temporary gate
+    # reason), and when the queue worker released it (cascade started) or expired it.
+    queued_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    queue_reason: Mapped[Optional[str]] = mapped_column(String(60))
+    released_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    recheck_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))  # a not-now lead waits until then
+    alerted_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))  # "left the queue" post sent
 
     __table_args__ = (
         Index("uq_speed_to_lead_source_lead", "source", "lead_id", unique=True),
         Index("ix_speed_to_lead_held_text", "source", "received_at",
               postgresql_where=text("text_status = 'held_for_window'")),
+        Index("ix_speed_to_lead_queued", "received_at", postgresql_where=text("call_status = 'queued'")),
+        Index("ix_speed_to_lead_call_tagged_at", "call_tagged_at"),
         CheckConstraint("source IN ('lendingflow', 'web')", name="ck_speed_to_lead_source"),
     )
+
+
+class LendingSpeedToLeadNotice(LendingBase):
+    """P2.1 call queue: one row per queue notice posted to the lead-alerts channel (``kind`` = morning / backlog, one
+    per Eastern day), so the minute worker posts each once."""
+
+    __tablename__ = "speed_to_lead_notices"
+
+    kind: Mapped[str] = mapped_column(String(30), primary_key=True)
+    day: Mapped[date] = mapped_column(Date, primary_key=True)
+    posted_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_now,
+                                                server_default=text("now()"))
