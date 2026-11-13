@@ -67,5 +67,6 @@ def render_markdown() -> str:
             f"{'yes' if r.unconfirmed else 'no'} |"
         )
     lines.append("")
-    lines.append(f"_{DISCLAIMER}. Placeholder lender values: every figure is unconfirmed._")
+    lines.append(f"_{DISCLAIMER}. Central's FICO grid and experience cuts are confirmed; base caps, sizing "
+                 "shares and rural/refinance cuts are still placeholders, so quotes are flagged unconfirmed._")
     return "\n".join(lines)

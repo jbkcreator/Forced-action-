@@ -24,7 +24,6 @@ from config.lending_instant_quote import (
     LEVERAGE_EXHAUSTED,
     LEVERAGE_ADJUSTMENTS_CONFIRMED,
     NEEDS_LLC_FORMATION,
-    NEW_CONSTRUCTION_EXIT_RULE_ENABLED,
     NEW_CONSTRUCTION_MIN_EXITS,
     NEW_CONSTRUCTION_NEEDS_EXIT,
     PRICING_GRID,
@@ -32,6 +31,8 @@ from config.lending_instant_quote import (
     QUOTE_LENDER_KEY,
     QUOTE_UNAVAILABLE,
     REFINANCE_CUT,
+    REFINANCE_QUOTES_ENABLED,
+    REFINANCE_RULE_PENDING,
     REFINANCE_CUT_REASON,
     RURAL_CUT,
     RURAL_CUT_REASON,
@@ -95,6 +96,7 @@ class QuoteResult:
     unconfirmed: bool
     cuts: tuple[Cut, ...] = field(default_factory=tuple)
     conditions: tuple[Condition, ...] = field(default_factory=tuple)
+    notes: tuple[str, ...] = field(default_factory=tuple)  # caller-visible caveats, e.g. RURAL_STATUS_UNKNOWN
     rules_fired: tuple[str, ...] = field(default_factory=tuple)
     disclaimer: str = DISCLAIMER
 
@@ -148,12 +150,15 @@ def _zip_outside_state(request: QuoteRequest) -> bool:
     return state_fips is None or not county.startswith(state_fips)
 
 
-def _ineligible_reason(request: QuoteRequest, credit_box: LenderRules, sponsor: _Sponsor) -> Optional[str]:
+def _ineligible_reason(request: QuoteRequest, credit_box: LenderRules, sponsor: _Sponsor,
+                      new_construction_exit_rule: bool) -> Optional[str]:
     if request.borrower_type == "individual" and request.state in ENTITY_ONLY_STATES:
         return NEEDS_LLC_FORMATION
     if _zip_outside_state(request):
         return ZIP_STATE_MISMATCH
-    if (NEW_CONSTRUCTION_EXIT_RULE_ENABLED and request.purpose == "new_construction"
+    if request.purpose == "refinance" and not REFINANCE_QUOTES_ENABLED:
+        return REFINANCE_RULE_PENDING
+    if (new_construction_exit_rule and request.purpose == "new_construction"
             and sponsor.exits < NEW_CONSTRUCTION_MIN_EXITS):
         return NEW_CONSTRUCTION_NEEDS_EXIT
     if credit_box.approved_states and request.state not in credit_box.approved_states:
@@ -173,7 +178,7 @@ def _conditions(pricing_fico: int, loan: Decimal) -> tuple[Condition, ...]:
 
 
 def _leverage(request: QuoteRequest, sponsor: _Sponsor) -> tuple[tuple[Cut, ...], Decimal, tuple[str, ...]]:
-    """The LTC cuts that apply (each with its reason), the fee surcharge, and notes for the audit row."""
+    """The LTC cuts that apply (each with its reason), the fee surcharge, and caller-visible notes."""
     tier = next(t for t in PRICING_GRID if sponsor.pricing_fico >= t.min_fico)
     cuts: list[Cut] = []
     if tier.ltc_cut:
@@ -192,7 +197,8 @@ def _leverage(request: QuoteRequest, sponsor: _Sponsor) -> tuple[tuple[Cut, ...]
     return tuple(cuts), tier.fee_surcharge, tuple(notes)
 
 
-def quote(request: QuoteRequest) -> QuoteResult:
+def quote(request: QuoteRequest, *, new_construction_exit_rule: bool = False) -> QuoteResult:
+    """``new_construction_exit_rule`` is the second program's 1-exit rule; the caller passes its switch."""
     lender = _QUOTE_LENDER
     credit_box = effective_rules(lender)
     shares, shares_confirmed = resolve_params(SOFT_APPROVAL_PARAMS.get(QUOTE_LENDER_KEY))
@@ -201,7 +207,7 @@ def quote(request: QuoteRequest) -> QuoteResult:
     sponsor = _sponsor(request.guarantors)
     unsized_score = _score(request, sponsor.completed_deals, None)
 
-    ineligible = _ineligible_reason(request, credit_box, sponsor)
+    ineligible = _ineligible_reason(request, credit_box, sponsor, new_construction_exit_rule)
     if ineligible is not None:
         return _rejected(ineligible, unsized_score, unconfirmed)
 
@@ -236,5 +242,6 @@ def quote(request: QuoteRequest) -> QuoteResult:
         unconfirmed=unconfirmed,
         cuts=cuts,
         conditions=conditions,
+        notes=notes,
         rules_fired=tuple(c.reason for c in cuts) + notes + tuple(c.code for c in conditions),
     )

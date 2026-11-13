@@ -181,10 +181,20 @@ def test_zip_outside_the_crosswalk_is_noted_and_takes_no_rural_cut():
     result = quote(_request(zip_code="00000"))
 
     assert "CFPB_RURAL" not in [c.reason for c in result.cuts]
+    assert "RURAL_STATUS_UNKNOWN" in result.notes
     assert "RURAL_STATUS_UNKNOWN" in result.rules_fired
 
 
-def test_refinance_takes_the_refinance_cut():
+def test_refinance_is_withheld_until_the_debt_balance_rule_arrives():
+    result = quote(_request(purpose="refinance", existing_debt=Decimal("150000")))
+
+    assert result.status == "rejected"
+    assert result.reason == "REFINANCE_RULE_PENDING"
+    assert result.loan_amount is None
+
+
+def test_refinance_takes_the_refinance_cut_once_enabled(monkeypatch):
+    monkeypatch.setattr("src.lending.instant_quote.engine.REFINANCE_QUOTES_ENABLED", True)
     # 85% - 5% = 80% x 250K = 200K
     result = quote(_request(purpose="refinance", existing_debt=Decimal("150000")))
 
@@ -227,11 +237,11 @@ def test_new_construction_without_an_exit_is_quoted_while_the_rule_is_off():
     assert "NEW_CONSTRUCTION_NEEDS_EXIT" not in result.rules_fired
 
 
-def test_new_construction_needs_an_exit_once_the_rule_is_switched_on(monkeypatch):
-    monkeypatch.setattr("src.lending.instant_quote.engine.NEW_CONSTRUCTION_EXIT_RULE_ENABLED", True)
-
-    no_exit = quote(_request(purpose="new_construction", guarantors=(Guarantor(fico=720, completed_deals=3, exits=0),)))
-    one_exit = quote(_request(purpose="new_construction", guarantors=(Guarantor(fico=720, completed_deals=3, exits=1),)))
+def test_new_construction_needs_an_exit_once_the_rule_is_switched_on():
+    no_exit = quote(_request(purpose="new_construction", guarantors=(Guarantor(fico=720, completed_deals=3, exits=0),)),
+                    new_construction_exit_rule=True)
+    one_exit = quote(_request(purpose="new_construction", guarantors=(Guarantor(fico=720, completed_deals=3, exits=1),)),
+                     new_construction_exit_rule=True)
 
     assert no_exit.status == "rejected"
     assert no_exit.reason == "NEW_CONSTRUCTION_NEEDS_EXIT"

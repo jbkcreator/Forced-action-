@@ -926,6 +926,8 @@ class AppSettings(BaseSettings):
 	# callers send the key in X-Api-Key. Unset key = every caller refused.
 	lending_instant_quote_enabled: bool = Field(default=False, env="LENDING_INSTANT_QUOTE_ENABLED")
 	lending_instant_quote_api_key: Optional[SecretStr] = Field(default=None, env="LENDING_INSTANT_QUOTE_API_KEY")
+	# Second program's 1-exit new-construction rule. Off until Josh approves that program in writing.
+	lending_instant_quote_exit_rule_enabled: bool = Field(default=False, env="LENDING_INSTANT_QUOTE_EXIT_RULE_ENABLED")
 	# T-07 Minute-5 pre-qualification PDF. Off until Josh + compliance review the template.
 	lending_prequal_pdf_enabled: bool = Field(default=False, env="LENDING_PREQUAL_PDF_ENABLED")
 	# Placeholder range: +/- this percent around the requested amount, clamped to fitting lenders' limits.

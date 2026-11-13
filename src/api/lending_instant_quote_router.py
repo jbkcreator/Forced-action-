@@ -18,6 +18,7 @@ from pydantic import BaseModel, Field
 
 from config.lending_instant_quote import (
     API_KEY_HEADER,
+    MAX_DEAL_AMOUNT,
     RATE_LIMIT_PER_WINDOW,
     RATE_LIMIT_SCOPE,
     RATE_LIMIT_WINDOW_SECONDS,
@@ -26,7 +27,7 @@ from config.settings import get_settings
 from src.lending.instant_quote import Guarantor, QuoteRequest, QuoteResult, quote
 from src.lending.instant_quote.engine import BorrowerType, Purpose, QuoteStatus
 from src.lending.instant_quote.store import QuoteRecord, QuoteStore, SqlQuoteStore
-from src.services.rate_limit import enforce_or_429
+from src.services.rate_limit import enforce_bucket_or_429
 
 logger = logging.getLogger(__name__)
 
@@ -35,7 +36,7 @@ router = APIRouter(prefix="/api/lending", tags=["lending-instant-quote"])
 
 class GuarantorIn(BaseModel):
     fico: int = Field(ge=300, le=850)
-    completed_deals: int = Field(default=0, ge=0)
+    completed_deals: int = Field(ge=0)  # required: a missing count would take the 0-deal cut silently
     exits: int = Field(default=0, ge=0)
 
 
@@ -45,10 +46,10 @@ class QuoteIn(BaseModel):
     borrower_type: BorrowerType
     guarantors: list[GuarantorIn] = Field(min_length=1, max_length=10)
     purpose: Purpose
-    purchase_price: Decimal = Field(gt=0)
-    rehab: Decimal = Field(ge=0)
-    arv: Decimal = Field(gt=0)
-    existing_debt: Optional[Decimal] = Field(default=None, ge=0)
+    purchase_price: Decimal = Field(gt=0, le=MAX_DEAL_AMOUNT)
+    rehab: Decimal = Field(ge=0, le=MAX_DEAL_AMOUNT)
+    arv: Decimal = Field(gt=0, le=MAX_DEAL_AMOUNT)
+    existing_debt: Optional[Decimal] = Field(default=None, ge=0, le=MAX_DEAL_AMOUNT)
 
 
 
@@ -75,6 +76,7 @@ class QuoteOut(BaseModel):
     conditions: list[ConditionOut]
     borrower_score: int
     unconfirmed: bool
+    notes: list[str]
     disclaimer: str
 
 
@@ -84,8 +86,8 @@ def _gate(request: Request, api_key: Optional[str] = Header(default=None, alias=
     if not get_settings().lending_instant_quote_enabled:
         raise HTTPException(status_code=404, detail="Not found")
     key_bucket = _require_key(api_key)
-    enforce_or_429(request, scope=f"{RATE_LIMIT_SCOPE}:{key_bucket}", limit=RATE_LIMIT_PER_WINDOW,
-                   window_seconds=RATE_LIMIT_WINDOW_SECONDS)
+    enforce_bucket_or_429(RATE_LIMIT_SCOPE, key_bucket, limit=RATE_LIMIT_PER_WINDOW,
+                          window_seconds=RATE_LIMIT_WINDOW_SECONDS)
     return key_bucket
 
 
@@ -126,6 +128,7 @@ def _to_response(quote_id: str, result: QuoteResult) -> QuoteOut:
         conditions=[ConditionOut(code=c.code, amount=c.amount) for c in result.conditions],
         borrower_score=result.borrower_score,
         unconfirmed=result.unconfirmed,
+        notes=list(result.notes),
         disclaimer=result.disclaimer,
     )
 
@@ -144,11 +147,11 @@ def _json_safe(value: Any) -> Any:
     return value
 
 
-def _record(body: QuoteIn, result: QuoteResult, key_bucket: str) -> QuoteRecord:
+def _record(request: QuoteRequest, result: QuoteResult, key_bucket: str) -> QuoteRecord:
     return QuoteRecord(
         status=result.status,
         reason=result.reason,
-        request=body.model_dump(mode="json"),
+        request=_json_safe(asdict(request)),
         result=_json_safe(asdict(result)),
         rules_fired=list(result.rules_fired),
         unconfirmed=result.unconfirmed,
@@ -162,11 +165,13 @@ def instant_quote(
     key_bucket: str = Depends(_gate),
     store: QuoteStore = Depends(get_quote_store),
 ) -> QuoteOut:
-    result = quote(_to_request(body))
+    quote_request = _to_request(body)
+    result = quote(quote_request, new_construction_exit_rule=get_settings().lending_instant_quote_exit_rule_enabled)
     try:
-        quote_id = store.save(_record(body, result, key_bucket))
+        quote_id = store.save(_record(quote_request, result, key_bucket))
     except Exception as exc:
-        logger.error("[instant-quote] audit write failed, quote withheld: %s", type(exc).__name__)
+        logger.error("[instant-quote] audit write failed, quote withheld: %s state=%s purpose=%s status=%s key=%s",
+                     type(exc).__name__, quote_request.state, quote_request.purpose, result.status, key_bucket)
         raise HTTPException(status_code=500, detail="Quote unavailable") from exc
     logger.info("[instant-quote] quote=%s status=%s reason=%s unconfirmed=%s",
                 quote_id, result.status, result.reason, result.unconfirmed)

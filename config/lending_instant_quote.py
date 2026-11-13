@@ -73,13 +73,21 @@ REFINANCE_CUT = Decimal("-0.05")
 REFINANCE_CUT_REASON = "REFINANCE"
 LEVERAGE_ADJUSTMENTS_CONFIRMED = False
 
+# Refinance quotes are withheld until the debt-balance rule arrives (client Q4): a flat cut would give a wrong
+# figure for every refinance. Flip only together with a real debt-balance rule.
+REFINANCE_QUOTES_ENABLED = False
+REFINANCE_RULE_PENDING = "REFINANCE_RULE_PENDING"
+
+# Input ceiling for every dollar field: bounds the calculator's max-price search (it steps down from the ARV in
+# $1,000 steps) and rejects typos before any work.
+MAX_DEAL_AMOUNT = 50_000_000
+
 # Experience (ticket 06): Central cuts starting LTC 2.5% at 1-2 deals and 5% at none (Term Sheet Intake
 # Checklist, Nov 2 2026). Experience = the most experienced guarantor. 3+ deals: no cut.
 EXPERIENCE_CUTS: dict[int, Decimal] = {0: Decimal("-0.05"), 1: Decimal("-0.025"), 2: Decimal("-0.025")}
 EXPERIENCE_CUT_REASON = "EXPERIENCE"
 
-# Second-program new-construction rule (1 exit required). OFF: that program stays blocked until Josh approves
-# in writing (brief: NDL lane only). Neutral code name; the response never names a lender.
-NEW_CONSTRUCTION_EXIT_RULE_ENABLED = False
+# Second-program new-construction rule (1 exit required). Switch: settings.lending_instant_quote_exit_rule_enabled
+# (off: that program stays blocked until Josh approves in writing). Neutral code name; never names a lender.
 NEW_CONSTRUCTION_MIN_EXITS = 1
 NEW_CONSTRUCTION_NEEDS_EXIT = "NEW_CONSTRUCTION_NEEDS_EXIT"

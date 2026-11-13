@@ -88,10 +88,38 @@ def test_a_rejected_quote_names_no_lender_and_carries_no_figures(enabled, client
     assert "central" not in resp.text.lower() and "backflip" not in resp.text.lower()
 
 
-def test_refinance_without_existing_debt_is_quoted(enabled, client):
-    body = {**BODY, "purpose": "refinance"}
+def test_refinance_is_withheld_with_a_reason(enabled, client):
+    body = {**BODY, "purpose": "refinance", "existing_debt": "150000"}
+    data = client.post(URL, json=body, headers={"X-Api-Key": KEY}).json()
 
-    assert client.post(URL, json=body, headers={"X-Api-Key": KEY}).json()["status"] == "indicative"
+    assert data["status"] == "rejected"
+    assert data["reason"] == "REFINANCE_RULE_PENDING"
+
+
+@pytest.mark.parametrize("change", [
+    {"arv": "50000001"}, {"purchase_price": "50000001"}, {"rehab": "50000001"}, {"existing_debt": "50000001"},
+])
+def test_amounts_above_the_ceiling_are_rejected_before_any_work(enabled, client, change):
+    assert client.post(URL, json={**BODY, **change}, headers={"X-Api-Key": KEY}).status_code == 422
+
+
+def test_completed_deals_must_be_sent_for_every_guarantor(enabled, client):
+    body = {**BODY, "guarantors": [{"fico": 720, "exits": 3}]}
+
+    assert client.post(URL, json=body, headers={"X-Api-Key": KEY}).status_code == 422
+
+
+def test_unknown_rural_status_is_visible_to_the_caller(enabled, client):
+    # 33608 = MacDill AFB: in Hillsborough, not a residential ZCTA in the crosswalk
+    data = client.post(URL, json={**BODY, "zip_code": "33608"}, headers={"X-Api-Key": KEY}).json()
+
+    assert "RURAL_STATUS_UNKNOWN" in data["notes"]
+
+
+def test_the_audit_row_holds_the_request_as_the_engine_saw_it(enabled, client, store):
+    client.post(URL, json={**BODY, "state": "fl"}, headers={"X-Api-Key": KEY})
+
+    assert store.records[0].request["state"] == "FL"
 
 
 def test_switched_off_endpoint_reveals_nothing_even_for_a_bad_body(client, monkeypatch):
@@ -134,6 +162,13 @@ def test_keyless_callers_get_401_not_429(enabled, client):
     codes = {client.post(URL, json=BODY).status_code for _ in range(35)}
 
     assert codes == {401}
+
+
+def test_a_rotating_forwarded_for_header_does_not_reset_the_key_limit(enabled, client):
+    codes = [client.post(URL, json=BODY, headers={"X-Api-Key": KEY, "x-forwarded-for": f"203.0.113.{i}"}).status_code
+             for i in range(31)]
+
+    assert codes[30] == 429
 
 
 def test_rate_limited_after_30_a_minute(enabled, client):

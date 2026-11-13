@@ -31,3 +31,4 @@ def test_proof_table_lists_every_case_and_marks_pending_ones():
     assert "| Multi-guarantor (720 + 640) |" in table
     assert "| 206,000 | 206,000 |" in table
     assert table.count("awaiting Instant-Quote-Rules.md") == len(DOC_CASES)
+    assert "every figure is unconfirmed" not in table
