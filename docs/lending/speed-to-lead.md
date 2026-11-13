@@ -102,7 +102,7 @@ What happens next:
   form's separate **AI call consent box** with exactly the approved wording (`config/lending_web.AI_CALL_CONSENT_TEXT`,
   a draft until Josh approves it; UI PR forced-action-ui #10) and is not suppressed. The call box alone is not
   consent to the AI call, and the AI box alone starts no calls (the AI only follows the Josh/David cascade). LendingFlow
-  leads have no recorded AI-call consent, so they never get it (open question for Josh). The tag is removed from a
+  leads get it too, unless suppressed (team decision, Nov 13). The tag is removed from a
   returning contact that no longer qualifies.
 * **Emergency halt**: no tag at all while it is set. `@Cora emergency halt` also removes `ndl-speed-to-lead` and
   `ndl-ai-voice-ok` from every lead whose cascade started in the last 5 minutes, so the workflow skips David's call
@@ -187,5 +187,4 @@ from GHL (read-only; the stored GHL call import is used only if that read fails)
 * The callers' hours (built: Mon-Fri 9:00-7:15 ET, the alarm hours), the 3-minute spacing, the 5-minute "fresh"
   limit, the 72-hour queue limit and the backlog alert (10 leads / 30 minutes): confirm or change.
 * Holidays: should the queue skip any days besides weekends?
-* Does LendingFlow's consent cover automated (AI) calls? Until then LendingFlow leads never get Voice AI.
 * Approve the whisper and the Voice AI opening line above.

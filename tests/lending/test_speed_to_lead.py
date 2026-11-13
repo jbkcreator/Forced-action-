@@ -106,7 +106,7 @@ def web_lead(**over):
 
 def lendingflow_lead(**over):
     lead = web_lead(id=5, ghl_contact_id="c-5", sms_consent=False, call_consent=False, ai_call_consent=False,
-                    ai_call_consent_text_matches=False,
+                    ai_call_consent_text_matches=False, from_lendingflow=True,
                     intro_sms_tagged_at=NOW - timedelta(seconds=1))
     lead.update(over)
     return lead
@@ -163,11 +163,11 @@ def test_a_consented_website_lead_gets_the_text_then_the_cascade_with_voice_ai(g
     assert record["text_tagged_at"] == NOW and record["call_tagged_at"] == NOW and record["voice"] is True
 
 
-def test_a_lendingflow_lead_gets_the_cascade_but_never_voice_ai_and_no_scrub(gates):
+def test_a_lendingflow_lead_gets_the_cascade_with_voice_ai_and_no_scrub(gates):
     outcome, tags, db = run(lendingflow_lead(), source="lendingflow")
-    assert tags.calls == [("remove", "c-5", GHL_TAG_AI_VOICE_OK), ("remove", "c-5", GHL_TAG_SPEED_TO_LEAD),
+    assert tags.calls == [("add", "c-5", GHL_TAG_AI_VOICE_OK), ("remove", "c-5", GHL_TAG_SPEED_TO_LEAD),
                           ("add", "c-5", GHL_TAG_SPEED_TO_LEAD)]
-    assert outcome.text_status == TEXT_BY_LENDINGFLOW and outcome.voice_eligible is False
+    assert outcome.text_status == TEXT_BY_LENDINGFLOW and outcome.voice_eligible is True
     assert db.records[0]["text_tagged_at"] == NOW - timedelta(seconds=1)  # T-09's own tag time, for the report
     assert gates.scrubbed == []  # LendingFlow leads need no scrub (client decision)
 
@@ -763,3 +763,11 @@ def test_a_scrub_that_crosses_the_cutoff_queues_the_lead(gates):
     outcome = speed_to_lead.start(FakeDb(web_lead()), "web", 7, tags=FakeTags(), scrubber=lambda p: [],
                                   clock=lambda: next(times))
     assert (outcome.call_status, outcome.queue_reason) == (CALL_QUEUED, "outside_hours")
+
+
+
+def test_a_suppressed_lendingflow_lead_never_gets_voice_ai():
+    assert speed_to_lead.voice_eligible({"suppressed": True, "from_lendingflow": True, "ai_call_consent": False,
+                                         "ai_call_consent_text_matches": False}) is False
+    assert speed_to_lead.voice_eligible({"suppressed": False, "from_lendingflow": True, "ai_call_consent": False,
+                                         "ai_call_consent_text_matches": False}) is True

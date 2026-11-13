@@ -26,9 +26,9 @@ follow-up; website: the delivery itself) ``start`` runs every gate and adds the 
   together. A lead still queued after QUEUE_MAX_AGE leaves the queue with a Slack line; a backlog and a morning
   summary are posted to the lead-alerts channel once a day.
 * **Voice AI** (brief section 7: only on consented leads, discloses it is an AI assistant for Next Deal Lending). Our
-  code only marks who may get it: a website lead whose AI-call consent box was ticked with the exact wording. It runs
-  2 minutes after that lead's cascade starts, queued leads included. A LendingFlow lead has no recorded AI-call
-  consent, so it never gets the tag (open question for Josh).
+  code only marks who may get it: every LendingFlow lead (team decision, Nov 13) and a website lead whose AI-call
+  consent box was ticked with the exact wording, never a suppressed number. It runs 2 minutes after that lead's
+  cascade starts, queued leads included.
 
 The lending emergency halt withholds every tag and the queue releases nothing while it is on. Nothing here ever fails
 a delivery: errors are logged by lead id and the lead still reaches BatchDialer as usual (no hold: team decision,
@@ -142,11 +142,12 @@ _LEAD = {
     SOURCE_LENDINGFLOW: text(
         "SELECT id, phone, email, property_state, property_zip, received_at, ghl_contact_id, suppressed, "
         "handled_in_ghl_at, intro_sms_tagged_at, false AS sms_consent, false AS call_consent, "
-        "false AS ai_call_consent, false AS ai_call_consent_text_matches FROM lending.lendingflow_leads WHERE id = :id"),
+        "false AS ai_call_consent, false AS ai_call_consent_text_matches, true AS from_lendingflow "
+        "FROM lending.lendingflow_leads WHERE id = :id"),
     SOURCE_WEB: text(
         "SELECT id, phone, email, property_state, NULL AS property_zip, received_at, ghl_contact_id, suppressed, "
         "handled_in_ghl_at, NULL AS intro_sms_tagged_at, sms_consent, call_consent, ai_call_consent, "
-        "COALESCE(ai_call_consent_text_matches, false) AS ai_call_consent_text_matches "
+        "COALESCE(ai_call_consent_text_matches, false) AS ai_call_consent_text_matches, false AS from_lendingflow "
         "FROM lending.web_leads WHERE id = :id"),
 }
 _CLAIM = text("""
@@ -241,10 +242,15 @@ def callers_hours_start(now: datetime) -> datetime:
 
 
 def voice_eligible(lead: Mapping[str, Any]) -> bool:
-    """A recorded, unrevoked AI-call consent: the website form's AI call box ticked with exactly the approved wording
-    (``config/lending_web.AI_CALL_CONSENT_TEXT``), on a number that is not suppressed. LendingFlow leads have no
-    AI-call consent record, so never. The Voice AI only follows the Josh/David cascade, which needs the call box."""
-    return bool(lead["ai_call_consent"] and lead["ai_call_consent_text_matches"] and not lead["suppressed"])
+    """Who may get the Voice AI call, on a number that is not suppressed: every LendingFlow lead (team decision, Nov 13:
+    the Voice AI runs for LendingFlow and website leads; LendingFlow leads count as consented, as for their texts since
+    Nov 3), and a website lead who ticked the AI call box with exactly the approved wording
+    (``config/lending_web.AI_CALL_CONSENT_TEXT``). The Voice AI only follows the Josh/David cascade."""
+    if lead["suppressed"]:
+        return False
+    if lead.get("from_lendingflow"):
+        return True
+    return bool(lead["ai_call_consent"] and lead["ai_call_consent_text_matches"])
 
 
 def _web_text(db, lead: Mapping[str, Any], tags: TagClient, *, halted: bool, now: datetime) -> tuple[str, Optional[datetime]]:
