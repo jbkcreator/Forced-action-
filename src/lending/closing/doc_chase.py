@@ -7,7 +7,9 @@ expires or the chase closes. Messages go out from the sweep (``run_chase_sweep``
 from __future__ import annotations
 
 import logging
+import os
 import secrets
+import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Optional
@@ -20,7 +22,7 @@ from src.lending.closing.drafts import Recipient, chase_draft, submit_draft
 from src.lending.closing.rules import build_checklist, due_chase_day
 from src.lending.cora_inbox import add_to_inbox_safely
 from src.lending.partner_service import PartnerLinkNotConfigured, link_base_url
-from src.lending.partners import hash_token
+from src.lending.partners import InvalidSubmission, Upload, check_uploads, hash_token
 
 logger = logging.getLogger(__name__)
 
@@ -206,3 +208,57 @@ def run_chase_sweep(db, gate: SendGate, *, approvals_channel: str, now: Optional
         except Exception as exc:  # class only: SQL errors embed bound parameters
             logger.error("[doc-chase] chase %s skipped this sweep (%s)", chase["id"], type(exc).__name__)
     return queued
+
+
+# ---- uploads -------------------------------------------------------------------------------------------------------
+
+_ITEMS = text("SELECT item_code, label, received_at FROM lending.doc_chase_items WHERE chase_id = :c ORDER BY id")
+_INSERT_UPLOAD = text("""
+    INSERT INTO lending.doc_chase_uploads (chase_id, item_code, original_name, stored_path, content_type, size_bytes,
+                                           uploaded_at)
+    VALUES (:c, :code, :name, :path, :type, :size, :now)
+""")
+_MARK_RECEIVED = text("UPDATE lending.doc_chase_items SET received_at = COALESCE(received_at, :now) "
+                      "WHERE chase_id = :c AND item_code = :code")
+
+
+def chase_items(db, chase_id: int) -> list[dict[str, Any]]:
+    return [dict(row) for row in db.execute(_ITEMS, {"c": chase_id}).mappings()]
+
+
+def _write_private(folder: str, extension: str, data: bytes) -> str:
+    """Write under a generated name, readable by this user only; the borrower's file name never reaches the disk."""
+    os.makedirs(folder, mode=0o700, exist_ok=True)
+    os.chmod(folder, 0o700)
+    path = os.path.join(folder, f"{uuid.uuid4().hex}{extension}")
+    descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(descriptor, "wb") as handle:
+        handle.write(data)
+    return path
+
+
+def record_upload(db, chase: dict[str, Any], item_code: str, upload: Upload, *, upload_dir: str,
+                  now: datetime) -> None:
+    """Store one document for one checklist item and tick it. Raises InvalidSubmission for a bad file or item."""
+    items = {item["item_code"]: item for item in chase_items(db, chase["id"])}
+    if item_code not in items:
+        raise InvalidSubmission("choose which document this is")
+    present = check_uploads([upload])
+    if not present:
+        raise InvalidSubmission("choose a file to upload")
+    extension = os.path.splitext(upload.original_name)[1].lower()  # one of UPLOAD_TYPES, checked above
+    path = _write_private(os.path.join(upload_dir, str(chase["id"])), extension, upload.data)
+    try:
+        with db.begin_nested():
+            db.execute(_INSERT_UPLOAD, {"c": chase["id"], "code": item_code, "name": upload.original_name[:255],
+                                        "path": path, "type": upload.content_type, "size": len(upload.data),
+                                        "now": now})
+            db.execute(_MARK_RECEIVED, {"now": now, "c": chase["id"], "code": item_code})
+    except Exception:
+        os.remove(path)
+        raise
+    received = sum(1 for item in items.values() if item["received_at"] is not None or item["item_code"] == item_code)
+    add_to_inbox_safely(db, event_type="doc_chase_upload", dedup_key=f"{chase['id']}:{item_code}:{now.isoformat()}",
+                        summary=f"{_who(chase)} uploaded {items[item_code]['label']}: {received} of {len(items)} "
+                                "documents received.", payload={"chase_id": chase["id"], "item_code": item_code})
+    logger.info("[doc-chase] chase %s: %s uploaded (%s/%s)", chase["id"], item_code, received, len(items))
