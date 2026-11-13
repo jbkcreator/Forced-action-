@@ -81,3 +81,10 @@ def test_unknown_and_closed_chase_get_inactive_page(setup, closing_db):
     closing_db.execute(text("UPDATE lending.doc_chases SET status = 'complete'"))
     assert client.get(f"/api/lending/docs/{token}").status_code == 404
     assert _upload(client, token).status_code == 404
+
+
+def test_uploads_capped_per_document_and_inbox_not_flooded(setup, closing_db):
+    client, token, _, _, events = setup
+    statuses = [_upload(client, token).status_code for _ in range(6)]
+    assert statuses == [303] * 5 + [400]
+    assert len({e["dedup_key"] for e in events}) == 1

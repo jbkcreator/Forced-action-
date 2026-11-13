@@ -131,3 +131,19 @@ def test_card_shows_last4_only(closing_db):
     chat = FakeChatPort()
     _post(closing_db, chat, Gate())
     assert "0101" in _card_text(chat) and "8135550101" not in _card_text(chat) + chat.posts[-1]["text"]
+
+
+class BrokenGate(Gate):
+    def submit(self, draft, *, tool_name, context, ttl=None):
+        if "opp-bad" in context.tool_use_id:
+            raise RuntimeError("lane violation")
+        return super().submit(draft, tool_name=tool_name, context=context, ttl=ttl)
+
+
+def test_one_failing_deal_does_not_stop_the_card(closing_db):
+    _stage(closing_db, "opp-bad", "Application", timedelta(days=5), phone="+18135550111")
+    _stage(closing_db, "opp-ok", "Application", timedelta(days=4), phone="+18135550112")
+    chat, gate = FakeChatPort(), BrokenGate()
+    assert _post(closing_db, chat, gate)
+    card = _card_text(chat)
+    assert "0111" in card and "0112" in card and "call them" in card and len(gate.drafts) == 1

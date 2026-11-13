@@ -16,7 +16,14 @@ from typing import Any, Callable, Optional
 
 from sqlalchemy import text
 
-from config.lending_closing import CHASE_DAYS, CLOSED_STAGE_KEYS, TOKEN_TTL, UPLOAD_LINK_PATH
+from config.lending_closing import (
+    CHASE_DAYS,
+    CLOSED_STAGE_KEYS,
+    MAX_UPLOADS_PER_CHASE,
+    MAX_UPLOADS_PER_ITEM,
+    TOKEN_TTL,
+    UPLOAD_LINK_PATH,
+)
 from packages.agent_core.send_gate import SendGate
 from src.lending.closing.drafts import Recipient, chase_draft, submit_draft
 from src.lending.closing.rules import build_checklist, due_chase_day
@@ -37,7 +44,12 @@ class StartedChase:
     reused: bool
 
 
-_OPEN_FOR_PHONE = text("SELECT id FROM lending.doc_chases WHERE status = 'open' AND phone = :phone")
+_OPEN_FOR_BORROWER = text("""
+    SELECT id FROM lending.doc_chases
+     WHERE status = 'open'
+       AND (phone = CAST(:phone AS varchar)
+            OR (CAST(:phone AS varchar) IS NULL AND phone IS NULL AND lower(email) = lower(CAST(:email AS varchar))))
+""")
 _MISSING = text("SELECT label FROM lending.doc_chase_items WHERE chase_id = :c AND received_at IS NULL ORDER BY id")
 _OPPORTUNITY = text("SELECT ghl_opportunity_id FROM lending.ghl_opportunity_stage WHERE phone = :phone "
                     "ORDER BY updated_at DESC LIMIT 1")
@@ -55,7 +67,7 @@ _INSERT_CHASE = text("""
 """)
 _INSERT_ITEM = text("INSERT INTO lending.doc_chase_items (chase_id, item_code, label) VALUES (:c, :code, :label)")
 _INSERT_LINK = text("INSERT INTO lending.doc_chase_links (chase_id, token_hash, expires_at, created_at) "
-                    "VALUES (:c, :hash, :expires, :now)")
+                    "VALUES (:c, :hash, :expires, :now) ON CONFLICT (token_hash) DO NOTHING")
 _CHASE_FOR_TOKEN = text("""
     SELECT c.* FROM lending.doc_chase_links l JOIN lending.doc_chases c ON c.id = l.chase_id
      WHERE l.token_hash = :hash AND l.revoked_at IS NULL AND l.expires_at > :now AND c.status = 'open'
@@ -94,10 +106,9 @@ def start_chase(db, recipient: Recipient, *, lead_ref: str, accepted_by: str, le
     if not recipient.phone and not recipient.email:
         raise ValueError("the borrower has no phone or email on record")
     now = now or datetime.now(timezone.utc)
-    if recipient.phone:
-        existing = db.execute(_OPEN_FOR_PHONE, {"phone": recipient.phone}).scalar()
-        if existing is not None:
-            return StartedChase(existing, _missing(db, existing), reused=True)
+    existing = db.execute(_OPEN_FOR_BORROWER, {"phone": recipient.phone, "email": recipient.email}).scalar()
+    if existing is not None:
+        return StartedChase(existing, _missing(db, existing), reused=True)
     conditions = _quote_conditions(db, quote_id) if quote_id else []
     checklist = build_checklist(lender_key, conditions)
     phone_params = {"phone": recipient.phone}
@@ -120,6 +131,12 @@ def issue_link(db, chase_id: int, now: datetime) -> str:
     token = secrets.token_urlsafe(TOKEN_BYTES)
     db.execute(_INSERT_LINK, {"c": chase_id, "hash": hash_token(token), "expires": now + TOKEN_TTL, "now": now})
     return base + UPLOAD_LINK_PATH.format(token=token)
+
+
+def restore_link(db, chase_id: int, link: str, now: datetime) -> None:
+    """Make an already-sent link work again (its hash was rolled back with the sweep that issued it)."""
+    db.execute(_INSERT_LINK, {"c": chase_id, "hash": hash_token(link.rsplit("/", 1)[1]), "expires": now + TOKEN_TTL,
+                              "now": now})
 
 
 def chase_for_token(db, token: str, now: datetime) -> Optional[dict[str, Any]]:
@@ -163,8 +180,18 @@ def _close(db, chase: dict[str, Any], status: str, reason: str, now: datetime, s
 
 
 def _chase_step(db, gate: SendGate, chase: dict[str, Any], day: int, missing: tuple[str, ...], *,
-                approvals_channel: str, now: datetime, text_consent: Callable[[str], bool]) -> bool:
-    """Queue the day's message; True when a draft went to the gate. No usable channel raises one inbox item."""
+                approvals_channel: str, now: datetime, text_consent: Callable[[str], bool],
+                find_draft: Optional[Callable[[str], Any]]) -> bool:
+    """Queue the day's message; True when a draft went to the gate. No usable channel raises one inbox item.
+    A draft already queued under this step's key (a sweep whose transaction was lost after the gate committed it)
+    is adopted: its link is made valid again and the step recorded, so the borrower never gets a dead link."""
+    key = f"doc_chase:{chase['id']}:d{day}"
+    queued = find_draft(key) if find_draft is not None else None
+    if queued is not None:
+        if queued.payload.get("upload_link"):
+            restore_link(db, chase["id"], queued.payload["upload_link"], now)
+        db.execute(_INSERT_TOUCH, {"c": chase["id"], "day": day, "action": queued.action_id, "now": now})
+        return False
     text_ok = bool(chase["phone"]) and text_consent(chase["phone"])
     if not text_ok and not chase["email"]:
         db.execute(_INSERT_TOUCH, {"c": chase["id"], "day": day, "action": None, "now": now})
@@ -177,14 +204,13 @@ def _chase_step(db, gate: SendGate, chase: dict[str, Any], day: int, missing: tu
                         missing=missing, text_ok=text_ok,
                         contact_ref=f"ghl:{chase['ghl_contact_id']}" if chase["ghl_contact_id"] else f"doc_chase:{chase['id']}",
                         deal_ref=f"doc_chase:{chase['id']}")
-    action_id = submit_draft(gate, draft, key=f"doc_chase:{chase['id']}:d{day}", channel=approvals_channel,
-                             ttl=DRAFT_TTL)
+    action_id = submit_draft(gate, draft, key=key, channel=approvals_channel, ttl=DRAFT_TTL)
     db.execute(_INSERT_TOUCH, {"c": chase["id"], "day": day, "action": action_id, "now": now})
     return True
 
 
 def run_chase_sweep(db, gate: SendGate, *, approvals_channel: str, now: Optional[datetime] = None,
-                    text_consent: Callable[[str], bool]) -> int:
+                    text_consent: Callable[[str], bool], find_draft: Optional[Callable[[str], Any]] = None) -> int:
     """One pass over the open chases: close finished or lost ones, queue the due step. Returns drafts queued.
     Each chase runs in its own savepoint, so one failure never stops the others; the caller commits."""
     now = now or datetime.now(timezone.utc)
@@ -203,7 +229,7 @@ def run_chase_sweep(db, gate: SendGate, *, approvals_channel: str, now: Optional
                     day = due_chase_day(chase["accepted_at"], now, frozenset(chase["sent_days"] or ()))
                     if day is not None and _chase_step(db, gate, chase, day, missing,
                                                        approvals_channel=approvals_channel, now=now,
-                                                       text_consent=text_consent):
+                                                       text_consent=text_consent, find_draft=find_draft):
                         queued += 1
         except Exception as exc:  # class only: SQL errors embed bound parameters
             logger.error("[doc-chase] chase %s skipped this sweep (%s)", chase["id"], type(exc).__name__)
@@ -218,6 +244,8 @@ _INSERT_UPLOAD = text("""
                                            uploaded_at)
     VALUES (:c, :code, :name, :path, :type, :size, :now)
 """)
+_UPLOAD_COUNTS = text("SELECT count(*) AS chase_total, count(*) FILTER (WHERE item_code = :code) AS item_total "
+                      "FROM lending.doc_chase_uploads WHERE chase_id = :c")
 _MARK_RECEIVED = text("UPDATE lending.doc_chase_items SET received_at = COALESCE(received_at, :now) "
                       "WHERE chase_id = :c AND item_code = :code")
 
@@ -246,6 +274,9 @@ def record_upload(db, chase: dict[str, Any], item_code: str, upload: Upload, *, 
     present = check_uploads([upload])
     if not present:
         raise InvalidSubmission("choose a file to upload")
+    counts = db.execute(_UPLOAD_COUNTS, {"c": chase["id"], "code": item_code}).one()
+    if counts.item_total >= MAX_UPLOADS_PER_ITEM or counts.chase_total >= MAX_UPLOADS_PER_CHASE:
+        raise InvalidSubmission("this document can't take more uploads; call (656) 221-1100 to replace one")
     extension = os.path.splitext(upload.original_name)[1].lower()  # one of UPLOAD_TYPES, checked above
     path = _write_private(os.path.join(upload_dir, str(chase["id"])), extension, upload.data)
     try:
@@ -258,7 +289,7 @@ def record_upload(db, chase: dict[str, Any], item_code: str, upload: Upload, *, 
         os.remove(path)
         raise
     received = sum(1 for item in items.values() if item["received_at"] is not None or item["item_code"] == item_code)
-    add_to_inbox_safely(db, event_type="doc_chase_upload", dedup_key=f"{chase['id']}:{item_code}:{now.isoformat()}",
+    add_to_inbox_safely(db, event_type="doc_chase_upload", dedup_key=f"{chase['id']}:{item_code}",
                         summary=f"{_who(chase)} uploaded {items[item_code]['label']}: {received} of {len(items)} "
                                 "documents received.", payload={"chase_id": chase["id"], "item_code": item_code})
     logger.info("[doc-chase] chase %s: %s uploaded (%s/%s)", chase["id"], item_code, received, len(items))

@@ -22,6 +22,7 @@ from zoneinfo import ZoneInfo
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from config.lending_compliance import DEFAULT_TZ
@@ -672,12 +673,17 @@ class CoraToolkit:
         lead = self._lead(args.lead_ref)
         first_name = (lead.name or "").split()[0] if (lead.name or "").strip() else None
         recipient = Recipient(first_name, lead.phone, lead.email, lead.ghl_contact_id)
-        try:
-            with self._inbox() as session:
-                started = start_chase(session, recipient, lead_ref=lead.ref, accepted_by=f"slack:{context.user_id}",
-                                      quote_id=args.quote_id)
-        except (PartnerLinkNotConfigured, ValueError) as error:
-            raise ToolInputError(str(error)) from error
+        for attempt in (1, 2):  # a start racing another one for the same borrower gets the chase that won
+            try:
+                with self._inbox() as session:
+                    started = start_chase(session, recipient, lead_ref=lead.ref,
+                                          accepted_by=f"slack:{context.user_id}", quote_id=args.quote_id)
+                break
+            except IntegrityError:
+                if attempt == 2:
+                    raise
+            except (PartnerLinkNotConfigured, ValueError) as error:
+                raise ToolInputError(str(error)) from error
         note = ("a chase was already open for this borrower; it carries on" if started.reused else
                 "the document request goes to #approvals as a card within a minute; confirm it to the user")
         return {"chase": started.chase_id, "reused": started.reused,

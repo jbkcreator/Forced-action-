@@ -169,7 +169,7 @@ def _deal_line(deal: StuckDeal, action: str) -> str:
     return f"{line}\n      {action}"
 
 
-def _action(deal: StuckDeal, gate: SendGate, approvals_channel: str, text_consent: Callable[[str], bool]) -> str:
+def _action(db, deal: StuckDeal, gate: SendGate, approvals_channel: str, text_consent: Callable[[str], bool]) -> str:
     if deal.owner in ("lender", "title"):
         draft = LENDER_TITLE_DRAFTS[deal.owner].format(name=deal.first_name or "the borrower", stage=deal.stage_name,
                                                        days=deal.days)
@@ -177,7 +177,13 @@ def _action(deal: StuckDeal, gate: SendGate, approvals_channel: str, text_consen
     if deal.chase_id is not None:
         step = "request sent" if deal.last_chase_day in (None, 0) else f"day {deal.last_chase_day} reminder sent"
         return f"Document chase running ({step}); next reminder goes out on schedule"
-    if _draft_nudge(deal, gate, approvals_channel, text_consent):
+    try:
+        with db.begin_nested():
+            drafted = _draft_nudge(deal, gate, approvals_channel, text_consent)
+    except Exception as exc:  # class only: one deal never stops the card
+        logger.error("[closing-blockers] check-in for %s not drafted (%s)", deal.opportunity_id, type(exc).__name__)
+        return "Check-in could not be drafted: call them"
+    if drafted:
         return f"Check-in drafted for approval in <#{approvals_channel}>"
     return "No text consent or email on file: call them"
 
@@ -203,7 +209,7 @@ def post_blocker_card(db, chat: ChatPort, gate: SendGate, *, channel: Optional[s
             return False
         deals = stuck_deals(db, now)
         header, blocks = render_blocker_card(
-            day, [_deal_line(deal, _action(deal, gate, approvals_channel, text_consent)) for deal in deals])
+            day, [_deal_line(deal, _action(db, deal, gate, approvals_channel, text_consent)) for deal in deals])
         result = chat.post(text=header, blocks=blocks, channel=channel)
         if not result.ok:
             raise RuntimeError(f"closing blocker card not posted ({result.error or 'no Slack response'})")

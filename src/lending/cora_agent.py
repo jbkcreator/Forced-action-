@@ -623,7 +623,7 @@ def build_live_services(settings: AppSettings) -> Optional[CoraServices]:
                               approval_channel=config.approval_channel_id or "",
                               is_graduated=make_is_graduated(engine))
     closing_blockers, doc_chase = build_closing_steps(settings, engine=engine, chat=chat, gate=services.gate,
-                                                      config=config)
+                                                      config=config, queue=services.queue)
     return services._replace(web_client=web, inbox_digest=digest,
                              morning_digest=make_morning_digest(engine, store, chat, config),
                              instantly_replies=make_instantly_replies(engine, store, config, messages_client,
@@ -634,7 +634,8 @@ def build_live_services(settings: AppSettings) -> Optional[CoraServices]:
 
 
 def build_closing_steps(settings: AppSettings, *, engine: Engine, chat: ChatPort, gate: SendGate,
-                        config: AgentCoreConfig) -> tuple[Optional[Callable[[], bool]], Optional[Callable[[], int]]]:
+                        config: AgentCoreConfig, queue: Optional[PendingActionQueue] = None
+                        ) -> tuple[Optional[Callable[[], bool]], Optional[Callable[[], int]]]:
     """P2.4 sweep steps, each on its own transaction; None while its flag is off. The card goes to Cora's channel
     and every draft to #approvals, with the borrower's text consent read in the same transaction."""
     approvals = (config.approval_channel_id or "") if config is not None else ""
@@ -647,7 +648,8 @@ def build_closing_steps(settings: AppSettings, *, engine: Engine, chat: ChatPort
     def chase_sweep() -> int:
         with Session(engine) as db, db.begin():
             return run_chase_sweep(db, gate, approvals_channel=approvals,
-                                   text_consent=lambda phone: has_text_consent(db, phone))
+                                   text_consent=lambda phone: has_text_consent(db, phone),
+                                   find_draft=queue.find_by_idempotency_key if queue is not None else None)
 
     return (blocker_card if settings.lending_closing_blockers_enabled else None,
             chase_sweep if settings.lending_doc_chase_enabled else None)

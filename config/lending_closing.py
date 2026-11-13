@@ -23,6 +23,8 @@ CARD_LAST_TIME = time(12, 0)
 
 CHASE_DAYS = (0, 2, 5, 8)  # ET calendar days after acceptance: the request, then the brief's Day 2 / 5 / 8
 TOKEN_TTL = timedelta(days=30)
+MAX_UPLOADS_PER_ITEM = 5  # a leaked link cannot fill the disk: newer copies are allowed up to this
+MAX_UPLOADS_PER_CHASE = 40
 UPLOAD_LINK_PATH = "/api/lending/docs/{token}"
 REQUESTED_BY = "doc_chase"  # pending_actions.requested_by for every P2.4 draft
 

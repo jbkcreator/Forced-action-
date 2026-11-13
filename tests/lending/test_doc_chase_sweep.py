@@ -106,3 +106,27 @@ def test_no_channel_raises_inbox_item_once(closing_db, link_base, inbox):
     _sweep(closing_db, gate, 0, consent=False)
     assert gate.drafts == {} and [e["event_type"] for e in inbox] == ["doc_chase_no_channel"]
     assert closing_db.execute(text("SELECT count(*) FROM lending.doc_chase_links")).scalar() == 0
+
+
+class RecoveringGate(Gate):
+    """Keeps every draft by key like the real queue; ``find`` is PendingActionQueue.find_by_idempotency_key."""
+
+    def find(self, key):
+        draft = self.drafts.get(key)
+        return None if draft is None else type("A", (), {"action_id": list(self.drafts).index(key) + 1,
+                                                          "payload": draft.payload})()
+
+
+def test_link_survives_a_rollback_after_the_draft_was_queued(closing_db, chase, inbox):
+    from src.lending.closing.doc_chase import chase_for_token
+    gate = RecoveringGate()
+    savepoint = closing_db.begin_nested()
+    run_chase_sweep(closing_db, gate, approvals_channel="C_APPROVALS", now=ACCEPTED,
+                    text_consent=lambda phone: True, find_draft=gate.find)
+    savepoint.rollback()  # the sweep's transaction is lost after the gate committed the draft
+    run_chase_sweep(closing_db, gate, approvals_channel="C_APPROVALS", now=ACCEPTED,
+                    text_consent=lambda phone: True, find_draft=gate.find)
+    draft, = gate.drafts.values()
+    token = draft.payload["upload_link"].rsplit("/", 1)[1]
+    assert chase_for_token(closing_db, token, ACCEPTED) is not None
+    assert closing_db.execute(text("SELECT action_id FROM lending.doc_chase_touches")).scalar() == 1

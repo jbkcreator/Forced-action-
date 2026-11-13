@@ -42,6 +42,8 @@ def chase_draft(kind: str, recipient: Recipient, *, link: Optional[str], missing
     summary = (f"📄 {kind} · {version}\n{recipient.first_name or 'Borrower'}{last4}: "
                f"{len(missing)} document(s) missing")
     payload = {"template_version": version, "ghl_contact_id": recipient.ghl_contact_id, "deal_ref": deal_ref, **fields}
+    if link:
+        payload["upload_link"] = link  # read back if the sweep's transaction is lost after the draft was queued
     return EgressDraft(channel=channel, payload=payload, summary=summary, recipient_phone=recipient.phone,
                        recipient_email=recipient.email, contact_ref=contact_ref, deal_ref=deal_ref)
 

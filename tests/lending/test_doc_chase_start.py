@@ -82,3 +82,11 @@ def test_every_issued_link_works_until_expiry_or_close(closing_db, link_base):
     assert chase_for_token(closing_db, "not-a-token", NOW) is None
     closing_db.execute(text("UPDATE lending.doc_chases SET status = 'complete'"))
     assert chase_for_token(closing_db, token, NOW) is None
+
+
+def test_email_only_borrower_reuses_open_chase(closing_db, link_base):
+    ana = Recipient("Ana", None, "Ana@Example.com", None)
+    first = start_chase(closing_db, ana, lead_ref="web_lead:9", accepted_by="slack:U1", now=NOW)
+    second = start_chase(closing_db, Recipient("Ana", None, "ana@example.com", None), lead_ref="web_lead:9",
+                         accepted_by="slack:U1", now=NOW)
+    assert second.reused and second.chase_id == first.chase_id

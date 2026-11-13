@@ -1571,6 +1571,8 @@ class LendingDocChase(LendingBase):
     __table_args__ = (
         CheckConstraint("status IN ('open', 'complete', 'cancelled')", name="ck_lending_doc_chases_status"),
         Index("uq_lending_doc_chases_open_phone", "phone", unique=True, postgresql_where=text("status = 'open'")),
+        Index("uq_lending_doc_chases_open_email", text("lower(email)"), unique=True,
+              postgresql_where=text("status = 'open' AND phone IS NULL")),
         Index("idx_lending_doc_chases_opportunity", "ghl_opportunity_id"),
     )
 
