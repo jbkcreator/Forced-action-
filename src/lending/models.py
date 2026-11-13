@@ -1525,3 +1525,34 @@ class LendingTemplateGraduation(LendingBase):
     edit_rate: Mapped[float] = mapped_column(Numeric(5, 4), nullable=False)
     revoked_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
     revoked_by: Mapped[Optional[str]] = mapped_column(String(64))
+
+
+class LendingSpeedToLead(LendingBase):
+    """P2.1: one row per new lead the speed-to-lead step looked at (``src/lending/speed_to_lead.py``).
+
+    The timings Josh is shown (``python -m src.lending.speed_to_lead --report``): when the lead arrived, when the
+    intro-text tag and the call-cascade tag reached GHL, and why either was withheld. The calls themselves are GHL's
+    (``call_dispositions`` with ``call_source = 'ghl'``). Unique per lead, so a retried delivery never starts a
+    second cascade. No phone or email is stored here."""
+
+    __tablename__ = "speed_to_lead"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    source: Mapped[str] = mapped_column(String(20), nullable=False)  # lendingflow | web
+    lead_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    ghl_contact_id: Mapped[Optional[str]] = mapped_column(String(64))
+    received_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_now, server_default=text("now()"))
+    text_status: Mapped[Optional[str]] = mapped_column(String(30))
+    text_tagged_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    call_status: Mapped[Optional[str]] = mapped_column(String(30))
+    call_block_reason: Mapped[Optional[str]] = mapped_column(String(60))
+    call_tagged_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    voice_eligible: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default=text("false"))
+
+    __table_args__ = (
+        Index("uq_speed_to_lead_source_lead", "source", "lead_id", unique=True),
+        Index("ix_speed_to_lead_held_text", "source", "received_at",
+              postgresql_where=text("text_status = 'held_for_window'")),
+        CheckConstraint("source IN ('lendingflow', 'web')", name="ck_speed_to_lead_source"),
+    )

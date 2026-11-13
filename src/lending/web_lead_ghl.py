@@ -33,6 +33,7 @@ from config.lending_web import (
     GHL_TAG_SMS_CONSENT_YES,
     GHL_TAG_WEB_LEAD,
 )
+from config.lending_lendingflow import INTRO_NAME_FALLBACK
 from config.settings import get_settings
 from src.lending.cold_leads import reconcile_warm_contact
 from src.lending.ghl_account import GhlAccount, ghl_headers, lending_ghl_account
@@ -81,6 +82,9 @@ def _custom_fields(lead: Mapping[str, Any]) -> list[dict[str, str]]:
         fields.append({"id": settings.lending_ghl_cf_loan_amount, "value": str(lead["loan_amount"])})
     if settings.lending_ghl_cf_credit_band and lead["credit_band"]:
         fields.append({"id": settings.lending_ghl_cf_credit_band, "value": lead["credit_band"]})
+    if settings.lending_ghl_cf_intro_name:  # P2.1 web intro text: first name or "there", as for LendingFlow
+        first = str(lead["name"] or "").strip().partition(" ")[0]
+        fields.append({"id": settings.lending_ghl_cf_intro_name, "value": first or INTRO_NAME_FALLBACK})
     if settings.lending_ghl_cf_property_address and lead["property_address"]:
         fields.append({"id": settings.lending_ghl_cf_property_address, "value": lead["property_address"]})
     return fields

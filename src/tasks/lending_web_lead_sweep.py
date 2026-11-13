@@ -24,6 +24,8 @@ from src.lending.disposition_delivery import _configured_slack, _slack_client
 from src.lending.slack_names import name_and_ref
 from src.lending.slack_test_filter import log_skipped, hidden_web_lead_ids
 from src.lending.web_lead_ghl import get_live_sink
+from config.lending_speed_to_lead import SOURCE_WEB
+from src.lending import speed_to_lead
 from src.lending.web_leads import deliver_pending
 
 logger = logging.getLogger(__name__)
@@ -76,10 +78,23 @@ def alert_undelivered(slack_client: Any = None, minutes: Optional[int] = None) -
         return 0
 
 
+def release_held_web_intro() -> int:
+    """P2.1: website intro texts held for the 8am-8pm window. Never raises."""
+    try:
+        with lending_session() as db:
+            released = speed_to_lead.release_held_web_intro(db, speed_to_lead.live_tag_client())
+            db.commit()
+        return released
+    except Exception as exc:
+        logger.error("[lending-web] held intro release failed: %s", type(exc).__name__)
+        return 0
+
+
 def run() -> int:
     with lending_session() as db:
-        delivered = deliver_pending(db, get_live_sink())
-    logger.info("[lending-web] sweep delivered=%d", delivered)
+        delivered = deliver_pending(db, get_live_sink(), after_delivery=speed_to_lead.live_step(SOURCE_WEB))
+    released = release_held_web_intro()
+    logger.info("[lending-web] sweep delivered=%d intro_released=%d", delivered, released)
     # Website leads into the BatchDialer "Website" campaign (call-consent tick + DNC scrub; removals always run).
     lendingflow_dialer.run_from_settings(lendingflow_dialer.WEBSITE)
     alert_undelivered()

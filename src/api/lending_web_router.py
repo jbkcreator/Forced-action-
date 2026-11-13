@@ -17,6 +17,8 @@ from config.lending_web import RATE_LIMIT_PER_WINDOW, RATE_LIMIT_SCOPE, RATE_LIM
 from src.api.deps import get_db
 from src.lending.db import lending_session
 from src.lending.web_lead_ghl import get_live_sink
+from config.lending_speed_to_lead import SOURCE_WEB
+from src.lending import speed_to_lead
 from src.lending.web_leads import InvalidWebLead, build_input, deliver_pending, merge_into_existing, save_web_lead, will_be_contacted
 from src.services.rate_limit import client_ip, enforce_or_429
 
@@ -29,7 +31,7 @@ def deliver_in_background(lead_id: int) -> None:
     """Runs after the response. Never raises: the saved row and the sweep cover any failure."""
     try:
         with lending_session() as db:
-            deliver_pending(db, get_live_sink(), lead_id=lead_id)
+            deliver_pending(db, get_live_sink(), lead_id=lead_id, after_delivery=speed_to_lead.live_step(SOURCE_WEB))
     except Exception as exc:
         logger.error("[lending-web] background delivery crashed lead=%s: %s", lead_id, type(exc).__name__)
 

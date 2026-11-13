@@ -15,6 +15,7 @@ import logging
 import re
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
+from collections.abc import Callable
 from typing import Any, Mapping, Optional, Protocol
 
 from sqlalchemy import text
@@ -649,12 +650,20 @@ def release_held_and_commit(sink: Optional[Any]) -> int:
         return 0
 
 
-def run_followups(db, followups: list[FollowUp]) -> None:
+def run_followups(db, followups: list[FollowUp],
+                  after_delivery: Optional[Callable[[Any, int], None]] = None) -> None:
     """After the delivery commit: emit the event. A lead is marked done only when it succeeded; otherwise the
     sweep redoes it (skipped once ``event_emitted_at`` is set). No pre-qual letter here: it waits for the call
     figures (Q2). Never raises; logs lead id only."""
     for item in followups:
         lead = item.lead
+        if after_delivery is not None:  # P2.1 speed-to-lead first: Josh's phone should ring as soon as possible
+            after_delivery(db, lead["id"])
+            try:
+                db.commit()
+            except Exception as exc:
+                db.rollback()
+                logger.error("[lendingflow] speed-to-lead commit failed lead=%s: %s", lead["id"], type(exc).__name__)
         if _emit_event(db, lead):
             try:
                 _mark(db, lead["id"], "followup_done_at", datetime.now(timezone.utc))
@@ -663,7 +672,8 @@ def run_followups(db, followups: list[FollowUp]) -> None:
                 logger.error("[lendingflow] follow-up mark failed lead=%s: %s", lead["id"], type(exc).__name__)
 
 
-def deliver_and_follow_up(sink: Optional[LeadSink], *, lead_id: Optional[int] = None) -> int:
+def deliver_and_follow_up(sink: Optional[LeadSink], *, lead_id: Optional[int] = None,
+                          after_delivery: Optional[Callable[[Any, int], None]] = None) -> int:
     """Background / sweep entry point: deliver (own session, committed), then follow up. Never raises."""
     from src.lending.db import lending_session
 
@@ -671,7 +681,7 @@ def deliver_and_follow_up(sink: Optional[LeadSink], *, lead_id: Optional[int] = 
         with lending_session() as db:
             followups = deliver_pending(db, sink, lead_id=lead_id)
             db.commit()  # delivery state is durable before any follow-up runs
-            run_followups(db, followups)
+            run_followups(db, followups, after_delivery)
         return len(followups)
     except Exception as exc:
         logger.error("[lendingflow] background delivery crashed lead=%s: %s", lead_id, type(exc).__name__)

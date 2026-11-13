@@ -12,6 +12,7 @@ import logging
 import re
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from collections.abc import Callable
 from typing import Any, Mapping, Optional, Protocol
 
 from sqlalchemy import text
@@ -322,12 +323,14 @@ _DELIVERABLE = (
 )
 
 
-def deliver_pending(db, sink: Optional[LeadSink], *, lead_id: Optional[int] = None, now: Optional[datetime] = None) -> int:
+def deliver_pending(db, sink: Optional[LeadSink], *, lead_id: Optional[int] = None, now: Optional[datetime] = None,
+                    after_delivery: Optional[Callable[[Any, int], None]] = None) -> int:
     """Deliver stored leads to the sink; returns how many reached it. One lead (``lead_id``, used
     right after submit) or the retry backlog. The backlog is every lead not yet in GHL that is younger
     than GHL_GIVE_UP_AFTER_HOURS and past its backoff wait, so a long outage is retried for days, not
     minutes. With no sink (GHL not configured) leads stay pending and no attempt is counted, so
-    configuring GHL later drains them. Never raises per lead."""
+    configuring GHL later drains them. ``after_delivery`` (P2.1 speed-to-lead; live callers only) runs for each lead
+    that reached GHL and never raises. Never raises per lead."""
     now = now or datetime.now(timezone.utc)
     if sink is None:
         logger.warning("[lending-web] GHL is not configured: web leads stay pending")
@@ -343,7 +346,11 @@ def deliver_pending(db, sink: Optional[LeadSink], *, lead_id: Optional[int] = No
     rows = db.execute(text(_DELIVERABLE.format(extra=extra)), params).mappings().all()
     delivered = 0
     for row in rows:
-        delivered += _deliver_one(db, sink, dict(row), now)
+        lead = dict(row)
+        reached = _deliver_one(db, sink, lead, now)
+        delivered += reached
+        if reached and after_delivery is not None:
+            after_delivery(db, lead["id"])
     return delivered
 
 
