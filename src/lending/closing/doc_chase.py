@@ -51,8 +51,9 @@ _OPEN_FOR_BORROWER = text("""
             OR (CAST(:phone AS varchar) IS NULL AND phone IS NULL AND lower(email) = lower(CAST(:email AS varchar))))
 """)
 _MISSING = text("SELECT label FROM lending.doc_chase_items WHERE chase_id = :c AND received_at IS NULL ORDER BY id")
-_OPPORTUNITY = text("SELECT ghl_opportunity_id FROM lending.ghl_opportunity_stage WHERE phone = :phone "
-                    "ORDER BY updated_at DESC LIMIT 1")
+# Only an unambiguous match: a borrower with two deals in GHL is never guessed.
+_OPPORTUNITY = text("SELECT min(ghl_opportunity_id) FROM lending.ghl_opportunity_stage WHERE phone = :phone "
+                    "HAVING count(*) = 1")
 _LOAN_FILE = text("SELECT id FROM lending.loan_files WHERE borrower_phone = :phone ORDER BY created_at DESC LIMIT 1")
 # P2.2 stores each quote's request and result in lending.instant_quotes; conditions[] carries {"code": ...}.
 _QUOTE_CONDITIONS = text("SELECT c ->> 'code' FROM lending.instant_quotes q, "
@@ -160,6 +161,14 @@ _OPEN_CHASES = text("""
      ORDER BY c.id
        FOR UPDATE OF c SKIP LOCKED
 """)
+# A chase started before its deal reached GHL picks the deal up once the borrower's phone has exactly one.
+_ATTACH_OPPORTUNITIES = text("""
+    UPDATE lending.doc_chases c SET ghl_opportunity_id = m.opp, updated_at = :now
+      FROM (SELECT phone, min(ghl_opportunity_id) AS opp FROM lending.ghl_opportunity_stage
+             WHERE phone IS NOT NULL GROUP BY phone HAVING count(*) = 1) m
+     WHERE c.status = 'open' AND c.ghl_opportunity_id IS NULL AND c.phone = m.phone
+""")
+_QUEUED_ACTIONS = text("SELECT action_id FROM lending.doc_chase_touches WHERE chase_id = :c AND action_id IS NOT NULL")
 _CLOSE = text("UPDATE lending.doc_chases SET status = :status, status_reason = :reason, updated_at = :now WHERE id = :c")
 _REVOKE_LINKS = text("UPDATE lending.doc_chase_links SET revoked_at = :now WHERE chase_id = :c AND revoked_at IS NULL")
 _INSERT_TOUCH = text("INSERT INTO lending.doc_chase_touches (chase_id, chase_day, action_id, created_at) "
@@ -171,12 +180,26 @@ def _who(chase: dict[str, Any]) -> str:
     return f"{chase['first_name'] or 'Borrower'}{last4}"
 
 
-def _close(db, chase: dict[str, Any], status: str, reason: str, now: datetime, summary: str) -> None:
+def _close(db, chase: dict[str, Any], status: str, reason: str, now: datetime, summary: str,
+           block_draft: Optional[Callable[[int, str], Any]]) -> None:
+    """Close the chase, revoke its links and withdraw its drafts still awaiting approval. An approved draft not yet
+    sent (outside the window, waiting on the carrier) is refused by Cora's send check, which reads the chase status."""
     db.execute(_CLOSE, {"status": status, "reason": reason, "now": now, "c": chase["id"]})
     db.execute(_REVOKE_LINKS, {"now": now, "c": chase["id"]})
+    if block_draft is not None:
+        for action_id in db.execute(_QUEUED_ACTIONS, {"c": chase["id"]}).scalars():
+            block_draft(action_id, f"document chase {status}")
     add_to_inbox_safely(db, event_type=f"doc_chase_{status}", dedup_key=str(chase["id"]), summary=summary,
                         payload={"chase_id": chase["id"], "reason": reason})
     logger.info("[doc-chase] chase %s %s (%s)", chase["id"], status, reason)
+
+
+def chase_id_of(deal_ref: Optional[str]) -> Optional[int]:
+    """The chase a draft belongs to (``deal_ref`` ``doc_chase:<id>``), else None."""
+    prefix = "doc_chase:"
+    if deal_ref and deal_ref.startswith(prefix) and deal_ref[len(prefix):].isdigit():
+        return int(deal_ref[len(prefix):])
+    return None
 
 
 def _chase_step(db, gate: SendGate, chase: dict[str, Any], day: int, missing: tuple[str, ...], *,
@@ -210,21 +233,24 @@ def _chase_step(db, gate: SendGate, chase: dict[str, Any], day: int, missing: tu
 
 
 def run_chase_sweep(db, gate: SendGate, *, approvals_channel: str, now: Optional[datetime] = None,
-                    text_consent: Callable[[str], bool], find_draft: Optional[Callable[[str], Any]] = None) -> int:
+                    text_consent: Callable[[str], bool], find_draft: Optional[Callable[[str], Any]] = None,
+                    block_draft: Optional[Callable[[int, str], Any]] = None) -> int:
     """One pass over the open chases: close finished or lost ones, queue the due step. Returns drafts queued.
     Each chase runs in its own savepoint, so one failure never stops the others; the caller commits."""
     now = now or datetime.now(timezone.utc)
     queued = 0
+    db.execute(_ATTACH_OPPORTUNITIES, {"now": now})
     for chase in [dict(row) for row in db.execute(_OPEN_CHASES).mappings()]:
         try:
             with db.begin_nested():
                 missing = _missing(db, chase["id"])
                 if chase["stage_key"] in CLOSED_STAGE_KEYS:
                     _close(db, chase, "cancelled", f"stage:{chase['stage_key']}", now,
-                           f"{_who(chase)}: document chase stopped, the deal moved to {chase['stage_key']}.")
+                           f"{_who(chase)}: document chase stopped, the deal moved to {chase['stage_key']}.",
+                           block_draft)
                 elif not missing:
                     _close(db, chase, "complete", "all received", now,
-                           f"{_who(chase)}: all documents received.")
+                           f"{_who(chase)}: all documents received.", block_draft)
                 else:
                     day = due_chase_day(chase["accepted_at"], now, frozenset(chase["sent_days"] or ()))
                     if day is not None and _chase_step(db, gate, chase, day, missing,

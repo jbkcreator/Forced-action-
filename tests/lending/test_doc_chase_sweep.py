@@ -130,3 +130,32 @@ def test_link_survives_a_rollback_after_the_draft_was_queued(closing_db, chase, 
     token = draft.payload["upload_link"].rsplit("/", 1)[1]
     assert chase_for_token(closing_db, token, ACCEPTED) is not None
     assert closing_db.execute(text("SELECT action_id FROM lending.doc_chase_touches")).scalar() == 1
+
+
+def test_closing_a_chase_blocks_its_drafts_still_waiting(closing_db, chase, inbox):
+    gate, blocked = Gate(), []
+    _sweep(closing_db, gate, 0)
+    closing_db.execute(text("UPDATE lending.doc_chase_items SET received_at = now()"))
+    run_chase_sweep(closing_db, gate, approvals_channel="C_APPROVALS", now=ACCEPTED + timedelta(days=2),
+                    text_consent=lambda phone: True, block_draft=lambda action_id, reason: blocked.append(action_id))
+    assert blocked == [1]
+
+
+def test_chase_started_before_its_deal_reached_ghl_still_stops_when_the_deal_is_lost(closing_db, chase, inbox):
+    gate = Gate()
+    _sweep(closing_db, gate, 0)
+    closing_db.execute(text("INSERT INTO lending.ghl_opportunity_stage (ghl_opportunity_id, stage_name, stage_key, "
+                            "entered_at, phone) VALUES ('opp-late', 'Lost', 'lost', now(), '+18135550101')"))
+    _sweep(closing_db, gate, 2)
+    row = closing_db.execute(text("SELECT status, ghl_opportunity_id FROM lending.doc_chases")).one()
+    assert tuple(row) == ("cancelled", "opp-late") and len(gate.drafts) == 1
+
+
+def test_borrower_with_two_deals_is_not_guessed(closing_db, chase, inbox):
+    for opp in ("opp-a", "opp-b"):
+        closing_db.execute(text("INSERT INTO lending.ghl_opportunity_stage (ghl_opportunity_id, stage_name, "
+                                "stage_key, entered_at, phone) VALUES (:o, 'Lost', 'lost', now(), '+18135550101')"),
+                           {"o": opp})
+    _sweep(closing_db, Gate(), 0)
+    row = closing_db.execute(text("SELECT status, ghl_opportunity_id FROM lending.doc_chases")).one()
+    assert tuple(row) == ("open", None)

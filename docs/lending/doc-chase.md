@@ -22,11 +22,12 @@ on `lending-api`, settings and copy in `config/lending_closing.py`. Both parts r
 
 Once a day between 7:00 and noon ET (`lending.closing_blocker_cards` stops a second post). Lists every deal in
 Application, Ready to fund or Submitted to lender (`ACTIVE_STAGE_KEYS`) for more than 3 days, oldest first, red.
-Who holds it up: missing documents mean the borrower (the partner when the deal came from a partner's file);
+A long card continues in its thread, so every deal is shown in full. Who holds it up: missing documents mean the borrower (the partner when the deal came from a partner's file);
 otherwise Application = borrower, Submitted to lender = lender, Ready to fund = closing (title).
 
 - Borrower deal with a document chase running: the chase does the reminding, the card shows the last step.
-- Borrower deal without a chase: a check-in draft goes to #approvals (at most one per deal every 3 days in a stage).
+- Borrower deal without a chase: a check-in draft goes to #approvals (at most one per deal every 3 days in a stage),
+  by text with consent, else by the email on the lead record (website lead, LendingFlow lead or loan file).
 - No text consent and no email: the card says to call.
 - Lender or title: the card shows a ready-to-copy line for Josh. Cora never contacts lenders or title companies.
 
@@ -47,7 +48,9 @@ upload link; every link works for 30 days or until the chase closes. Template ve
 are counted by the P1.4 tracker like any other.
 
 Closes: `complete` when every document is in, `cancelled` when the deal enters Funded, Lost or Nurture. Links are
-revoked and Cora's inbox gets one item. Each upload also raises an inbox item ("3 of 6 received").
+revoked, drafts still awaiting approval are withdrawn, Cora's send check refuses any approved reminder of a closed
+chase, and Cora's inbox gets one item. A chase started before its deal reached GHL is matched to the deal on a later
+sweep, but only when the borrower's phone has exactly one GHL opportunity (never guessed). Each upload also raises an inbox item ("3 of 6 received").
 `get_document_chases` answers "who still owes documents?".
 
 ## Open with Josh

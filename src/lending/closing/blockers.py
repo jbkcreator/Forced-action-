@@ -115,18 +115,52 @@ def _first_names(db, phones: list[Optional[str]]) -> dict[str, str]:
         return {}
 
 
+# Where a borrower's email and GHL contact live when no chase holds them, newest record first.
+_LEAD_CONTACTS = (
+    text("SELECT DISTINCT ON (phone) phone, email, ghl_contact_id FROM lending.web_leads "
+         "WHERE phone = ANY(:phones) ORDER BY phone, received_at DESC"),
+    text("SELECT DISTINCT ON (phone) phone, email, ghl_contact_id FROM lending.lendingflow_leads "
+         "WHERE phone = ANY(:phones) ORDER BY phone, received_at DESC"),
+    text("SELECT DISTINCT ON (borrower_phone) borrower_phone AS phone, borrower_email AS email, "
+         "NULL AS ghl_contact_id FROM lending.loan_files WHERE borrower_phone = ANY(:phones) "
+         "ORDER BY borrower_phone, created_at DESC"),
+)
+
+
+def _lead_contacts(db, phones: list[str]) -> dict[str, dict[str, Optional[str]]]:
+    """Email and GHL contact per phone from the lead records; each source in a savepoint, first one found wins."""
+    found: dict[str, dict[str, Optional[str]]] = {}
+    for statement in _LEAD_CONTACTS:
+        wanted = [phone for phone in phones if not (found.get(phone) or {}).get("email")]
+        if not wanted:
+            break
+        try:
+            with db.begin_nested():
+                rows = db.execute(statement, {"phones": wanted}).mappings().all()
+        except Exception as exc:  # class only: SQL errors embed bound parameters
+            logger.warning("[closing-blockers] lead contact lookup skipped (%s)", type(exc).__name__)
+            continue
+        for row in rows:
+            current = found.setdefault(row["phone"], {"email": None, "ghl_contact_id": None})
+            current["email"] = current["email"] or row["email"]
+            current["ghl_contact_id"] = current["ghl_contact_id"] or row["ghl_contact_id"]
+    return found
+
+
 def stuck_deals(db, now: datetime) -> list[StuckDeal]:
     """Deals in an active stage for more than STUCK_AFTER, oldest first. P2.5's daily blockers read this too."""
     rows = db.execute(_STUCK, {"stages": sorted(ACTIVE_STAGE_KEYS), "cutoff": now - STUCK_AFTER}).mappings().all()
     names = _first_names(db, [row["phone"] for row in rows if not row["first_name"]])
+    contacts = _lead_contacts(db, sorted({row["phone"] for row in rows if row["phone"] and row["chase_id"] is None}))
     deals = []
     for row in rows:
         missing = tuple(row["labels"] or ())
+        lead = contacts.get(row["phone"], {})
         deals.append(StuckDeal(
             opportunity_id=row["ghl_opportunity_id"], stage_name=row["stage_name"], stage_key=row["stage_key"],
             entered_at=row["entered_at"], days=(now - row["entered_at"]).days,
-            first_name=row["first_name"] or names.get(row["phone"]), phone=row["phone"], email=row["email"],
-            ghl_contact_id=row["ghl_contact_id"],
+            first_name=row["first_name"] or names.get(row["phone"]), phone=row["phone"],
+            email=row["email"] or lead.get("email"), ghl_contact_id=row["ghl_contact_id"] or lead.get("ghl_contact_id"),
             owner=blame(row["stage_key"], missing_items=len(missing), from_partner=bool(row["from_partner"])),
             missing=missing, chase_id=row["chase_id"], last_chase_day=row["last_chase_day"]))
     return deals
@@ -188,11 +222,35 @@ def _action(db, deal: StuckDeal, gate: SendGate, approvals_channel: str, text_co
     return "No text consent or email on file: call them"
 
 
-def render_blocker_card(day: date, lines: list[str]) -> tuple[str, list[dict]]:
+SECTION_CHARS = 2800  # under briefing's 2,900-character section cut, so no deal is ever truncated
+SECTIONS_PER_MESSAGE = 20  # header + divider/section pairs stays under Slack's 50 blocks
+
+
+def _sections(lines: list[str]) -> list[list[str]]:
+    sections: list[list[str]] = [[]]
+    size = 0
+    for line in lines:
+        if sections[-1] and size + len(line) + 1 > SECTION_CHARS:
+            sections.append([])
+            size = 0
+        sections[-1].append(line)
+        size += len(line) + 1
+    return sections
+
+
+def render_blocker_card(day: date, lines: list[str]) -> list[tuple[str, list[dict]]]:
+    """The card as one or more Slack messages (the rest go in its thread); every deal is shown in full."""
     header = f"Stuck deals, {day.strftime('%a %b')} {day.day}"
-    section = BriefSection(f"Deals stuck more than {STUCK_AFTER.days} days ({len(lines)})", lines,
-                           empty_text=f"No deals stuck more than {STUCK_AFTER.days} days.")
-    return header, render_brief_blocks(header, [section])
+    title = f"Deals stuck more than {STUCK_AFTER.days} days ({len(lines)})"
+    if not lines:
+        section = BriefSection(title, [], empty_text=f"No deals stuck more than {STUCK_AFTER.days} days.")
+        return [(header, render_brief_blocks(header, [section]))]
+    sections = [BriefSection(title if i == 0 else f"{title}, continued", chunk) for i, chunk in enumerate(_sections(lines))]
+    messages = []
+    for start in range(0, len(sections), SECTIONS_PER_MESSAGE):
+        text_header = header if start == 0 else f"{header} (continued)"
+        messages.append((text_header, render_brief_blocks(text_header, sections[start:start + SECTIONS_PER_MESSAGE])))
+    return messages
 
 
 def post_blocker_card(db, chat: ChatPort, gate: SendGate, *, channel: Optional[str], approvals_channel: str,
@@ -208,11 +266,14 @@ def post_blocker_card(db, chat: ChatPort, gate: SendGate, *, channel: Optional[s
         if db.execute(_CLAIM, {"day": day}).scalar() is None:
             return False
         deals = stuck_deals(db, now)
-        header, blocks = render_blocker_card(
+        messages = render_blocker_card(
             day, [_deal_line(deal, _action(db, deal, gate, approvals_channel, text_consent)) for deal in deals])
-        result = chat.post(text=header, blocks=blocks, channel=channel)
-        if not result.ok:
-            raise RuntimeError(f"closing blocker card not posted ({result.error or 'no Slack response'})")
-        db.execute(_RECORD_POST, {"channel": result.channel or channel, "ts": result.ts, "day": day})
+        first = None
+        for header, blocks in messages:
+            result = chat.post(text=header, blocks=blocks, channel=channel, thread_ts=first.ts if first else None)
+            if not result.ok:
+                raise RuntimeError(f"closing blocker card not posted ({result.error or 'no Slack response'})")
+            first = first or result
+        db.execute(_RECORD_POST, {"channel": first.channel or channel, "ts": first.ts, "day": day})
     logger.info("[closing-blockers] card posted for %s with %s stuck deal(s)", day.isoformat(), len(deals))
     return True

@@ -147,3 +147,29 @@ def test_one_failing_deal_does_not_stop_the_card(closing_db):
     assert _post(closing_db, chat, gate)
     card = _card_text(chat)
     assert "0111" in card and "0112" in card and "call them" in card and len(gate.drafts) == 1
+
+
+def test_check_in_uses_the_lead_record_email_without_text_consent(closing_db):
+    closing_db.execute(text("CREATE TABLE lending.web_leads (id BIGSERIAL PRIMARY KEY, phone VARCHAR(20), "
+                            "email VARCHAR(255), ghl_contact_id VARCHAR(64), received_at TIMESTAMPTZ DEFAULT now())"))
+    closing_db.execute(text("INSERT INTO lending.web_leads (phone, email, ghl_contact_id) "
+                            "VALUES ('+18135550101', 'mark@example.com', 'ghl-9')"))
+    _stage(closing_db, "opp8", "Application", timedelta(days=4))
+    chat, gate = FakeChatPort(), Gate()
+    _post(closing_db, chat, gate, consent=False)
+    draft, = gate.drafts.values()
+    assert draft.channel == "ghl_email" and draft.payload["to_email"] == "mark@example.com"
+    assert draft.payload["ghl_contact_id"] == "ghl-9" and "no text consent or email" not in _card_text(chat).lower()
+
+
+def test_every_stuck_deal_is_visible_however_long_the_card(closing_db):
+    for i in range(60):
+        _stage(closing_db, f"opp-{i:02d}", "Submitted to lender", timedelta(days=4, minutes=i),
+               phone=f"+1813555{i:04d}")
+    chat = FakeChatPort()
+    _post(closing_db, chat, Gate())
+    everything = "".join(json.dumps(p["blocks"], ensure_ascii=False) for p in chat.posts)
+    assert all(f"…{i:04d}" in everything for i in range(60))
+    assert "…" not in "".join(b["text"]["text"][-2:] for p in chat.posts for b in p["blocks"] if b["type"] == "section")
+    assert all(len(p["blocks"]) <= 50 for p in chat.posts)
+    assert all(p["thread_ts"] == chat.posts[0]["ts"] for p in chat.posts[1:])

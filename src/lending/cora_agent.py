@@ -50,7 +50,7 @@ from src.lending.agent_jobs.worker import JobQueueWorker, make_check
 from src.lending.attempt_log import lending_ghl_readers
 from src.lending.compliance import text_window_open
 from src.lending.closing.blockers import post_blocker_card
-from src.lending.closing.doc_chase import run_chase_sweep
+from src.lending.closing.doc_chase import chase_id_of, run_chase_sweep
 from src.lending.consent import has_text_consent
 from src.lending.cora_channels import ChannelDirectory
 from src.lending.cora_inbox import format_inbox_context, items_on_post, surface_new_items
@@ -104,6 +104,7 @@ _SUPPRESSED = text("""
 """)
 # An Instantly answer also honours FA's email opt-outs (an unsubscribe Instantly reported to FA's webhook reaches the
 # lending list only on the opt-out poller's next pass).
+_CHASE_OPEN = text("SELECT EXISTS (SELECT 1 FROM lending.doc_chases WHERE id = :id AND status = 'open')")
 _EMAIL_OPTED_OUT = text("SELECT EXISTS (SELECT 1 FROM email_opt_outs WHERE lower(email) = :e)")
 
 _MODEL_UNAVAILABLE = "I couldn't reach my language model just now. Nothing was sent; please try again in a minute."
@@ -214,7 +215,10 @@ def make_send_check(engine: Engine, *, carrier_approved: bool = False,
         email = (action.recipient_email or "").strip().lower() or None
         if not phone and not email:
             return "no recipient recorded, so opt-out status cannot be verified"
+        chase_id = chase_id_of(action.deal_ref)
         with engine.connect() as conn:
+            if chase_id is not None and not conn.execute(_CHASE_OPEN, {"id": chase_id}).scalar():
+                return "the document chase is closed"  # P2.4: all documents in, or the deal funded or lost
             if conn.execute(_SUPPRESSED, {"p": phone, "e": email}).scalar():
                 return "recipient is suppressed or marked do-not-contact"
             if action.channel in INSTANTLY_CHANNELS and conn.execute(_EMAIL_OPTED_OUT, {"e": email}).scalar():
@@ -649,7 +653,8 @@ def build_closing_steps(settings: AppSettings, *, engine: Engine, chat: ChatPort
         with Session(engine) as db, db.begin():
             return run_chase_sweep(db, gate, approvals_channel=approvals,
                                    text_consent=lambda phone: has_text_consent(db, phone),
-                                   find_draft=queue.find_by_idempotency_key if queue is not None else None)
+                                   find_draft=queue.find_by_idempotency_key if queue is not None else None,
+                                   block_draft=queue.block_pending if queue is not None else None)
 
     return (blocker_card if settings.lending_closing_blockers_enabled else None,
             chase_sweep if settings.lending_doc_chase_enabled else None)
