@@ -21,7 +21,6 @@ QUOTE_UNAVAILABLE = "QUOTE_UNAVAILABLE"
 ENTITY_ONLY_STATES = frozenset({"FL"})
 NEEDS_LLC_FORMATION = "NEEDS_LLC_FORMATION"
 STATE_NOT_ELIGIBLE = "STATE_NOT_ELIGIBLE"
-FICO_BELOW_FLOOR = "FICO_BELOW_FLOOR"
 ZIP_STATE_MISMATCH = "ZIP_STATE_MISMATCH"
 LEVERAGE_EXHAUSTED = "LEVERAGE_EXHAUSTED"  # stacked cuts took the LTC cap to zero
 STATE_FIPS: dict[str, str] = {"FL": "12", "GA": "13", "TX": "48"}  # states the ZIP crosswalk covers
@@ -39,9 +38,8 @@ RATE_LIMIT_WINDOW_SECONDS = 60
 API_KEY_HEADER = "X-Api-Key"
 
 
-# Pricing grid (ticket 05). PLACEHOLDER: the brief gives only the ranges (LTC -2.5% to -15%, fee +0.25% to
-# +4.0%); the tier selector and per-tier values await claude/Instant-Quote-Rules.md (client Q1). Tiers are
-# picked by pricing FICO here as a stand-in. Any quote priced on this grid is flagged unconfirmed.
+# Pricing grid (ticket 05): Central Lending's credit box by pricing FICO, "as read on Oct 30", from Josh's
+# Term Sheet Intake Checklist (Nov 2 2026). There is no credit floor: the grid prices down to under 600.
 @dataclass(frozen=True)
 class GridTier:
     min_fico: int
@@ -50,15 +48,15 @@ class GridTier:
 
 
 PRICING_GRID: tuple[GridTier, ...] = (  # highest min_fico first
-    GridTier(760, Decimal("-0.025"), Decimal("0.0025")),
-    GridTier(740, Decimal("-0.05"), Decimal("0.005")),
-    GridTier(720, Decimal("-0.075"), Decimal("0.01")),
-    GridTier(700, Decimal("-0.10"), Decimal("0.015")),
-    GridTier(680, Decimal("-0.115"), Decimal("0.02")),
-    GridTier(660, Decimal("-0.13"), Decimal("0.03")),
+    GridTier(700, Decimal("0"), Decimal("0")),
+    GridTier(680, Decimal("0"), Decimal("0.0025")),
+    GridTier(660, Decimal("-0.025"), Decimal("0")),
+    GridTier(640, Decimal("-0.025"), Decimal("0.005")),
+    GridTier(620, Decimal("-0.05"), Decimal("0.0125")),
+    GridTier(600, Decimal("-0.10"), Decimal("0.02")),
     GridTier(0, Decimal("-0.15"), Decimal("0.04")),
 )
-PRICING_GRID_CONFIRMED = False
+PRICING_GRID_CONFIRMED = True
 GRID_CUT_REASON = "PRICING_GRID"
 
 # CFPB rural + refinance (ticket 07). County list = CFPB rural/underserved 2026 (refresh yearly);
@@ -75,10 +73,9 @@ REFINANCE_CUT = Decimal("-0.05")
 REFINANCE_CUT_REASON = "REFINANCE"
 LEVERAGE_ADJUSTMENTS_CONFIRMED = False
 
-# Experience (ticket 06). Central's 1-2 completed-deal haircut is from the brief; 0 deals has no stated rule
-# (client Q11) and takes no cut. Experience = the most experienced guarantor.
-EXPERIENCE_HAIRCUT_DEALS = range(1, 3)
-EXPERIENCE_HAIRCUT = Decimal("-0.025")
+# Experience (ticket 06): Central cuts starting LTC 2.5% at 1-2 deals and 5% at none (Term Sheet Intake
+# Checklist, Nov 2 2026). Experience = the most experienced guarantor. 3+ deals: no cut.
+EXPERIENCE_CUTS: dict[int, Decimal] = {0: Decimal("-0.05"), 1: Decimal("-0.025"), 2: Decimal("-0.025")}
 EXPERIENCE_CUT_REASON = "EXPERIENCE"
 
 # Second-program new-construction rule (1 exit required). OFF: that program stays blocked until Josh approves

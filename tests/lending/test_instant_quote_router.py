@@ -61,9 +61,9 @@ def test_returns_an_indicative_quote(enabled, client):
     assert resp.status_code == 200
     body = resp.json()
     assert body["status"] == "indicative"
-    assert body["loan_amount"] == "193000"
+    assert body["loan_amount"] == "212000"
     assert body["rehab_funding"] == "50000"
-    assert body["purchase_advance"] == "143000"
+    assert body["purchase_advance"] == "162000"
     assert body["disclaimer"] == "Indicative, subject to underwriting"
     assert body["unconfirmed"] is True
     assert body["quote_id"]
@@ -153,7 +153,7 @@ def test_every_quote_is_stored_and_its_id_is_the_quote_id(enabled, client, store
     assert body["quote_id"] == "q-1"
     assert record.status == "indicative"
     assert record.request["purchase_price"] == "200000"
-    assert record.result["loan_amount"] == "193000"
+    assert record.result["loan_amount"] == "212000"
     assert record.unconfirmed is True
     assert KEY not in record.api_key_label
 

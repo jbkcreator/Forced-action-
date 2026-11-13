@@ -10,15 +10,12 @@ from decimal import Decimal
 from typing import Literal, Optional
 
 from config.lender_matrix import LENDER_MATRIX, LenderRules, effective_rules, fully_confirmed
-from config.lender_matrix import field_status_of
 from config.lending_instant_quote import (
     CALCULATION_REJECTION_CODES,
     DISCLAIMER,
     ENTITY_ONLY_STATES,
     EXPERIENCE_CUT_REASON,
-    EXPERIENCE_HAIRCUT,
-    EXPERIENCE_HAIRCUT_DEALS,
-    FICO_BELOW_FLOOR,
+    EXPERIENCE_CUTS,
     GRID_CUT_REASON,
     INTEREST_RESERVE_CONDITION,
     INTEREST_RESERVE_FICO_THRESHOLD,
@@ -43,7 +40,6 @@ from config.lending_instant_quote import (
     STATE_NOT_ELIGIBLE,
     ZIP_STATE_MISMATCH,
 )
-from src.lending.contracts import FieldStatus
 from src.lending.instant_quote.rural import county_of, is_rural
 from config.lending_soft_approval import SOFT_APPROVAL_PARAMS, resolve_params
 from src.lending.borrower_score import BorrowerFacts, score_borrower
@@ -152,9 +148,7 @@ def _zip_outside_state(request: QuoteRequest) -> bool:
     return state_fips is None or not county.startswith(state_fips)
 
 
-def _ineligible_reason(request: QuoteRequest, credit_box: LenderRules, lender: LenderRules,
-                      sponsor: _Sponsor) -> Optional[str]:
-    pricing_fico = sponsor.pricing_fico
+def _ineligible_reason(request: QuoteRequest, credit_box: LenderRules, sponsor: _Sponsor) -> Optional[str]:
     if request.borrower_type == "individual" and request.state in ENTITY_ONLY_STATES:
         return NEEDS_LLC_FORMATION
     if _zip_outside_state(request):
@@ -164,11 +158,8 @@ def _ineligible_reason(request: QuoteRequest, credit_box: LenderRules, lender: L
         return NEW_CONSTRUCTION_NEEDS_EXIT
     if credit_box.approved_states and request.state not in credit_box.approved_states:
         return STATE_NOT_ELIGIBLE
-    # A placeholder floor never rejects: Central's placeholder 680 would block every quote the 660
-    # interest-reserve rule exists for (client Q2). The quote is flagged unconfirmed instead.
-    floor_confirmed = field_status_of(lender, "credit_floor") is FieldStatus.CONFIRMED
-    if floor_confirmed and credit_box.credit_floor is not None and pricing_fico < credit_box.credit_floor:
-        return FICO_BELOW_FLOOR
+    # No FICO floor: Central's grid prices down to under 600 (the matrix's 680 is a placeholder; 680 is the
+    # second program's new-construction minimum, per Josh's Nov 2 checklist).
     return None
 
 
@@ -184,9 +175,12 @@ def _conditions(pricing_fico: int, loan: Decimal) -> tuple[Condition, ...]:
 def _leverage(request: QuoteRequest, sponsor: _Sponsor) -> tuple[tuple[Cut, ...], Decimal, tuple[str, ...]]:
     """The LTC cuts that apply (each with its reason), the fee surcharge, and notes for the audit row."""
     tier = next(t for t in PRICING_GRID if sponsor.pricing_fico >= t.min_fico)
-    cuts = [Cut(reason=GRID_CUT_REASON, pct=tier.ltc_cut)]
-    if sponsor.completed_deals in EXPERIENCE_HAIRCUT_DEALS:
-        cuts.append(Cut(reason=EXPERIENCE_CUT_REASON, pct=EXPERIENCE_HAIRCUT))
+    cuts: list[Cut] = []
+    if tier.ltc_cut:
+        cuts.append(Cut(reason=GRID_CUT_REASON, pct=tier.ltc_cut))
+    experience_cut = EXPERIENCE_CUTS.get(sponsor.completed_deals)
+    if experience_cut:
+        cuts.append(Cut(reason=EXPERIENCE_CUT_REASON, pct=experience_cut))
     notes: list[str] = []
     rural = is_rural(request.zip_code)
     if rural is None:
@@ -207,7 +201,7 @@ def quote(request: QuoteRequest) -> QuoteResult:
     sponsor = _sponsor(request.guarantors)
     unsized_score = _score(request, sponsor.completed_deals, None)
 
-    ineligible = _ineligible_reason(request, credit_box, lender, sponsor)
+    ineligible = _ineligible_reason(request, credit_box, sponsor)
     if ineligible is not None:
         return _rejected(ineligible, unsized_score, unconfirmed)
 
