@@ -1525,3 +1525,122 @@ class LendingTemplateGraduation(LendingBase):
     edit_rate: Mapped[float] = mapped_column(Numeric(5, 4), nullable=False)
     revoked_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
     revoked_by: Mapped[Optional[str]] = mapped_column(String(64))
+
+
+class LendingGhlOpportunityStage(LendingBase):
+    """P2.4: the stage each GHL opportunity is in now and since when, kept by ``POST /webhooks/lending/ghl-stage``.
+    A redelivered stage keeps ``entered_at``; a move to a different stage resets it (``ghl_stage_events`` keeps
+    the first entry per stage only, so it cannot say how long a deal has sat where it is)."""
+
+    __tablename__ = "ghl_opportunity_stage"
+
+    ghl_opportunity_id: Mapped[str] = mapped_column(String(100), primary_key=True)
+    stage_name: Mapped[str] = mapped_column(String(100), nullable=False)
+    stage_key: Mapped[str] = mapped_column(String(100), nullable=False)
+    entered_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    phone: Mapped[Optional[str]] = mapped_column(String(20))  # phone_utils.normalize
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_now, server_default=text("now()"))
+
+    __table_args__ = (Index("idx_lending_ghl_opportunity_stage_key", "stage_key", "entered_at"),
+                      Index("idx_lending_ghl_opportunity_stage_phone", "phone"))
+
+
+class LendingDocChase(LendingBase):
+    """P2.4: one document chase, started when an approver says the borrower accepted the term sheet. One open chase
+    per phone. Its upload links are in ``doc_chase_links``."""
+
+    __tablename__ = "doc_chases"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    lead_ref: Mapped[str] = mapped_column(String(40), nullable=False)
+    ghl_contact_id: Mapped[Optional[str]] = mapped_column(String(100))
+    ghl_opportunity_id: Mapped[Optional[str]] = mapped_column(String(100))
+    loan_file_id: Mapped[Optional[int]] = mapped_column(BigInteger)  # lending.loan_files.id when the phone has one
+    first_name: Mapped[Optional[str]] = mapped_column(String(80))
+    phone: Mapped[Optional[str]] = mapped_column(String(20))  # phone_utils.normalize
+    email: Mapped[Optional[str]] = mapped_column(String(255))
+    lender_key: Mapped[str] = mapped_column(String(40), nullable=False)
+    quote_id: Mapped[Optional[uuid.UUID]] = mapped_column(UUID(as_uuid=True))
+    accepted_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    accepted_by: Mapped[str] = mapped_column(String(64), nullable=False)
+    status: Mapped[str] = mapped_column(String(12), nullable=False, default="open", server_default=text("'open'"))
+    status_reason: Mapped[Optional[str]] = mapped_column(String(120))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_now, server_default=text("now()"))
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_now, server_default=text("now()"))
+
+    __table_args__ = (
+        CheckConstraint("status IN ('open', 'complete', 'cancelled')", name="ck_lending_doc_chases_status"),
+        Index("uq_lending_doc_chases_open_phone", "phone", unique=True, postgresql_where=text("status = 'open'")),
+        Index("uq_lending_doc_chases_open_email", text("lower(email)"), unique=True,
+              postgresql_where=text("status = 'open' AND phone IS NULL")),
+        Index("idx_lending_doc_chases_opportunity", "ghl_opportunity_id"),
+    )
+
+
+class LendingDocChaseLink(LendingBase):
+    """P2.4: one upload link sent in a chase message. Only the SHA-256 of the token is stored. Every link of a chase
+    works until it expires or the chase closes, so an older message's link still opens the page."""
+
+    __tablename__ = "doc_chase_links"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    chase_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("lending.doc_chases.id"), nullable=False)
+    token_hash: Mapped[str] = mapped_column(String(64), nullable=False, unique=True)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    revoked_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_now, server_default=text("now()"))
+
+    __table_args__ = (Index("idx_lending_doc_chase_links_chase", "chase_id"),)
+
+
+class LendingDocChaseItem(LendingBase):
+    """P2.4: one required document on a chase (lender checklist plus quote conditions)."""
+
+    __tablename__ = "doc_chase_items"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    chase_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("lending.doc_chases.id"), nullable=False)
+    item_code: Mapped[str] = mapped_column(String(40), nullable=False)
+    label: Mapped[str] = mapped_column(String(200), nullable=False)
+    received_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+
+    __table_args__ = (Index("uq_lending_doc_chase_items_code", "chase_id", "item_code", unique=True),)
+
+
+class LendingDocChaseUpload(LendingBase):
+    """P2.4: one file a borrower uploaded through the chase link; stored on disk under a generated name."""
+
+    __tablename__ = "doc_chase_uploads"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    chase_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("lending.doc_chases.id"), nullable=False)
+    item_code: Mapped[str] = mapped_column(String(40), nullable=False)
+    original_name: Mapped[str] = mapped_column(String(255), nullable=False)
+    stored_path: Mapped[str] = mapped_column(String(300), nullable=False)
+    content_type: Mapped[str] = mapped_column(String(100), nullable=False)
+    size_bytes: Mapped[int] = mapped_column(Integer, nullable=False)
+    uploaded_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_now, server_default=text("now()"))
+
+    __table_args__ = (Index("idx_lending_doc_chase_uploads_chase", "chase_id"),)
+
+
+class LendingDocChaseTouch(LendingBase):
+    """P2.4: one chase step (day 0 / 2 / 5 / 8) taken for a chase; ``action_id`` is NULL when no channel was usable."""
+
+    __tablename__ = "doc_chase_touches"
+
+    chase_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("lending.doc_chases.id"), primary_key=True)
+    chase_day: Mapped[int] = mapped_column(SmallInteger, primary_key=True)
+    action_id: Mapped[Optional[int]] = mapped_column(BigInteger)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_now, server_default=text("now()"))
+
+
+class LendingClosingBlockerCard(LendingBase):
+    """P2.4: one row per ET day the 7 AM closing blocker card was posted (same claim pattern as the morning digest)."""
+
+    __tablename__ = "closing_blocker_cards"
+
+    card_day: Mapped[date] = mapped_column(Date, primary_key=True)
+    slack_channel: Mapped[Optional[str]] = mapped_column(String(32))
+    slack_ts: Mapped[Optional[str]] = mapped_column(String(64))
+    posted_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))

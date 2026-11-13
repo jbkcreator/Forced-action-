@@ -10,7 +10,7 @@ setting skips that post and logs it; it never lands in another channel.
 |---|---|---|---|
 | #lead-alerts | `LENDING_OPS_CHANNEL` | Lending | LendingFlow "call now" alert (@-mentions `LENDING_CORA_APPROVER_USER_IDS`, on with `LENDING_LEAD_ARRIVAL_ALERT_ENABLED`); 5-minute uncalled/unreached flags; returning-borrower form alert |
 | #lead-alerts | `LENDING_REPLIES_CHANNEL` | Lending | Rate/terms and reschedule handoffs, AI-quoted-number alerts, reply-SLA alert |
-| #cora | `LENDING_CORA_CHANNEL` | Cora | Chat with Cora; 7:30am digest; inbox digest; 8am routing-hold summary; emergency halt notices; `/lenders` and `/partners` audit posts; pinned callbacks |
+| #cora | `LENDING_CORA_CHANNEL` | Cora | Chat with Cora; 7am stuck-deal card (P2.4); 7:30am digest; inbox digest; 8am routing-hold summary; emergency halt notices; `/lenders` and `/partners` audit posts; pinned callbacks |
 | #approvals | `LENDING_CORA_APPROVALS_CHANNEL` | Cora | Approve / Revise / Reject cards. **Required**: Cora does not start without it. A Revise reply typed here needs no @-mention |
 | #deals | `LENDING_DEALS_CHANNEL` | Cora | R-1 routing posts (Routed / Held / Declined) with Details, Decline / Approved / Funded and Re-route buttons |
 | #deals | `LENDING_PARTNER_CHANNEL` | Lending | Partner file cards; partner notice not delivered |

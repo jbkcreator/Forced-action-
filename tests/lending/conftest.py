@@ -17,6 +17,7 @@ from migrations.apply_lending_call_dispositions_dialer import apply_to
 from migrations.apply_lending_ghl_stage_events import apply_to as apply_to_stage_events
 from migrations.apply_lending_pr319_client_feedback import apply_to as apply_to_feedback
 from migrations.apply_lending_followup_call_tracking import apply_to as apply_to_followup
+from migrations.apply_lending_doc_chase import apply_to as apply_to_doc_chase
 from src.lending.models import LENDING_SCHEMA, LendingCallDisposition
 
 
@@ -45,6 +46,7 @@ def lending_db():
     apply_to_feedback(conn)
     apply_to_stage_events(conn)
     apply_to_followup(conn)  # call_source column (checked first, so no lock on the live table)
+    apply_to_doc_chase(conn)  # P2.4 ghl_opportunity_stage, written by the stage webhook
     session = Session(bind=conn, join_transaction_mode="create_savepoint")
     yield session
     session.close()
@@ -203,3 +205,47 @@ def no_cold_leads(monkeypatch):
     """The cold-lead check reads Postgres before every GHL text and email; tests see no cold leads by default.
     Tests of the check itself swap in their own session factory."""
     monkeypatch.setattr("src.lending.cold_leads._session_factory", _NotHalted)
+
+
+@pytest.fixture
+def closing_db():
+    """P2.4 tables in a throwaway schema inside one rolled-back transaction. No DDL touches live ``lending`` tables:
+    every ``lending.`` in a statement on this connection is rewritten to the throwaway schema."""
+    import uuid
+
+    from sqlalchemy import event
+
+    from config.settings import get_settings
+    from migrations.apply_lending_doc_chase import apply_to as apply_doc_chase
+    from src.lending.models import LendingGhlStageEvent
+
+    url = get_settings().database_url
+    if not url:
+        pytest.skip("requires a live Postgres DATABASE_URL")
+    engine = create_engine(str(url), connect_args={"connect_timeout": 20})
+    try:
+        conn = engine.connect()
+    except Exception:
+        engine.dispose()
+        pytest.skip("Postgres is not reachable")
+    schema = f"p24t_{uuid.uuid4().hex[:10]}"
+    tx = conn.begin()
+    conn.execute(text("SET LOCAL lock_timeout = '5s'"))
+    conn.execute(text("SET LOCAL statement_timeout = '30s'"))
+    conn.execute(text(f'CREATE SCHEMA "{schema}"'))
+    LendingGhlStageEvent.__table__.create(conn.execution_options(schema_translate_map={LENDING_SCHEMA: schema}))
+    conn.execute(text(f'CREATE TABLE "{schema}".loan_files (id BIGSERIAL PRIMARY KEY, borrower_phone VARCHAR(20), '
+                      "partner_id BIGINT, created_at TIMESTAMPTZ NOT NULL DEFAULT now())"))
+
+    @event.listens_for(conn, "before_cursor_execute", retval=True)
+    def _to_schema(_conn, _cursor, statement, parameters, _context, _many):
+        return statement.replace(f"{LENDING_SCHEMA}.", f"{schema}."), parameters
+
+    apply_doc_chase(conn, schema)
+    session = Session(bind=conn, join_transaction_mode="create_savepoint")
+    session.info["schema"] = schema
+    yield session
+    session.close()
+    tx.rollback()
+    conn.close()
+    engine.dispose()

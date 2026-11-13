@@ -527,3 +527,11 @@ def test_cold_email_checks_fa_email_opt_outs_too() -> None:
     reason = cora_agent.make_send_check(engine, email_window=lambda phone: True)(
         _action("instantly_cold_email", phone=None, email="sam@example.com"))
     assert reason == "recipient is suppressed or marked do-not-contact"
+
+
+def test_send_check_blocks_a_reminder_of_a_closed_document_chase() -> None:
+    from dataclasses import replace
+
+    action = replace(_action(), deal_ref="doc_chase:5")
+    reason = cora_agent.make_send_check(ScriptedEngine(False), carrier_approved=True)(action)
+    assert reason == "the document chase is closed" and not isinstance(reason, SendDeferred)

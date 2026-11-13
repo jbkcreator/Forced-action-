@@ -148,12 +148,13 @@ SAM = _Lead("web_lead:7", "Sam Smith", "+17275550100", "sam@example.com", "ghl-1
 
 def test_tool_set_and_safety_levels() -> None:
     tools = {tool.name: tool for tool in CoraToolkit(engine=None, memory=None).tools()}  # type: ignore[arg-type]
-    assert len(tools) == 22
+    assert len(tools) == 24
     assert tools["get_ledger_export_status"].safety is SafetyLevel.READ_ONLY
     egress = {name for name, tool in tools.items() if tool.safety is SafetyLevel.EXTERNAL_EGRESS}
     assert egress == {"draft_sms", "draft_email", "draft_pipeline_move", "draft_add_tag", "draft_add_note"}
     assert {name for name, tool in tools.items() if tool.approver_only} == {
-        "save_standing_rule", "deactivate_standing_rule", "dismiss_inbox_item", "route_inbox_item"}
+        "save_standing_rule", "deactivate_standing_rule", "dismiss_inbox_item", "route_inbox_item",
+        "start_document_chase"}
     assert tools["query_lending_data"].safety is SafetyLevel.READ_ONLY
     assert tools["list_inbox_items"].safety is SafetyLevel.READ_ONLY
     assert tools["list_channels"].safety is SafetyLevel.READ_ONLY and tools["read_channel"].safety is SafetyLevel.READ_ONLY
