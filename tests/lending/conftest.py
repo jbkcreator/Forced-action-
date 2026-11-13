@@ -125,10 +125,13 @@ def inbox_writes(monkeypatch):
 
 @pytest.fixture
 def web_leads_db(lending_db):
-    """lending_db plus lending.web_leads (rolled back with the test)."""
+    """lending_db plus lending.web_leads (rolled back with the test), including the P2.1 AI-call consent columns that
+    apply_lending_speed_to_lead adds to an existing table."""
+    from migrations.apply_lending_speed_to_lead import apply_to as apply_speed_to_lead
     from migrations.apply_lending_web_leads import apply_to as apply_web_leads
 
     apply_web_leads(lending_db.get_bind())
+    apply_speed_to_lead(lending_db.get_bind())
     return lending_db
 
 

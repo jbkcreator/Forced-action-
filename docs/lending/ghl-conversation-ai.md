@@ -23,7 +23,8 @@ cost first (answer B2); do not switch it on before that. Texting also needs the 
 3. Never promise approval, funding, timing or terms.
 4. Never mention Backflip or any other lender, and never discuss lender channel rules.
 5. Honour STOP, "unsubscribe" and "wrong number" at once; do not reply to a STOP.
-6. No AI voice calls. Text only.
+6. No AI voice calls. Text only. (The one exception is P2.1's Speed-to-Lead Voice AI, a separate GHL agent for
+   consented leads only: `speed-to-lead.md`.)
 
 ## The rate / terms reply (from the caller playbook, adapted to text)
 

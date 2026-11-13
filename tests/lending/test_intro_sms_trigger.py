@@ -109,7 +109,12 @@ def ghl_calls(monkeypatch):
 
 
 def _tag_calls(calls):
-    return [c[2]["tags"] for c in calls if c[1] == "tags"]
+    """Tags added (POST), in order. Removals are checked by _tag_removals."""
+    return [c[2]["tags"] for c in calls if c[1] == "tags" and c[0] == "POST"]
+
+
+def _tag_removals(calls):
+    return [c[2]["tags"] for c in calls if c[1] == "tags" and c[0] == "DELETE"]
 
 
 # ------------------------------------------------------------------ the tag contract (no database)
@@ -393,7 +398,7 @@ def test_switching_off_stops_the_release(lf_db, ghl_calls, intro_on, monkeypatch
 
 def test_a_failed_release_is_left_for_the_next_sweep(lf_db, ghl_calls, intro_on):
     class TagFails:
-        def add_intro_ready_tag(self, contact_id):
+        def add_intro_ready_tag(self, contact_id, *, rearm=False):
             raise DeliveryError("add intro-ready tag: HTTP 500")
 
     lead_id = _held_lead(lf_db)
@@ -438,3 +443,36 @@ def test_an_overnight_lead_is_still_released_when_its_window_opens(lf_db, ghl_ca
     assert _tagged_at(lf_db, lead_id) is None
     assert release_held_intro_sms(lf_db, LendingFlowGhlSink(GhlAccount("k", "loc")), now=opens) == 1
     assert _tagged_at(lf_db, lead_id) == opens
+
+
+
+# ------------------------------------------------------------------ P2.1 review: a returning borrower's intro text
+
+def _ready_steps(calls):
+    return [(c[0], c[2]["tags"]) for c in calls if c[1] == "tags" and c[2]["tags"] == [GHL_TAG_INTRO_READY]]
+
+
+def test_a_first_push_re_arms_the_intro_tag_for_a_returning_contact(ghl_calls, intro_on):
+    LendingFlowGhlSink(GhlAccount("k", "loc")).add_intro_ready_tag("c1", rearm=True)
+    assert _ready_steps(ghl_calls) == [("DELETE", [GHL_TAG_INTRO_READY]), ("POST", [GHL_TAG_INTRO_READY])]
+
+
+def test_the_push_re_arms_only_on_the_lead_s_first_attempt(monkeypatch):
+    sink = LendingFlowGhlSink(GhlAccount("k", "loc"))
+    seen = []
+    monkeypatch.setattr(sink, "_upsert_contact", lambda lead: "c1")
+    monkeypatch.setattr(sink, "_call", lambda *a, **k: {})
+    monkeypatch.setattr(sink, "_ensure_pipeline_card", lambda lead, contact_id: False)
+    monkeypatch.setattr(sink, "_add_note", lambda lead, contact_id: None)
+    monkeypatch.setattr(sink, "add_intro_ready_tag", lambda contact_id, *, rearm=False: seen.append(rearm))
+    monkeypatch.setattr("src.lending.lendingflow_ghl._intro_ready_tags", lambda lead: [GHL_TAG_INTRO_READY])
+    base = {"phone": "+18135550100", "suppressed": True, "consent_status": "present"}
+    sink.push({**base, "ghl_attempts": 0})
+    sink.push({**base, "ghl_attempts": 1})  # a retry after a later step failed: the tag may already be on
+    assert seen == [True, False]
+
+
+def test_a_held_intro_release_re_arms_the_tag(lf_db, ghl_calls, intro_on):
+    _held_lead(lf_db)
+    assert release_held_intro_sms(lf_db, LendingFlowGhlSink(GhlAccount("k", "loc")), now=OPEN_NOW) == 1
+    assert _ready_steps(ghl_calls)[-2:] == [("DELETE", [GHL_TAG_INTRO_READY]), ("POST", [GHL_TAG_INTRO_READY])]

@@ -87,13 +87,19 @@ class LendingFlowGhlSink:
                                    email=lead.get("email"))
         ready = _intro_ready_tags(lead)
         if ready:  # its own call, after the other tags are in place; a failure fails the push and the sweep retries it
-            self.add_intro_ready_tag(contact_id)
+            # Re-armed on the lead's first push only: a returning borrower's contact still carries the tag from the last
+            # inquiry. A retried push (a later step failed after the tag went on) only adds it, so no second text.
+            self.add_intro_ready_tag(contact_id, rearm=int(lead.get("ghl_attempts") or 0) == 0)
         pipeline_card = self._ensure_pipeline_card(lead, contact_id)
         self._add_note(lead, contact_id)
         return PushResult(contact_id=contact_id, pipeline_card=pipeline_card, intro_ready_tagged=bool(ready))
 
-    def add_intro_ready_tag(self, contact_id: str) -> None:
-        """Starts the GHL intro-SMS workflow. Re-adding a tag that is already there does not start it again."""
+    def add_intro_ready_tag(self, contact_id: str, *, rearm: bool = False) -> None:
+        """Starts the GHL intro-SMS workflow. GHL starts it only when the tag is newly added, so with ``rearm`` the tag
+        is removed first (a returning borrower's contact still has it from an earlier inquiry)."""
+        if rearm:
+            self._call("remove intro-ready tag", "DELETE", f"/contacts/{contact_id}/tags",
+                       json={"tags": [GHL_TAG_INTRO_READY]})
         self._call("add intro-ready tag", "POST", f"/contacts/{contact_id}/tags", json={"tags": [GHL_TAG_INTRO_READY]})
 
     def _upsert_contact(self, lead: Mapping[str, Any]) -> str:

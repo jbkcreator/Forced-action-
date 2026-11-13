@@ -460,6 +460,10 @@ class LendingWebLead(LendingBase):
     consent_text_matches: Mapped[Optional[bool]] = mapped_column(Boolean)  # equals config.lending_web.SMS_CONSENT_TEXT
     call_consent_text: Mapped[Optional[str]] = mapped_column(Text)  # the call box's label the visitor saw, verbatim
     call_consent_text_matches: Mapped[Optional[bool]] = mapped_column(Boolean)  # equals config.lending_web.CALL_CONSENT_TEXT
+    # P2.1 box 4: calls from the AI voice assistant only (the Voice AI gate)
+    ai_call_consent: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default=text("false"))
+    ai_call_consent_text: Mapped[Optional[str]] = mapped_column(Text)  # the AI box's label the visitor saw, verbatim
+    ai_call_consent_text_matches: Mapped[Optional[bool]] = mapped_column(Boolean)  # equals AI_CALL_CONSENT_TEXT
     page_url: Mapped[Optional[str]] = mapped_column(String(300))
     ip_address: Mapped[Optional[str]] = mapped_column(String(45))
     user_agent: Mapped[Optional[str]] = mapped_column(String(300))
@@ -1525,3 +1529,55 @@ class LendingTemplateGraduation(LendingBase):
     edit_rate: Mapped[float] = mapped_column(Numeric(5, 4), nullable=False)
     revoked_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
     revoked_by: Mapped[Optional[str]] = mapped_column(String(64))
+
+
+class LendingSpeedToLead(LendingBase):
+    """P2.1: one row per new lead the speed-to-lead step looked at (``src/lending/speed_to_lead.py``).
+
+    The timings Josh is shown (``python -m src.lending.speed_to_lead --report``): when the lead arrived, when the
+    intro-text tag and the call-cascade tag reached GHL, and why either was withheld. The calls themselves are GHL's
+    (``call_dispositions`` with ``call_source = 'ghl'``). Unique per lead, so a retried delivery never starts a
+    second cascade. No phone or email is stored here."""
+
+    __tablename__ = "speed_to_lead"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    source: Mapped[str] = mapped_column(String(20), nullable=False)  # lendingflow | web
+    lead_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    ghl_contact_id: Mapped[Optional[str]] = mapped_column(String(64))
+    received_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_now, server_default=text("now()"))
+    text_status: Mapped[Optional[str]] = mapped_column(String(30))
+    text_tagged_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    call_status: Mapped[Optional[str]] = mapped_column(String(30))
+    call_block_reason: Mapped[Optional[str]] = mapped_column(String(60))
+    call_tagged_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    voice_eligible: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default=text("false"))
+    # The call queue: when the lead was queued and why (outside_hours / delayed / waiting_turn / a temporary gate
+    # reason), and when the queue worker released it (cascade started) or expired it.
+    queued_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    queue_reason: Mapped[Optional[str]] = mapped_column(String(60))
+    released_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    recheck_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))  # a not-now lead waits until then
+    alerted_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))  # "left the queue" post sent
+
+    __table_args__ = (
+        Index("uq_speed_to_lead_source_lead", "source", "lead_id", unique=True),
+        Index("ix_speed_to_lead_held_text", "source", "received_at",
+              postgresql_where=text("text_status = 'held_for_window'")),
+        Index("ix_speed_to_lead_queued", "received_at", postgresql_where=text("call_status = 'queued'")),
+        Index("ix_speed_to_lead_call_tagged_at", "call_tagged_at"),
+        CheckConstraint("source IN ('lendingflow', 'web')", name="ck_speed_to_lead_source"),
+    )
+
+
+class LendingSpeedToLeadNotice(LendingBase):
+    """P2.1 call queue: one row per queue notice posted to the lead-alerts channel (``kind`` = morning / backlog, one
+    per Eastern day), so the minute worker posts each once."""
+
+    __tablename__ = "speed_to_lead_notices"
+
+    kind: Mapped[str] = mapped_column(String(30), primary_key=True)
+    day: Mapped[date] = mapped_column(Date, primary_key=True)
+    posted_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_now,
+                                                server_default=text("now()"))
