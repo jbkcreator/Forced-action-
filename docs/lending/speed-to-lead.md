@@ -27,7 +27,7 @@ shows.
   text box was ticked, `consent.has_text_consent` (consent row, no opt-out, not do-not-contact), not halted, and
   8am-8pm for the borrower. Outside the window the text is held; the web-lead sweep (every 5 minutes) sends it once the
   window opens, for up to 24 hours. LendingFlow leads keep T-09's own rules.
-* **Call cascade** (`LENDING_SPEED_TO_LEAD_ENABLED`): the lead reached GHL less than 10 minutes after it arrived, and
+* **Call cascade** (`LENDING_SPEED_TO_LEAD_ENABLED`): the lead reached GHL at most 100 seconds after it arrived (later: no call, BatchDialer as usual; the intro text is not affected), and
   `ghl_call_gate.blocked_reasons` allows the number now (suppression, DNC result, already reached, attempt caps, the
   8am-8pm calling window, emergency halt). Website leads also need the call-consent box, and get a fresh DNC scrub
   first (1 Tracerfy credit); a failed scrub means no call. LendingFlow leads need no scrub (client decision).

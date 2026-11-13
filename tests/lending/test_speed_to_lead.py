@@ -219,14 +219,16 @@ def test_no_website_intro_text_before_carrier_approval(gates):
 
 
 def test_a_lead_that_reaches_ghl_late_gets_no_cascade(gates):
-    outcome, tags, _ = run(web_lead(received_at=NOW - timedelta(minutes=11)))
+    outcome, tags, _ = run(web_lead(received_at=NOW - timedelta(minutes=5)))
     assert outcome.call_status == CALL_STALE and not [c for c in tags.calls if c[2] == GHL_TAG_SPEED_TO_LEAD]
 
 
-def test_a_lead_exactly_ten_minutes_old_still_gets_the_cascade_one_second_later_does_not(gates):
-    on_the_edge, _, _ = run(web_lead(received_at=NOW - timedelta(minutes=10)))
-    past_it, _, _ = run(web_lead(received_at=NOW - timedelta(minutes=10, seconds=1)))
+def test_a_lead_exactly_100_seconds_old_still_gets_the_cascade_one_second_later_does_not(gates):
+    on_the_edge, _, _ = run(web_lead(received_at=NOW - timedelta(seconds=100)))
+    past_it, tags, _ = run(web_lead(received_at=NOW - timedelta(seconds=101)))
     assert (on_the_edge.call_status, past_it.call_status) == (CALL_TAGGED, CALL_STALE)
+    assert past_it.text_status == TEXT_TAGGED  # the intro text does not use the limit
+    assert ("add", "c-7", GHL_TAG_WEB_INTRO_READY) in tags.calls
 
 
 # ── the intro text gates ─────────────────────────────────────────────────────

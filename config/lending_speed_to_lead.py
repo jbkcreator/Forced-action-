@@ -17,9 +17,10 @@ GHL_TAG_AI_VOICE_OK = "ndl-ai-voice-ok"
 # Starts the GHL workflow "NDL - Web Intro SMS" (the website twin of LendingFlow's ``lendingflow-intro-ready``).
 GHL_TAG_WEB_INTRO_READY = "web-intro-ready"
 
-# A lead older than this when its GHL delivery finishes (a retried delivery, a recovered follow-up) gets no call
-# cascade: "within 60 seconds" no longer applies, and BatchDialer picks it up as usual.
-CASCADE_MAX_LEAD_AGE = timedelta(minutes=10)
+# The brief's "call Josh within 60 seconds", with room for a slow GHL delivery (team decision, Nov 13): a lead that
+# reaches GHL more than this long after the form (a retried delivery, a recovered follow-up) gets no call cascade, and
+# BatchDialer picks it up as usual. The intro text does not use this limit.
+CASCADE_MAX_LEAD_AGE = timedelta(seconds=100)
 # Documented for the GHL workflow; the wait itself is a GHL step.
 AI_VOICE_AFTER_SECONDS = 120
 # The emergency halt removes the cascade tags from every lead whose cascade started this recently (Josh, David and the
