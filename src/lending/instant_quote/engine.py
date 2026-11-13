@@ -16,16 +16,26 @@ from config.lending_instant_quote import (
     DISCLAIMER,
     ENTITY_ONLY_STATES,
     FICO_BELOW_FLOOR,
+    GRID_CUT_REASON,
     INTEREST_RESERVE_CONDITION,
     INTEREST_RESERVE_FICO_THRESHOLD,
     INTEREST_RESERVE_RATE,
     INTEREST_RESERVE_TERM_MONTHS,
+    LEVERAGE_ADJUSTMENTS_CONFIRMED,
     NEEDS_LLC_FORMATION,
+    PRICING_GRID,
+    PRICING_GRID_CONFIRMED,
     QUOTE_LENDER_KEY,
     QUOTE_UNAVAILABLE,
+    REFINANCE_CUT,
+    REFINANCE_CUT_REASON,
+    RURAL_CUT,
+    RURAL_CUT_REASON,
+    RURAL_UNKNOWN_NOTE,
     STATE_NOT_ELIGIBLE,
 )
 from src.lending.contracts import FieldStatus
+from src.lending.instant_quote.rural import is_rural
 from config.lending_soft_approval import SOFT_APPROVAL_PARAMS, resolve_params
 from src.lending.borrower_score import BorrowerFacts, score_borrower
 from src.lending.soft_approval.calc import CalculationUnavailable, LenderTerms, calculate_figures
@@ -124,11 +134,38 @@ def _conditions(pricing_fico: int, loan: Decimal) -> tuple[Condition, ...]:
     return (Condition(code=INTEREST_RESERVE_CONDITION, amount=amount),)
 
 
+def _leverage(request: QuoteRequest, pricing_fico: int) -> tuple[tuple[Cut, ...], Decimal, tuple[str, ...]]:
+    """The LTC cuts that apply (each with its reason), the fee surcharge, and notes for the audit row."""
+    tier = next(t for t in PRICING_GRID if pricing_fico >= t.min_fico)
+    cuts = [Cut(reason=GRID_CUT_REASON, pct=tier.ltc_cut)]
+    notes: list[str] = []
+    rural = is_rural(request.zip_code)
+    if rural is None:
+        notes.append(RURAL_UNKNOWN_NOTE)
+    elif rural:
+        cuts.append(Cut(reason=RURAL_CUT_REASON, pct=RURAL_CUT))
+    if request.purpose == "refinance":
+        cuts.append(Cut(reason=REFINANCE_CUT_REASON, pct=REFINANCE_CUT))
+    return tuple(cuts), tier.fee_surcharge, tuple(notes)
+
+
 def quote(request: QuoteRequest) -> QuoteResult:
     lender = _quote_lender()
     credit_box = effective_rules(lender)
     shares, shares_confirmed = resolve_params(SOFT_APPROVAL_PARAMS.get(QUOTE_LENDER_KEY))
-    ltc = credit_box.max_ltc
+    unconfirmed = not (fully_confirmed(lender) and shares_confirmed
+                       and PRICING_GRID_CONFIRMED and LEVERAGE_ADJUSTMENTS_CONFIRMED)
+    experience = max(g.completed_deals for g in request.guarantors)
+    pricing_fico = min(g.fico for g in request.guarantors)
+
+    ineligible = _ineligible_reason(request, credit_box, lender, pricing_fico)
+    if ineligible is not None:
+        return _rejected(ineligible, _score(request, experience, None), unconfirmed)
+
+    cuts, fee_surcharge, notes = _leverage(request, pricing_fico)
+    ltc = max(credit_box.max_ltc + sum(c.pct for c in cuts), Decimal("0"))
+    if ltc == 0:
+        return _rejected(CALCULATION_REJECTION_CODES["loan_too_small"], _score(request, experience, None), unconfirmed)
     terms = LenderTerms(
         rehab_funding_pct=shares.rehab_funding_pct,
         purchase_advance_pct=shares.purchase_advance_pct,
@@ -137,18 +174,12 @@ def quote(request: QuoteRequest) -> QuoteResult:
         max_loan=credit_box.max_loan_amount,
         min_loan=credit_box.min_loan_amount,
     )
-    unconfirmed = not (fully_confirmed(lender) and shares_confirmed)
-    experience = max(g.completed_deals for g in request.guarantors)
-    pricing_fico = min(g.fico for g in request.guarantors)
-    ineligible = _ineligible_reason(request, credit_box, lender, pricing_fico)
-    if ineligible is not None:
-        return _rejected(ineligible, _score(request, experience, None), unconfirmed)
     try:
         figures = calculate_figures(request.purchase_price, request.rehab, request.arv, terms)
     except CalculationUnavailable as exc:
         reason = CALCULATION_REJECTION_CODES.get(exc.reason, QUOTE_UNAVAILABLE)
         return _rejected(reason, _score(request, experience, None), unconfirmed)
-    score = _score(request, experience, figures.net_loan)
+
     conditions = _conditions(pricing_fico, figures.net_loan)
     return QuoteResult(
         status="indicative",
@@ -157,9 +188,10 @@ def quote(request: QuoteRequest) -> QuoteResult:
         rehab_funding=figures.rehab_funding,
         purchase_advance=figures.purchase_advance,
         effective_ltc=ltc,
-        fee_surcharge_pct=Decimal("0"),
-        borrower_score=score,
+        fee_surcharge_pct=fee_surcharge,
+        borrower_score=_score(request, experience, figures.net_loan),
         unconfirmed=unconfirmed,
+        cuts=cuts,
         conditions=conditions,
-        rules_fired=tuple(c.code for c in conditions),
+        rules_fired=tuple(c.reason for c in cuts) + notes + tuple(c.code for c in conditions),
     )

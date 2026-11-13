@@ -14,7 +14,7 @@ from decimal import Decimal
 from typing import Any, Optional
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Request
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 from config.lending_instant_quote import (
     API_KEY_HEADER,
@@ -49,6 +49,12 @@ class QuoteIn(BaseModel):
     rehab: Decimal = Field(ge=0)
     arv: Decimal = Field(gt=0)
     existing_debt: Optional[Decimal] = Field(default=None, ge=0)
+
+    @model_validator(mode="after")
+    def _refinance_needs_debt(self) -> "QuoteIn":
+        if self.purpose == "refinance" and self.existing_debt is None:
+            raise ValueError("existing_debt is required for a refinance")
+        return self
 
 
 class CutOut(BaseModel):
