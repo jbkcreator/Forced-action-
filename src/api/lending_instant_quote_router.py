@@ -9,11 +9,11 @@ from __future__ import annotations
 import hashlib
 import hmac
 import logging
-import uuid
+from dataclasses import asdict
 from decimal import Decimal
-from typing import Optional
+from typing import Any, Optional
 
-from fastapi import APIRouter, Header, HTTPException, Request
+from fastapi import APIRouter, Depends, Header, HTTPException, Request
 from pydantic import BaseModel, Field
 
 from config.lending_instant_quote import (
@@ -25,6 +25,7 @@ from config.lending_instant_quote import (
 from config.settings import get_settings
 from src.lending.instant_quote import Guarantor, QuoteRequest, QuoteResult, quote
 from src.lending.instant_quote.engine import BorrowerType, Purpose, QuoteStatus
+from src.lending.instant_quote.store import QuoteRecord, QuoteStore, SqlQuoteStore
 from src.services.rate_limit import enforce_or_429
 
 logger = logging.getLogger(__name__)
@@ -117,11 +118,38 @@ def _to_response(quote_id: str, result: QuoteResult) -> QuoteOut:
     )
 
 
+def get_quote_store() -> QuoteStore:
+    return SqlQuoteStore()
+
+
+def _json_safe(value: Any) -> Any:
+    if isinstance(value, Decimal):
+        return str(value)
+    if isinstance(value, dict):
+        return {k: _json_safe(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(v) for v in value]
+    return value
+
+
+def _record(body: QuoteIn, result: QuoteResult, key_bucket: str) -> QuoteRecord:
+    return QuoteRecord(
+        status=result.status,
+        reason=result.reason,
+        request=_json_safe(body.model_dump()),
+        result=_json_safe(asdict(result)),
+        rules_fired=list(result.rules_fired),
+        unconfirmed=result.unconfirmed,
+        api_key_label=key_bucket,
+    )
+
+
 @router.post("/instant-quote", response_model=QuoteOut)
 def instant_quote(
     body: QuoteIn,
     request: Request,
     api_key: Optional[str] = Header(default=None, alias=API_KEY_HEADER),
+    store: QuoteStore = Depends(get_quote_store),
 ) -> QuoteOut:
     if not get_settings().lending_instant_quote_enabled:
         raise HTTPException(status_code=404, detail="Not found")
@@ -129,7 +157,11 @@ def instant_quote(
     enforce_or_429(request, scope=f"{RATE_LIMIT_SCOPE}:{key_bucket}", limit=RATE_LIMIT_PER_WINDOW,
                    window_seconds=RATE_LIMIT_WINDOW_SECONDS)
     result = quote(_to_request(body))
-    quote_id = uuid.uuid4().hex
+    try:
+        quote_id = store.save(_record(body, result, key_bucket))
+    except Exception as exc:
+        logger.error("[instant-quote] audit write failed, quote withheld: %s", type(exc).__name__)
+        raise HTTPException(status_code=500, detail="Quote unavailable") from exc
     logger.info("[instant-quote] quote=%s status=%s reason=%s unconfirmed=%s",
                 quote_id, result.status, result.reason, result.unconfirmed)
     return _to_response(quote_id, result)

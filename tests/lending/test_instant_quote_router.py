@@ -26,14 +26,32 @@ def enabled(monkeypatch):
     monkeypatch.setattr(get_settings(), "lending_instant_quote_api_key", SecretStr(KEY))
 
 
+class FakeQuoteStore:
+    def __init__(self, fail: bool = False) -> None:
+        self.records = []
+        self.fail = fail
+
+    def save(self, record) -> str:
+        if self.fail:
+            raise RuntimeError("db down")
+        self.records.append(record)
+        return f"q-{len(self.records)}"
+
+
 @pytest.fixture
-def client():
-    from src.api.lending_instant_quote_router import router
+def store():
+    return FakeQuoteStore()
+
+
+@pytest.fixture
+def client(store):
+    from src.api.lending_instant_quote_router import get_quote_store, router
     from src.services.rate_limit import reset_local_buckets
 
     reset_local_buckets()
     app = FastAPI()
     app.include_router(router)
+    app.dependency_overrides[get_quote_store] = lambda: store
     return TestClient(app, headers={"x-forwarded-for": f"198.19.0.{next(_ip_counter)}"})
 
 
@@ -107,3 +125,34 @@ def test_rate_limited_after_30_a_minute(enabled, client):
 
     assert codes[:30] == [200] * 30
     assert codes[30] == 429
+
+
+# --- 02 audit trail ---
+
+def test_every_quote_is_stored_and_its_id_is_the_quote_id(enabled, client, store):
+    body = client.post(URL, json=BODY, headers={"X-Api-Key": KEY}).json()
+
+    assert len(store.records) == 1
+    record = store.records[0]
+    assert body["quote_id"] == "q-1"
+    assert record.status == "indicative"
+    assert record.request["purchase_price"] == "200000"
+    assert record.result["loan_amount"] == "212000"
+    assert record.unconfirmed is True
+    assert KEY not in record.api_key_label
+
+
+def test_a_rejected_quote_is_stored_with_its_reason(enabled, client, store):
+    client.post(URL, json={**BODY, "borrower_type": "individual"}, headers={"X-Api-Key": KEY})
+
+    assert store.records[0].status == "rejected"
+    assert store.records[0].reason == "NEEDS_LLC_FORMATION"
+    assert store.records[0].rules_fired == ["NEEDS_LLC_FORMATION"]
+
+
+def test_no_quote_is_returned_when_it_cannot_be_stored(enabled, store, client):
+    store.fail = True
+    resp = client.post(URL, json=BODY, headers={"X-Api-Key": KEY})
+
+    assert resp.status_code == 500
+    assert "db down" not in resp.text
