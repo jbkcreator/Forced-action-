@@ -7,6 +7,7 @@ from unittest.mock import MagicMock
 import pytest
 from pydantic import SecretStr
 
+from config.lending_compliance import GHL_DND_CHANNELS
 from config.settings import get_settings
 from src.lending import ghl_account, ghl_dnd, ghl_dnd_backstop
 
@@ -140,6 +141,66 @@ def test_dnd_upsert_reports_failure_without_raising(monkeypatch, kwargs):
     _creds(monkeypatch, lending_key=LENDING_KEY, lending_location="lending-loc")
     _ghl_request(monkeypatch, **kwargs)
     assert ghl_dnd.set_ghl_dnd(PHONE) is False
+
+
+def _ghl_refusing_permanent_channels(monkeypatch, permanent: set[str], refusal_status=401):
+    """Fake GHL: an upsert that touches a permanently blocked channel is refused, naming that channel."""
+    calls = []
+
+    def fake(method, url, **kwargs):
+        calls.append({"method": method, "url": url, **kwargs})
+        if url.endswith("/tags"):
+            return MagicMock(status_code=200)
+        blocked = sorted(permanent & set((kwargs["json"].get("dndSettings") or {})))
+        response = MagicMock(status_code=refusal_status if blocked else 200)
+        response.json.return_value = (
+            {"statusCode": refusal_status, "message": f"Not authorized to update permanent dnd setting for {blocked[0]}"}
+            if blocked else {"contact": {"id": "c9"}})
+        return response
+
+    monkeypatch.setattr("src.services.ghl_webhook._ghl_request", fake)
+    return calls
+
+
+def test_a_channel_ghl_blocked_permanently_is_left_out_and_the_rest_are_set(monkeypatch):
+    """A STOP reply makes GHL's SMS DND permanent and the API may not touch it, which used to fail the whole
+    upsert on every poll; the opt-out is already in force there, so the other channels are set instead."""
+    _creds(monkeypatch, lending_key=LENDING_KEY, lending_location="lending-loc")
+    calls = _ghl_refusing_permanent_channels(monkeypatch, {"SMS"})
+    assert ghl_dnd.set_ghl_dnd(PHONE) is True
+    first, retry, tag = calls
+    assert "SMS" in first["json"]["dndSettings"]
+    assert "SMS" not in retry["json"]["dndSettings"] and retry["json"]["dnd"] is True
+    assert set(retry["json"]["dndSettings"]) == set(GHL_DND_CHANNELS) - {"SMS"}
+    assert tag["url"].endswith("/contacts/c9/tags")
+
+
+def test_every_permanently_blocked_channel_is_left_out_one_refusal_at_a_time(monkeypatch):
+    _creds(monkeypatch, lending_key=LENDING_KEY, lending_location="lending-loc")
+    calls = _ghl_refusing_permanent_channels(monkeypatch, {"SMS", "Call"})
+    assert ghl_dnd.set_ghl_dnd(PHONE) is True
+    upserts = [call for call in calls if call["url"].endswith("/contacts/upsert")]
+    assert len(upserts) == 3
+    assert set(upserts[-1]["json"]["dndSettings"]) == set(GHL_DND_CHANNELS) - {"SMS", "Call"}
+
+
+@pytest.mark.parametrize("body", [
+    {"message": "Invalid JWT"},
+    {"message": "Not authorized to update permanent dnd setting for Fax"},
+])
+def test_any_other_refusal_still_fails_without_retrying(monkeypatch, body):
+    _creds(monkeypatch, lending_key=LENDING_KEY, lending_location="lending-loc")
+    calls = []
+
+    def fake(method, url, **kwargs):
+        calls.append(url)
+        response = MagicMock(status_code=401)
+        response.json.return_value = body
+        return response
+
+    monkeypatch.setattr("src.services.ghl_webhook._ghl_request", fake)
+    assert ghl_dnd.set_ghl_dnd(PHONE) is False
+    assert len(calls) == 1
 
 
 def test_dnd_upsert_without_the_lending_account_makes_no_request(monkeypatch):
