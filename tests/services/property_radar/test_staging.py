@@ -38,7 +38,7 @@ def _rec(**overrides) -> dict:
 
 def _row(session, radar_id: str = RID) -> dict:
     return dict(session.execute(
-        text("SELECT status, change_flags, prior, changed_at, owner_name "
+        text("SELECT status, change_flags, prior, changed_at, owner_name, campaign "
              "FROM property_radar_records WHERE radar_id = :rid"),
         {"rid": radar_id},
     ).mappings().one())
@@ -197,3 +197,15 @@ def test_duplicate_radar_id_in_one_batch_is_skipped(fresh_db):
 
 def test_empty_batch_returns_zeros(fresh_db):
     assert upsert_records(fresh_db, []) == (0, 0, 0)
+
+
+def test_portfolio_restage_keeps_maturity_campaign(fresh_db):
+    upsert_records(fresh_db, [_rec()])
+    upsert_records(fresh_db, [_rec(campaign="investor_portfolio")])
+    assert _row(fresh_db)["campaign"] == "maturity_target_lender"
+
+
+def test_maturity_restage_replaces_portfolio_campaign(fresh_db):
+    upsert_records(fresh_db, [_rec(campaign="investor_portfolio")])
+    upsert_records(fresh_db, [_rec(campaign="private_maturity")])
+    assert _row(fresh_db)["campaign"] == "private_maturity"
