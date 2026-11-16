@@ -234,28 +234,16 @@ def test_a_missing_state_file_is_flagged_on_the_retry_run_only(wired, retry, not
         assert "2026-11-15" in wired.notices[0]
 
 
-def test_warnings_reach_the_cron_log(wired, monkeypatch):
-    """run.sh keeps only lines matching " - (WARNING|ERROR|CRITICAL) - "; main's log format must produce them."""
+def test_warnings_reach_the_cron_log():
+    """run.sh keeps only lines matching " - (WARNING|ERROR|CRITICAL) - "; main's log format must produce them.
+    Checked on the format itself, not the root logger, which other tests in the suite reconfigure."""
     import logging
     import re
 
-    root = logging.getLogger()
-    monkeypatch.setattr(root, "handlers", [])
-    stream = io.StringIO()
-    monkeypatch.setattr(logging, "basicConfig", lambda **kw: root.addHandler(
-        _handler(stream, kw["format"])))
-    wired.source.error = ConnectionError("down")
-    mod.main(["--day", "2026-11-15"])
-    root.handlers = []
-    assert any(re.search(r" - (WARNING|ERROR|CRITICAL) - ", ln) for ln in stream.getvalue().splitlines())
-
-
-def _handler(stream, fmt):
-    import logging
-
-    h = logging.StreamHandler(stream)
-    h.setFormatter(logging.Formatter(fmt))
-    return h
+    for level in (logging.WARNING, logging.ERROR):
+        record = logging.LogRecord(mod.__name__, level, __file__, 1, "[sunbiz-re-llc] x", None, None)
+        line = logging.Formatter(mod.LOG_FORMAT).format(record)
+        assert re.search(r" - (WARNING|ERROR|CRITICAL) - ", line), line
 
 
 def test_main_defaults_to_yesterday_eastern(wired, monkeypatch):

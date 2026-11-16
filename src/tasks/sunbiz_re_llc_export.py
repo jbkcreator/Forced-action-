@@ -40,6 +40,8 @@ from src.scrappers.sunbiz.daily_filings import (
 logger = logging.getLogger(__name__)
 
 ET = ZoneInfo("America/New_York")
+# run.sh keeps only lines matching " - (WARNING|ERROR|CRITICAL) - " in the cron log
+LOG_FORMAT = "%(asctime)s - %(levelname)s - %(name)s - %(message)s"
 Uploader = Callable[[str, str, str, bytes], None]  # (parent folder id, dated subfolder, file name, bytes)
 
 _BASE_COLUMNS = (
@@ -130,7 +132,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     from src.scrappers.sunbiz.daily_filings import SunbizSftp
 
     if not logging.getLogger().handlers:
-        logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(name)s - %(message)s")  # run.sh keeps " - WARNING - " lines
+        logging.basicConfig(level=logging.INFO, format=LOG_FORMAT)
     parser = argparse.ArgumentParser(description="Daily Florida real estate LLC export to Drive (P3.2)")
     parser.add_argument("--day", type=date.fromisoformat, help="state file date (default: yesterday ET)")
     parser.add_argument("--dry-run", action="store_true", help="download and count; upload nothing")
