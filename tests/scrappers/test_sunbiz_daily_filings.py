@@ -112,6 +112,13 @@ def test_parse_file_counts_rejected_lines_and_skips_blank_ones():
     assert rejected == 1
 
 
+@pytest.mark.parametrize("byte", ["\x85", "\x0c", "\x1c", "\x0b"])
+def test_a_control_byte_inside_a_record_does_not_split_it(byte):
+    data = (_record(name=f"ACME{byte} HOMES LLC") + "\r\n" + _record(document_number="L2")).encode("latin-1")
+    filings, rejected = mod.parse_file(data)
+    assert rejected == 0 and [f.document_number for f in filings] == ["L26000000001", "L2"]
+
+
 def test_parse_file_never_fails_on_a_non_ascii_byte():
     data = _record(name="CAF\xc9 HOMES LLC").encode("latin-1")
     filings, rejected = mod.parse_file(data)

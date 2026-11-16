@@ -121,7 +121,9 @@ def parse_record(line: str) -> Optional[Filing]:
 def parse_file(data: bytes) -> tuple[list[Filing], int]:
     """(filings, rejected lines) for one daily file."""
     filings, rejected = [], 0
-    for line in data.decode(FILE_ENCODING).splitlines():
+    # split("\n"), not splitlines(): splitlines() also breaks on control characters (\x85, \x0c, \x1c-\x1e) that
+    # a stray byte inside a record decodes to, which would cut that record in two. parse_record strips the "\r".
+    for line in data.decode(FILE_ENCODING).split("\n"):
         if not line.strip():
             continue
         filing = parse_record(line)
