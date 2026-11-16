@@ -1055,6 +1055,8 @@ class AppSettings(BaseSettings):
 	# LENDING_DRIVE_SERVICE_ACCOUNT_KEY_PATH (else the Sheets key) with the drive scope; the folder is "NDL Ledger Exports", shared with that account
 	lending_ledger_export_enabled: bool = Field(default=False, env="LENDING_LEDGER_EXPORT_ENABLED")
 	lending_ledger_export_folder_id: str = Field(default="", env="LENDING_LEDGER_EXPORT_FOLDER_ID")
+	# P2.5: the 7:20pm closing scoreboard's numbers to Drive (scoreboard.csv in the same folder); needs the folder id above
+	lending_scoreboard_export_enabled: bool = Field(default=False, env="LENDING_SCOREBOARD_EXPORT_ENABLED")
 	# Drive service account (shared with the P1.1 job queue); blank = LENDING_SHEETS_SERVICE_ACCOUNT_KEY_PATH
 	lending_drive_service_account_key_path: str = Field(default="", env="LENDING_DRIVE_SERVICE_ACCOUNT_KEY_PATH")
 	# Opt-out mailbox listener (src/lending/email_opt_out.py): reads mail sent to LENDING_OPTOUT_ADDRESS over IMAP.
