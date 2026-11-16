@@ -44,11 +44,13 @@ def store():
 
 
 @pytest.fixture
-def client(store):
+def client(store, monkeypatch):
     from src.api.lending_instant_quote_router import get_quote_store, router
-    from src.services.rate_limit import reset_local_buckets
+    from src.services import rate_limit
 
-    reset_local_buckets()
+    # CI has Redis, whose key bucket outlives a test; the in-process buckets are reset per test.
+    monkeypatch.setattr(rate_limit, "redis_available", lambda: False)
+    rate_limit.reset_local_buckets()
     app = FastAPI()
     app.include_router(router)
     app.dependency_overrides[get_quote_store] = lambda: store
