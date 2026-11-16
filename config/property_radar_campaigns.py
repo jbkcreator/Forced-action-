@@ -70,7 +70,7 @@ _ALL_LENDER_NAMES: list[str] = [
 
 
 # Cora P3.1: a loan becomes a "coming due" lead this many days before it matures (5.5 months).
-MATURITY_TRIGGER_DAYS: int = 165
+MATURITY_TRIGGER_DAYS: int = 167
 # Term assumed when PropertyRadar gives none (hard-money bridge loans run 12 months).
 ASSUMED_TERM_DAYS: int = 365
 
@@ -78,7 +78,8 @@ ASSUMED_TERM_DAYS: int = 365
 
 def _maturity_near_edge_days() -> int:
     """Recorded 8 months ago, or, with PROPERTY_RADAR_STATEWIDE_ENABLED, the day a 12-month loan
-    crosses the 5.5-month trigger (recorded 200 days ago)."""
+    crosses the 5.5-month trigger (recorded 198 days ago). Read at call time so the flag
+    takes effect without a restart."""
     from config.settings import get_settings
 
     if get_settings().property_radar_statewide_enabled:
@@ -86,16 +87,18 @@ def _maturity_near_edge_days() -> int:
     return 8 * 30
 
 
-# Date windows as (older_days, newer_days) before today; the far edge is 15 months.
-_MATURITY_WINDOW_DAYS: tuple[int, int] = (15 * 30, _maturity_near_edge_days())
+def _maturity_window_days() -> tuple[int, int]:
+    """(older_days, newer_days) before today; the far edge is 15 months."""
+    return (15 * 30, _maturity_near_edge_days())
 
-# List 8 window per state. FL dials only loans 30–90 days from maturity on a
-# 12-month term (recorded 275–335 days ago); GA takes the full 8–15 month
-# window because GA starts at zero records.
-PRIVATE_MATURITY_WINDOW_DAYS: dict[str, tuple[int, int]] = {
-    "FL": (365 - 30, 365 - 90),
-    "GA": _MATURITY_WINDOW_DAYS,
-}
+
+# List 8 window for FL: dials only loans 30–90 days from maturity on a 12-month term
+# (recorded 275–335 days ago). GA takes the full maturity window (starts at zero records).
+_FL_PRIVATE_MATURITY_WINDOW_DAYS: tuple[int, int] = (365 - 30, 365 - 90)
+
+
+def _private_maturity_window_days(state: str) -> tuple[int, int]:
+    return _FL_PRIVATE_MATURITY_WINDOW_DAYS if state == "FL" else _maturity_window_days()
 
 # List 9: last purchase 90–365 days ago and not resold since.
 STALLED_FLIP_PURCHASE_WINDOW_DAYS: tuple[int, int] = (365, 90)
@@ -132,7 +135,7 @@ def _window_dates(
 def _maturity_window_dates(as_of: Optional[date] = None) -> tuple[date, date]:
     """Return (start, end) dates for loans recorded 8–15 months ago, as of ``as_of``
     (default today). Returns real ``date`` objects — callers format for the API."""
-    return _window_dates(*_MATURITY_WINDOW_DAYS, as_of=as_of)
+    return _window_dates(*_maturity_window_days(), as_of=as_of)
 
 
 def _fmt(d: date) -> str:
@@ -196,7 +199,7 @@ def _outside_window_criterion(name: str, window_days: tuple[int, int]) -> dict:
 
 
 def _maturity_date_criterion(daily_since: Optional[date]) -> dict:
-    return _date_window_criterion("FirstDate", _MATURITY_WINDOW_DAYS, daily_since)
+    return _date_window_criterion("FirstDate", _maturity_window_days(), daily_since)
 
 
 def _fl_maturity_target_lender(daily_since: Optional[date] = None) -> list[dict]:
@@ -242,7 +245,7 @@ def _private_maturity(state: str, daily_since: Optional[date] = None) -> list[di
         _CORPORATE,
         _NOT_LISTED,
         _PRIVATE_FIRST_LOAN,
-        _date_window_criterion("FirstDate", PRIVATE_MATURITY_WINDOW_DAYS[state], daily_since),
+        _date_window_criterion("FirstDate", _private_maturity_window_days(state), daily_since),
         _state(state),
     ]
 
@@ -255,7 +258,7 @@ def _stalled_flip(state: str, daily_since: Optional[date] = None) -> list[dict]:
         # The last transfer is the flipper's own purchase: not resold since.
         _date_window_criterion("LastTransferRecDate", STALLED_FLIP_PURCHASE_WINDOW_DAYS, daily_since),
         # Records already covered by private_maturity are not bought again.
-        _outside_window_criterion("FirstDate", PRIVATE_MATURITY_WINDOW_DAYS[state]),
+        _outside_window_criterion("FirstDate", _private_maturity_window_days(state)),
         _state(state),
     ]
 
