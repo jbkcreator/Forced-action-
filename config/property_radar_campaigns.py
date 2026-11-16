@@ -15,6 +15,9 @@ CAMPAIGN_CRITERIA — keyed by (state, campaign_key). Each value is a list of
     private_maturity        List 8 — first loan coded Private by PropertyRadar
     stalled_flip            List 9 — financed (private) purchase, not resold
     auction_winner          List 6 — trustee-sale buyers
+  Cora P3.1 export signals (no source list, so the calling-pool bridge never dials them):
+    cash_purchase           100% down purchase in the last 90 days, not owner-occupied
+    investor_portfolio      company-owned, not owner-occupied, bought in the last 12 months
   PropertyRadar does not code the named hard-money lenders as Private, so
   maturity_target_lender and private_maturity never overlap. stalled_flip
   and private_maturity overlap as a loan ages, so they share seen_ids
@@ -66,8 +69,25 @@ _ALL_LENDER_NAMES: list[str] = [
 ]
 
 
-# Date windows as (older_days, newer_days) before today.
-_MATURITY_WINDOW_DAYS: tuple[int, int] = (15 * 30, 8 * 30)  # recorded ~8–15 months ago
+# Cora P3.1: a loan becomes a "coming due" lead this many days before it matures (5.5 months).
+MATURITY_TRIGGER_DAYS: int = 165
+# Term assumed when PropertyRadar gives none (hard-money bridge loans run 12 months).
+ASSUMED_TERM_DAYS: int = 365
+
+
+
+def _maturity_near_edge_days() -> int:
+    """Recorded 8 months ago, or, with PROPERTY_RADAR_STATEWIDE_ENABLED, the day a 12-month loan
+    crosses the 5.5-month trigger (recorded 200 days ago)."""
+    from config.settings import get_settings
+
+    if get_settings().property_radar_statewide_enabled:
+        return ASSUMED_TERM_DAYS - MATURITY_TRIGGER_DAYS
+    return 8 * 30
+
+
+# Date windows as (older_days, newer_days) before today; the far edge is 15 months.
+_MATURITY_WINDOW_DAYS: tuple[int, int] = (15 * 30, _maturity_near_edge_days())
 
 # List 8 window per state. FL dials only loans 30–90 days from maturity on a
 # 12-month term (recorded 275–335 days ago); GA takes the full 8–15 month
@@ -82,6 +102,19 @@ STALLED_FLIP_PURCHASE_WINDOW_DAYS: tuple[int, int] = (365, 90)
 
 # List 6: trustee-sale purchase in the last 12 months.
 AUCTION_WINNER_PURCHASE_WINDOW_DAYS: tuple[int, int] = (365, 0)
+
+# Cora P3.1 cash purchases: bought with 100% down in the last 90 days by a non-occupant.
+CASH_PURCHASE_WINDOW_DAYS: tuple[int, int] = (90, 0)
+CASH_PURCHASE_MIN_DOWN_PERCENT: int = 100
+
+# Cora P3.1 investor-owned portfolios: company-owned, not owner-occupied, bought in the last
+# 12 months. PropertyRadar has no "properties owned" criterion, so the portfolio size is
+# counted over the staged records by the export (INVESTOR_PORTFOLIO_MIN_PROPERTIES).
+INVESTOR_PORTFOLIO_WINDOW_DAYS: tuple[int, int] = (365, 0)
+INVESTOR_PORTFOLIO_MIN_PROPERTIES: int = 3
+
+# Campaigns whose records are maturing-loan leads.
+MATURITY_CAMPAIGNS: frozenset[str] = frozenset({"maturity_target_lender", "private_maturity"})
 
 # Far-past lower bound for an open-ended "before" date range.
 _EARLIEST_DATE = date(1990, 1, 1)
@@ -235,6 +268,29 @@ def _auction_winner(state: str, daily_since: Optional[date] = None) -> list[dict
     ]
 
 
+_NOT_OWNER_OCCUPIED = {"name": "isSameMailingOrExempt", "value": ["0"]}
+
+
+def _cash_purchase(state: str, daily_since: Optional[date] = None) -> list[dict]:
+    return [
+        _NOT_OWNER_OCCUPIED,
+        _NOT_LISTED,
+        {"name": "LastTransferDownPaymentPercent", "value": [[CASH_PURCHASE_MIN_DOWN_PERCENT, None]]},
+        _date_window_criterion("LastTransferRecDate", CASH_PURCHASE_WINDOW_DAYS, daily_since),
+        _state(state),
+    ]
+
+
+def _investor_portfolio(state: str, daily_since: Optional[date] = None) -> list[dict]:
+    return [
+        _CORPORATE,
+        _NOT_OWNER_OCCUPIED,
+        _NOT_LISTED,
+        _date_window_criterion("LastTransferRecDate", INVESTOR_PORTFOLIO_WINDOW_DAYS, daily_since),
+        _state(state),
+    ]
+
+
 def _for_state(builder, state: str):
     return lambda daily_since=None: builder(state, daily_since)
 
@@ -250,6 +306,8 @@ _CAMPAIGN_BUILDERS: dict[tuple[str, str], object] = {
             ("private_maturity", _private_maturity),
             ("stalled_flip", _stalled_flip),
             ("auction_winner", _auction_winner),
+            ("cash_purchase", _cash_purchase),
+            ("investor_portfolio", _investor_portfolio),
         )
     },
 }
@@ -262,4 +320,6 @@ DEFAULT_CAMPAIGN: str = "maturity_target_lender"
 SHARED_SEEN_CAMPAIGNS: dict[str, tuple[str, ...]] = {
     "stalled_flip": ("private_maturity",),
     "private_maturity": ("stalled_flip",),
+    "cash_purchase": ("investor_portfolio",),
+    "investor_portfolio": ("cash_purchase",),
 }

@@ -25,7 +25,8 @@ Adding a state (config only, no code change):
   A new campaign also needs a CAMPAIGN_PRIORITY entry (config/lead_ownership.py) and
   handoff entries (config/property_radar_handoff.py).
 
-Monitoring stays off: the cron line in scripts/cron/crontab.txt is commented out.
+Cron (scripts/cron/crontab.txt) runs one --apply --cron line per state and campaign; each does nothing
+while PROPERTY_RADAR_STATEWIDE_ENABLED or PROPERTY_RADAR_ENABLED is false.
 """
 from __future__ import annotations
 
@@ -212,7 +213,7 @@ def default_stages(trace_results: Optional[Path] = None) -> Stages:
              stats: PullStats) -> Iterator[list[dict[str, Any]]]:
         crit = criteria(session, mode, state, campaign)
         try:
-            pull_task._check_budget(port, crit, state, campaign)
+            pull_task._check_budget(port, crit, state, campaign, month_used=pull_task._month_exports(session))
         except Exception:
             logger.exception("PropertyRadar budget check refused or failed for %s/%s", state, campaign)
             raise
@@ -272,10 +273,15 @@ def main() -> None:
     parser.add_argument("--trace-results", type=Path,
                         help="Tracerfy results CSV. Without it, an --apply run traces staged records live")
     parser.add_argument("--apply", action="store_true", help="Buy, stage, link and hand off (default: dry run)")
+    parser.add_argument("--cron", action="store_true",
+                        help="Scheduled run: do nothing while PROPERTY_RADAR_STATEWIDE_ENABLED is false")
     args = parser.parse_args()
 
     from config.property_radar_campaigns import ENABLED_STATES
     from config.settings import get_settings
+    if args.cron and not get_settings().property_radar_statewide_enabled:
+        logger.info("PROPERTY_RADAR_STATEWIDE_ENABLED is false - scheduled run skipped.")
+        return
     if args.apply and not get_settings().property_radar_enabled:
         logger.warning("PROPERTY_RADAR_ENABLED is false - refusing --apply.")
         return
