@@ -113,10 +113,30 @@ def test_a_first_time_stage_after_funded_still_applies(client, lending_db):
     assert _current(lending_db) == "application"
 
 
-def test_a_repeated_event_still_moves_a_deal_between_active_stages(client, lending_db):
-    for stage in ("Application", "Submitted to lender", "Application"):
-        _stage(client, stage)
+def _age_events(db, hours=2, opp="opp-9"):
+    """The earlier deliveries happened ``hours`` ago (past the redelivery window)."""
+    db.execute(text("UPDATE lending.ghl_stage_events SET event_at = now() - make_interval(hours => :h) "
+                    "WHERE ghl_opportunity_id = :o"), {"h": hours, "o": opp})
+
+
+def test_a_redelivery_within_the_hour_never_moves_an_active_deal_back(client, lending_db):
+    _stage(client, "Application"), _stage(client, "Submitted to lender")
+    _stage(client, "Application")                     # GHL redelivers the earlier event minutes later
+    assert _current(lending_db) == "submitted to lender"
+
+
+def test_a_repeated_stage_later_than_the_hour_is_a_real_move(client, lending_db):
+    _stage(client, "Application"), _stage(client, "Submitted to lender")
+    _age_events(lending_db)
+    _stage(client, "Application")                     # the deal really went back
     assert _current(lending_db) == "application"
+
+
+def test_a_lost_deal_revived_to_a_stage_it_was_in_before_is_reopened(client, lending_db):
+    _stage(client, "Application"), _stage(client, "Lost")
+    _age_events(lending_db, hours=48)
+    assert _stage(client, "Application") is False     # a repeat in ghl_stage_events...
+    assert _current(lending_db) == "application"      # ...but days later: Josh revived it
 
 
 def test_a_redelivered_funded_keeps_funded(client, lending_db):

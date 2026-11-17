@@ -71,7 +71,8 @@ def test_quote_id_must_be_a_uuid():
 
 
 def test_open_chase_summaries(closing_db, chase_on):
-    chase_id = start_chase(closing_db, Recipient("Mark", "+18135550101", None, None), lead_ref="web_lead:1",
+    chase_id = start_chase(closing_db, Recipient("Mark", "+18135550101", "mark@example.com", None),
+                           lead_ref="web_lead:1",
                            accepted_by="slack:U1", now=NOW - timedelta(days=3)).chase_id
     closing_db.execute(text("UPDATE lending.doc_chase_items SET received_at = now() WHERE item_code = 'valuation'"))
     closing_db.execute(text("INSERT INTO lending.doc_chase_touches (chase_id, chase_day) VALUES (:c, 0), (:c, 2)"),

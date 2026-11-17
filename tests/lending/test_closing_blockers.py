@@ -216,3 +216,14 @@ def test_names_stages_and_labels_are_escaped_on_the_card(closing_db):
     card = _card_text(chat)
     assert "<!channel>" not in card and "<!here>" not in card and "<@U123>" not in card
     assert "&lt;!channel&gt;" in card and "&lt;!here&gt;" in card and "&lt;@U123&gt;" in card
+
+
+def test_a_failure_to_save_the_slack_ts_never_reposts_the_card(closing_db, monkeypatch):
+    import src.lending.closing.blockers as blockers
+
+    _stage(closing_db, "opp-r", "Application", timedelta(days=4))
+    monkeypatch.setattr(blockers, "_RECORD_POST", text("UPDATE lending.no_such_table SET x = 1"))
+    chat = FakeChatPort()
+    assert _post(closing_db, chat, Gate())
+    assert not _post(closing_db, chat, Gate(), now=AT_7_00 + timedelta(minutes=1))
+    assert len(chat.posts) == 1

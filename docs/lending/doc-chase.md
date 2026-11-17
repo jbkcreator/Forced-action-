@@ -19,6 +19,10 @@ on `lending-api`, settings and copy in `config/lending_closing.py`. Both parts r
    never copied to Drive or Slack. Include it in the server backup. There is no automatic deletion yet: it is built
    once Josh sets the retention period.
 
+Current stage: each GHL stage webhook updates `lending.ghl_opportunity_stage` (time = when it arrived; GHL sends
+no event time). The same stage event for the same deal repeated within an hour of its first delivery is treated as
+a redelivery and never moves the deal; a later repeat is a real move (e.g. a Lost deal revived to Application).
+
 ## 7 AM closing blocker card (#cora)
 
 Once a day between 7:00 and noon ET (`lending.closing_blocker_cards` stops a second post). Lists every deal in
@@ -38,7 +42,11 @@ otherwise Application = borrower, Submitted to lender = lender, Ready to fund = 
 
 Start: an approver tells Cora the borrower accepted the term sheet, e.g. "Mark accepted the term sheet, start the
 document chase" (tool `start_document_chase`; optional P2.2 `quote_id`, whose `INTEREST_RESERVE_FULL_TERM`
-condition adds a document). One open chase per phone; asking again keeps the open one.
+condition adds a document). One open chase per phone; asking again keeps the open one. While texts with links are
+off, a borrower with no email is refused with the reason (no link could ever reach them).
+
+Where the documents are: on the lending-api server under `LENDING_DOC_UPLOAD_DIR`, one folder per chase; Cora's
+inbox says what arrived. There is no way yet for Josh to open them without server access (open item below).
 
 Checklist: Central Lending's list from Josh's Term Sheet Intake Checklist (Nov 2). Backflip has none (blocked).
 
@@ -60,4 +68,5 @@ sweep, but only when the borrower's phone has exactly one GHL opportunity (never
 
 ## Open with Josh
 
-Active stages, the owner per stage, the message wording (`TEMPLATES`) and the document retention period.
+Active stages, the owner per stage, the message wording (`TEMPLATES`), the document retention period, and how
+Josh opens uploaded documents (a restricted Drive folder, a private download link from Cora, or on request).

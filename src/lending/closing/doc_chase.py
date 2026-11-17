@@ -124,6 +124,9 @@ def start_chase(db, recipient: Recipient, *, lead_ref: str, accepted_by: str, le
     upload_dir()  # no link goes out that could not store what the borrower uploads
     if not recipient.phone and not recipient.email:
         raise ValueError("the borrower has no phone or email on record")
+    if not recipient.email and not _sms_links_allowed():
+        raise ValueError("the borrower has no email on record and texts with upload links are off until the 10DLC "
+                         "campaign allows links (LENDING_DOC_CHASE_SMS_LINKS_ENABLED): add their email first")
     now = now or datetime.now(timezone.utc)
     existing = db.execute(_OPEN_FOR_BORROWER, {"phone": recipient.phone, "email": recipient.email}).scalar()
     if existing is not None:

@@ -102,3 +102,13 @@ def test_no_chase_starts_without_an_absolute_upload_folder(closing_db, link_base
         _start(closing_db)
     assert closing_db.execute(text("SELECT count(*) FROM lending.doc_chases")).scalar() == 0
     assert AppSettings.model_fields["lending_doc_upload_dir"].default == ""
+
+
+def test_a_phone_only_borrower_is_refused_while_texts_with_links_are_off(closing_db, link_base, monkeypatch):
+    from config.settings import get_settings
+    monkeypatch.setattr(get_settings(), "lending_doc_chase_sms_links_enabled", False, raising=False)
+    with pytest.raises(ValueError, match="no email"):
+        start_chase(closing_db, Recipient("Ana", "+18135550102", None, None), lead_ref="web_lead:8",
+                    accepted_by="slack:U1", now=NOW)
+    assert closing_db.execute(text("SELECT count(*) FROM lending.doc_chases")).scalar() == 0
+    assert _start(closing_db).reused is False             # with an email it starts (links go by email)

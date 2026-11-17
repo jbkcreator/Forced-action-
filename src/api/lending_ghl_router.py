@@ -119,12 +119,12 @@ def _now() -> datetime:
 def _record_current_stage(db: Session, opportunity_id: str, stage: str, phone: Optional[str], *,
                           repeat: bool) -> None:
     """P2.4 current stage, in a savepoint: a failure is logged and never loses the scoreboard's stage event.
-    ``repeat``: the event was already recorded, so it cannot move a funded or lost deal back (blockers.py)."""
+    ``repeat``: the event was already recorded; a redelivery never moves the deal (blockers.upsert_current_stage)."""
     try:
         with db.begin_nested():
             if not upsert_current_stage(db, opportunity_id=opportunity_id, stage_name=stage, phone=phone, now=_now(),
                                         repeat=repeat):
-                logger.warning("[lending-ghl] repeated stage event ignored: the deal is funded or lost")
+                logger.warning("[lending-ghl] stage event redelivered within the hour: deal left in its current stage")
     except Exception as exc:  # class only: SQL errors embed bound parameters
         logger.error("[lending-ghl] current stage not recorded (%s)", type(exc).__name__)
 

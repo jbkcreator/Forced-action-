@@ -13,6 +13,9 @@ ACTIVE_STAGE_KEYS = frozenset({"application", "ready to fund", "submitted to len
 # A document chase on a deal in one of these stops.
 CLOSED_STAGE_KEYS = frozenset({"funded", "lost", "nurture"})
 STUCK_AFTER = timedelta(days=3)  # brief: "stuck for more than 3 days"
+# GHL's stage webhook body carries no event time. A stage event repeated (same deal, same stage) within this long
+# of its first delivery is a redelivery and never moves the deal; a later repeat is a real move (a revived deal).
+REDELIVERY_WINDOW = timedelta(hours=1)
 
 # Who holds a stuck deal up when no documents are missing. Missing documents always mean borrower (or partner).
 STAGE_OWNER = {"application": "borrower", "ready to fund": "title", "submitted to lender": "lender"}

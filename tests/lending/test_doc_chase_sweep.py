@@ -184,9 +184,12 @@ def test_links_off_sends_by_email_even_with_text_consent(closing_db, chase, inbo
     assert all("api/lending/docs/" in d.payload["body"] for d in gate.drafts.values())
 
 
-def test_links_off_and_no_email_goes_to_the_inbox_not_a_text(closing_db, link_base, inbox, no_sms_links):
+def test_links_off_and_no_email_goes_to_the_inbox_not_a_text(closing_db, link_base, inbox, monkeypatch):
+    """A phone-only chase started while links were on, then links turned off: no text, an inbox item instead."""
+    from config.settings import get_settings
     start_chase(closing_db, Recipient("Ana", "+18135550102", None, None), lead_ref="web_lead:8",
                 accepted_by="slack:U1", now=ACCEPTED)
+    monkeypatch.setattr(get_settings(), "lending_doc_chase_sms_links_enabled", False, raising=False)
     gate = Gate()
     _sweep(closing_db, gate, 0, consent=True)
     assert gate.drafts == {}

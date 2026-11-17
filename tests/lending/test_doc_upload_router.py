@@ -24,6 +24,7 @@ def setup(closing_db, monkeypatch, tmp_path):
     settings = get_settings()
     monkeypatch.setattr(settings, "lending_partner_link_base_url", "https://api.example.com", raising=False)
     monkeypatch.setattr(settings, "lending_doc_upload_dir", str(tmp_path), raising=False)
+    monkeypatch.setattr(settings, "lending_doc_chase_sms_links_enabled", True, raising=False)  # phone-only borrower
     monkeypatch.setattr(lending_doc_upload_router, "enforce_or_429", lambda *args, **kwargs: None)
     events = []
     monkeypatch.setattr("src.lending.closing.doc_chase.add_to_inbox_safely", lambda db, **e: events.append(e))

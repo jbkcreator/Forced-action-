@@ -20,9 +20,9 @@ from config.lending_closing import (
     ACTIVE_STAGE_KEYS,
     CARD_LAST_TIME,
     CARD_TIME,
-    CLOSED_STAGE_KEYS,
     LENDER_TITLE_DRAFTS,
     OWNER_LABELS,
+    REDELIVERY_WINDOW,
     STUCK_AFTER,
 )
 from config.lending_compliance import DEFAULT_TZ
@@ -47,23 +47,23 @@ _UPSERT_STAGE = text("""
         entered_at = CASE WHEN lending.ghl_opportunity_stage.stage_key = EXCLUDED.stage_key
                           THEN lending.ghl_opportunity_stage.entered_at ELSE EXCLUDED.entered_at END
      WHERE NOT (CAST(:repeat AS boolean)
-                AND lending.ghl_opportunity_stage.stage_key = ANY(CAST(:final AS varchar[]))
-                AND lending.ghl_opportunity_stage.stage_key <> EXCLUDED.stage_key)
+                AND lending.ghl_opportunity_stage.stage_key <> EXCLUDED.stage_key
+                AND EXISTS (SELECT 1 FROM lending.ghl_stage_events e
+                             WHERE e.ghl_opportunity_id = EXCLUDED.ghl_opportunity_id
+                               AND e.stage_key = EXCLUDED.stage_key AND e.event_at > :since))
 """)
-# A deal never leaves these on a stage event already recorded once: a redelivered or late "Application" after
-# "Funded" would otherwise reopen a funded deal (chase reminders, the 7 AM card). GHL's stage webhook body carries
-# no event time, so delivery order is the only order available.
-FINAL_STAGE_KEYS = frozenset({"funded", "lost"}) & CLOSED_STAGE_KEYS
 
 
 def upsert_current_stage(db, *, opportunity_id: str, stage_name: str, phone: Optional[str], now: datetime,
                          repeat: bool = False) -> bool:
     """Record that the opportunity is in ``stage_name``; a repeat of its current stage keeps the original entry time.
-    ``repeat``: this stage event was already recorded (``ghl_stage_events`` refused it as a duplicate); such an event
-    never moves a deal out of Funded or Lost. Returns False when the row was left unchanged."""
+    ``repeat``: this stage event was already recorded (``ghl_stage_events`` refused it as a duplicate). Within
+    REDELIVERY_WINDOW of that first delivery it is a redelivery and never moves the deal (e.g. "Application"
+    redelivered after "Funded"); later it is a real move, such as a Lost deal revived to Application. GHL sends no
+    event time, so a redelivery later than the window is applied as a move. False when the row was left unchanged."""
     return bool(db.execute(_UPSERT_STAGE, {
         "opp": opportunity_id, "stage": stage_name, "key": stage_name.strip().lower(), "now": now, "phone": phone,
-        "repeat": repeat, "final": sorted(FINAL_STAGE_KEYS)}).rowcount)
+        "repeat": repeat, "since": now - REDELIVERY_WINDOW}).rowcount)
 
 
 # ---- the 7 AM card -------------------------------------------------------------------------------------------------
@@ -287,7 +287,12 @@ def post_blocker_card(db, chat: ChatPort, gate: SendGate, *, channel: Optional[s
         first = chat.post(text=header, blocks=blocks, channel=channel, thread_ts=None)
         if not first.ok:
             raise RuntimeError(f"closing blocker card not posted ({first.error or 'no Slack response'})")
-        db.execute(_RECORD_POST, {"channel": first.channel or channel, "ts": first.ts, "day": day})
+        try:  # the card is up: a failure to note where must not roll the claim back and post it again
+            with db.begin_nested():
+                db.execute(_RECORD_POST, {"channel": first.channel or channel, "ts": first.ts, "day": day})
+        except Exception as exc:  # class only: SQL errors embed bound parameters
+            logger.error("[closing-blockers] card for %s posted but its Slack ts not saved (%s)", day.isoformat(),
+                         type(exc).__name__)
         for number, (header, blocks) in enumerate(messages[1:], start=2):
             result = chat.post(text=header, blocks=blocks, channel=channel, thread_ts=first.ts)
             if not result.ok:
