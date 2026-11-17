@@ -202,3 +202,17 @@ def test_a_failed_thread_message_keeps_the_day_claimed_and_never_reposts(closing
     row = closing_db.execute(text("SELECT slack_ts FROM lending.closing_blocker_cards WHERE card_day = :d"),
                              {"d": DAY}).one()
     assert row.slack_ts == chat.posts[0]["ts"]
+
+
+def test_names_stages_and_labels_are_escaped_on_the_card(closing_db):
+    _stage(closing_db, "opp-x", "Application", timedelta(days=4))
+    _chase(closing_db, missing=("Photo <!here> ID",), received=())
+    closing_db.execute(text("UPDATE lending.doc_chases SET first_name = '<!channel>'"))
+    _stage(closing_db, "opp-l", "Submitted to lender", timedelta(days=5), phone="+18135550199")
+    closing_db.execute(text("UPDATE lending.ghl_opportunity_stage SET stage_name = 'Submitted <@U123> to lender' "
+                            "WHERE ghl_opportunity_id = 'opp-l'"))
+    chat = FakeChatPort()
+    _post(closing_db, chat, Gate())
+    card = _card_text(chat)
+    assert "<!channel>" not in card and "<!here>" not in card and "<@U123>" not in card
+    assert "&lt;!channel&gt;" in card and "&lt;!here&gt;" in card and "&lt;@U123&gt;" in card

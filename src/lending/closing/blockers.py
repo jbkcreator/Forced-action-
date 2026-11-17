@@ -28,6 +28,7 @@ from config.lending_closing import (
 from config.lending_compliance import DEFAULT_TZ
 from packages.agent_core.briefing import BriefSection, render_brief_blocks
 from packages.agent_core.chatport import ChatPort
+from packages.agent_core.redaction import slack_safe
 from packages.agent_core.send_gate import SendGate
 from src.lending.closing.drafts import Recipient, chase_draft, submit_draft
 from src.lending.closing.rules import Owner, blame
@@ -184,8 +185,9 @@ def card_day(now: datetime) -> Optional[date]:
 
 
 def _who(deal: StuckDeal) -> str:
+    """Names come from the web form, LendingFlow and partner files: escaped, so "<!channel>" is shown, not run."""
     last4 = f" (…{deal.phone_last4})" if deal.phone_last4 else ""
-    return f"{deal.first_name or 'Borrower'}{last4}"
+    return f"{slack_safe(deal.first_name or 'Borrower')}{last4}"
 
 
 def _nudge_key(deal: StuckDeal) -> str:
@@ -208,17 +210,17 @@ def _draft_nudge(deal: StuckDeal, gate: SendGate, approvals_channel: str,
 
 
 def _deal_line(deal: StuckDeal, action: str) -> str:
-    line = (f"🔴 *{_who(deal)}* · {deal.stage_name} · {deal.days} days · "
+    line = (f"🔴 *{_who(deal)}* · {slack_safe(deal.stage_name)} · {deal.days} days · "
             f"waiting on {OWNER_LABELS[deal.owner]}")
     if deal.missing:
-        line += f"\n      Missing: {', '.join(deal.missing)}"
+        line += f"\n      Missing: {', '.join(slack_safe(label) for label in deal.missing)}"
     return f"{line}\n      {action}"
 
 
 def _action(db, deal: StuckDeal, gate: SendGate, approvals_channel: str, text_consent: Callable[[str], bool]) -> str:
     if deal.owner in ("lender", "title"):
-        draft = LENDER_TITLE_DRAFTS[deal.owner].format(name=deal.first_name or "the borrower", stage=deal.stage_name,
-                                                       days=deal.days)
+        draft = LENDER_TITLE_DRAFTS[deal.owner].format(name=slack_safe(deal.first_name or "the borrower"),
+                                                       stage=slack_safe(deal.stage_name), days=deal.days)
         return f"Draft for you to send: _{draft}_"
     if deal.chase_id is not None:
         step = "request sent" if deal.last_chase_day in (None, 0) else f"day {deal.last_chase_day} reminder sent"
