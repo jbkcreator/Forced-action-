@@ -4,7 +4,12 @@ from datetime import timedelta
 
 import pytest
 
-from packages.agent_core.approval import ApprovalAction, apply_click, render_action_card, render_decided_card
+from packages.agent_core.approval import (
+    ApprovalAction,
+    apply_click,
+    render_action_card,
+    render_decided_card,
+)
 from packages.agent_core.pending_actions import ActionStatus, PendingActionQueue
 from packages.agent_core.redaction import mask_emails, mask_long_digit_runs
 

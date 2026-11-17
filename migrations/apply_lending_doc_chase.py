@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import logging
 
-from sqlalchemy import create_engine, text
+from sqlalchemy import Table, create_engine, text
 from sqlalchemy.engine import Connection, Engine
 from sqlalchemy.schema import CreateIndex
 
@@ -42,7 +42,8 @@ def apply_to(conn: Connection, schema: str = LENDING_SCHEMA) -> None:
     # create(checkfirst=True) skips a table that already exists, so an index added after a first run (e.g. the
     # one-open-chase-per-email unique index) would never reach it: every model index is created if missing.
     for model in TABLES:
-        for index in sorted(model.__table__.indexes, key=lambda i: i.name or ""):
+        table: Table = model.__table__  # type: ignore[assignment]  # declarative tables are Table at runtime
+        for index in sorted(table.indexes, key=lambda i: str(i.name or "")):
             translated.execute(CreateIndex(index, if_not_exists=True))
     # Deals that moved before this table existed: their latest stage entry. Never overwrites a live row.
     conn.execute(text(

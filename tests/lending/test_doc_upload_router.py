@@ -134,7 +134,10 @@ def test_real_images_are_accepted(setup, name, data, content_type):
 def test_access_log_lines_never_carry_the_upload_token():
     import logging
 
-    from src.api.lending_doc_upload_router import UploadTokenLogFilter, redact_upload_tokens
+    from src.api.lending_doc_upload_router import (
+        UploadTokenLogFilter,
+        redact_upload_tokens,
+    )
     token = "Zk3n8QvR2xYp7LmA9cTb4WsE6uHf1JdG0oKiNqVrXyU"
     assert redact_upload_tokens(f"POST /api/lending/docs/{token}/upload") == "POST /api/lending/docs/[…]/upload"
     record = logging.LogRecord("uvicorn.access", logging.INFO, __file__, 1, '%s - "%s %s HTTP/%s" %d', (
