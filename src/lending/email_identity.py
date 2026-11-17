@@ -20,6 +20,7 @@ from sqlalchemy import text
 
 from config.settings import get_settings
 from src.services.phone_utils import normalize
+from src.utils.sentry import capture_error
 
 logger = logging.getLogger(__name__)
 
@@ -30,10 +31,18 @@ class LendingEmailIdentity:
     bcc: tuple[str, ...]
 
 
+_NOT_IN_AN_ADDRESS = frozenset(",;<>\"' \t")
+SENTRY_EVENT = "lending_lendingflow_sender_unset"
+
+
 def _address(value: str) -> str | None:
+    """One bare address (``name@domain.tld``), lowercased; None for anything else, a list or a "Name <x>" form."""
     address = value.strip().lower()
-    local, at, domain = address.partition("@")
-    return address if at and local and "." in domain and " " not in address else None
+    if address.count("@") != 1 or any(char in _NOT_IN_AN_ADDRESS for char in address):
+        return None
+    local, _, domain = address.partition("@")
+    labels = domain.split(".")
+    return address if local and len(labels) > 1 and all(labels) else None
 
 
 def _parse_bcc(raw: str) -> tuple[str, ...] | None:
@@ -60,8 +69,11 @@ def lending_email_identity() -> LendingEmailIdentity | None:
     problems = tuple(name for name, ok in (("LENDING_LENDINGFLOW_EMAIL_FROM", from_address),
                                            ("LENDING_LENDINGFLOW_EMAIL_BCC", bcc)) if not ok)
     if problems != _warned:
-        logger.error("[lending-email] no email to a LendingFlow lead will be sent; missing or invalid: %s",
-                     ", ".join(problems))
+        names = ", ".join(problems)
+        logger.error("[lending-email] no email to a LendingFlow lead will be sent; missing or invalid: %s", names,
+                     extra={"event": SENTRY_EVENT, "missing_settings": list(problems)})
+        capture_error(f"LendingFlow emails refused: {names} missing or invalid",
+                      tags={"event": SENTRY_EVENT, "missing_settings": names}, fingerprint=[SENTRY_EVENT, names])
         _warned = problems
     return None
 

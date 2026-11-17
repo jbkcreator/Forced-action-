@@ -8,8 +8,8 @@ FILE_URL = "https://files.example/conv/abc.pdf"
 
 
 class _Settings:
-    lending_lendingflow_email_from = "david.willis@nextdeallending.com"
-    lending_lendingflow_email_bcc = "josh@nextdeallending.com"
+    lending_lendingflow_email_from = "lf-sender@nextdeallending.com"
+    lending_lendingflow_email_bcc = "lf-bcc@nextdeallending.com"
 
 
 class _Resp:
@@ -59,12 +59,12 @@ def test_deliver_uploads_then_sends_email_with_attachment(no_sender):
     assert body["type"] == "Email" and body["contactId"] == "cid1"
     assert body["subject"] == EMAIL_SUBJECT
     assert body["attachments"] == [FILE_URL]
-    assert body["emailFrom"] == "david.willis@nextdeallending.com"
-    assert body["emailBcc"] == ["josh@nextdeallending.com"] and "emailCc" not in body
+    assert body["emailFrom"] == "lf-sender@nextdeallending.com"
+    assert body["emailBcc"] == ["lf-bcc@nextdeallending.com"] and "emailCc" not in body
 
 
-@pytest.mark.parametrize("sender,bcc", [(None, "josh@nextdeallending.com"), ("david.willis@nextdeallending.com", "")])
-def test_nothing_uploaded_or_sent_without_david_and_josh(monkeypatch, sender, bcc):
+@pytest.mark.parametrize("sender,bcc", [(None, "lf-bcc@nextdeallending.com"), ("lf-sender@nextdeallending.com", "")])
+def test_nothing_uploaded_or_sent_without_the_lendingflow_sender(monkeypatch, sender, bcc):
     from src.lending import email_identity
 
     class S:

@@ -105,6 +105,7 @@ def get_email_sender() -> Optional[GhlEmailSender]:
     account, address = lending_ghl_account(), email_from_address()
     if account is None or not address:
         return None
+    email_identity.lending_email_identity()  # reports a missing LendingFlow sender (log + Sentry) when a service starts
     return GhlEmailSender(account, address)
 
 

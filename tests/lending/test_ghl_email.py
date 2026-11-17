@@ -152,7 +152,7 @@ def test_rejected_email_is_retried_then_failed(writes):
 
 # -- LendingFlow leads: From David, BCC Josh, never CC (client request, Nov 17) ---------------------------------------
 
-DAVID, JOSH = "david.willis@nextdeallending.com", "josh@nextdeallending.com"
+LF_SENDER, LF_BCC = "lf-sender@nextdeallending.com", "lf-bcc@nextdeallending.com"
 _real_is_lendingflow_recipient = email_identity.is_lendingflow_recipient
 
 
@@ -164,19 +164,19 @@ def _lendingflow(monkeypatch, answer):
     monkeypatch.setattr(email_identity, "is_lendingflow_recipient", check)
 
 
-def _lendingflow_settings(monkeypatch, *, sender=DAVID, bcc=JOSH):
+def _lendingflow_settings(monkeypatch, *, sender=LF_SENDER, bcc=LF_BCC):
     s = get_settings()
     monkeypatch.setattr(s, "lending_lendingflow_email_from", sender, raising=False)
     monkeypatch.setattr(s, "lending_lendingflow_email_bcc", bcc, raising=False)
 
 
-def test_email_to_a_lendingflow_lead_is_from_david_with_josh_in_bcc_only(monkeypatch):
+def test_email_to_a_lendingflow_lead_is_from_the_lendingflow_sender_with_bcc_only(monkeypatch):
     _lendingflow(monkeypatch, True)
-    _lendingflow_settings(monkeypatch, sender=f" {DAVID.upper()} ", bcc=f"{JOSH}, {JOSH}")
+    _lendingflow_settings(monkeypatch, sender=f" {LF_SENDER.upper()} ", bcc=f"{LF_BCC}, {LF_BCC}")
     request = Recorder(Resp(200, {"contact": {"id": "ct1"}}), Resp(201, {"messageId": "m1"}))
     GhlEmailSender(ACCOUNT, FROM, request=request)(TO, "s", "b", phone=PHONE)
     body = request.calls[1][2]["json"]
-    assert body["emailFrom"] == DAVID and body["emailBcc"] == [JOSH]
+    assert body["emailFrom"] == LF_SENDER and body["emailBcc"] == [LF_BCC]
     assert "emailCc" not in body
 
 
@@ -189,8 +189,8 @@ def test_email_to_anyone_else_keeps_the_usual_sender_and_no_bcc(monkeypatch):
     assert body["emailFrom"] == FROM and "emailBcc" not in body and "emailCc" not in body
 
 
-@pytest.mark.parametrize("sender,bcc", [(None, JOSH), (DAVID, ""), (DAVID, "josh"), ("david", JOSH)])
-def test_email_to_a_lendingflow_lead_is_refused_without_david_and_josh(monkeypatch, sender, bcc):
+@pytest.mark.parametrize("sender,bcc", [(None, LF_BCC), (LF_SENDER, ""), (LF_SENDER, "not-an-address"), ("sender", LF_BCC)])
+def test_email_to_a_lendingflow_lead_is_refused_without_the_lendingflow_sender(monkeypatch, sender, bcc):
     _lendingflow(monkeypatch, True)
     _lendingflow_settings(monkeypatch, sender=sender, bcc=bcc)
     request = Recorder()

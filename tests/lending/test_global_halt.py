@@ -195,7 +195,7 @@ def _recorded_ghl_posts(monkeypatch) -> list[str]:
     from src.lending import email_identity
 
     monkeypatch.setattr(email_identity, "get_settings", lambda: SimpleNamespace(
-        lending_lendingflow_email_from="david.willis@nextdeallending.com", lending_lendingflow_email_bcc="josh@nextdeallending.com"))
+        lending_lendingflow_email_from="lf-sender@nextdeallending.com", lending_lendingflow_email_bcc="lf-bcc@nextdeallending.com"))
     return calls
 
 
