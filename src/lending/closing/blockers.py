@@ -267,9 +267,10 @@ def render_blocker_card(day: date, lines: list[str]) -> list[tuple[str, list[dic
 
 def post_blocker_card(db, chat: ChatPort, gate: SendGate, *, channel: Optional[str], approvals_channel: str,
                       now: Optional[datetime] = None, text_consent: Callable[[str], bool]) -> bool:
-    """Post today's card if due and not yet posted; True when posted. Runs in a savepoint on ``db``: a refused post
-    raises and rolls the day's claim back, so the next sweep tries again. Drafts are keyed, so a retry never
-    queues a second check-in."""
+    """Post today's card if due and not yet posted; True when posted. Runs in a savepoint on ``db``: a refused first
+    message raises and rolls the day's claim back, so the next sweep tries again (drafts are keyed, so a retry never
+    queues a second check-in). Once the first message is up the day stays claimed: a refused continuation in its
+    thread is logged and not retried, so the card is never posted twice."""
     now = now or datetime.now(timezone.utc)
     day = card_day(now)
     if day is None or not channel:
@@ -280,12 +281,17 @@ def post_blocker_card(db, chat: ChatPort, gate: SendGate, *, channel: Optional[s
         deals = stuck_deals(db, now)
         messages = render_blocker_card(
             day, [_deal_line(deal, _action(db, deal, gate, approvals_channel, text_consent)) for deal in deals])
-        first = None
-        for header, blocks in messages:
-            result = chat.post(text=header, blocks=blocks, channel=channel, thread_ts=first.ts if first else None)
-            if not result.ok:
-                raise RuntimeError(f"closing blocker card not posted ({result.error or 'no Slack response'})")
-            first = first or result
+        header, blocks = messages[0]
+        first = chat.post(text=header, blocks=blocks, channel=channel, thread_ts=None)
+        if not first.ok:
+            raise RuntimeError(f"closing blocker card not posted ({first.error or 'no Slack response'})")
         db.execute(_RECORD_POST, {"channel": first.channel or channel, "ts": first.ts, "day": day})
+        for number, (header, blocks) in enumerate(messages[1:], start=2):
+            result = chat.post(text=header, blocks=blocks, channel=channel, thread_ts=first.ts)
+            if not result.ok:
+                logger.error("[closing-blockers] card for %s: thread message %s of %s not posted (%s); the rest of "
+                             "the card is missing today", day.isoformat(), number, len(messages),
+                             result.error or "no Slack response")
+                break
     logger.info("[closing-blockers] card posted for %s with %s stuck deal(s)", day.isoformat(), len(deals))
     return True

@@ -173,3 +173,32 @@ def test_every_stuck_deal_is_visible_however_long_the_card(closing_db):
     assert "…" not in "".join(b["text"]["text"][-2:] for p in chat.posts for b in p["blocks"] if b["type"] == "section")
     assert all(len(p["blocks"]) <= 50 for p in chat.posts)
     assert all(p["thread_ts"] == chat.posts[0]["ts"] for p in chat.posts[1:])
+
+
+class ThreadFailingChat(FakeChatPort):
+    """The first message posts; every thread continuation is refused."""
+
+    def post(self, **kwargs) -> PostResult:
+        if kwargs.get("thread_ts"):
+            self.refused = getattr(self, "refused", 0) + 1
+            return PostResult(ok=False, error="invalid_blocks")
+        return super().post(**kwargs)
+
+
+def test_a_failed_thread_message_keeps_the_day_claimed_and_never_reposts(closing_db, monkeypatch):
+    import src.lending.closing.blockers as blockers
+
+    monkeypatch.setattr(blockers, "SECTIONS_PER_MESSAGE", 1)  # one section per message: the card needs a thread
+    for i in range(60):
+        _stage(closing_db, f"opp-{i:02d}", "Submitted to lender", timedelta(days=4, minutes=i),
+               phone=f"+1813555{i:04d}")
+    chat = ThreadFailingChat()
+    chat.refused = 0
+    assert _post(closing_db, chat, Gate())
+    assert len(chat.posts) == 1 and chat.refused == 1          # stops at the first refused continuation
+    for minute in range(1, 4):                                  # the next sweeps post nothing
+        assert not _post(closing_db, chat, Gate(), now=AT_7_00 + timedelta(minutes=minute))
+    assert len(chat.posts) == 1 and chat.refused == 1
+    row = closing_db.execute(text("SELECT slack_ts FROM lending.closing_blocker_cards WHERE card_day = :d"),
+                             {"d": DAY}).one()
+    assert row.slack_ts == chat.posts[0]["ts"]
