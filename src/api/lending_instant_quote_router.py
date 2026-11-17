@@ -1,4 +1,4 @@
-"""Cora P2.2 instant quote endpoint, served by ``lending-api`` under ``/api/lending/``.
+"""Instant quote endpoint, served by ``lending-api`` under ``/api/lending/``.
 
 POST /api/lending/instant-quote: deal facts + guarantor soft-pull FICOs in, an indicative quote out.
 Off until ``LENDING_INSTANT_QUOTE_ENABLED`` (404 while off); callers send ``X-Api-Key``; rate limited.
@@ -81,8 +81,9 @@ class QuoteOut(BaseModel):
 
 
 def _gate(request: Request, api_key: Optional[str] = Header(default=None, alias=API_KEY_HEADER)) -> str:
-    """Switch, key and rate limit, as a dependency so they run before the body is validated:
-    a switched-off endpoint or a keyless caller never gets a 422 describing the request schema."""
+    """Switch, key and rate limit, as a dependency so they run before the body is validated: a switched-off
+    endpoint or a keyless caller never gets a 422 describing the request schema. (A body that is not JSON at all
+    is still answered 422 by FastAPI before any dependency runs; that names no field.)"""
     if not get_settings().lending_instant_quote_enabled:
         raise HTTPException(status_code=404, detail="Not found")
     key_bucket = _require_key(api_key)

@@ -1,4 +1,4 @@
-"""Cora P2.2: POST /api/lending/instant-quote (keyed, rate limited, off by default). No database."""
+"""POST /api/lending/instant-quote (keyed, rate limited, off by default). No database."""
 from __future__ import annotations
 
 import itertools

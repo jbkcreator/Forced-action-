@@ -1,4 +1,4 @@
-"""Cora P2.2 done-when proof: the multi-guarantor run and the 4 Instant-Quote-Rules.md cases."""
+"""Instant quote acceptance proof: the multi-guarantor run and the 4 Instant-Quote-Rules.md cases."""
 from __future__ import annotations
 
 from decimal import Decimal
@@ -21,7 +21,7 @@ def test_multi_guarantor_case_prices_off_the_lowest_fico_with_the_reserve():
 @pytest.mark.parametrize("case", DOC_CASES, ids=lambda c: c.name)
 def test_documented_case_returns_the_exact_documented_loan_amount(case):
     if case.request is None or case.expected_loan is None:
-        pytest.skip("awaiting claude/Instant-Quote-Rules.md (client Q1)")
+        pytest.skip("awaiting the client's instant-quote rules document")
     assert quote(case.request).loan_amount == case.expected_loan
 
 

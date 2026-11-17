@@ -1,7 +1,7 @@
-"""Cora P2.2 done-when proof cases (brief: "The 4 test cases in Instant-Quote-Rules.md return the exact
+"""Instant quote acceptance cases (brief: "The 4 test cases in Instant-Quote-Rules.md return the exact
 documented loan amounts. A multi-guarantor test file prices off the lowest FICO with the interest reserve added").
 
-The 4 documented cases are empty until the rules doc arrives (client Q1): fill ``request`` and ``expected_loan``
+The 4 documented cases are empty until the client's rules document arrives: fill ``request`` and ``expected_loan``
 from it, verbatim. Figures in the table are indicative, subject to underwriting.
 """
 from __future__ import annotations

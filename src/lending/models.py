@@ -1528,7 +1528,7 @@ class LendingTemplateGraduation(LendingBase):
 
 
 class LendingInstantQuote(LendingBase):
-    """One instant quote issued by POST /api/lending/instant-quote (Cora P2.2), indicative or rejected.
+    """One instant quote issued by POST /api/lending/instant-quote, indicative or rejected.
 
     The audit record: the request and result exactly as issued, the rules that fired and whether any
     lender value was a placeholder. ``id`` is the public quote_id. ``api_key_label`` is a hash prefix of

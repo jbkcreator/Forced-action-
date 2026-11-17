@@ -1,8 +1,8 @@
-"""Cora P2.2 instant quote: constants and the rule set the engine reads.
+"""Instant quote: constants and the rule set the engine reads.
 
 Base caps come from the lender matrix (``central_lending``); the sizing shares from the soft-approval params.
-Values from claude/Instant-Quote-Rules.md are placeholders until received: a quote that uses one is flagged
-``unconfirmed``. Only Central Lending is quoted (NDL lane; Backflip stays off until Josh approves in writing).
+Values still awaiting the client's instant-quote rules document are placeholders: a quote that uses one is flagged
+``unconfirmed``. Only Central Lending is quoted (NDL lane; Backflip stays off until the client approves in writing).
 """
 from __future__ import annotations
 
@@ -17,16 +17,23 @@ DISCLAIMER = "Indicative, subject to underwriting"
 CALCULATION_REJECTION_CODES: dict[str, str] = {"loan_too_small": "LOAN_TOO_SMALL"}
 QUOTE_UNAVAILABLE = "QUOTE_UNAVAILABLE"
 
-# Eligibility rejections (ticket 03).
+# Eligibility rejections.
 ENTITY_ONLY_STATES = frozenset({"FL"})
 NEEDS_LLC_FORMATION = "NEEDS_LLC_FORMATION"
 STATE_NOT_ELIGIBLE = "STATE_NOT_ELIGIBLE"
 ZIP_STATE_MISMATCH = "ZIP_STATE_MISMATCH"
 LEVERAGE_EXHAUSTED = "LEVERAGE_EXHAUSTED"  # stacked cuts took the LTC cap to zero
 STATE_FIPS: dict[str, str] = {"FL": "12", "GA": "13", "TX": "48"}  # states the ZIP crosswalk covers
+# USPS 3-digit ZIP prefixes per state, inclusive ranges: catches a ZIP from another state when it is not in the
+# crosswalk (the crosswalk only holds FL/GA/TX ZCTAs, so an out-of-state ZIP would otherwise pass unchecked).
+STATE_ZIP_PREFIXES: dict[str, tuple[tuple[int, int], ...]] = {
+    "FL": ((320, 349),),
+    "GA": ((300, 319), (398, 399)),
+    "TX": ((733, 733), (750, 799), (885, 885)),
+}
 
-# Interest reserve (ticket 04): a pricing FICO below the threshold requires a full-term reserve.
-# Rate and term are unconfirmed (client Q5): while either is None the condition carries no amount.
+# Interest reserve: a pricing FICO below the threshold requires a full-term reserve.
+# Rate and term are awaiting client confirmation: while either is None the condition carries no amount.
 INTEREST_RESERVE_FICO_THRESHOLD = 660
 INTEREST_RESERVE_CONDITION = "INTEREST_RESERVE_FULL_TERM"
 INTEREST_RESERVE_RATE: Decimal | None = None  # annual, 0 to 1
@@ -38,7 +45,7 @@ RATE_LIMIT_WINDOW_SECONDS = 60
 API_KEY_HEADER = "X-Api-Key"
 
 
-# Pricing grid (ticket 05): Central Lending's credit box by pricing FICO, "as read on Oct 30", from Josh's
+# Pricing grid: Central Lending's credit box by pricing FICO, "as read on Oct 30", from the client's
 # Term Sheet Intake Checklist (Nov 2 2026). There is no credit floor: the grid prices down to under 600.
 @dataclass(frozen=True)
 class GridTier:
@@ -59,9 +66,9 @@ PRICING_GRID: tuple[GridTier, ...] = (  # highest min_fico first
 PRICING_GRID_CONFIRMED = True
 GRID_CUT_REASON = "PRICING_GRID"
 
-# CFPB rural + refinance (ticket 07). County list = CFPB rural/underserved 2026 (refresh yearly);
+# CFPB rural + refinance. County list = CFPB rural/underserved 2026 (refresh yearly);
 # ZIP -> county = Census 2020 ZCTA-county relationship, largest land share, FL/GA/TX only.
-# Cut sizes are PLACEHOLDERS; the refinance cut is flat until the debt-balance rule arrives (client Q8).
+# Cut sizes are PLACEHOLDERS; the refinance cut is flat until the debt-balance rule arrives from the client.
 # existing_debt is optional and kept on the audit row for that rule.
 _DATA_DIR = Path(__file__).resolve().parent / "lending_quote_data"
 CFPB_RURAL_COUNTIES_FILE = _DATA_DIR / "cfpb_rural_underserved_2026.csv"
@@ -73,7 +80,7 @@ REFINANCE_CUT = Decimal("-0.05")
 REFINANCE_CUT_REASON = "REFINANCE"
 LEVERAGE_ADJUSTMENTS_CONFIRMED = False
 
-# Refinance quotes are withheld until the debt-balance rule arrives (client Q4): a flat cut would give a wrong
+# Refinance quotes are withheld until the debt-balance rule arrives from the client: a flat cut would give a wrong
 # figure for every refinance. Flip only together with a real debt-balance rule.
 REFINANCE_QUOTES_ENABLED = False
 REFINANCE_RULE_PENDING = "REFINANCE_RULE_PENDING"
@@ -82,12 +89,12 @@ REFINANCE_RULE_PENDING = "REFINANCE_RULE_PENDING"
 # $1,000 steps) and rejects typos before any work.
 MAX_DEAL_AMOUNT = 50_000_000
 
-# Experience (ticket 06): Central cuts starting LTC 2.5% at 1-2 deals and 5% at none (Term Sheet Intake
+# Experience: Central cuts starting LTC 2.5% at 1-2 deals and 5% at none (Term Sheet Intake
 # Checklist, Nov 2 2026). Experience = the most experienced guarantor. 3+ deals: no cut.
 EXPERIENCE_CUTS: dict[int, Decimal] = {0: Decimal("-0.05"), 1: Decimal("-0.025"), 2: Decimal("-0.025")}
 EXPERIENCE_CUT_REASON = "EXPERIENCE"
 
 # Second-program new-construction rule (1 exit required). Switch: settings.lending_instant_quote_exit_rule_enabled
-# (off: that program stays blocked until Josh approves in writing). Neutral code name; never names a lender.
+# (off: that program stays blocked until the client approves in writing). Neutral code name; never names a lender.
 NEW_CONSTRUCTION_MIN_EXITS = 1
 NEW_CONSTRUCTION_NEEDS_EXIT = "NEW_CONSTRUCTION_NEEDS_EXIT"

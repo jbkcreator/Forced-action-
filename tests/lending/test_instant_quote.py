@@ -1,6 +1,6 @@
-"""Cora P2.2: instant quote engine (pure). Expected figures are worked by hand from Central Lending's
+"""Instant quote engine (pure). Expected figures are worked by hand from Central Lending's
 placeholder box (LTC 85%, ARV cap 70%, min loan $75K), the soft-approval placeholder shares
-(85% of purchase, 100% of rehab), and Central's FICO grid from Josh's Nov 2 checklist (700+: no cut, no fee;
+(85% of purchase, 100% of rehab), and Central's FICO grid from the client's Nov 2 checklist (700+: no cut, no fee;
 640-659: -2.5% LTC, +0.5% fee; 620-639: -5%, +1.25%) and experience cuts (0 deals -5%, 1-2 deals -2.5%).
 ZIP 33602 is Hillsborough (not rural)."""
 from __future__ import annotations
@@ -178,11 +178,36 @@ def test_metro_county_takes_no_rural_cut():
 
 
 def test_zip_outside_the_crosswalk_is_noted_and_takes_no_rural_cut():
-    result = quote(_request(zip_code="00000"))
+    # 33601 = Tampa PO boxes: a Florida ZIP with no ZCTA, so not in the crosswalk
+    result = quote(_request(zip_code="33601"))
 
+    assert result.status == "indicative"
     assert "CFPB_RURAL" not in [c.reason for c in result.cuts]
     assert "RURAL_STATUS_UNKNOWN" in result.notes
     assert "RURAL_STATUS_UNKNOWN" in result.rules_fired
+
+
+def test_zip_from_another_state_outside_the_crosswalk_is_rejected():
+    # 10001 = New York: not in the FL/GA/TX crosswalk, so its 3-digit prefix decides
+    result = quote(_request(state="FL", zip_code="10001"))
+
+    assert result.status == "rejected"
+    assert result.reason == "ZIP_STATE_MISMATCH"
+
+
+def test_each_state_accepts_its_own_zips_outside_the_crosswalk():
+    # PO-box ZIPs in each state's USPS range (Tampa, Atlanta, Dallas) and El Paso's 885
+    for state, zip_code in (("FL", "33601"), ("GA", "30301"), ("TX", "75221"), ("TX", "88510")):
+        assert quote(_request(state=state, zip_code=zip_code)).reason != "ZIP_STATE_MISMATCH", (state, zip_code)
+
+
+def test_calculator_warnings_reach_the_caller():
+    # ARV 700K over a 200K price is over 3x: often a typo, so the caller is told
+    result = quote(_request(arv=Decimal("700000")))
+
+    assert result.status == "indicative"
+    assert "ARV_OVER_3X" in result.notes
+    assert "ARV_OVER_3X" in result.rules_fired
 
 
 def test_refinance_is_withheld_until_the_debt_balance_rule_arrives():

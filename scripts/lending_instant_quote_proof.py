@@ -1,4 +1,4 @@
-"""Cora P2.2 proof for Josh: render the done-when cases as a markdown table.
+"""Instant quote proof for the client: render the acceptance cases as a markdown table.
 
 Pure: runs the quote engine only (no database, no network).
 

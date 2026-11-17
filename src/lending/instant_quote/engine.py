@@ -1,4 +1,4 @@
-"""Instant quote engine (Cora P2.2): deal facts + guarantor FICOs in, an indicative quote out.
+"""Instant quote engine: deal facts + guarantor FICOs in, an indicative quote out.
 
 Pure: no database, no clock, no I/O. Base caps come from the lender matrix and the loan is sized by the
 soft-approval calculator (unchanged). A quote is never more than "indicative, subject to underwriting".
@@ -38,6 +38,7 @@ from config.lending_instant_quote import (
     RURAL_CUT_REASON,
     RURAL_UNKNOWN_NOTE,
     STATE_FIPS,
+    STATE_ZIP_PREFIXES,
     STATE_NOT_ELIGIBLE,
     ZIP_STATE_MISMATCH,
 )
@@ -142,12 +143,18 @@ def _sponsor(guarantors: tuple[Guarantor, ...]) -> _Sponsor:
 
 
 def _zip_outside_state(request: QuoteRequest) -> bool:
-    """True when the crosswalk places the ZIP in a different state than the one given."""
+    """True when the ZIP belongs to a different state than the one given: by its county when the crosswalk has
+    it, else by the state's USPS ZIP prefixes (a PO-box or unique ZIP in the right state is not in the crosswalk
+    and passes). A state with no known prefixes is left to the credit box's state check."""
     county = county_of(request.zip_code)
-    if county is None:
+    if county is not None:
+        state_fips = STATE_FIPS.get(request.state)
+        return state_fips is None or not county.startswith(state_fips)
+    ranges = STATE_ZIP_PREFIXES.get(request.state)
+    if ranges is None:
         return False
-    state_fips = STATE_FIPS.get(request.state)
-    return state_fips is None or not county.startswith(state_fips)
+    prefix = int(request.zip_code[:3])
+    return not any(low <= prefix <= high for low, high in ranges)
 
 
 def _ineligible_reason(request: QuoteRequest, credit_box: LenderRules, sponsor: _Sponsor,
@@ -164,7 +171,7 @@ def _ineligible_reason(request: QuoteRequest, credit_box: LenderRules, sponsor: 
     if credit_box.approved_states and request.state not in credit_box.approved_states:
         return STATE_NOT_ELIGIBLE
     # No FICO floor: Central's grid prices down to under 600 (the matrix's 680 is a placeholder; 680 is the
-    # second program's new-construction minimum, per Josh's Nov 2 checklist).
+    # second program's new-construction minimum, per the client's Nov 2 checklist).
     return None
 
 
@@ -230,6 +237,8 @@ def quote(request: QuoteRequest, *, new_construction_exit_rule: bool = False) ->
         return _rejected(reason, unsized_score, unconfirmed)
 
     conditions = _conditions(sponsor.pricing_fico, figures.net_loan)
+    # The calculator's warnings (an upside-down deal, an ARV over 3x the price: often a typo) reach the caller.
+    notes = notes + tuple(flag.name for flag in figures.flags)
     return QuoteResult(
         status="indicative",
         reason=None,

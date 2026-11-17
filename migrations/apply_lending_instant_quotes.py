@@ -1,4 +1,4 @@
-"""Cora P2.2: ``lending.instant_quotes`` (one audit row per instant quote issued).
+"""Instant quote audit table: ``lending.instant_quotes`` (one audit row per instant quote issued).
 
 Idempotent; run after apply_lending_compliance.py (creates the ``lending`` schema).
 
