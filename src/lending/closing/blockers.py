@@ -18,9 +18,9 @@ from sqlalchemy import text
 
 from config.lending_closing import (
     ACTIVE_STAGE_KEYS,
-    CLOSED_STAGE_KEYS,
     CARD_LAST_TIME,
     CARD_TIME,
+    CLOSED_STAGE_KEYS,
     LENDER_TITLE_DRAFTS,
     OWNER_LABELS,
     STUCK_AFTER,

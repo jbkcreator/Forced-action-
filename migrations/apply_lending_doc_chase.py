@@ -13,8 +13,8 @@ from __future__ import annotations
 import logging
 
 from sqlalchemy import create_engine, text
-from sqlalchemy.schema import CreateIndex
 from sqlalchemy.engine import Connection, Engine
+from sqlalchemy.schema import CreateIndex
 
 from config.settings import get_settings
 from src.lending.models import (

@@ -11,6 +11,8 @@ per IP and checked like the partner door's (count, size, type); files are stored
 from __future__ import annotations
 
 import logging
+import os
+import re
 from datetime import datetime, timezone
 from functools import lru_cache
 from pathlib import Path
@@ -43,6 +45,25 @@ router = APIRouter(prefix="/api/lending/docs", tags=["lending-docs"])
 
 _LENDING_DIR = Path(__file__).resolve().parents[1] / "lending"
 RATE_LIMIT_SCOPE = "lending_doc_upload"
+_TOKEN_IN_PATH = re.compile(r"(/api/lending/docs/)[^/\s?\"]+")
+
+
+def redact_upload_tokens(value: str) -> str:
+    """``/api/lending/docs/<token>/upload`` -> ``/api/lending/docs/[…]/upload``: the token is the borrower's key."""
+    return _TOKEN_IN_PATH.sub(r"\1[…]", value)
+
+
+class UploadTokenLogFilter(logging.Filter):
+    """Keeps upload tokens out of the access log (uvicorn / gunicorn log the request path)."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        if isinstance(record.args, tuple):
+            record.args = tuple(redact_upload_tokens(a) if isinstance(a, str) else a for a in record.args)
+        elif isinstance(record.args, dict):
+            record.args = {k: redact_upload_tokens(v) if isinstance(v, str) else v for k, v in record.args.items()}
+        if isinstance(record.msg, str):
+            record.msg = redact_upload_tokens(record.msg)
+        return True
 
 
 @lru_cache(maxsize=1)
@@ -88,8 +109,9 @@ def upload_document(token: str, request: Request, item_code: str = Form(default=
         return _inactive()
     data = document.file.read(MAX_UPLOAD_BYTES + 1)  # one byte past the limit detects an oversize file
     upload = Upload(original_name=document.filename or "", content_type=document.content_type or "", data=data)
+    stored: Optional[str] = None
     try:
-        record_upload(db, chase, item_code, upload, upload_dir=upload_dir(), now=now)
+        stored = record_upload(db, chase, item_code, upload, upload_dir=upload_dir(), now=now)
         db.commit()
     except InvalidSubmission as exc:  # refused before anything is written
         return _checklist(db, token, chase, errors=[str(exc)], status_code=400)
@@ -98,6 +120,11 @@ def upload_document(token: str, request: Request, item_code: str = Form(default=
         return _checklist(db, token, chase, errors=["The upload didn't go through. Please try again."], status_code=500)
     except Exception as exc:  # class only: SQL errors embed bound parameters
         db.rollback()
+        if stored is not None:  # written, but its row was rolled back: no file without a record
+            try:
+                os.remove(stored)
+            except OSError:
+                logger.error("[doc-upload] chase %s: orphaned upload not removed", chase["id"])
         logger.error("[doc-upload] chase %s upload failed (%s)", chase["id"], type(exc).__name__)
         return _checklist(db, token, chase, errors=["The upload didn't go through. Please try again."], status_code=500)
     return RedirectResponse(f"/api/lending/docs/{token}", status_code=303)

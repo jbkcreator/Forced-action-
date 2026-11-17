@@ -97,3 +97,63 @@ def test_upload_refused_when_the_upload_folder_is_not_absolute(setup, closing_db
     response = _upload(client, token)
     assert response.status_code == 500 and "didn" in response.text
     assert closing_db.execute(text("SELECT count(*) FROM lending.doc_chase_uploads")).scalar() == 0
+
+
+def test_a_failed_commit_leaves_no_file_on_disk(setup, closing_db, monkeypatch):
+    client, token, _, folder, _ = setup
+    monkeypatch.setattr(closing_db, "commit", lambda: (_ for _ in ()).throw(RuntimeError("db down")))
+    response = _upload(client, token)
+    assert response.status_code == 500
+    assert [f for f in folder.rglob("*") if f.is_file()] == []
+
+
+@pytest.mark.parametrize("name,data,content_type", [
+    ("id.pdf", b"MZ\x90\x00 not really a pdf", "application/pdf"),
+    ("id.jpg", b"%PDF-1.4 a pdf named jpg", "image/jpeg"),
+    ("id.png", b"\xff\xd8\xff a jpeg named png", "image/png"),
+    ("id.heic", b"\x00\x00\x00\x18ftypmp42", "image/heic"),
+])
+def test_a_file_whose_content_does_not_match_its_type_is_refused(setup, closing_db, name, data, content_type):
+    client, token, _, folder, _ = setup
+    response = _upload(client, token, name=name, data=data, content_type=content_type)
+    assert response.status_code == 400 and "not a real" in response.text
+    assert closing_db.execute(text("SELECT count(*) FROM lending.doc_chase_uploads")).scalar() == 0
+    assert [f for f in folder.rglob("*") if f.is_file()] == []
+
+
+@pytest.mark.parametrize("name,data,content_type", [
+    ("id.jpg", b"\xff\xd8\xff\xe0 jpeg", "image/jpeg"),
+    ("id.png", b"\x89PNG\r\n\x1a\n png", "image/png"),
+    ("id.heic", b"\x00\x00\x00\x18ftypheic", "image/heic"),
+])
+def test_real_images_are_accepted(setup, name, data, content_type):
+    client, token, _, _, _ = setup
+    assert _upload(client, token, name=name, data=data, content_type=content_type).status_code == 303
+
+
+def test_access_log_lines_never_carry_the_upload_token():
+    import logging
+
+    from src.api.lending_doc_upload_router import UploadTokenLogFilter, redact_upload_tokens
+    token = "Zk3n8QvR2xYp7LmA9cTb4WsE6uHf1JdG0oKiNqVrXyU"
+    assert redact_upload_tokens(f"POST /api/lending/docs/{token}/upload") == "POST /api/lending/docs/[…]/upload"
+    record = logging.LogRecord("uvicorn.access", logging.INFO, __file__, 1, '%s - "%s %s HTTP/%s" %d', (
+        "1.2.3.4:5", "GET", f"/api/lending/docs/{token}", "1.1", 200), None)
+    UploadTokenLogFilter().filter(record)
+    assert token not in record.getMessage() and "/api/lending/docs/[…]" in record.getMessage()
+
+
+def test_the_lending_api_installs_the_access_log_filter():
+    import logging
+
+    import src.lending.api  # noqa: F401  (installs the filters on import)
+    from src.api.lending_doc_upload_router import UploadTokenLogFilter
+    for name in ("uvicorn.access", "gunicorn.access"):
+        assert any(isinstance(f, UploadTokenLogFilter) for f in logging.getLogger(name).filters)
+
+
+def test_nginx_example_turns_off_access_logs_and_sets_the_body_limit_for_uploads():
+    from pathlib import Path
+    conf = (Path(__file__).resolve().parents[2] / "deploy" / "nginx" / "lending-api.conf.example").read_text()
+    block = conf.split("location /api/lending/docs/ {", 1)[1].split("}", 1)[0]
+    assert "access_log off;" in block and "client_max_body_size 11m;" in block

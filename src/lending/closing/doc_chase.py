@@ -301,6 +301,23 @@ _UPLOAD_COUNTS = text("SELECT count(*) AS chase_total, count(*) FILTER (WHERE it
                       "FROM lending.doc_chase_uploads WHERE chase_id = :c")
 _MARK_RECEIVED = text("UPDATE lending.doc_chase_items SET received_at = COALESCE(received_at, :now) "
                       "WHERE chase_id = :c AND item_code = :code")
+# Two uploads at once for one chase are counted one after the other, so the caps hold.
+_LOCK_CHASE = text("SELECT id FROM lending.doc_chases WHERE id = :c FOR UPDATE")
+
+# What each allowed file type starts with: the browser's extension and content type are only claims.
+_HEIC_BRANDS = (b"heic", b"heix", b"hevc", b"hevx", b"heim", b"heis", b"mif1", b"msf1")
+
+
+def _content_matches(extension: str, data: bytes) -> bool:
+    if extension == ".pdf":
+        return data.startswith(b"%PDF-")
+    if extension in (".jpg", ".jpeg"):
+        return data.startswith(b"\xff\xd8\xff")
+    if extension == ".png":
+        return data.startswith(b"\x89PNG\r\n\x1a\n")
+    if extension == ".heic":
+        return data[4:8] == b"ftyp" and data[8:12] in _HEIC_BRANDS
+    return False
 
 
 def chase_items(db, chase_id: int) -> list[dict[str, Any]]:
@@ -319,8 +336,10 @@ def _write_private(folder: str, extension: str, data: bytes) -> str:
 
 
 def record_upload(db, chase: dict[str, Any], item_code: str, upload: Upload, *, upload_dir: str,
-                  now: datetime) -> None:
-    """Store one document for one checklist item and tick it. Raises InvalidSubmission for a bad file or item."""
+                  now: datetime) -> str:
+    """Store one document for one checklist item and tick it; returns the stored path, so a caller whose commit
+    fails can remove the file. Raises InvalidSubmission for a bad file or item."""
+    db.execute(_LOCK_CHASE, {"c": chase["id"]})
     items = {item["item_code"]: item for item in chase_items(db, chase["id"])}
     if item_code not in items:
         raise InvalidSubmission("choose which document this is")
@@ -331,6 +350,8 @@ def record_upload(db, chase: dict[str, Any], item_code: str, upload: Upload, *, 
     if counts.item_total >= MAX_UPLOADS_PER_ITEM or counts.chase_total >= MAX_UPLOADS_PER_CHASE:
         raise InvalidSubmission("this document can't take more uploads; call (656) 221-1100 to replace one")
     extension = os.path.splitext(upload.original_name)[1].lower()  # one of UPLOAD_TYPES, checked above
+    if not _content_matches(extension, upload.data):
+        raise InvalidSubmission(f"{upload.original_name}: the file is not a real PDF, JPG, PNG or HEIC")
     path = _write_private(os.path.join(upload_dir, str(chase["id"])), extension, upload.data)
     try:
         with db.begin_nested():
@@ -346,6 +367,7 @@ def record_upload(db, chase: dict[str, Any], item_code: str, upload: Upload, *, 
                         summary=f"{_who(chase)} uploaded {items[item_code]['label']}: {received} of {len(items)} "
                                 "documents received.", payload={"chase_id": chase["id"], "item_code": item_code})
     logger.info("[doc-chase] chase %s: %s uploaded (%s/%s)", chase["id"], item_code, received, len(items))
+    return path
 
 
 # ---- what Cora answers about open chases ---------------------------------------------------------------------------
