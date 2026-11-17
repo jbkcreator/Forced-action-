@@ -3,7 +3,8 @@
 GET  /api/lending/docs/{token}          the chase's checklist with one upload per document (mobile first)
 POST /api/lending/docs/{token}/upload   one file for one checklist item (multipart: item_code, document)
 
-The token in the URL is the borrower's credential (only its SHA-256 is stored). An unknown, expired or revoked link,
+The token in the URL is the borrower's credential (``doc_chase_links`` keeps only its SHA-256; the full link is in
+the drafted message until sent, shown masked on the approval card). An unknown, expired or revoked link,
 or one whose chase is complete or cancelled, gets the plain "link no longer active" page. Uploads are rate limited
 per IP and checked like the partner door's (count, size, type); files are stored under generated names.
 """

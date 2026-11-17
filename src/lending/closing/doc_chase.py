@@ -1,8 +1,10 @@
 """P2.4 document chase: started when an approver tells Cora the borrower accepted the term sheet.
 
 The chase holds the lender's checklist (config/lending_closing.py) plus any document a P2.2 quote condition adds.
-Each message carries its own upload link (only the token's SHA-256 is stored); every link of a chase works until it
-expires or the chase closes. Messages go out from the sweep (``run_chase_sweep``) as approval cards.
+Each message carries its own upload link; every link of a chase works until it expires or the chase closes.
+``doc_chase_links`` keeps only the token's SHA-256. The full link is in the drafted message itself, so it is also in
+that draft's ``pending_actions.payload`` until sent (needed to send it and to restore it after a lost sweep); the
+approval card in #approvals shows it masked. Messages go out from the sweep (``run_chase_sweep``) as approval cards.
 """
 from __future__ import annotations
 
