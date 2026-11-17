@@ -10,8 +10,9 @@ on `lending-api`, settings and copy in `config/lending_closing.py`. Both parts r
    writes `lending.ghl_opportunity_stage`). It backfills each deal's current stage from `lending.ghl_stage_events`.
 2. GHL: the "Pipeline Stage Changed" workflow that posts to `POST /webhooks/lending/ghl-stage` must fire for
    **every** stage of the lending pipeline, including moves made through the API (P2.3 relies on the same).
-3. Env: `LENDING_CLOSING_BLOCKERS_ENABLED=true`, `LENDING_DOC_CHASE_ENABLED=true`, `LENDING_DOC_UPLOAD_DIR`
-   (default `data/doc_uploads`, relative to the app directory), and `LENDING_PARTNER_LINK_BASE_URL` (https host of
+3. Env: `LENDING_CLOSING_BLOCKERS_ENABLED=true`, `LENDING_DOC_CHASE_ENABLED=true`, `LENDING_DOC_UPLOAD_DIR` (an
+   **absolute** path on persistent, backed-up storage; unset or relative = no chase starts and no upload is stored),
+   `LENDING_DOC_CHASE_SMS_LINKS_ENABLED` (see Messages), and `LENDING_PARTNER_LINK_BASE_URL` (https host of
    the upload links; already set for the partner door). Cora needs `LENDING_CORA_CHANNEL` and
    `LENDING_CORA_APPROVALS_CHANNEL` (already required).
 4. The upload folder holds borrowers' financial documents: folder `0700`, files `0600`, never served by nginx,

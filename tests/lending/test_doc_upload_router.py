@@ -88,3 +88,12 @@ def test_uploads_capped_per_document_and_inbox_not_flooded(setup, closing_db):
     statuses = [_upload(client, token).status_code for _ in range(6)]
     assert statuses == [303] * 5 + [400]
     assert len({e["dedup_key"] for e in events}) == 1
+
+
+def test_upload_refused_when_the_upload_folder_is_not_absolute(setup, closing_db, monkeypatch):
+    from config.settings import get_settings
+    client, token, chase_id, _, _ = setup
+    monkeypatch.setattr(get_settings(), "lending_doc_upload_dir", "data/doc_uploads", raising=False)
+    response = _upload(client, token)
+    assert response.status_code == 500 and "didn" in response.text
+    assert closing_db.execute(text("SELECT count(*) FROM lending.doc_chase_uploads")).scalar() == 0

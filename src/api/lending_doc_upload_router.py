@@ -21,9 +21,18 @@ from fastapi.responses import HTMLResponse, RedirectResponse
 from jinja2 import ChoiceLoader, Environment, FileSystemLoader
 from sqlalchemy.orm import Session
 
-from config.lending_partners import MAX_UPLOAD_BYTES, RATE_LIMIT_PER_WINDOW, RATE_LIMIT_WINDOW_SECONDS
-from config.settings import get_settings
-from src.lending.closing.doc_chase import chase_for_token, chase_items, record_upload
+from config.lending_partners import (
+    MAX_UPLOAD_BYTES,
+    RATE_LIMIT_PER_WINDOW,
+    RATE_LIMIT_WINDOW_SECONDS,
+)
+from src.lending.closing.doc_chase import (
+    UploadStorageNotConfigured,
+    chase_for_token,
+    chase_items,
+    record_upload,
+    upload_dir,
+)
 from src.lending.db import get_lending_db
 from src.lending.partners import InvalidSubmission, Upload
 from src.services.rate_limit import enforce_or_429
@@ -80,10 +89,13 @@ def upload_document(token: str, request: Request, item_code: str = Form(default=
     data = document.file.read(MAX_UPLOAD_BYTES + 1)  # one byte past the limit detects an oversize file
     upload = Upload(original_name=document.filename or "", content_type=document.content_type or "", data=data)
     try:
-        record_upload(db, chase, item_code, upload, upload_dir=get_settings().lending_doc_upload_dir, now=now)
+        record_upload(db, chase, item_code, upload, upload_dir=upload_dir(), now=now)
         db.commit()
     except InvalidSubmission as exc:  # refused before anything is written
         return _checklist(db, token, chase, errors=[str(exc)], status_code=400)
+    except UploadStorageNotConfigured:
+        logger.error("[doc-upload] chase %s: LENDING_DOC_UPLOAD_DIR is not an absolute path; upload refused", chase["id"])
+        return _checklist(db, token, chase, errors=["The upload didn't go through. Please try again."], status_code=500)
     except Exception as exc:  # class only: SQL errors embed bound parameters
         db.rollback()
         logger.error("[doc-upload] chase %s upload failed (%s)", chase["id"], type(exc).__name__)

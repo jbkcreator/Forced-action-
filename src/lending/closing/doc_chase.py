@@ -39,6 +39,21 @@ TOKEN_BYTES = 32
 CENTRAL_LENDING = "central_lending"
 
 
+class UploadStorageNotConfigured(ValueError):
+    """LENDING_DOC_UPLOAD_DIR is unset or relative: borrower documents would land where a rebuild loses them."""
+
+
+def upload_dir() -> str:
+    """Where borrower documents are stored: an absolute path, else UploadStorageNotConfigured (fail closed)."""
+    from config.settings import get_settings
+
+    folder = (get_settings().lending_doc_upload_dir or "").strip()
+    if not folder or not os.path.isabs(folder):
+        raise UploadStorageNotConfigured("LENDING_DOC_UPLOAD_DIR must be an absolute path on persistent storage: "
+                                         "borrower documents cannot be stored")
+    return folder
+
+
 @dataclass(frozen=True)
 class StartedChase:
     chase_id: int
@@ -106,6 +121,7 @@ def start_chase(db, recipient: Recipient, *, lead_ref: str, accepted_by: str, le
     """Open a chase for the borrower (or return the open one). Does not commit; the first message goes from the sweep."""
     if link_base_url() is None:
         raise PartnerLinkNotConfigured("LENDING_PARTNER_LINK_BASE_URL is not set: upload links cannot be made")
+    upload_dir()  # no link goes out that could not store what the borrower uploads
     if not recipient.phone and not recipient.email:
         raise ValueError("the borrower has no phone or email on record")
     now = now or datetime.now(timezone.utc)

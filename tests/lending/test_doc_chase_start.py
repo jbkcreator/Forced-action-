@@ -15,9 +15,10 @@ MARK = Recipient("Mark", "+18135550101", "mark@example.com", "c1")
 
 
 @pytest.fixture
-def link_base(monkeypatch):
+def link_base(monkeypatch, tmp_path):
     from config.settings import get_settings
     monkeypatch.setattr(get_settings(), "lending_partner_link_base_url", "https://api.example.com", raising=False)
+    monkeypatch.setattr(get_settings(), "lending_doc_upload_dir", str(tmp_path / "docs"), raising=False)
 
 
 def _start(db, **kwargs):
@@ -90,3 +91,14 @@ def test_email_only_borrower_reuses_open_chase(closing_db, link_base):
     second = start_chase(closing_db, Recipient("Ana", None, "ana@example.com", None), lead_ref="web_lead:9",
                          accepted_by="slack:U1", now=NOW)
     assert second.reused and second.chase_id == first.chase_id
+
+
+@pytest.mark.parametrize("folder", ["", "data/doc_uploads", "  "])
+def test_no_chase_starts_without_an_absolute_upload_folder(closing_db, link_base, monkeypatch, folder):
+    from config.settings import AppSettings, get_settings
+    from src.lending.closing.doc_chase import UploadStorageNotConfigured
+    monkeypatch.setattr(get_settings(), "lending_doc_upload_dir", folder, raising=False)
+    with pytest.raises(UploadStorageNotConfigured):
+        _start(closing_db)
+    assert closing_db.execute(text("SELECT count(*) FROM lending.doc_chases")).scalar() == 0
+    assert AppSettings.model_fields["lending_doc_upload_dir"].default == ""

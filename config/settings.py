@@ -939,7 +939,9 @@ class AppSettings(BaseSettings):
 	# LENDING_TEXT_BACK_BOOKING_LINK_ENABLED); off = the request and reminders go by email, or to Cora's inbox as
 	# "call them" when there is no email.
 	lending_doc_chase_sms_links_enabled: bool = Field(default=False, env="LENDING_DOC_CHASE_SMS_LINKS_ENABLED")
-	lending_doc_upload_dir: str = Field(default="data/doc_uploads", env="LENDING_DOC_UPLOAD_DIR")  # borrower documents; link host = LENDING_PARTNER_LINK_BASE_URL
+	# Borrower documents (link host = LENDING_PARTNER_LINK_BASE_URL). An absolute path on persistent, backed-up
+	# storage; unset or relative = no chase starts and no upload is stored (a rebuild could lose them).
+	lending_doc_upload_dir: str = Field(default="", env="LENDING_DOC_UPLOAD_DIR")
 	# Shared secret the GHL "DND changed" workflow sends in X-Webhook-Secret. Unset = endpoint closed.
 	lending_ghl_webhook_secret: Optional[SecretStr] = Field(default=None, env="LENDING_GHL_WEBHOOK_SECRET")
 	lending_ghl_sms_from_number: Optional[str] = Field(default=None, env="LENDING_GHL_SMS_FROM_NUMBER")  # E.164; the GHL SMS number (texting only). Calls run through BatchDialer on a different number

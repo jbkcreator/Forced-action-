@@ -32,9 +32,10 @@ class _Same:
 
 
 @pytest.fixture
-def chase_on(monkeypatch):
+def chase_on(monkeypatch, tmp_path):
     from config.settings import get_settings
     monkeypatch.setattr(get_settings(), "lending_doc_chase_enabled", True, raising=False)
+    monkeypatch.setattr(get_settings(), "lending_doc_upload_dir", str(tmp_path / "docs"), raising=False)
     monkeypatch.setattr(get_settings(), "lending_partner_link_base_url", "https://api.example.com", raising=False)
 
 
