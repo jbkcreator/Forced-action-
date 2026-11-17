@@ -49,7 +49,13 @@ from src.lending.agent_jobs.drive import google_job_folders
 from src.lending.agent_jobs.worker import JobQueueWorker, make_check
 from src.lending.attempt_log import lending_ghl_readers
 from src.lending.compliance import text_window_open
-from src.lending.closing.blockers import claim_card_day, post_blocker_card, release_card_day
+from src.lending.closing.blockers import (
+    card_day,
+    claim_card_day,
+    post_blocker_card,
+    record_post,
+    release_card_day,
+)
 from src.lending.closing.doc_chase import chase_id_of, run_chase_sweep
 from src.lending.closing.doc_copies import DriveCopyStep, live_copier
 from src.lending.consent import has_text_consent
@@ -645,22 +651,33 @@ def build_closing_steps(settings: AppSettings, *, engine: Engine, chat: ChatPort
     and every draft to #approvals, with the borrower's text consent read in the same transaction."""
     approvals = (config.approval_channel_id or "") if config is not None else ""
 
+    posted_days: set = set()  # cards this process posted: a later stale claim never reposts them
+
     def blocker_card() -> bool:
         """Claim the day in its own committed transaction, then post. Released only when nothing was posted (an
         error before the first message); a failed commit after the post keeps the claim, so no second card."""
         if not config.slack_channel_id:
             return False
         now = datetime.now(timezone.utc)
+        if card_day(now) in posted_days:
+            return False
         with Session(engine) as db, db.begin():
             day = claim_card_day(db, now)
         if day is None:
             return False
+
+        def mark_posted(channel: str, ts: Optional[str]) -> None:
+            posted_days.add(day)  # first: even if the commit below fails, this process never posts it again
+            with Session(engine) as posted_db, posted_db.begin():
+                record_post(posted_db, day, channel, ts)
+
         release = False
         try:
             with Session(engine) as db, db.begin():
                 try:
                     return post_blocker_card(db, chat, gate, channel=config.slack_channel_id,
                                              approvals_channel=approvals, now=now, claimed=True,
+                                             on_posted=mark_posted,
                                              text_consent=lambda phone: has_text_consent(db, phone))
                 except Exception:
                     release = True

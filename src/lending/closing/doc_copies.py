@@ -9,7 +9,8 @@ twice (``upload_bytes`` also replaces by name).
 Never gives up: a failed copy is retried later with a growing wait per upload (RETRY_FIRST doubling to RETRY_MAX),
 so once the cause is fixed every waiting document goes. A failure also stops the batch and pauses the whole step
 (PAUSE_FIRST doubling to PAUSE_MAX), and each run has a time budget, so a hanging Drive never holds Cora's sweep for
-long. One ops notice per run when uploads reach ALERT_AFTER failed tries (one cause, one notice). The file on the
+long. One ops notice while uploads have failed ALERT_AFTER times or more, at most once per ALERT_COOLDOWN (one
+cause, one notice, not one per file). The file on the
 server stays (the source of truth and the server backup).
 """
 from __future__ import annotations
@@ -31,6 +32,7 @@ RETRY_FIRST = timedelta(minutes=1)
 RETRY_MAX = timedelta(hours=6)
 PAUSE_FIRST = timedelta(minutes=5)
 PAUSE_MAX = timedelta(hours=1)
+ALERT_COOLDOWN = timedelta(hours=6)
 
 # (parent folder id, subfolder name, file name, data, mime type) -> Drive file id
 DriveCopier = Callable[[str, str, str, bytes, str], str]
@@ -47,9 +49,11 @@ _COPIED = text("UPDATE lending.doc_chase_uploads SET drive_file_id = :file, driv
 # Next try after n failures: 1, 2, 4 ... minutes (2^(n-1)), at most RETRY_MAX. SET reads the old drive_attempts.
 _FAILED = text("UPDATE lending.doc_chase_uploads SET drive_attempts = drive_attempts + 1, "
                "drive_retry_at = CAST(:now AS timestamptz) "
-               "+ LEAST(power(2, drive_attempts), :cap) * interval '1 minute' "
+               "+ LEAST(power(2, LEAST(drive_attempts, 16)), :cap) * interval '1 minute' "
                "WHERE id = :id RETURNING drive_attempts")
 _RETRY_CAP_MINUTES = int(RETRY_MAX / RETRY_FIRST)
+_STUCK = text("SELECT count(*) FROM lending.doc_chase_uploads WHERE drive_file_id IS NULL "
+              "AND drive_attempts >= :attempts")
 
 
 def live_copier() -> DriveCopier:
@@ -71,14 +75,13 @@ def live_copier() -> DriveCopier:
 
 
 def copy_uploads_to_drive(db, *, folder_id: str, copier: DriveCopier, now: Optional[datetime] = None,
-                          notify: Optional[Callable[[str], Any]] = None,
-                          clock: Callable[[], float] = time.monotonic) -> tuple[int, bool]:
-    """Copy uploads that are due; returns (copied, failed). Stops at the first failure or when the time budget is
-    used. Each copy is recorded in its own savepoint; the caller commits."""
+                          clock: Callable[[], float] = time.monotonic) -> tuple[int, Optional[str]]:
+    """Copy uploads that are due; returns (copied, error class of the failure or None). Stops at the first failure
+    or when the time budget is used. Each copy is recorded in its own savepoint; the caller commits."""
     if not folder_id:
-        return 0, False
+        return 0, None
     now = now or datetime.now(timezone.utc)
-    started, copied, failed, alerting, error = clock(), 0, False, 0, ""
+    started, copied, error = clock(), 0, None
     for row in db.execute(_PENDING, {"now": now, "batch": BATCH}).mappings().all():
         if clock() - started > TIME_BUDGET_SECONDS:
             break
@@ -94,18 +97,16 @@ def copy_uploads_to_drive(db, *, folder_id: str, copier: DriveCopier, now: Optio
             attempts = db.execute(_FAILED, {"id": row["id"], "now": now, "cap": _RETRY_CAP_MINUTES}).scalar() or 1
             logger.error("[doc-copies] upload %s not copied to Drive (%s), try %s; retrying later", row["id"],
                          type(exc).__name__, attempts)
-            if attempts == ALERT_AFTER:
-                alerting += 1
-            failed = True
             error = type(exc).__name__
             break
-    if alerting and notify is not None:
-        notify(f":warning: {alerting} borrower document(s) could not be copied to Drive after {ALERT_AFTER} tries "
-               f"({error}). They are safe on the server and copying keeps retrying; check "
-               "LENDING_DOC_UPLOAD_DRIVE_FOLDER_ID, the folder's sharing and the Drive service account key.")
     if copied:
         logger.info("[doc-copies] %s document(s) copied to Drive", copied)
-    return copied, failed
+    return copied, error
+
+
+def stuck_uploads(db) -> int:
+    """Uploads not yet in Drive that have failed ALERT_AFTER times or more."""
+    return int(db.execute(_STUCK, {"attempts": ALERT_AFTER}).scalar() or 0)
 
 
 class DriveCopyStep:
@@ -118,21 +119,36 @@ class DriveCopyStep:
         self._clock = clock
         self._pause = PAUSE_FIRST
         self._paused_until: Optional[datetime] = None
+        self._alerted_at: Optional[datetime] = None
 
     def __call__(self) -> int:
         now = self._clock()
         if self._paused_until is not None and now < self._paused_until:
             return 0
+        stuck = 0
         try:
             with self._session_factory() as db, db.begin():
-                copied, failed = copy_uploads_to_drive(db, folder_id=self._folder_id, copier=self._copier, now=now,
-                                                       notify=self._notify)
+                copied, error = copy_uploads_to_drive(db, folder_id=self._folder_id, copier=self._copier, now=now)
+                if error is not None:
+                    stuck = stuck_uploads(db)
         except Exception as exc:  # class only
             logger.error("[doc-copies] run skipped (%s)", type(exc).__name__)
-            copied, failed = 0, True
-        if failed:
+            copied, error = 0, type(exc).__name__
+        if error is not None:
             self._paused_until = now + self._pause
             self._pause = min(self._pause * 2, PAUSE_MAX)
+            self._alert(stuck, error, now)
         else:
             self._paused_until, self._pause = None, PAUSE_FIRST
         return copied
+
+    def _alert(self, stuck: int, error: str, now: datetime) -> None:
+        """One notice per outage: only when uploads have failed ALERT_AFTER times, at most every ALERT_COOLDOWN."""
+        if not stuck or self._notify is None:
+            return
+        if self._alerted_at is not None and now - self._alerted_at < ALERT_COOLDOWN:
+            return
+        self._alerted_at = now
+        self._notify(f":warning: {stuck} borrower document(s) not yet copied to Drive after {ALERT_AFTER} or more "
+                     f"tries ({error}). They are safe on the server and copying keeps retrying; check "
+                     "LENDING_DOC_UPLOAD_DRIVE_FOLDER_ID, the folder's sharing and the Drive service account key.")

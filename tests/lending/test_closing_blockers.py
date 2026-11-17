@@ -252,19 +252,29 @@ class _Commit:
         return False
 
 
+_CLOCK = {"now": AT_7_00}
+
+
 def _sweep_card(closing_db, monkeypatch, chat, now):
+    """One sweep by a fresh process (no memory of earlier posts)."""
+    _CLOCK["now"] = now
+    return _card_step(closing_db, monkeypatch, chat)()
+
+
+def _card_step(closing_db, monkeypatch, chat):
+    """Cora's card step (one process) on the test's session, with the clock in _CLOCK."""
     from types import SimpleNamespace
 
     import src.lending.cora_agent as cora
 
     monkeypatch.setattr(cora, "Session", lambda engine: _Tx(closing_db))
-    monkeypatch.setattr(cora, "datetime", SimpleNamespace(now=lambda tz=None: now))
+    monkeypatch.setattr(cora, "datetime", SimpleNamespace(now=lambda tz=None: _CLOCK["now"]))
     monkeypatch.setattr(cora, "has_text_consent", lambda db, phone: True)
     settings = SimpleNamespace(lending_closing_blockers_enabled=True, lending_doc_chase_enabled=False,
                                lending_doc_upload_drive_folder_id="")
     config = SimpleNamespace(approval_channel_id="C_APPROVALS", slack_channel_id="C_CORA")
     card, _ = cora.build_closing_steps(settings, engine=None, chat=chat, gate=Gate(), config=config)
-    return card()
+    return card
 
 
 def test_the_sweep_claims_the_day_before_posting_so_a_lost_commit_never_reposts(closing_db, monkeypatch):
@@ -278,10 +288,27 @@ def test_the_sweep_claims_the_day_before_posting_so_a_lost_commit_never_reposts(
         return original_post(**kwargs)
 
     chat.post = post_then_lose_commit
-    with pytest.raises(ConnectionError):
-        _sweep_card(closing_db, monkeypatch, chat, AT_7_00)
+    from src.lending.closing.blockers import CLAIM_STALE
+    card = _card_step(closing_db, monkeypatch, chat)
+    _CLOCK["now"] = AT_7_00
+    assert card()  # posted; recording it failed (logged), the claim stays
     assert len(chat.posts) == 1
-    assert not _sweep_card(closing_db, monkeypatch, chat, AT_7_00 + timedelta(minutes=1))  # still claimed
+    for later in (timedelta(minutes=1), CLAIM_STALE + timedelta(minutes=1), 3 * CLAIM_STALE):
+        _CLOCK["now"] = AT_7_00 + later
+        assert not card()  # never posted again by this process, even once the claim looks stale
+    assert len(chat.posts) == 1
+
+
+def test_a_claim_left_unposted_by_a_crash_is_taken_again_once_stale(closing_db, monkeypatch):
+    from src.lending.closing.blockers import CLAIM_STALE, claim_card_day
+    _stage(closing_db, "opp-s", "Application", timedelta(days=4))
+    assert claim_card_day(closing_db, AT_7_00) == DAY  # Cora stops before posting: the claim stays
+    chat = FakeChatPort()
+    _Tx.fail_commit = False
+    assert not _sweep_card(closing_db, monkeypatch, chat, AT_7_00 + timedelta(minutes=5))  # still fresh
+    assert _sweep_card(closing_db, monkeypatch, chat, AT_7_00 + CLAIM_STALE + timedelta(minutes=1))
+    assert len(chat.posts) == 1
+    assert not _sweep_card(closing_db, monkeypatch, chat, AT_7_00 + 3 * CLAIM_STALE)  # posted: never again
     assert len(chat.posts) == 1
 
 

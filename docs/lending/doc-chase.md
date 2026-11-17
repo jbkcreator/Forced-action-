@@ -24,8 +24,9 @@ on `lending-api`, settings and copy in `config/lending_closing.py`. Both parts r
    member of that drive sees it) and not Josh's My Drive (a service account has no storage of its own, so uploads
    there fail). Cora's sweep copies each upload to `chase-<id>/<item>-<upload id>.<ext>` (no borrower name in Drive)
    once. A failure waits and retries (1, 2, 4 ... minutes, at most 6 hours) and pauses the copy step (5 minutes,
-   up to an hour) so Cora's sweep is never held; it never gives up, and an upload that has failed 5 times raises one
-   ops notice. Empty = documents stay on the server only.
+   up to an hour) so Cora's sweep is never held; it never gives up. While uploads have failed 5 times or more, one
+   ops notice per outage (repeated at most every 6 hours), not one per document. Files over 5 MB go as a resumable
+   upload. Empty = documents stay on the server only.
 
 Current stage: each GHL stage webhook updates `lending.ghl_opportunity_stage` (time = when it arrived; GHL sends
 no event time). A stage event this deal already sent before (a repeat) is held when the deal entered its current
@@ -35,7 +36,9 @@ a held repeat raises a Cora inbox item: if the deal really went back, move it in
 
 ## 7 AM closing blocker card (#cora)
 
-Once a day between 7:00 and noon ET (`lending.closing_blocker_cards` stops a second post). Lists every deal in
+Once a day between 7:00 and noon ET (`lending.closing_blocker_cards` stops a second post). Cora claims the day in
+its own transaction before posting and records the post as soon as Slack has it; a claim left unposted (Cora stopped
+in between) is taken again after 10 minutes. Lists every deal in
 Application, Ready to fund or Submitted to lender (`ACTIVE_STAGE_KEYS`) for more than 3 days, oldest first, red.
 A long card continues in its thread, so every deal is shown in full. Who holds it up: missing documents mean the borrower (the partner when the deal came from a partner's file);
 otherwise Application = borrower, Submitted to lender = lender, Ready to fund = closing (title).

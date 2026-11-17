@@ -94,8 +94,14 @@ _STUCK = text("""
      WHERE s.stage_key = ANY(:stages) AND s.entered_at < :cutoff
      ORDER BY s.entered_at, s.ghl_opportunity_id
 """)
-_CLAIM = text("INSERT INTO lending.closing_blocker_cards (card_day) VALUES (:day) "
-              "ON CONFLICT (card_day) DO NOTHING RETURNING card_day")
+# A claim never posted (Cora stopped between claim and post, or its release failed) is taken again once stale.
+_CLAIM = text("""
+    INSERT INTO lending.closing_blocker_cards (card_day, claimed_at) VALUES (:day, :now)
+    ON CONFLICT (card_day) DO UPDATE SET claimed_at = EXCLUDED.claimed_at
+     WHERE lending.closing_blocker_cards.posted_at IS NULL AND lending.closing_blocker_cards.claimed_at < :stale
+    RETURNING card_day
+""")
+CLAIM_STALE = timedelta(minutes=10)
 _RELEASE = text("DELETE FROM lending.closing_blocker_cards WHERE card_day = :day AND posted_at IS NULL")
 _RECORD_POST = text("UPDATE lending.closing_blocker_cards SET slack_channel = :channel, slack_ts = :ts, "
                     "posted_at = CURRENT_TIMESTAMP WHERE card_day = :day")
@@ -278,9 +284,14 @@ def claim_card_day(db, now: datetime) -> Optional[date]:
     """Take today's card (in the caller's transaction); None when not due or already taken. The sweep commits the
     claim on its own before posting, so a failed commit after the post can never lead to a second card."""
     day = card_day(now)
-    if day is None or db.execute(_CLAIM, {"day": day}).scalar() is None:
+    if day is None or db.execute(_CLAIM, {"day": day, "now": now, "stale": now - CLAIM_STALE}).scalar() is None:
         return None
     return day
+
+
+def record_post(db, day: date, channel: str, ts: Optional[str]) -> None:
+    """Mark today's card posted (where it is). The sweep commits this on its own right after the Slack post."""
+    db.execute(_RECORD_POST, {"channel": channel, "ts": ts, "day": day})
 
 
 def release_card_day(db, day: date) -> None:
@@ -290,18 +301,19 @@ def release_card_day(db, day: date) -> None:
 
 def post_blocker_card(db, chat: ChatPort, gate: SendGate, *, channel: Optional[str], approvals_channel: str,
                       now: Optional[datetime] = None, text_consent: Callable[[str], bool],
-                      claimed: bool = False) -> bool:
+                      claimed: bool = False, on_posted: Optional[Callable[[str, Optional[str]], None]] = None) -> bool:
     """Post today's card if due and not yet posted; True when posted. Runs in a savepoint on ``db``: a refused first
     message raises and rolls the day's claim back, so the next sweep tries again (drafts are keyed, so a retry never
     queues a second check-in). Once the first message is up the day stays claimed: a refused continuation in its
     thread is logged and not retried, so the card is never posted twice. ``claimed``: the caller already took the
-    day with ``claim_card_day`` (committed) and releases it if this raises."""
+    day with ``claim_card_day`` (committed) and releases it if this raises. ``on_posted(channel, ts)``: records the
+    post in its own committed transaction as soon as Slack has the card (else it is recorded here)."""
     now = now or datetime.now(timezone.utc)
     day = card_day(now)
     if day is None or not channel:
         return False
     with db.begin_nested():
-        if not claimed and db.execute(_CLAIM, {"day": day}).scalar() is None:
+        if not claimed and db.execute(_CLAIM, {"day": day, "now": now, "stale": now - CLAIM_STALE}).scalar() is None:
             return False
         deals = stuck_deals(db, now)
         messages = render_blocker_card(
@@ -311,8 +323,11 @@ def post_blocker_card(db, chat: ChatPort, gate: SendGate, *, channel: Optional[s
         if not first.ok:
             raise RuntimeError(f"closing blocker card not posted ({first.error or 'no Slack response'})")
         try:  # the card is up: a failure to note where must not roll the claim back and post it again
-            with db.begin_nested():
-                db.execute(_RECORD_POST, {"channel": first.channel or channel, "ts": first.ts, "day": day})
+            if on_posted is not None:
+                on_posted(first.channel or channel, first.ts)
+            else:
+                with db.begin_nested():
+                    record_post(db, day, first.channel or channel, first.ts)
         except Exception as exc:  # class only: SQL errors embed bound parameters
             logger.error("[closing-blockers] card for %s posted but its Slack ts not saved (%s)", day.isoformat(),
                          type(exc).__name__)

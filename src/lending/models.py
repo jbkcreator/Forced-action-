@@ -1647,3 +1647,4 @@ class LendingClosingBlockerCard(LendingBase):
     slack_channel: Mapped[Optional[str]] = mapped_column(String(32))
     slack_ts: Mapped[Optional[str]] = mapped_column(String(64))
     posted_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    claimed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), server_default=text("now()"))
