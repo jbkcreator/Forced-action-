@@ -42,7 +42,9 @@ condition adds a document). One open chase per phone; asking again keeps the ope
 Checklist: Central Lending's list from Josh's Term Sheet Intake Checklist (Nov 2). Backflip has none (blocked).
 
 Messages (approval cards in #approvals; text with consent, else email; the relay still checks consent, the 8 AM to
-8 PM window, suppression, the lane deny list and the halt): the request on acceptance day, reminders on ET days 2, 5
+8 PM window, suppression, the lane deny list and the halt). Chase texts carry the upload link, so they go only once
+`LENDING_DOC_CHASE_SMS_LINKS_ENABLED=true` (off until the 10DLC campaign declares embedded links); while it is off
+the request and reminders go by email, or to Cora's inbox as "call them" when there is no email. Steps: the request on acceptance day, reminders on ET days 2, 5
 and 8 while anything is missing. After an outage only the latest due step goes out. Each message carries its own
 upload link; every link works for 30 days or until the chase closes. Template versions `DOCS-*` and `BLOCKER-*`
 are counted by the P1.4 tracker like any other.

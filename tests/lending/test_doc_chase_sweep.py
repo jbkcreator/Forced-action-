@@ -27,6 +27,7 @@ class Gate:
 def link_base(monkeypatch):
     from config.settings import get_settings
     monkeypatch.setattr(get_settings(), "lending_partner_link_base_url", "https://api.example.com", raising=False)
+    monkeypatch.setattr(get_settings(), "lending_doc_chase_sms_links_enabled", True, raising=False)
 
 
 @pytest.fixture
@@ -159,3 +160,34 @@ def test_borrower_with_two_deals_is_not_guessed(closing_db, chase, inbox):
     _sweep(closing_db, Gate(), 0)
     row = closing_db.execute(text("SELECT status, ghl_opportunity_id FROM lending.doc_chases")).one()
     assert tuple(row) == ("open", None)
+
+
+# ---- texts with links wait for the 10DLC campaign (LENDING_DOC_CHASE_SMS_LINKS_ENABLED) ------------------------------
+
+@pytest.fixture
+def no_sms_links(monkeypatch):
+    from config.settings import get_settings
+    monkeypatch.setattr(get_settings(), "lending_doc_chase_sms_links_enabled", False, raising=False)
+
+
+def test_links_off_by_default():
+    from config.settings import AppSettings
+    assert AppSettings.model_fields["lending_doc_chase_sms_links_enabled"].default is False
+
+
+def test_links_off_sends_by_email_even_with_text_consent(closing_db, chase, inbox, no_sms_links):
+    gate = Gate()
+    for day in (0, 2):
+        _sweep(closing_db, gate, day, consent=True)
+    assert [d.channel for d in gate.drafts.values()] == ["ghl_email", "ghl_email"]
+    assert all("api/lending/docs/" in d.payload["body"] for d in gate.drafts.values())
+
+
+def test_links_off_and_no_email_goes_to_the_inbox_not_a_text(closing_db, link_base, inbox, no_sms_links):
+    start_chase(closing_db, Recipient("Ana", "+18135550102", None, None), lead_ref="web_lead:8",
+                accepted_by="slack:U1", now=ACCEPTED)
+    gate = Gate()
+    _sweep(closing_db, gate, 0, consent=True)
+    assert gate.drafts == {}
+    assert [e["event_type"] for e in inbox] == ["doc_chase_no_channel"]
+    assert "texts with links are off" in inbox[0]["summary"]

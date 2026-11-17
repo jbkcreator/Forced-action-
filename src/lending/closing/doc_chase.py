@@ -202,6 +202,13 @@ def chase_id_of(deal_ref: Optional[str]) -> Optional[int]:
     return None
 
 
+def _sms_links_allowed() -> bool:
+    """Chase texts carry the upload link, so they go only once the 10DLC campaign declares embedded links."""
+    from config.settings import get_settings
+
+    return bool(get_settings().lending_doc_chase_sms_links_enabled)
+
+
 def _chase_step(db, gate: SendGate, chase: dict[str, Any], day: int, missing: tuple[str, ...], *,
                 approvals_channel: str, now: datetime, text_consent: Callable[[str], bool],
                 find_draft: Optional[Callable[[str], Any]]) -> bool:
@@ -215,12 +222,14 @@ def _chase_step(db, gate: SendGate, chase: dict[str, Any], day: int, missing: tu
             restore_link(db, chase["id"], queued.payload["upload_link"], now)
         db.execute(_INSERT_TOUCH, {"c": chase["id"], "day": day, "action": queued.action_id, "now": now})
         return False
-    text_ok = bool(chase["phone"]) and text_consent(chase["phone"])
+    links_by_text = _sms_links_allowed()
+    text_ok = bool(chase["phone"]) and links_by_text and text_consent(chase["phone"])
     if not text_ok and not chase["email"]:
         db.execute(_INSERT_TOUCH, {"c": chase["id"], "day": day, "action": None, "now": now})
+        why = "no text consent or email on file" if links_by_text else "no email on file (texts with links are off)"
         add_to_inbox_safely(db, event_type="doc_chase_no_channel", dedup_key=str(chase["id"]),
-                            summary=f"{_who(chase)}: documents still missing and no text consent or email on file. "
-                                    "Call them.", payload={"chase_id": chase["id"]})
+                            summary=f"{_who(chase)}: documents still missing and {why}. Call them.",
+                            payload={"chase_id": chase["id"]})
         return False
     recipient = Recipient(chase["first_name"], chase["phone"], chase["email"], chase["ghl_contact_id"])
     draft = chase_draft("request" if day == 0 else f"d{day}", recipient, link=issue_link(db, chase["id"], now),

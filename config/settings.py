@@ -935,6 +935,10 @@ class AppSettings(BaseSettings):
 	# P2.4 closing blocker card (7 AM, LENDING_CORA_CHANNEL) and document chase (src/lending/closing/); both off by default.
 	lending_closing_blockers_enabled: bool = Field(default=False, env="LENDING_CLOSING_BLOCKERS_ENABLED")
 	lending_doc_chase_enabled: bool = Field(default=False, env="LENDING_DOC_CHASE_ENABLED")
+	# Chase texts carry the upload link. Off until the 10DLC campaign declares embedded links (the same condition as
+	# LENDING_TEXT_BACK_BOOKING_LINK_ENABLED); off = the request and reminders go by email, or to Cora's inbox as
+	# "call them" when there is no email.
+	lending_doc_chase_sms_links_enabled: bool = Field(default=False, env="LENDING_DOC_CHASE_SMS_LINKS_ENABLED")
 	lending_doc_upload_dir: str = Field(default="data/doc_uploads", env="LENDING_DOC_UPLOAD_DIR")  # borrower documents; link host = LENDING_PARTNER_LINK_BASE_URL
 	# Shared secret the GHL "DND changed" workflow sends in X-Webhook-Secret. Unset = endpoint closed.
 	lending_ghl_webhook_secret: Optional[SecretStr] = Field(default=None, env="LENDING_GHL_WEBHOOK_SECRET")
