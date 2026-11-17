@@ -63,6 +63,9 @@ class Stages:
     stage: Callable[[Session, list[dict[str, Any]]], tuple[int, int, int]]
     link: Callable[[Session], dict[str, int]]
     handoff: Callable[[Session, str, bool, Optional[Callable[[], None]]], dict[str, int]]
+    # Writes the exports bought so far onto the open run row after each staged batch, so a run killed
+    # mid-pull still counts towards PROPERTY_RADAR_MONTHLY_CAP.
+    record_exports: Optional[Callable[[Session, Any, int], None]] = None
 
 
 @dataclass
@@ -149,6 +152,8 @@ def _pull_and_stage(session: Session, stages: Stages, summary: RunSummary, *,
             session.commit()
             # Seen only after the batch is committed: a failed stage must be re-fetched.
             stages.mark_seen(session, state, campaign, [r["radar_id"] for r in batch])
+            if stages.record_exports is not None:
+                stages.record_exports(session, run_id, stats.exports)
             session.commit()
             committed += 1
             fetched += len(batch)
@@ -178,9 +183,10 @@ _RUN_CLOSE_SQL = """
     SET finished_at = now(), records_fetched = :fetched, exports_consumed = :exports, status = :status
     WHERE id = :id
 """
+_RUN_EXPORTS_SQL = "UPDATE property_radar_pull_runs SET exports_consumed = :exports WHERE id = :id"
 
 
-def default_stages(trace_results: Optional[Path] = None) -> Stages:
+def default_stages(trace_results: Optional[Path] = None, gap_from_days: Optional[int] = None) -> Stages:
     """Real stages. Imported lazily: each belongs to another developer's module."""
     from config.property_radar_campaigns import build_campaign_criteria
     from src.services.property_radar import linking, staging
@@ -194,7 +200,7 @@ def default_stages(trace_results: Optional[Path] = None) -> Stages:
 
     def criteria(session: Session, mode: str, state: str, campaign: str) -> list[dict]:
         since = pull_task._last_successful_run_date(session, state, campaign) if mode == "daily" else None
-        return build_campaign_criteria(state, campaign, daily_since=since)
+        return build_campaign_criteria(state, campaign, daily_since=since, gap_from_days=gap_from_days)
 
     def count(session: Session, mode: str, state: str, campaign: str) -> int:
         try:
@@ -208,6 +214,9 @@ def default_stages(trace_results: Optional[Path] = None) -> Stages:
 
     def close_run(session: Session, run_id: int, status: str, fetched: int, exports: int) -> None:
         session.execute(text(_RUN_CLOSE_SQL), {"id": run_id, "status": status, "fetched": fetched, "exports": exports})
+
+    def record_exports(session: Session, run_id: int, exports: int) -> None:
+        session.execute(text(_RUN_EXPORTS_SQL), {"id": run_id, "exports": exports})
 
     def pull(session: Session, mode: str, state: str, campaign: str,
              stats: PullStats) -> Iterator[list[dict[str, Any]]]:
@@ -256,7 +265,7 @@ def default_stages(trace_results: Optional[Path] = None) -> Stages:
 
     return Stages(
         count=count, open_run=open_run, pull=pull, close_run=close_run, mark_seen=pull_task._mark_seen,
-        stage=staging.upsert_records, link=linking.link_unlinked, handoff=handoff,
+        stage=staging.upsert_records, link=linking.link_unlinked, handoff=handoff, record_exports=record_exports,
     )
 
 
@@ -273,9 +282,14 @@ def main() -> None:
     parser.add_argument("--trace-results", type=Path,
                         help="Tracerfy results CSV. Without it, an --apply run traces staged records live")
     parser.add_argument("--apply", action="store_true", help="Buy, stage, link and hand off (default: dry run)")
+    parser.add_argument("--gap-from-days", type=int,
+                        help="with --mode backlog: once, after PROPERTY_RADAR_STATEWIDE_ENABLED moves the maturity "
+                             "near edge in, pull the loans recorded this many days back to the new edge (e.g. 240)")
     parser.add_argument("--cron", action="store_true",
                         help="Scheduled run: do nothing while PROPERTY_RADAR_STATEWIDE_ENABLED is false")
     args = parser.parse_args()
+    if args.gap_from_days is not None and args.mode != "backlog":
+        parser.error("--gap-from-days needs --mode backlog")
 
     from config.property_radar_campaigns import ENABLED_STATES
     from config.settings import get_settings
@@ -290,9 +304,14 @@ def main() -> None:
         return
 
     from src.core.database import get_db_context
-    with get_db_context() as session:
-        summary = run(session, default_stages(args.trace_results), mode=args.mode, state=args.state,
-                      campaign=args.campaign, apply=args.apply)
+    from src.tasks.property_radar_maturity_pull import BudgetRefused
+    try:
+        with get_db_context() as session:
+            summary = run(session, default_stages(args.trace_results, args.gap_from_days), mode=args.mode,
+                          state=args.state, campaign=args.campaign, apply=args.apply)
+    except BudgetRefused:
+        logger.warning("PropertyRadar %s/%s: budget guard refused the pull; nothing bought.", args.state, args.campaign)
+        return
     logger.info("\n%s", summary.render())
 
 

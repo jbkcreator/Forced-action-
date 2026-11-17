@@ -277,3 +277,46 @@ def test_applied_run_without_a_csv_traces_live(monkeypatch):
 def test_dry_run_never_spends_on_a_live_trace(monkeypatch):
     traced, handed = _handoff_with(monkeypatch, apply=False)
     assert traced == [] and handed["contacts_by_radar"] == {}
+
+
+def test_exports_bought_are_written_after_each_batch():
+    from dataclasses import replace
+
+    session, calls = MagicMock(), []
+    stages = replace(_stages(calls, [[_record(1), _record(2)], [_record(3)]]),
+                     record_exports=lambda s, run_id, exports: calls.append(f"exports:{run_id}:{exports}"))
+    run(session, stages, mode="daily", state="FL", campaign="maturity_target_lender", apply=True)
+    assert [c for c in calls if c.startswith("exports")] == ["exports:7:2", "exports:7:3"]
+
+
+def test_budget_refusal_ends_the_run_without_an_error(monkeypatch):
+    from config.settings import get_settings
+    from src.tasks import property_radar_runner as runner
+    from src.tasks.property_radar_maturity_pull import BudgetRefused
+
+    monkeypatch.setattr(get_settings(), "property_radar_enabled", True)
+    monkeypatch.setattr(runner, "default_stages", lambda *a: None)
+
+    def refuse(*a, **k):
+        raise BudgetRefused("PropertyRadar budget guard: over the monthly cap")
+
+    monkeypatch.setattr(runner, "run", refuse)
+
+    class _Ctx:
+        def __enter__(self):
+            return None
+
+        def __exit__(self, *exc):
+            return False
+
+    monkeypatch.setattr("src.core.database.get_db_context", lambda: _Ctx())
+    monkeypatch.setattr("sys.argv", ["runner", "--apply", "--state", "FL"])
+    assert runner.main() is None
+
+
+def test_gap_pull_needs_backlog_mode(monkeypatch):
+    from src.tasks import property_radar_runner as runner
+
+    monkeypatch.setattr("sys.argv", ["runner", "--mode", "daily", "--gap-from-days", "240"])
+    with pytest.raises(SystemExit):
+        runner.main()

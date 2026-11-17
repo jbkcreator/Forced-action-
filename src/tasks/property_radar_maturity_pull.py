@@ -92,15 +92,19 @@ def _month_exports(session) -> int:
     """Exports bought so far this calendar month (UTC), every state and campaign."""
     return int(session.execute(text(
         "SELECT COALESCE(SUM(exports_consumed), 0) FROM property_radar_pull_runs "
-        "WHERE started_at >= date_trunc('month', now())"
+        "WHERE started_at >= date_trunc('month', now() AT TIME ZONE 'UTC') AT TIME ZONE 'UTC'"
     )).scalar() or 0)
+
+
+class BudgetRefused(RuntimeError):
+    """A pull the budget guard refused before anything was bought."""
 
 
 def _check_budget(
     port, criteria: list[dict], state: str, campaign: str, max_records: Optional[int] = None,
     month_used: int = 0,
 ) -> int:
-    """Return the safe export count, or raise RuntimeError if over budget.
+    """Return the safe export count, or raise BudgetRefused if over budget.
 
     Calls count() (free) first, then checks remaining allowance and per-run cap
     against the records this run will actually buy (``max_records`` caps it).
@@ -116,7 +120,7 @@ def _check_budget(
 
     monthly_cap = settings.property_radar_monthly_cap
     if month_used + total > monthly_cap:
-        raise RuntimeError(
+        raise BudgetRefused(
             f"PropertyRadar budget guard: {total} records on top of {month_used} already bought "
             f"this month exceeds the monthly cap of {monthly_cap} — aborting "
             f"(raise PROPERTY_RADAR_MONTHLY_CAP only with budget approval)"
@@ -125,7 +129,7 @@ def _check_budget(
     allowance = port.allowance()
     per_run_cap = settings.property_radar_per_run_cap
     if allowance.verified and total > allowance.total_remaining:
-        raise RuntimeError(
+        raise BudgetRefused(
             f"PropertyRadar budget guard: {total} matching records but only "
             f"{allowance.total_remaining} export credits remaining — aborting"
         )
@@ -138,7 +142,7 @@ def _check_budget(
             per_run_cap,
         )
     if total > per_run_cap:
-        raise RuntimeError(
+        raise BudgetRefused(
             f"PropertyRadar budget guard: {total} matching records exceeds "
             f"per-run cap of {per_run_cap} — aborting (raise PROPERTY_RADAR_PER_RUN_CAP or "
             f"split the pull into county-scoped runs)"

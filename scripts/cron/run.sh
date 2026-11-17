@@ -25,6 +25,11 @@ if [[ "$1" == *"tax_delinquent_engine"* ]]; then
     TIMEOUT=7200                           # 2 hours for tax scraper
 fi
 
+# PropertyRadar runner: never retried. A retry after a purchase began would buy the same window again.
+if [[ "$1" == *"property_radar_runner"* ]]; then
+    MAX_ATTEMPTS=1
+fi
+
 # Master parcel pipeline: bulk download + ~500k-row load/update (weekly Sunday)
 if [[ "$1" == *"master_engine"* ]]; then
     TIMEOUT=14400                          # 4 hours (worst-case scrape + convert + load/update)

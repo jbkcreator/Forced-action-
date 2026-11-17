@@ -146,7 +146,7 @@ _INSERT_SQL = f"""
 _UPDATE_SQL = f"""
     UPDATE property_radar_records r SET
         {", ".join(f"{c} = x.{c}" for c in _COLUMNS if c not in _KEY_COLUMNS + ("campaign",))},
-        campaign     = CASE WHEN r.campaign = ANY(:maturity) AND NOT (x.campaign = ANY(:maturity))
+        campaign     = CASE WHEN r.campaign = ANY(:maturity) AND (x.campaign IS NULL OR NOT (x.campaign = ANY(:maturity)))
                             THEN r.campaign ELSE x.campaign END,
         status       = x.status,
         change_flags = CASE WHEN x.has_change THEN x.change_flags ELSE r.change_flags END,

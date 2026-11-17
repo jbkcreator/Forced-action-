@@ -147,6 +147,7 @@ def build_campaign_criteria(
     campaign: str,
     *,
     daily_since: Optional[date] = None,
+    gap_from_days: Optional[int] = None,
 ) -> list[dict]:
     """Return the Criteria list for a given (state, campaign) pair.
 
@@ -159,11 +160,26 @@ def build_campaign_criteria(
     (§2.3): pass the last successful daily/backlog run's date here, and only
     ~16/week new-to-the-window Florida loans get queried, not the whole ~700+
     record backlog every time. Pass None (the default) for a full backlog pull.
+
+    ``gap_from_days``: a maturity campaign's FirstDate window becomes loans recorded
+    ``gap_from_days`` back to the day before today's near edge. Used once, by hand, after
+    PROPERTY_RADAR_STATEWIDE_ENABLED moves the near edge in (240 -> 198 days): the daily
+    watermark was set under the old edge, so those loans are otherwise never pulled.
     """
     key = (state.upper(), campaign)
     if key not in _CAMPAIGN_BUILDERS:
         raise ValueError(f"Unknown campaign: state={state!r} campaign={campaign!r}")
-    return _CAMPAIGN_BUILDERS[key](daily_since)
+    criteria = _CAMPAIGN_BUILDERS[key](daily_since)
+    if gap_from_days is None:
+        return criteria
+    if campaign not in MATURITY_CAMPAIGNS:
+        raise ValueError(f"gap_from_days applies to maturity campaigns only, not {campaign!r}")
+    window = _private_maturity_window_days(state.upper()) if campaign == "private_maturity" else _maturity_window_days()
+    near = window[1]
+    if gap_from_days <= near:
+        raise ValueError(f"gap_from_days must be beyond the near edge ({near} days)")
+    gap = _date_window_criterion("FirstDate", (gap_from_days, near + 1), None)
+    return [gap if c.get("name") == "FirstDate" else c for c in criteria]
 
 
 def _date_window_criterion(
@@ -290,6 +306,9 @@ def _investor_portfolio(state: str, daily_since: Optional[date] = None) -> list[
         _NOT_OWNER_OCCUPIED,
         _NOT_LISTED,
         _date_window_criterion("LastTransferRecDate", INVESTOR_PORTFOLIO_WINDOW_DAYS, daily_since),
+        # Loans the maturity campaigns buy are not bought again here (records with no first loan
+        # are left out too: PropertyRadar has no NOT, and a range never matches a blank date).
+        _outside_window_criterion("FirstDate", _maturity_window_days()),
         _state(state),
     ]
 

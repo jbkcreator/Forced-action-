@@ -209,3 +209,9 @@ def test_maturity_restage_replaces_portfolio_campaign(fresh_db):
     upsert_records(fresh_db, [_rec(campaign="investor_portfolio")])
     upsert_records(fresh_db, [_rec(campaign="private_maturity")])
     assert _row(fresh_db)["campaign"] == "private_maturity"
+
+
+def test_restage_without_a_campaign_keeps_maturity_campaign(fresh_db):
+    upsert_records(fresh_db, [_rec()])
+    upsert_records(fresh_db, [_rec(campaign=None)])
+    assert _row(fresh_db)["campaign"] == "maturity_target_lender"

@@ -6,15 +6,20 @@ rows; the Wholesaler list is not a P3.1 signal). A property found in both is one
 
   maturing_loan       a maturity campaign or Verified maturity list record inside the 5.5-month trigger
   cash_purchase       a Cash buyer list record, or a cash_purchase campaign record
-  investor_portfolio  an investor_portfolio campaign record, or any company-owned record whose
-                      owner holds INVESTOR_PORTFOLIO_MIN_PROPERTIES or more leads across both stores
+  investor_portfolio  a company-owned record whose owner holds INVESTOR_PORTFOLIO_MIN_PROPERTIES or more
+                      leads across both stores
 
 The daily export is a delta, decided from the record alone (nothing is stored): a record is exported on the
 ET day it was first stored, and a daily-pull maturing loan stored before its trigger is exported on the day
 it crosses it. A re-run of a day therefore builds the same file. The backfill is every lead that qualifies
 as of a day, for the one-time starter file.
 
-Pure functions take no database; ``collect`` does the reads.
+Contact gates (``contact_gates``): a suppressed or do-not-contact number, and a Georgia owner who is a natural
+person, has its phone and email left out of the file (``contact_status`` says why). GHL gets the same cold-lead
+checks as src.lending.ghl_load_sync: warm numbers (website / LendingFlow leads) and numbers already pushed by the
+dialer load sync are never pushed, and nothing is pushed while the emergency halt is set.
+
+Pure functions take no database; ``collect`` and ``contact_gates`` do the reads.
 """
 from __future__ import annotations
 
@@ -40,7 +45,7 @@ from config.property_radar_campaigns import (
 from config.property_radar_fips import county_fips
 from src.lending.compliance import suppressed_phones
 from src.lending.ledger_export import ET, day_window
-from src.lending.pr_maturity_bridge import _first_phone, _load_trace_contacts, map_entity_status
+from src.lending.pr_maturity_bridge import first_phone, load_trace_contacts, map_entity_status
 
 logger = logging.getLogger(__name__)
 
@@ -54,6 +59,18 @@ GHL_TAG_SOURCE = GHL_TAG_SOURCE_PREFIX + "property-radar"
 GHL_TAG_SIGNAL_PREFIX = "ndl-signal-"
 # Georgia: natural persons are never cold-called, so only business owners become contacts.
 GA_CONTACT_ENTITY_TYPES = frozenset({"LLC", "CORPORATION"})
+ENTITY_NAME_TYPES = GA_CONTACT_ENTITY_TYPES | {"TRUST"}
+
+# Contact gate outcomes. Blanked: phone and email are left out of the file. The others stay in the file, unpushed.
+GATE_SUPPRESSED = "suppressed"
+GATE_GA_NATURAL_PERSON = "ga_natural_person"
+GATE_WARM = "warm"
+GATE_ALREADY_IN_GHL = "already_in_ghl"
+BLANKED_GATES = frozenset({GATE_SUPPRESSED, GATE_GA_NATURAL_PERSON})
+CONTACT_OK = "ok"
+CONTACT_NO_PHONE = "no_phone"
+# The emergency halt is read again every this many pushes.
+HALT_CHECK_EVERY = 25
 
 PAGE_SIZE = 1000
 
@@ -74,7 +91,7 @@ COLUMNS = (
     "owner_name", "principal_name", "ownership_type", "portfolio_properties",
     "mailing_address", "mailing_city", "mailing_state", "mailing_zip",
     "lender_name", "loan_amount", "loan_recorded_date", "maturity_date", "maturity_estimated",
-    "days_to_maturity", "campaign", "source", "phone", "email", "fa_property_id", "radar_id",
+    "days_to_maturity", "campaign", "source", "phone", "email", "contact_status", "fa_property_id", "radar_id",
 )
 
 GhlPush = Callable[[Mapping[str, Any], list[str]], Any]
@@ -151,7 +168,7 @@ def signals(record: Mapping[str, Any], portfolio_size: int) -> list[str]:
         found.append(SIGNAL_MATURING)
     if campaign in CASH_CAMPAIGNS:
         found.append(SIGNAL_CASH)
-    if campaign == SIGNAL_PORTFOLIO or portfolio_size >= INVESTOR_PORTFOLIO_MIN_PROPERTIES:
+    if portfolio_size >= INVESTOR_PORTFOLIO_MIN_PROPERTIES:
         found.append(SIGNAL_PORTFOLIO)
     return found
 
@@ -189,6 +206,7 @@ def build_row(record: Mapping[str, Any], *, day: date, portfolio_size: int, phon
         "source": record.get("source") or SOURCE_DAILY,
         "phone": phone or "",
         "email": email or "",
+        "contact_status": CONTACT_OK if phone else CONTACT_NO_PHONE,
         "fa_property_id": record.get("property_id") or "",
         "radar_id": record.get("radar_id"),
     }
@@ -210,39 +228,60 @@ def ghl_tags(row: Mapping[str, Any]) -> list[str]:
     return tags
 
 
-def ghl_skip_reason(row: Mapping[str, Any], suppressed: set[str]) -> Optional[str]:
-    if not row.get("phone"):
-        return "no_phone"
-    if row["phone"] in suppressed:
-        return "suppressed"
+def _is_ga_natural_person(row: Mapping[str, Any]) -> bool:
     entity = map_entity_status(row.get("ownership_type"), row.get("owner_name"))
-    if str(row.get("state") or "").upper() == "GA" and entity not in GA_CONTACT_ENTITY_TYPES:
-        return "ga_natural_person"
-    return None
+    return str(row.get("state") or "").upper() == "GA" and entity not in GA_CONTACT_ENTITY_TYPES
 
 
-def push_to_ghl(rows: list[dict[str, Any]], push: GhlPush, suppressed: set[str]) -> Counter:
-    """One GHL contact per phone. A refused push is counted and the rest still go."""
-    outcome: Counter = Counter()
-    done: set[str] = set()
+def apply_contact_gates(rows: list[dict[str, Any]], gates: Mapping[str, str]) -> None:
+    """Leave out the phone and email of a suppressed number or a Georgia natural person; say why."""
     for row in rows:
-        reason = ghl_skip_reason(row, suppressed) or ("duplicate_phone" if row["phone"] in done else None)
-        if reason:
-            outcome[reason] += 1
+        reason = GATE_GA_NATURAL_PERSON if _is_ga_natural_person(row) else gates.get(row["phone"])
+        if reason in BLANKED_GATES:
+            row.update(phone="", email="", contact_status=reason)
+        elif reason:
+            row["contact_status"] = reason
+
+
+def contacts_by_phone(rows: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    """One GHL contact per pushable phone, carrying the tags of every row with that phone."""
+    contacts: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        if row["contact_status"] != CONTACT_OK:
             continue
-        done.add(row["phone"])
-        entity = map_entity_status(row.get("ownership_type"), row.get("owner_name"))
-        contact = {
-            "phone": row["phone"],
-            "borrower_name": row.get("principal_name") or row.get("owner_name"),
-            "entity_name": row.get("owner_name") if entity in ("LLC", "CORPORATION", "TRUST") else None,
-            "email": row.get("email") or None,
-        }
+        found = contacts.get(row["phone"])
+        if found is None:
+            entity = map_entity_status(row.get("ownership_type"), row.get("owner_name"))
+            contacts[row["phone"]] = {
+                "contact": {
+                    "phone": row["phone"],
+                    "borrower_name": row.get("principal_name") or row.get("owner_name"),
+                    "entity_name": row.get("owner_name") if entity in ENTITY_NAME_TYPES else None,
+                    "email": row.get("email") or None,
+                },
+                "tags": ghl_tags(row),
+                "radar_id": row.get("radar_id"),
+            }
+        else:
+            found["tags"] += [t for t in ghl_tags(row) if t not in found["tags"]]
+    return contacts
+
+
+def push_to_ghl(rows: list[dict[str, Any]], push: GhlPush, halted: Callable[[], bool]) -> Counter:
+    """Push each gated phone's contact once. A refused push is counted and the rest still go; once the emergency
+    halt is set the rest are left unpushed."""
+    outcome: Counter = Counter(row["contact_status"] for row in rows if row["contact_status"] != CONTACT_OK)
+    contacts = list(contacts_by_phone(rows).values())
+    for index, item in enumerate(contacts):
+        if index % HALT_CHECK_EVERY == 0 and halted():
+            logger.warning("[fa-export] emergency halt set; %d contact(s) not pushed", len(contacts) - index)
+            outcome["halted"] += len(contacts) - index
+            break
         try:
-            push(contact, ghl_tags(row))
+            push(item["contact"], item["tags"])
             outcome["pushed"] += 1
         except Exception as exc:  # class only: GHL errors can embed contact values
-            logger.warning("[fa-export] GHL push failed for radar_id=%s (%s)", row.get("radar_id"), type(exc).__name__)
+            logger.warning("[fa-export] GHL push failed for radar_id=%s (%s)", item["radar_id"], type(exc).__name__)
             outcome["failed"] += 1
     return outcome
 
@@ -261,6 +300,8 @@ def merge_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
         for column, value in row.items():
             if kept.get(column) in (None, "") and value not in (None, ""):
                 kept[column] = value
+    for row in merged.values():
+        row["contact_status"] = CONTACT_OK if row.get("phone") else CONTACT_NO_PHONE
     return list(merged.values())
 
 
@@ -302,9 +343,29 @@ _PORTFOLIO_LIST_PART = """UNION
           AND upper(owner_name) = ANY(:owners)"""
 
 
+# Columns the export reads from lending.pr_list_records (created on the calling-lists branch).
+LIST_COLUMNS = frozenset({
+    "id", "radar_id", "state", "county", "owner_mailing_address", "owner_mailing_city", "owner_mailing_state",
+    "owner_mailing_zip", "list_key", "qualifies", "property_address", "city", "zip", "owner_name", "principal_name",
+    "ownership_type", "lender_name", "loan_amount", "loan_recorded_date", "est_maturity_date", "first_seen_at",
+})
+_LIST_COLUMNS_SQL = """
+    SELECT column_name FROM information_schema.columns
+     WHERE table_schema = 'lending' AND table_name = 'pr_list_records'
+"""
+
+
 def _has_lists(session: Session) -> bool:
-    """The calling-list table is created by its own migration; without it only the daily pull is exported."""
-    return session.execute(text("SELECT to_regclass('lending.pr_list_records')")).scalar() is not None
+    """The calling-list table is created by its own migration. Without it, or with a column the export reads
+    missing, only the daily pull is exported."""
+    present = {r[0] for r in session.execute(text(_LIST_COLUMNS_SQL))}
+    if not present:
+        return False
+    missing = LIST_COLUMNS - present
+    if missing:
+        logger.error("[fa-export] lending.pr_list_records lacks %s; calling lists left out", sorted(missing))
+        return False
+    return True
 
 
 def _pages(session: Session, sql: str, params: dict[str, Any]) -> Iterator[dict[str, Any]]:
@@ -364,18 +425,42 @@ def collect(session: Session, day: date, *, backfill: bool = False) -> list[dict
     sizes = _portfolio_sizes(session, records, lists=lists)
     contacts: dict[str, dict[str, list]] = {}
     for chunk in _chunks(sorted({r["radar_id"] for r in records})):
-        contacts.update(_load_trace_contacts(session, chunk))
+        contacts.update(load_trace_contacts(session, chunk))
     rows = []
     for record in records:
         contact = contacts.get(record["radar_id"], {"phones": [], "emails": []})
         corporate = record.get("ownership_type") == "Corporate"
         size = sizes.get(str(record.get("owner_name") or "").upper(), 0) if corporate else 0
-        row = build_row(record, day=day, portfolio_size=size, phone=_first_phone(contact["phones"]),
+        row = build_row(record, day=day, portfolio_size=size, phone=first_phone(contact["phones"]),
                         email=contact["emails"][0].lower() if contact["emails"] else None)
         if row:
             rows.append(row)
     return merge_rows(rows)
 
 
-def suppressed_among(session: Session, rows: list[dict[str, Any]]) -> set[str]:
-    return suppressed_phones(session, sorted({r["phone"] for r in rows if r["phone"]}))
+_GATES_SQL = """
+    SELECT p.phone,
+           EXISTS (SELECT 1 FROM lending.contacts c WHERE c.phone = p.phone AND c.do_not_contact) AS do_not_contact,
+           (EXISTS (SELECT 1 FROM lending.web_leads w WHERE w.phone = p.phone)
+            OR EXISTS (SELECT 1 FROM lending.lendingflow_leads l WHERE l.phone = p.phone)) AS warm,
+           EXISTS (SELECT 1 FROM lending.dialer_load_records d
+                    WHERE d.phone = p.phone AND d.ghl_sync_status = 'pushed') AS already_in_ghl
+      FROM unnest(CAST(:phones AS text[])) AS p(phone)
+"""
+
+
+def contact_gates(session: Session, rows: list[dict[str, Any]]) -> dict[str, str]:
+    """phone -> the first gate it fails: suppressed (an opt-out anywhere, or do-not-contact), warm, already_in_ghl."""
+    phones = sorted({r["phone"] for r in rows if r["phone"]})
+    gates = dict.fromkeys(suppressed_phones(session, phones), GATE_SUPPRESSED)
+    for chunk in _chunks(phones):
+        for r in session.execute(text(_GATES_SQL), {"phones": chunk}).mappings():
+            if r["phone"] in gates:
+                continue
+            if r["do_not_contact"]:
+                gates[r["phone"]] = GATE_SUPPRESSED
+            elif r["warm"]:
+                gates[r["phone"]] = GATE_WARM
+            elif r["already_in_ghl"]:
+                gates[r["phone"]] = GATE_ALREADY_IN_GHL
+    return gates
