@@ -1,4 +1,4 @@
-"""P3.2: Florida's daily corporate filings file, parsed and filtered for newly formed real estate LLCs.
+"""Florida's daily corporate filings file, parsed and filtered for newly formed real estate LLCs.
 
 The state's Division of Corporations publishes the filings entered each day as a fixed-width file on its public SFTP
 server (``config/sunbiz_re_llc.py``). This module parses it (pure, no I/O) and picks the active Florida LLCs whose name
@@ -12,7 +12,7 @@ from __future__ import annotations
 import logging
 import re
 from dataclasses import dataclass
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from typing import Iterable, Iterator, Optional, Protocol
 
 from config.sunbiz_re_llc import (
@@ -20,6 +20,7 @@ from config.sunbiz_re_llc import (
     FILE_ENCODING,
     FILING_TYPES,
     KEYWORDS,
+    MAX_FILING_AGE_DAYS,
     OFFICER_SLOTS,
     RECORD_LENGTH,
     SFTP_DIR,
@@ -139,10 +140,14 @@ def matched_keyword(name: str) -> Optional[str]:
     return match.group(1).upper() if match else None
 
 
-def real_estate_llcs(filings: Iterable[Filing]) -> Iterator[tuple[Filing, str]]:
-    """Active Florida LLCs whose name holds a keyword, with the keyword matched."""
+def real_estate_llcs(filings: Iterable[Filing], day: Optional[date] = None) -> Iterator[tuple[Filing, str]]:
+    """Active Florida LLCs whose name holds a keyword, with the keyword matched. With ``day`` (the state file's date),
+    only filings dated within MAX_FILING_AGE_DAYS of it (or later): an older entity in the file is not new."""
+    oldest = day - timedelta(days=MAX_FILING_AGE_DAYS) if day is not None else None
     for filing in filings:
         if filing.filing_type not in FILING_TYPES or filing.status != ACTIVE_STATUS:
+            continue
+        if oldest is not None and (filing.file_date is None or filing.file_date < oldest):
             continue
         keyword = matched_keyword(filing.name)
         if keyword:
@@ -153,6 +158,10 @@ def real_estate_llcs(filings: Iterable[Filing]) -> Iterator[tuple[Filing, str]]:
 
 class DailyFileSource(Protocol):
     def fetch(self, day: date) -> Optional[bytes]: ...
+
+
+class StateFolderMissing(ConnectionError):
+    """The state's daily-files folder is not on the SFTP server (moved, renamed, or the login's home changed)."""
 
 
 class SunbizSftp:
@@ -195,6 +204,10 @@ class SunbizSftp:
             try:
                 sftp.getfo(path, buffer)
             except FileNotFoundError:
+                try:  # a missing folder must not look like a day without filings
+                    sftp.stat(SFTP_DIR)
+                except FileNotFoundError as exc:
+                    raise StateFolderMissing(f"{SFTP_DIR} not found on the state server") from exc
                 return None
             return buffer.getvalue()
         finally:

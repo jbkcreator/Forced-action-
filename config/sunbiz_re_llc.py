@@ -1,4 +1,4 @@
-"""P3.2: the daily Florida real estate LLC export (src/tasks/sunbiz_re_llc_export.py).
+"""The daily Florida real estate LLC export (src/tasks/sunbiz_re_llc_export.py).
 
 Source: the Florida Division of Corporations daily corporate filings file on its public SFTP server (``doc/cor``,
 ``yyyymmddc.txt``: the filings entered into the state's database that day, generated on work days and weekends with
@@ -9,13 +9,19 @@ states are filled. The state posts each day's file at about 11:30 PM ET that nig
 """
 from __future__ import annotations
 
-# The brief's keywords (P3.2), matched as whole words in the entity name, case-insensitive ("REI" does not match
-# "REIGN"). Josh may add more (PR Client blockers).
+# The brief's keywords, matched as whole words in the entity name, case-insensitive ("REI" does not match "REIGN").
+# More can be added here once the client confirms the list.
 KEYWORDS: tuple[str, ...] = ("REI", "HOMES", "INVESTMENTS", "CAPITAL")
 # "FLAL" = Florida Limited Liability Co. (the brief: "newly formed real estate LLCs"; foreign LLCs registering in
 # Florida are "FORL" and are not included).
 FILING_TYPES: frozenset[str] = frozenset({"FLAL"})
 ACTIVE_STATUS = "A"
+# "New" = filed within this many days of the state file's date (future-effective filings count). The daily file also
+# carries a few older entities (8 real days, Nov 9-16, 2026: 6 matched LLCs filed more than 30 days earlier);
+# no LLC appeared in two daily files (0 of 286), so there is no cross-day dedup.
+MAX_FILING_AGE_DAYS = 30
+# The normal run also exports these earlier days when their CSV is not in Drive yet (a file the state posted late).
+CATCH_UP_DAYS = 3
 
 SFTP_DIR = "doc/cor"
 SFTP_FILE = "{day:%Y%m%d}c.txt"

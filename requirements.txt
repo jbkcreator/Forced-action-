@@ -91,5 +91,7 @@ openpyxl>=3.1.0
 # delegation) — already present transitively before this was added; pinned
 # explicitly since Cora now depends on them directly.
 google-api-python-client>=2.180.0
-paramiko>=3.5.0    # SFTP: Florida's daily corporate filings (P3.2 src/scrappers/sunbiz/daily_filings.py)
 google-auth>=2.40.0
+
+# SFTP client for the state of Florida's daily corporate filings file (src/scrappers/sunbiz/daily_filings.py).
+paramiko>=3.5,<6

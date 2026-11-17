@@ -1051,7 +1051,7 @@ class AppSettings(BaseSettings):
 	# LENDING_DRIVE_SERVICE_ACCOUNT_KEY_PATH (else the Sheets key) with the drive scope; the folder is "NDL Ledger Exports", shared with that account
 	lending_ledger_export_enabled: bool = Field(default=False, env="LENDING_LEDGER_EXPORT_ENABLED")
 	lending_ledger_export_folder_id: str = Field(default="", env="LENDING_LEDGER_EXPORT_FOLDER_ID")
-	# P3.2 daily Florida real estate LLC export (src/tasks/sunbiz_re_llc_export.py): off until enabled with a Drive folder
+	# Daily Florida real estate LLC export (src/tasks/sunbiz_re_llc_export.py): off until enabled with a Drive folder
 	# shared with the lending Drive service account. SFTP: the state's public data server (login published on
 	# dos.fl.gov Daily Data; kept in .env, not in code).
 	sunbiz_re_llc_export_enabled: bool = Field(default=False, env="SUNBIZ_RE_LLC_EXPORT_ENABLED")

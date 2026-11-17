@@ -1,4 +1,4 @@
-"""P3.2: parsing and filtering the state's daily corporate filings file. Made-up records only; no network."""
+"""Florida real estate LLC export: parsing and filtering the state's daily filings file. Made-up records; no network."""
 from __future__ import annotations
 
 from datetime import date
@@ -155,11 +155,30 @@ def test_only_active_florida_llcs_with_a_keyword_are_kept():
                                                                                     ("KEEP2", "REI")]
 
 
+@pytest.mark.parametrize("file_date,kept", [
+    ("11152026", True),    # the file's own day
+    ("10162026", True),    # 30 days before: still new
+    ("10152026", False),   # 31 days: an older entity in the file
+    ("01152020", False),   # years old
+    ("12012026", True),    # future-effective filing
+    ("", False),           # no date: cannot show it is new
+])
+def test_only_filings_dated_within_30_days_of_the_file_count_as_new(file_date, kept):
+    filings, _ = mod.parse_file(_record(name="NEW HOMES LLC", file_date=file_date).encode("latin-1"))
+    assert bool(list(mod.real_estate_llcs(filings, date(2026, 11, 15)))) is kept
+
+
 # ── SunbizSftp (paramiko faked; no network) ──────────────────────────────────
 
 class _FakeSftp:
+    folder_exists = True
+
     def __init__(self, files: dict[str, bytes]):
         self.files, self.timeout = files, None
+
+    def stat(self, path):
+        if path != "doc/cor" or not _FakeSftp.folder_exists:
+            raise FileNotFoundError(path)
 
     def get_channel(self):
         return self
@@ -196,6 +215,7 @@ def fake_paramiko(monkeypatch):
     connects = []
     files: dict[str, bytes] = {}
     _FakeTransport.instances = []
+    _FakeSftp.folder_exists = True
     monkeypatch.setattr(socket, "create_connection", lambda addr, timeout: connects.append((addr, timeout)) or "sock")
     monkeypatch.setattr(paramiko, "Transport", _FakeTransport)
     monkeypatch.setattr(paramiko.SFTPClient, "from_transport", staticmethod(lambda t: _FakeSftp(files)))
@@ -230,6 +250,13 @@ def test_a_malformed_host_key_fails_before_connecting(fake_paramiko):
 
 def test_sftp_fetch_returns_none_when_the_state_made_no_file_and_still_closes(fake_paramiko):
     assert _sftp().fetch(date(2026, 11, 16)) is None
+    assert _FakeTransport.instances[0].closed
+
+
+def test_a_missing_state_folder_is_an_error_not_a_quiet_day(fake_paramiko):
+    _FakeSftp.folder_exists = False
+    with pytest.raises(mod.StateFolderMissing):
+        _sftp().fetch(date(2026, 11, 16))
     assert _FakeTransport.instances[0].closed
 
 

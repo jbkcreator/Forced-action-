@@ -1,4 +1,4 @@
-# Florida real estate LLC daily export (P3.2)
+# Florida real estate LLC daily export
 
 Every morning a CSV of the **Florida LLCs registered the day before** whose name contains **REI, Homes, Investments or
 Capital** lands in Google Drive, for the agents' outreach.
@@ -28,22 +28,31 @@ the past ~10 days plus some future-effective dates, so "new" means "in that day'
 
 ## Schedule
 
-`scripts/cron/crontab.txt`: `0 11 * * *` exports yesterday (ET). A failure exits 1 and `run.sh` retries. The
-`30 13 * * *` `--retry` run does nothing if the day's file is already in Drive, else runs again and, if it still
-fails, posts one notice to `LENDING_OPS_NOTICE_CHANNEL`. If the state's file for the day is still missing at the
-`--retry` run (no filings that day, or posted late), it posts a notice too; once the file appears, export it with
-`--day`. Warnings and errors reach `logs/cron/sunbiz_re_llc_export.log`.
+`scripts/cron/crontab.txt` (times in UTC): `0 11 * * *` (6 AM EST / 7 AM EDT) exports yesterday's ET date. A
+failure exits 1 and `run.sh` retries. It also exports any of the 3 days before that whose CSV is not in Drive yet,
+so a file the state posted late goes out the next morning by itself (`CATCH_UP_DAYS`). The `30 13 * * *` `--retry`
+run shares the `flock`, so it waits for the main run and its retries; it does nothing if the day's file is already in
+Drive, else runs again and, if it still fails, posts one notice to `LENDING_OPS_NOTICE_CHANNEL` in plain words
+(server key changed, login rejected, state folder not found, or the error type). If the state's file for the day is
+still missing at the `--retry` run, it posts a notice too. A missing state folder is reported as an error, never as
+a day without filings. Without the SFTP login the main run exits 0 (a retry cannot fix it) and `--retry` alerts.
+Warnings and errors reach `logs/cron/sunbiz_re_llc_export.log`.
+
+"New": only filings dated within 30 days of the file's date (`MAX_FILING_AGE_DAYS`; future-effective dates count).
+Over 8 real days (Nov 9-16, 2026) the file carried 6 matched LLCs filed earlier than that, and no LLC appeared in two
+daily files (0 of 286), so there is no cross-day dedup. Cells starting with `=`, `+`, `-` or `@` are written as text
+(prefixed `'`), so nothing runs as a formula when an agent opens the CSV.
 
 ## Switching on
 
 1. Drive folder: **`NDL Real Estate LLCs`** at the top level of the NDL Cora shared drive (its own folder, separate
-   from FA Exports), id `1hQroR2KdfqzEsjVOgkLtaNvDlpc8GIJB`, shared with the lending service account
-   (`fa-lending-engine@forcedaction.iam.gserviceaccount.com`) as Content manager. To move the export, share the new
-   folder with the service account the same way and change only `LENDING_SUNBIZ_LLC_EXPORT_FOLDER_ID`.
+   from FA Exports), shared with the lending Drive service account as Content manager; its id goes in
+   `LENDING_SUNBIZ_LLC_EXPORT_FOLDER_ID` (the real value is in the server `.env`, not here). To move the export,
+   share the new folder with the service account the same way and change only that setting.
 2. `.env`:
    ```
    SUNBIZ_RE_LLC_EXPORT_ENABLED=true
-   LENDING_SUNBIZ_LLC_EXPORT_FOLDER_ID=1hQroR2KdfqzEsjVOgkLtaNvDlpc8GIJB
+   LENDING_SUNBIZ_LLC_EXPORT_FOLDER_ID=<Drive folder id>
    SUNBIZ_SFTP_USERNAME=<from the state's Daily Data page>
    SUNBIZ_SFTP_PASSWORD=<from the state's Daily Data page>
    LENDING_DRIVE_SERVICE_ACCOUNT_KEY_PATH=<path to the service account JSON>

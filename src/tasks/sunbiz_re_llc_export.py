@@ -1,4 +1,4 @@
-"""P3.2: the daily CSV of newly formed Florida real estate LLCs, to Google Drive for agent outreach.
+"""The daily CSV of newly formed Florida real estate LLCs, to Google Drive for agent outreach.
 
 Each morning: download yesterday's daily corporate filings file from the state's public SFTP server, keep the active
 Florida LLCs whose name holds REI / Homes / Investments / Capital (``src/scrappers/sunbiz/daily_filings.py``), and
@@ -6,7 +6,8 @@ upload ``sunbiz_re_llcs_{day}.csv`` into the day's subfolder of LENDING_SUNBIZ_L
 service account (``src/lending/drive_upload.py``; the folder must be shared with it). A re-run replaces the file.
 
 No state file for the day (none on a day without filings, or not posted yet): nothing uploaded, exit 0; the
-``--retry`` run also posts an ops notice so a late or missing file is not missed.
+``--retry`` run also posts an ops notice, and the next mornings' runs export the day once its file appears
+(CATCH_UP_DAYS). A missing state folder is an error, never an empty day.
 A failure (SFTP, parsing, Drive) is logged and exits 1 so run.sh retries. The later ``--retry`` cron run does nothing
 when the day's file is already in Drive, else runs again and, if that fails too, posts an ops notice (one alert, not
 one per retry). Off until SUNBIZ_RE_LLC_EXPORT_ENABLED=true with the folder id and the SFTP login set.
@@ -21,10 +22,11 @@ import io
 import logging
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
-from typing import Callable, Optional, Sequence
+from typing import Any, Callable, Optional, Sequence
 from zoneinfo import ZoneInfo
 
 from config.sunbiz_re_llc import (
+    CATCH_UP_DAYS,
     EXPORT_FILE,
     OFFICER_SLOTS,
     RECORD_LENGTH,
@@ -69,6 +71,15 @@ def export_day(now: datetime) -> date:
     return now.astimezone(ET).date() - timedelta(days=1)
 
 
+_FORMULA_START = ("=", "+", "-", "@", "\t", "\r")
+
+
+def _cell(value: str) -> str:
+    """Names and addresses are free text anyone can register: a leading = + - @ would run as a formula in Sheets or
+    Excel, so such a value is written as text."""
+    return "'" + value if value.startswith(_FORMULA_START) else value
+
+
 def _row(filing: Filing, keyword: str) -> list[str]:
     row = [filing.document_number, filing.name, keyword, filing.filing_type, filing.status,
            filing.file_date.isoformat() if filing.file_date else "",
@@ -79,7 +90,7 @@ def _row(filing: Filing, keyword: str) -> list[str]:
     for slot in range(OFFICER_SLOTS):
         officer = filing.officers[slot] if slot < len(filing.officers) else None
         row += [getattr(officer, c) if officer else "" for c in _OFFICER_COLUMNS]
-    return row
+    return [_cell(value) for value in row]
 
 
 def build_csv(matches: Sequence[tuple[Filing, str]]) -> bytes:
@@ -108,7 +119,7 @@ def run(day: date, *, source: DailyFileSource, folder_id: str, upload: Optional[
         logger.warning("[sunbiz-re-llc] %s: %d line(s) not %d characters, skipped", day, result.rejected, RECORD_LENGTH)
     if filings == [] and result.rejected:
         raise ValueError("no record in the state file could be parsed (layout changed?)")
-    matches = list(real_estate_llcs(filings))
+    matches = list(real_estate_llcs(filings, day))
     result.matched = len(matches)
     if dry_run:
         return result
@@ -118,6 +129,22 @@ def run(day: date, *, source: DailyFileSource, folder_id: str, upload: Optional[
     upload(folder_id, day.isoformat(), name, build_csv(matches))
     result.uploaded = name
     return result
+
+
+def _reason(exc: BaseException) -> str:
+    """Plain words for the failures someone can act on; otherwise the error class (never its text: SFTP and Drive
+    errors can carry hosts and ids)."""
+    import paramiko
+
+    from src.scrappers.sunbiz.daily_filings import StateFolderMissing
+
+    if isinstance(exc, paramiko.BadHostKeyException):
+        return "the state server's key changed: check it and set SUNBIZ_SFTP_HOST_KEY"
+    if isinstance(exc, paramiko.AuthenticationException):
+        return "the SFTP login was rejected: check SUNBIZ_SFTP_USERNAME / SUNBIZ_SFTP_PASSWORD"
+    if isinstance(exc, StateFolderMissing):
+        return "the state's daily-files folder was not found on its server (moved or renamed?)"
+    return type(exc).__name__
 
 
 def _notify(message: str) -> None:
@@ -133,7 +160,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     if not logging.getLogger().handlers:
         logging.basicConfig(level=logging.INFO, format=LOG_FORMAT)
-    parser = argparse.ArgumentParser(description="Daily Florida real estate LLC export to Drive (P3.2)")
+    parser = argparse.ArgumentParser(description="Daily Florida real estate LLC export to Drive")
     parser.add_argument("--day", type=date.fromisoformat, help="state file date (default: yesterday ET)")
     parser.add_argument("--dry-run", action="store_true", help="download and count; upload nothing")
     parser.add_argument("--retry", action="store_true", help="second run: skip if done, post an ops notice on failure")
@@ -149,8 +176,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         if args.retry:
             _notify(f":warning: Florida real estate LLC file for {day.isoformat()} not exported: "
                     "SUNBIZ_SFTP_USERNAME / SUNBIZ_SFTP_PASSWORD not set.")
-            return 0  # alerted: a non-zero exit would make run.sh retry and alert again
-        return 1
+        return 0  # a run.sh retry cannot fix a missing setting; the --retry run alerts
     source = SunbizSftp(s.sunbiz_sftp_host, s.sunbiz_sftp_username, s.sunbiz_sftp_password.get_secret_value(),
                         s.sunbiz_sftp_host_key or SFTP_HOST_KEY)
     uploader = None if args.dry_run else DriveUploader()
@@ -161,11 +187,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             return 0
         result = run(day, source=source, folder_id=s.lending_sunbiz_llc_export_folder_id, upload=uploader,
                      dry_run=args.dry_run)
-    except Exception as exc:  # class only: SFTP / Drive errors can embed hosts and ids
-        logger.error("[sunbiz-re-llc] %s failed (%s)", day, type(exc).__name__)
+    except Exception as exc:  # reason only: SFTP / Drive errors can embed hosts and ids
+        logger.error("[sunbiz-re-llc] %s failed (%s)", day, _reason(exc))
         if args.retry:
-            _notify(f":warning: Florida real estate LLC file for {day.isoformat()} not exported after the retry "
-                    f"({type(exc).__name__}).")
+            _notify(f":warning: Florida real estate LLC file for {day.isoformat()} not exported after the retry: "
+                    f"{_reason(exc)}.")
             return 0  # alerted: a non-zero exit would make run.sh retry and alert again
         return 1
     if args.retry and not args.dry_run and not result.state_file:
@@ -175,7 +201,28 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     logger.info("[sunbiz-re-llc] %s%s state_file=%s filings=%d rejected=%d matched=%d uploaded=%s",
                 "dry run: " if args.dry_run else "", day, result.state_file, result.filings, result.rejected,
                 result.matched, result.uploaded)
-    return 0
+    if args.day or args.retry or uploader is None:
+        return 0
+    return _catch_up(day, source=source, folder_id=s.lending_sunbiz_llc_export_folder_id, uploader=uploader)
+
+
+def _catch_up(day: date, *, source: DailyFileSource, folder_id: str, uploader: Any) -> int:
+    """Export the CATCH_UP_DAYS before ``day`` whose CSV is not in Drive yet and whose state file is there now (a
+    file the state posted after that day's retry). A failure exits 1, so run.sh tries again (done days are skipped)."""
+    failed = False
+    for back in range(1, CATCH_UP_DAYS + 1):
+        earlier = day - timedelta(days=back)
+        try:
+            if uploader.has_file(folder_id, earlier.isoformat(), EXPORT_FILE.format(day=earlier.isoformat())):
+                continue
+            result = run(earlier, source=source, folder_id=folder_id, upload=uploader)
+        except Exception as exc:  # reason only
+            logger.error("[sunbiz-re-llc] catch-up %s failed (%s)", earlier, _reason(exc))
+            failed = True
+            continue
+        if result.uploaded:
+            logger.warning("[sunbiz-re-llc] %s exported late: its state file arrived after that day's runs", earlier)
+    return 1 if failed else 0
 
 
 if __name__ == "__main__":

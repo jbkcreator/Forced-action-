@@ -1,4 +1,4 @@
-"""P3.2: the daily real estate LLC CSV and its cron entry point. Made-up records, fake SFTP / Drive; no network."""
+"""The daily Florida real estate LLC CSV and its cron entry point. Made-up records, fake SFTP / Drive; no network."""
 from __future__ import annotations
 
 import csv
@@ -18,19 +18,24 @@ DAY = date(2026, 11, 15)
 
 
 class FakeSource:
-    def __init__(self, data: bytes | None = None, error: Exception | None = None):
-        self.data, self.error, self.days = data, error, []
+    """``data`` for every day, or ``by_day`` for some days (others have no file)."""
+
+    def __init__(self, data: bytes | None = None, error: Exception | None = None, by_day: dict | None = None):
+        self.data, self.error, self.days, self.by_day = data, error, [], by_day
 
     def fetch(self, day):
         self.days.append(day)
         if self.error:
             raise self.error
-        return self.data
+        return self.by_day.get(day) if self.by_day is not None else self.data
 
 
 class FakeUpload:
-    def __init__(self, existing: bool = False, error: Exception | None = None):
+    """``existing``: every day is in Drive; or ``in_drive``: the dated subfolders that are."""
+
+    def __init__(self, existing: bool = False, error: Exception | None = None, in_drive: set | None = None):
         self.calls, self.existing, self.error, self.checked = [], existing, error, []
+        self.in_drive = in_drive
 
     def __call__(self, parent_id, subfolder, name, data):
         if self.error:
@@ -39,7 +44,7 @@ class FakeUpload:
 
     def has_file(self, parent_id, subfolder, name):
         self.checked.append((parent_id, subfolder, name))
-        return self.existing
+        return subfolder in self.in_drive if self.in_drive is not None else self.existing
 
 
 def _file(*lines: str) -> bytes:
@@ -53,7 +58,7 @@ def _rows(data: bytes) -> list[dict]:
 # ── export_day ────────────────────────────────────────────────────────────────
 
 @pytest.mark.parametrize("now,expected", [
-    (datetime(2026, 11, 16, 16, 0, tzinfo=timezone.utc), date(2026, 11, 15)),   # 11:00 ET run
+    (datetime(2026, 11, 16, 11, 0, tzinfo=timezone.utc), date(2026, 11, 15)),   # the 11:00 UTC run (6 AM EST)
     (datetime(2026, 11, 16, 3, 0, tzinfo=timezone.utc), date(2026, 11, 14)),    # still Nov 15 in ET
     (datetime(2026, 3, 9, 15, 0, tzinfo=timezone.utc), date(2026, 3, 8)),       # day after the DST change
 ])
@@ -189,9 +194,9 @@ def test_main_dry_run_works_while_off_and_uploads_nothing(wired):
     assert wired.source.days == [DAY] and wired.upload.calls == []
 
 
-@pytest.mark.parametrize("retry,notices,code", [(False, 0, 1), (True, 1, 0)])
+@pytest.mark.parametrize("retry,notices,code", [(False, 0, 0), (True, 1, 0)])
 def test_main_without_the_sftp_login_fails_and_alerts_only_on_the_retry_run(wired, retry, notices, code):
-    """The retry run exits 0 after alerting: a non-zero exit would make run.sh retry and alert again."""
+    """Exit 0 both times: a run.sh retry cannot fix a missing setting, and the retry run alerts."""
     wired.settings = _settings(sunbiz_sftp_password=None)
     assert mod.main(["--day", "2026-11-15"] + (["--retry"] if retry else [])) == code
     assert wired.source.days == [] and len(wired.notices) == notices
@@ -248,8 +253,81 @@ def test_warnings_reach_the_cron_log():
 
 def test_main_defaults_to_yesterday_eastern(wired, monkeypatch):
     monkeypatch.setattr(mod, "export_day", lambda now: date(2026, 11, 14))
+    wired.upload.in_drive = {"2026-11-13", "2026-11-12", "2026-11-11"}  # earlier days already done
     assert mod.main([]) == 0
     assert wired.source.days == [date(2026, 11, 14)]
+
+
+def test_the_morning_run_exports_an_earlier_day_whose_file_came_late(wired, monkeypatch):
+    monkeypatch.setattr(mod, "export_day", lambda now: date(2026, 11, 16))
+    record = _file(_record())
+    wired.source = FakeSource(by_day={date(2026, 11, 16): record, date(2026, 11, 14): record})  # Nov 14 posted late
+    wired.upload.in_drive = {"2026-11-15"}
+    assert mod.main([]) == 0
+    assert [c[1] for c in wired.upload.calls] == ["2026-11-16", "2026-11-14"]
+    assert wired.source.days == [date(2026, 11, 16), date(2026, 11, 14), date(2026, 11, 13)]  # 15th done: skipped
+
+
+@pytest.mark.parametrize("args", [["--day", "2026-11-16"], ["--retry"], ["--dry-run"]])
+def test_only_the_normal_morning_run_catches_up(wired, monkeypatch, args):
+    monkeypatch.setattr(mod, "export_day", lambda now: date(2026, 11, 16))
+    wired.upload.in_drive = set()
+    mod.main(args)
+    assert date(2026, 11, 15) not in wired.source.days
+
+
+def test_a_failed_catch_up_day_exits_1_so_run_sh_tries_again(wired, monkeypatch):
+    monkeypatch.setattr(mod, "export_day", lambda now: date(2026, 11, 16))
+
+    class Flaky(FakeSource):
+        def fetch(self, day):
+            if day == date(2026, 11, 15):
+                raise ConnectionError("down")
+            return super().fetch(day)
+
+    wired.source = Flaky(_file(_record()))
+    wired.upload.in_drive = set()
+    assert mod.main([]) == 1
+    assert "2026-11-16" in [c[1] for c in wired.upload.calls]  # the main day still went
+
+
+@pytest.mark.parametrize("error,words", [
+    ("bad_host_key", "server's key changed"),
+    ("auth", "login was rejected"),
+    ("folder", "folder was not found"),
+    ("other", "ConnectionError"),
+])
+def test_the_retry_notice_says_what_to_fix(wired, error, words):
+    import paramiko
+
+    from src.scrappers.sunbiz.daily_filings import StateFolderMissing
+    errors = {"bad_host_key": _bad_host_key(), "auth": paramiko.AuthenticationException("no"),
+              "folder": StateFolderMissing("gone"), "other": ConnectionError("down at host.example")}
+    wired.source.error = errors[error]
+    assert mod.main(["--day", "2026-11-15", "--retry"]) == 0
+    assert len(wired.notices) == 1 and words in wired.notices[0] and "host.example" not in wired.notices[0]
+
+
+def _bad_host_key():
+    import paramiko
+
+    exc = paramiko.BadHostKeyException.__new__(paramiko.BadHostKeyException)
+    Exception.__init__(exc, "key mismatch")
+    return exc
+
+
+@pytest.mark.parametrize("value", ["=HYPERLINK(\"http://x\")", "+1+2", "-2+3", "@SUM(A1)", "\tTAB", "\rCR"])
+def test_a_cell_that_would_run_as_a_formula_is_written_as_text(value):
+    assert mod._cell(value) == "'" + value
+    assert mod._cell("SAFE HOMES LLC") == "SAFE HOMES LLC" and mod._cell("") == ""
+
+
+def test_a_formula_in_a_real_record_reaches_the_csv_as_text():
+    from src.scrappers.sunbiz.daily_filings import parse_record
+
+    filing = parse_record(_record(name="SAFE HOMES LLC", address_1='=HYPERLINK("http://x")'))
+    row = _rows(mod.build_csv([(filing, "HOMES")]))[0]
+    assert row["address_1"] == "'" + '=HYPERLINK("http://x")' and row["entity_name"] == "SAFE HOMES LLC"
 
 
 # ── wiring ────────────────────────────────────────────────────────────────────
@@ -264,5 +342,7 @@ def test_export_is_off_by_default():
 def test_cron_runs_the_export_and_the_retry():
     crontab = (Path(__file__).resolve().parents[2] / "scripts" / "cron" / "crontab.txt").read_text(encoding="utf-8")
     lines = [ln.strip() for ln in crontab.splitlines() if "sunbiz_re_llc_export" in ln and not ln.lstrip().startswith("#")]
-    assert lines == ["0 11 * * * $PROJECT/scripts/cron/run.sh src.tasks.sunbiz_re_llc_export",
-                     "30 13 * * * $PROJECT/scripts/cron/run.sh src.tasks.sunbiz_re_llc_export --retry"]
+    assert lines == [
+        "0 11 * * * flock /tmp/sunbiz_re_llc_export.lock $PROJECT/scripts/cron/run.sh src.tasks.sunbiz_re_llc_export",
+        "30 13 * * * flock -w 3000 /tmp/sunbiz_re_llc_export.lock $PROJECT/scripts/cron/run.sh "
+        "src.tasks.sunbiz_re_llc_export --retry"]
