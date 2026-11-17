@@ -56,15 +56,15 @@ inbox says what arrived and the chase number, e.g. "Mark (…0101) uploaded Phot
 
 Checklist: Central Lending's list from Josh's Term Sheet Intake Checklist (Nov 2). Backflip has none (blocked).
 
-Messages (approval cards in #approvals; text with consent, else email; the relay still checks consent, the 8 AM to
-8 PM window, suppression, the lane deny list and the halt). Chase texts carry the upload link, so they go only once
-`LENDING_DOC_CHASE_SMS_LINKS_ENABLED=true` (off until the 10DLC campaign declares embedded links); while it is off
-the request and reminders go by email, or to Cora's inbox as "call them" when there is no email. Steps: the
-request on acceptance day, reminders on ET days 2, 5 and 8 while anything is missing. After an outage only the latest due step goes out. Each message carries its own
-upload link; every link works for 30 days or until the chase closes. `doc_chase_links` keeps only the token's
-SHA-256; the full link is in the drafted message (so in `pending_actions.payload` until sent), and the approval card
-shows it masked (`…/api/lending/docs/[…]`). Template versions `DOCS-*` and `BLOCKER-*`
-are counted by the P1.4 tracker like any other.
+Messages (approval cards in #approvals; text with consent, else email; the relay still checks consent, the 8 AM to 8
+PM window, suppression, the lane deny list and the halt). Chase texts carry the upload link, so they go only once
+`LENDING_DOC_CHASE_SMS_LINKS_ENABLED=true` (off until the 10DLC campaign declares embedded links); while it is off the
+request and reminders go by email, or to Cora's inbox as "call them" when there is no email. Steps: the request on
+acceptance day, reminders on ET days 2, 5 and 8 while anything is missing. After an outage only the latest due step
+goes out. Each message carries its own upload link; every link works for 30 days or until the chase closes.
+`doc_chase_links` keeps only the token's SHA-256; the full link is in the drafted message (so in
+`pending_actions.payload` until sent), and the approval card shows it masked (`…/api/lending/docs/[…]`). Template
+versions `DOCS-*` and `BLOCKER-*` are counted by the P1.4 tracker like any other.
 
 Closes: `complete` when every document is in, `cancelled` when the deal enters Funded, Lost or Nurture. Links are
 revoked, drafts still awaiting approval are withdrawn, Cora's send check refuses any approved reminder of a closed
