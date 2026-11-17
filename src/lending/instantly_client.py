@@ -4,7 +4,9 @@ account.
 
 UNVERIFIED: the request shapes follow Instantly's public API v2 reference (``POST /api/v2/emails/reply`` with
 ``eaccount``, ``reply_to_uuid``, ``subject`` and ``body``; ``POST /api/v2/block-lists-entries``), not a captured
-call. Check them with one test reply before relying on them.
+call. Check them with one test reply before relying on them. Every reply is sent from David's inbox
+(``LENDING_EMAIL_FROM``) with Josh in ``bcc_address_email_list`` (``LENDING_EMAIL_BCC``), never CC; the BCC field
+name and its comma-separated string form match Instantly's OpenAPI spec (checked 2026-11-17), not a live call.
 
 Never retried: a reply that timed out may already have been sent, and the relay records it as failed instead of
 sending twice.
@@ -62,16 +64,22 @@ def _post(account: InstantlyAccount, path: str, payload: dict) -> dict:
         return {}
 
 
-def send_reply(account: InstantlyAccount, *, eaccount: str, reply_to_uuid: str, subject: str, body: str) -> Optional[str]:
-    """Reply inside the lead's thread from our inbox ``eaccount``. Returns Instantly's email id, if it gives one.
-    Refused while the lending-wide emergency halt is set (an unreadable flag counts as set), like the GHL senders."""
+def send_reply(account: InstantlyAccount, *, reply_to_uuid: str, subject: str, body: str) -> Optional[str]:
+    """Reply inside the lead's thread from David's inbox with Josh in BCC. Returns Instantly's email id, if it gives
+    one. Refused while the lending-wide emergency halt is set (an unreadable flag counts as set), like the GHL
+    senders, and while the lending email identity is not configured."""
+    from src.lending.email_identity import lending_email_identity
     from src.lending.global_halt import is_globally_halted
 
     if is_globally_halted():
         raise InstantlyError("lending emergency halt is on; nothing was sent")
+    identity = lending_email_identity()
+    if identity is None:
+        raise InstantlyError("lending email sender (LENDING_EMAIL_FROM / LENDING_EMAIL_BCC) not configured; nothing was sent")
     result = _post(account, "/api/v2/emails/reply", {
-        "eaccount": eaccount, "reply_to_uuid": reply_to_uuid, "subject": subject,
+        "eaccount": identity.from_address, "reply_to_uuid": reply_to_uuid, "subject": subject,
         "body": {"text": body, "html": _html_body(body)},
+        "bcc_address_email_list": ",".join(identity.bcc),
     })
     email_id = result.get("id")
     return str(email_id) if email_id else None

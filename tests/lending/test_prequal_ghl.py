@@ -8,7 +8,8 @@ FILE_URL = "https://files.example/conv/abc.pdf"
 
 
 class _Settings:
-    lending_prequal_email_from = None
+    lending_email_from = "david.willis@nextdeallending.com"
+    lending_email_bcc = "josh@nextdeallending.com"
 
 
 class _Resp:
@@ -43,7 +44,10 @@ class RecordingSink(GhlPrequalAttachmentSink):
 
 @pytest.fixture
 def no_sender(monkeypatch):
-    monkeypatch.setattr(prequal_ghl, "get_settings", lambda: _Settings())
+    """The lending email identity configured (David as sender, Josh in BCC)."""
+    from src.lending import email_identity
+
+    monkeypatch.setattr(email_identity, "get_settings", lambda: _Settings())
 
 
 def test_deliver_uploads_then_sends_email_with_attachment(no_sender):
@@ -55,16 +59,22 @@ def test_deliver_uploads_then_sends_email_with_attachment(no_sender):
     assert body["type"] == "Email" and body["contactId"] == "cid1"
     assert body["subject"] == EMAIL_SUBJECT
     assert body["attachments"] == [FILE_URL]
-    assert "emailFrom" not in body
+    assert body["emailFrom"] == "david.willis@nextdeallending.com"
+    assert body["emailBcc"] == ["josh@nextdeallending.com"] and "emailCc" not in body
 
 
-def test_email_from_set_when_configured(monkeypatch):
+@pytest.mark.parametrize("sender,bcc", [(None, "josh@nextdeallending.com"), ("david.willis@nextdeallending.com", "")])
+def test_nothing_uploaded_or_sent_without_david_and_josh(monkeypatch, sender, bcc):
+    from src.lending import email_identity
+
     class S:
-        lending_prequal_email_from = "hello@example.com"
-    monkeypatch.setattr(prequal_ghl, "get_settings", lambda: S())
+        lending_email_from = sender
+        lending_email_bcc = bcc
+    monkeypatch.setattr(email_identity, "get_settings", lambda: S())
     sink = RecordingSink()
-    sink.deliver(1, "cid1", b"%PDF")
-    assert sink.calls[1][3]["emailFrom"] == "hello@example.com"
+    with pytest.raises(DeliveryError) as refused:
+        sink.deliver(1, "cid1", b"%PDF")
+    assert sink.calls == [] and refused.value.config_error
 
 
 def test_upload_failure_sends_no_email(no_sender):

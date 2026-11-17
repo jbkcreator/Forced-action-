@@ -926,8 +926,6 @@ class AppSettings(BaseSettings):
 	lending_prequal_pdf_enabled: bool = Field(default=False, env="LENDING_PREQUAL_PDF_ENABLED")
 	# Placeholder range: +/- this percent around the requested amount, clamped to fitting lenders' limits.
 	lending_prequal_range_pct: int = Field(default=10, env="LENDING_PREQUAL_RANGE_PCT")
-	# Sender of the pre-qual email. Set a verified Next Deal Lending mailbox before enabling; unset = GHL's shared address.
-	lending_prequal_email_from: Optional[str] = Field(default=None, env="LENDING_PREQUAL_EMAIL_FROM")
 	# P-1 Partner Door. The form will not open until Josh's consent wording is set here (shown verbatim, stored on each file).
 	lending_partner_consent_text: str = Field(default="", env="LENDING_PARTNER_CONSENT_TEXT")
 	lending_partner_upload_dir: str = Field(default="data/partner_uploads", env="LENDING_PARTNER_UPLOAD_DIR")  # uploads + generated pre-qual PDFs
@@ -1097,7 +1095,6 @@ class AppSettings(BaseSettings):
 	# (defined above). Cold email stays off until the key, the passthrough campaign id and the footer postal address
 	# (CAN-SPAM) are all set.
 	lending_instantly_campaign_id: str = Field(default="", env="LENDING_INSTANTLY_CAMPAIGN_ID")
-	lending_instantly_sender_email: str = Field(default="", env="LENDING_INSTANTLY_SENDER_EMAIL")
 	lending_email_footer_brand: str = Field(default="Next Deal Lending", env="LENDING_EMAIL_FOOTER_BRAND")
 	lending_email_footer_postal_address: str = Field(default="", env="LENDING_EMAIL_FOOTER_POSTAL_ADDRESS")
 	lending_email_footer_phone: str = Field(default="(656) 221-1100", env="LENDING_EMAIL_FOOTER_PHONE")
@@ -1298,8 +1295,10 @@ class AppSettings(BaseSettings):
 		if not self.lending_call_window_et_start < self.lending_call_window_et_end:
 			raise ValueError("LENDING_CALL_WINDOW_ET_START must be before LENDING_CALL_WINDOW_ET_END")
 		return self
-	# Verified GHL sending address for those emails (hello@nextdeallending.com). Unset = no email sender.
-	lending_ghl_email_from: Optional[str] = Field(default=None, env="LENDING_GHL_EMAIL_FROM")
+	# Every lending email (GHL and Instantly) is From LENDING_EMAIL_FROM (David) with a blind copy to LENDING_EMAIL_BCC
+	# (Josh; comma-separated, never CC). Either unset or invalid = no lending email is sent (src/lending/email_identity.py).
+	lending_email_from: Optional[str] = Field(default=None, env="LENDING_EMAIL_FROM")
+	lending_email_bcc: str = Field(default="", env="LENDING_EMAIL_BCC")
 	# Logs the key paths (never values) of each incoming lending GHL webhook, to confirm the real field names.
 	lending_ghl_log_payload_shape: bool = Field(default=False, env="LENDING_GHL_LOG_PAYLOAD_SHAPE")
 	# A failed caller check cancels the AI-booked GHL appointment (frees Josh's slot). Off until the end-to-end test.

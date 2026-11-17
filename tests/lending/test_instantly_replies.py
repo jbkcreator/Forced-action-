@@ -491,7 +491,12 @@ def test_a_storage_failure_asks_instantly_to_retry(client, monkeypatch):
 
 @pytest.fixture
 def not_halted(monkeypatch):
+    """Not halted, and the lending email identity set: David as sender, Josh in BCC."""
+    from src.lending.email_identity import LendingEmailIdentity
+
     monkeypatch.setattr("src.lending.global_halt.is_globally_halted", lambda: False)
+    monkeypatch.setattr("src.lending.email_identity.lending_email_identity",
+                        lambda: LendingEmailIdentity("david.willis@nextdeallending.com", ("josh@nextdeallending.com",)))
 
 
 def test_the_emergency_halt_refuses_the_send_before_calling_instantly(monkeypatch):
@@ -499,7 +504,18 @@ def test_the_emergency_halt_refuses_the_send_before_calling_instantly(monkeypatc
     monkeypatch.setattr("src.lending.global_halt.is_globally_halted", lambda: True)
     monkeypatch.setattr(instantly_client.requests, "post", lambda *a, **k: called.append(1))
     with pytest.raises(instantly_client.InstantlyError, match="emergency halt"):
-        instantly_client.send_reply(instantly_client.InstantlyAccount("k", "https://x"), eaccount="a@b.com",
+        instantly_client.send_reply(instantly_client.InstantlyAccount("k", "https://x"),
+                                    reply_to_uuid="em-1", subject="s", body="b")
+    assert called == []
+
+
+def test_no_reply_is_sent_without_david_and_josh(monkeypatch):
+    called = []
+    monkeypatch.setattr("src.lending.global_halt.is_globally_halted", lambda: False)
+    monkeypatch.setattr("src.lending.email_identity.lending_email_identity", lambda: None)
+    monkeypatch.setattr(instantly_client.requests, "post", lambda *a, **k: called.append(1))
+    with pytest.raises(instantly_client.InstantlyError, match="LENDING_EMAIL_FROM"):
+        instantly_client.send_reply(instantly_client.InstantlyAccount("k", "https://x"),
                                     reply_to_uuid="em-1", subject="s", body="b")
     assert called == []
 
@@ -548,7 +564,7 @@ def test_an_instantly_answer_to_a_clear_address_may_send_and_ghl_email_is_unchan
     assert len(ghl.queries) == 1  # GHL email keeps its single suppression query
 
 
-def test_an_approved_answer_is_sent_inside_the_thread(monkeypatch, not_halted):
+def test_an_approved_answer_is_sent_inside_the_thread_from_david_with_josh_in_bcc(monkeypatch, not_halted):
     from src.lending.cora_agent import instantly_executor
 
     sent = {}
@@ -562,7 +578,9 @@ def test_an_approved_answer_is_sent_inside_the_thread(monkeypatch, not_halted):
     ref = send({"to_email": LEAD, "subject": "Re: Funding", "body": "Hi Mark\n<b>call?</b>",
                 "from_inbox": "josh@ndl-mail.com", "reply_to_uuid": "em-1"})
     assert ref == "out-1" and sent["url"] == "https://api.instantly.ai/api/v2/emails/reply"
-    assert sent["json"]["eaccount"] == "josh@ndl-mail.com" and sent["json"]["reply_to_uuid"] == "em-1"
+    assert sent["json"]["eaccount"] == "david.willis@nextdeallending.com" and sent["json"]["reply_to_uuid"] == "em-1"
+    assert sent["json"]["bcc_address_email_list"] == "josh@nextdeallending.com"
+    assert "cc_address_email_list" not in sent["json"]
     assert sent["json"]["body"]["html"] == "Hi Mark<br>&lt;b&gt;call?&lt;/b&gt;"
     assert sent["headers"]["Authorization"] == "Bearer key"
 
@@ -571,7 +589,7 @@ def test_an_instantly_refusal_fails_the_send_without_the_address(monkeypatch, no
     monkeypatch.setattr(instantly_client.requests, "post",
                         lambda *a, **k: SimpleNamespace(status_code=422, json=lambda: {}))
     with pytest.raises(instantly_client.InstantlyError) as raised:
-        instantly_client.send_reply(instantly_client.InstantlyAccount("k", "https://x"), eaccount="a@b.com",
+        instantly_client.send_reply(instantly_client.InstantlyAccount("k", "https://x"),
                                     reply_to_uuid="em-1", subject="s", body="b")
     assert "422" in str(raised.value) and "@" not in str(raised.value)
 

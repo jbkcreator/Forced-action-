@@ -3,8 +3,8 @@
 Two calls: upload the PDF to the contact's conversation (GHL hosts the file and returns its URL),
 then send an Email message carrying that URL in ``attachments``. Verified live Oct 2026 with API
 Version 2021-07-28: upload 201, send 201, delivered with the PDF attached. Nothing is stored on our side.
-The email goes out under ``LENDING_PREQUAL_EMAIL_FROM``; unset, GHL uses its shared sending address,
-so set it to a verified Next Deal Lending mailbox before the flag is turned on.
+The email goes out From ``LENDING_EMAIL_FROM`` (David) with Josh in ``emailBcc`` (``LENDING_EMAIL_BCC``), never CC;
+either unset, nothing is sent and the letter keeps its attempts (src/lending/email_identity.py).
 """
 from __future__ import annotations
 
@@ -13,9 +13,9 @@ from typing import Optional
 
 from config.lending_prequal import BORROWER_CALLBACK_PHONE, BORROWER_SIGNER
 from config.lending_web import GHL_CONFIG_ERROR_STATUS_CODES
-from config.settings import get_settings
 from requests.exceptions import ConnectTimeout, RequestException
 
+from src.lending.email_identity import lending_email_identity
 from src.lending.ghl_account import ghl_headers, ghl_multipart_headers, lending_ghl_account
 from src.lending.global_halt import is_globally_halted
 from src.lending.prequal import PrequalSink
@@ -49,18 +49,25 @@ def _refuse_if_halted() -> None:
         raise DeliveryError("prequal email: lending emergency halt is on; nothing sent", config_error=True)
 
 
+def with_lending_sender(body: dict) -> dict:
+    """The email body From David with Josh in BCC. Raised as a setup failure when either is not configured, so the
+    letter keeps its attempts and is sent once the settings are fixed."""
+    identity = lending_email_identity()
+    if identity is None:
+        raise DeliveryError("lending email sender (LENDING_EMAIL_FROM / LENDING_EMAIL_BCC) not configured; nothing sent",
+                            config_error=True)
+    return {**body, "emailFrom": identity.from_address, "emailBcc": list(identity.bcc)}
+
+
 class GhlPrequalAttachmentSink(GhlLeadSink):
     """Upload is idempotent and keeps the normal retries; the email send is a single attempt."""
 
     def deliver(self, lead_id: int, contact_id: str, pdf: bytes) -> None:
         _refuse_if_halted()
+        with_lending_sender({})  # checked before the upload: no PDF is hosted for an email that cannot go out
         url = self._upload(contact_id, pdf)
-        body = {"type": "Email", "contactId": contact_id, "subject": EMAIL_SUBJECT,
-                "html": EMAIL_HTML, "attachments": [url]}
-        email_from = get_settings().lending_prequal_email_from
-        if email_from:
-            body["emailFrom"] = email_from
-        self._send_email(body)
+        self._send_email(with_lending_sender({"type": "Email", "contactId": contact_id, "subject": EMAIL_SUBJECT,
+                                              "html": EMAIL_HTML, "attachments": [url]}))
         logger.info("[prequal] email sent lead_id=%s", lead_id)
 
     def _send_email(self, body: dict) -> None:

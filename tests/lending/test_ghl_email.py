@@ -8,11 +8,14 @@ import pytest
 from config.lending_reminders import MAX_SEND_ATTEMPTS
 from config.settings import get_settings
 from src.lending import reminder_worker
+from src.lending.email_identity import LendingEmailIdentity
 from src.lending.ghl_email import GhlEmailSender, get_email_sender
 from src.lending.ghl_sms import GhlAccount, GhlSmsError
 
 ACCOUNT = GhlAccount(api_key="k-secret", location_id="loc-ndl")
-FROM = "hello@nextdeallending.com"
+FROM = "david.willis@nextdeallending.com"
+JOSH = "josh@nextdeallending.com"
+IDENTITY = LendingEmailIdentity(from_address=FROM, bcc=(JOSH,))
 TO = "jane@example.com"
 PHONE = "+18135558601"
 
@@ -36,9 +39,9 @@ class Recorder:
         return self._responses.pop(0)
 
 
-def test_upserts_by_email_and_phone_then_sends_an_html_email_from_the_verified_address():
+def test_upserts_by_email_and_phone_then_sends_from_david_with_josh_in_bcc_only():
     request = Recorder(Resp(200, {"contact": {"id": "ct1"}}), Resp(201, {"messageId": "m1"}))
-    message_id = GhlEmailSender(ACCOUNT, FROM, request=request)(TO, "Your call", "Hi Jane,\nSee you <soon>.",
+    message_id = GhlEmailSender(ACCOUNT, IDENTITY, request=request)(TO, "Your call", "Hi Jane,\nSee you <soon>.",
                                                                 phone=PHONE, first_name="Jane")
     assert message_id == "m1"
     (_, u1, k1), (_, u2, k2) = request.calls
@@ -46,13 +49,14 @@ def test_upserts_by_email_and_phone_then_sends_an_html_email_from_the_verified_a
     assert k1["json"] == {"locationId": "loc-ndl", "email": TO, "phone": PHONE, "firstName": "Jane"}
     assert u2.endswith("/conversations/messages")
     assert k2["json"] == {"type": "Email", "contactId": "ct1", "subject": "Your call",
-                          "html": "Hi Jane,<br>See you &lt;soon&gt;.", "emailFrom": FROM}
+                          "html": "Hi Jane,<br>See you &lt;soon&gt;.", "emailFrom": FROM, "emailBcc": [JOSH]}
+    assert "emailCc" not in k2["json"]
     assert k2["headers"]["Version"] == "2021-04-15"
 
 
 def test_upsert_without_phone_or_name_sends_email_only():
     request = Recorder(Resp(200, {"contact": {"id": "ct1"}}), Resp(201, {"messageId": "m1"}))
-    GhlEmailSender(ACCOUNT, FROM, request=request)(TO, "s", "b")
+    GhlEmailSender(ACCOUNT, IDENTITY, request=request)(TO, "s", "b")
     assert request.calls[0][2]["json"] == {"locationId": "loc-ndl", "email": TO}
 
 
@@ -65,7 +69,7 @@ def test_upsert_without_phone_or_name_sends_email_only():
 ])
 def test_failures_say_whether_anything_may_have_gone_out(responses, fragment, ambiguous):
     with pytest.raises(GhlSmsError) as err:
-        GhlEmailSender(ACCOUNT, FROM, request=Recorder(*responses))(TO, "s", "b")
+        GhlEmailSender(ACCOUNT, IDENTITY, request=Recorder(*responses))(TO, "s", "b")
     assert fragment in str(err.value) and TO not in str(err.value)
     assert err.value.ambiguous is ambiguous
 
@@ -74,29 +78,39 @@ def test_nothing_is_sent_after_the_deadline():
     request = Recorder(Resp(200, {"contact": {"id": "ct1"}}))
     past = datetime.now(timezone.utc) - timedelta(minutes=1)
     with pytest.raises(GhlSmsError) as err:
-        GhlEmailSender(ACCOUNT, FROM, request=request)(TO, "s", "b", deadline=past)
+        GhlEmailSender(ACCOUNT, IDENTITY, request=request)(TO, "s", "b", deadline=past)
     assert not err.value.ambiguous and len(request.calls) == 1
 
 
-def test_no_sender_without_a_sending_address(monkeypatch):
+def _identity_settings(monkeypatch, *, sender, bcc):
     s = get_settings()
-    monkeypatch.setattr(s, "lending_ghl_email_from", None, raising=False)
+    monkeypatch.setattr(s, "lending_email_from", sender, raising=False)
+    monkeypatch.setattr(s, "lending_email_bcc", bcc, raising=False)
+
+
+@pytest.mark.parametrize("sender,bcc", [(None, JOSH), (FROM, ""), ("", JOSH), (FROM, "josh"), ("david", JOSH)])
+def test_no_sender_without_david_and_josh(monkeypatch, sender, bcc):
+    _identity_settings(monkeypatch, sender=sender, bcc=bcc)
     monkeypatch.setattr("src.lending.ghl_email.lending_ghl_account", lambda: ACCOUNT)
     assert get_email_sender() is None
 
 
 def test_no_sender_without_a_ghl_account(monkeypatch):
-    s = get_settings()
-    monkeypatch.setattr(s, "lending_ghl_email_from", FROM, raising=False)
+    _identity_settings(monkeypatch, sender=FROM, bcc=JOSH)
     monkeypatch.setattr("src.lending.ghl_email.lending_ghl_account", lambda: None)
     assert get_email_sender() is None
 
 
-def test_sender_built_when_both_are_set(monkeypatch):
-    s = get_settings()
-    monkeypatch.setattr(s, "lending_ghl_email_from", f"  {FROM} ", raising=False)
+def test_sender_built_when_all_are_set(monkeypatch):
+    _identity_settings(monkeypatch, sender=f"  {FROM.upper()} ", bcc=f" {JOSH} , {JOSH} ")
     monkeypatch.setattr("src.lending.ghl_email.lending_ghl_account", lambda: ACCOUNT)
-    assert isinstance(get_email_sender(), GhlEmailSender)
+    request = Recorder(Resp(200, {"contact": {"id": "ct1"}}), Resp(201, {"messageId": "m1"}))
+    sender = get_email_sender()
+    assert isinstance(sender, GhlEmailSender)
+    sender._request = request
+    sender(TO, "s", "b")
+    body = request.calls[1][2]["json"]
+    assert body["emailFrom"] == FROM and body["emailBcc"] == [JOSH]
 
 
 SLOT = datetime(2026, 10, 7, 14, 0, tzinfo=timezone.utc)

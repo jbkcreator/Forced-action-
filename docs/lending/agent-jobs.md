@@ -30,7 +30,7 @@ Code: `src/lending/agent_jobs/` (`job.py` parse, `checks.py` rules and rail, `dr
 | `LENDING_JOBS_PROCESSED_FOLDER_ID` | Drive folder id of `NDL Jobs/inbox/processed` (Cora moves each file there once taken) |
 | `LENDING_JOBS_DONE_FOLDER_ID` | Drive folder id of `NDL Jobs/done` |
 | `LENDING_INSTANTLY_API_KEY` | NDL's Instantly workspace key, shared with P1.3 (Instantly replies); never Forced Action's `INSTANTLY_API_KEY` |
-| `LENDING_INSTANTLY_SENDER_EMAIL` | NDL's cold sending inbox in Instantly |
+| `LENDING_EMAIL_FROM` / `LENDING_EMAIL_BCC` | David's inbox (the campaign's only sender) and Josh (BCC); see docs/lending/email-sender.md |
 | `LENDING_INSTANTLY_CAMPAIGN_ID` | Printed by the setup command below |
 | `LENDING_EMAIL_FOOTER_POSTAL_ADDRESS` | NDL's postal address for the CAN-SPAM footer (**required**: cold email stays off without it) |
 | `LENDING_EMAIL_FOOTER_BRAND` / `_PHONE` | Default "Next Deal Lending" / "(656) 221-1100" |
@@ -47,7 +47,7 @@ A folder id is the last part of the folder's Drive URL (`.../folders/<id>`).
 2. **Table.** `PYTHONPATH=. python migrations/apply_lending_agent_jobs.py`
 3. **Check the sample files parse.** `PYTHONPATH=. python -m src.lending.agent_jobs.worker --dry-run --from-dir docs/lending/agent-jobs-samples` prints `received=8 carded=0 invalid=0` (one sample per job type, a warm and a cold email, and a partner Deal Drop).
 4. **Cold email (once Muhammad gives the key and sending inbox, and the client gives the postal address).**
-   - Set `LENDING_INSTANTLY_API_KEY` and `LENDING_INSTANTLY_SENDER_EMAIL`.
+   - Set `LENDING_INSTANTLY_API_KEY`, `LENDING_EMAIL_FROM` and `LENDING_EMAIL_BCC`.
    - Run `PYTHONPATH=. python -m src.lending.instantly_email --setup-campaign`. It finds or creates the "NDL Cora Passthrough" campaign (one step: `{{ra_subject}}` / `{{ra_body}}`, sending 09:00–20:00 America/Detroit) and prints `LENDING_INSTANTLY_CAMPAIGN_ID`.
    - Set that id and `LENDING_EMAIL_FOOTER_POSTAL_ADDRESS`.
 5. **Switch on.** After Josh approves, set `LENDING_AGENT_JOBS_ENABLED=true` and deploy (`deploy.sh` restarts `fa-lending-cora`). The log shows `agent job queue off` or `not configured` if something is missing.
