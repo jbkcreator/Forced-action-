@@ -13,6 +13,7 @@ from __future__ import annotations
 import logging
 
 from sqlalchemy import create_engine, text
+from sqlalchemy.schema import CreateIndex
 from sqlalchemy.engine import Connection, Engine
 
 from config.settings import get_settings
@@ -38,6 +39,11 @@ def apply_to(conn: Connection, schema: str = LENDING_SCHEMA) -> None:
     translated = conn.execution_options(schema_translate_map={LENDING_SCHEMA: schema})
     for model in TABLES:
         model.__table__.create(translated, checkfirst=True)
+    # create(checkfirst=True) skips a table that already exists, so an index added after a first run (e.g. the
+    # one-open-chase-per-email unique index) would never reach it: every model index is created if missing.
+    for model in TABLES:
+        for index in sorted(model.__table__.indexes, key=lambda i: i.name or ""):
+            translated.execute(CreateIndex(index, if_not_exists=True))
     # Deals that moved before this table existed: their latest stage entry. Never overwrites a live row.
     conn.execute(text(
         f'INSERT INTO "{schema}".ghl_opportunity_stage (ghl_opportunity_id, stage_name, stage_key, entered_at, phone) '
