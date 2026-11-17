@@ -49,9 +49,9 @@ from src.lending.agent_jobs.drive import google_job_folders
 from src.lending.agent_jobs.worker import JobQueueWorker, make_check
 from src.lending.attempt_log import lending_ghl_readers
 from src.lending.compliance import text_window_open
-from src.lending.closing.blockers import post_blocker_card
+from src.lending.closing.blockers import claim_card_day, post_blocker_card, release_card_day
 from src.lending.closing.doc_chase import chase_id_of, run_chase_sweep
-from src.lending.closing.doc_copies import copy_uploads_to_drive, live_copier
+from src.lending.closing.doc_copies import DriveCopyStep, live_copier
 from src.lending.consent import has_text_consent
 from src.lending.cora_channels import ChannelDirectory
 from src.lending.cora_inbox import format_inbox_context, items_on_post, surface_new_items
@@ -646,12 +646,33 @@ def build_closing_steps(settings: AppSettings, *, engine: Engine, chat: ChatPort
     approvals = (config.approval_channel_id or "") if config is not None else ""
 
     def blocker_card() -> bool:
+        """Claim the day in its own committed transaction, then post. Released only when nothing was posted (an
+        error before the first message); a failed commit after the post keeps the claim, so no second card."""
+        if not config.slack_channel_id:
+            return False
+        now = datetime.now(timezone.utc)
         with Session(engine) as db, db.begin():
-            return post_blocker_card(db, chat, gate, channel=config.slack_channel_id, approvals_channel=approvals,
-                                     text_consent=lambda phone: has_text_consent(db, phone))
+            day = claim_card_day(db, now)
+        if day is None:
+            return False
+        release = False
+        try:
+            with Session(engine) as db, db.begin():
+                try:
+                    return post_blocker_card(db, chat, gate, channel=config.slack_channel_id,
+                                             approvals_channel=approvals, now=now, claimed=True,
+                                             text_consent=lambda phone: has_text_consent(db, phone))
+                except Exception:
+                    release = True
+                    raise
+        finally:
+            if release:
+                with Session(engine) as db, db.begin():
+                    release_card_day(db, day)
 
-    copier = (live_copier() if settings.lending_doc_chase_enabled and settings.lending_doc_upload_drive_folder_id
-              else None)
+    copy_step = (DriveCopyStep(lambda: Session(engine), folder_id=settings.lending_doc_upload_drive_folder_id,
+                               copier=live_copier(), notify=post_ops_notice)
+                 if settings.lending_doc_chase_enabled and settings.lending_doc_upload_drive_folder_id else None)
 
     def chase_sweep() -> int:
         with Session(engine) as db, db.begin():
@@ -659,13 +680,8 @@ def build_closing_steps(settings: AppSettings, *, engine: Engine, chat: ChatPort
                                      text_consent=lambda phone: has_text_consent(db, phone),
                                      find_draft=queue.find_by_idempotency_key if queue is not None else None,
                                      block_draft=queue.block_pending if queue is not None else None)
-        if copier is not None:  # its own transaction: a Drive problem never touches the chase
-            try:
-                with Session(engine) as db, db.begin():
-                    copy_uploads_to_drive(db, folder_id=settings.lending_doc_upload_drive_folder_id, copier=copier,
-                                          notify=post_ops_notice)
-            except Exception as exc:  # class only
-                logger.error("[cora] document copy to Drive skipped this sweep (%s)", type(exc).__name__)
+        if copy_step is not None:  # own transaction, time budget and pause: Drive never holds the chase or the sweep
+            copy_step()
         return queued
 
     return (blocker_card if settings.lending_closing_blockers_enabled else None,

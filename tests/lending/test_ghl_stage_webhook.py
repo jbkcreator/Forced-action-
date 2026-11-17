@@ -114,9 +114,35 @@ def test_a_first_time_stage_after_funded_still_applies(client, lending_db):
 
 
 def _age_events(db, hours=2, opp="opp-9"):
-    """The earlier deliveries happened ``hours`` ago (past the redelivery window)."""
+    """The deal's earlier deliveries, and its entry into its current stage, happened ``hours`` ago."""
     db.execute(text("UPDATE lending.ghl_stage_events SET event_at = now() - make_interval(hours => :h) "
                     "WHERE ghl_opportunity_id = :o"), {"h": hours, "o": opp})
+    db.execute(text("UPDATE lending.ghl_opportunity_stage SET entered_at = now() - make_interval(hours => :h) "
+                    "WHERE ghl_opportunity_id = :o"), {"h": hours, "o": opp})
+
+
+def _held_items(db):
+    return db.execute(text("SELECT summary FROM lending.cora_inbox WHERE event_type = 'ghl_stage_repeat_held'")
+                      ).scalars().all()
+
+
+def test_a_redelivery_after_a_revival_never_reopens_a_funded_deal(client, lending_db):
+    """Application (day 1), Lost, revived to Application days later, Funded, then the revival redelivered."""
+    _stage(client, "Application"), _stage(client, "Lost")
+    _age_events(lending_db, hours=72)
+    _stage(client, "Application")                     # the revival: applied
+    assert _current(lending_db) == "application"
+    _stage(client, "Funded")
+    _stage(client, "Application")                     # GHL redelivers the revival minutes after Funded
+    assert _current(lending_db) == "funded"
+
+
+def test_a_held_repeat_raises_one_inbox_item_naming_both_stages(client, lending_db):
+    _stage(client, "Application"), _stage(client, "Lost")
+    _stage(client, "Application"), _stage(client, "Application")
+    assert _current(lending_db) == "lost"
+    items = _held_items(lending_db)
+    assert len(items) == 1 and '"Application"' in items[0] and '"Lost"' in items[0] and "opp-9" in items[0]
 
 
 def test_a_redelivery_within_the_hour_never_moves_an_active_deal_back(client, lending_db):

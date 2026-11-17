@@ -18,14 +18,20 @@ on `lending-api`, settings and copy in `config/lending_closing.py`. Both parts r
 4. The upload folder holds borrowers' financial documents: folder `0700`, files `0600`, never served by nginx,
    never sent to Slack. Include it in the server backup. There is no automatic deletion yet: it is built once Josh
    sets the retention period.
-5. So Josh can open them: `LENDING_DOC_UPLOAD_DRIVE_FOLDER_ID` = a Drive folder **only Josh** (and whoever he names)
-   can open, shared with the lending service account as Content manager; never FA Exports, NDL Jobs, the ledger or
-   the LLC folders. Cora's sweep copies each upload to `chase-<id>/<item>-<upload id>.<ext>` (no borrower name in
-   Drive) once; a failure retries, and after 5 tries one ops notice. Empty = documents stay on the server only.
+5. So Josh can open them: `LENDING_DOC_UPLOAD_DRIVE_FOLDER_ID` = the id of a **new Shared Drive** "NDL Borrower
+   Documents" whose only members are Josh (Manager), whoever he names, and the lending service account
+   (`fa-lending-engine@forcedaction.iam.gserviceaccount.com`, Content manager). Not a folder inside NDL Cora (every
+   member of that drive sees it) and not Josh's My Drive (a service account has no storage of its own, so uploads
+   there fail). Cora's sweep copies each upload to `chase-<id>/<item>-<upload id>.<ext>` (no borrower name in Drive)
+   once. A failure waits and retries (1, 2, 4 ... minutes, at most 6 hours) and pauses the copy step (5 minutes,
+   up to an hour) so Cora's sweep is never held; it never gives up, and an upload that has failed 5 times raises one
+   ops notice. Empty = documents stay on the server only.
 
 Current stage: each GHL stage webhook updates `lending.ghl_opportunity_stage` (time = when it arrived; GHL sends
-no event time). The same stage event for the same deal repeated within an hour of its first delivery is treated as
-a redelivery and never moves the deal; a later repeat is a real move (e.g. a Lost deal revived to Application).
+no event time). A stage event this deal already sent before (a repeat) is held when the deal entered its current
+stage less than an hour ago: that is a redelivery (e.g. "Application" again just after "Funded"). Otherwise it is a
+real move (e.g. a Lost deal revived to Application days later). A real move back within the hour looks the same, so
+a held repeat raises a Cora inbox item: if the deal really went back, move it in GHL again after the hour.
 
 ## 7 AM closing blocker card (#cora)
 
@@ -47,7 +53,8 @@ otherwise Application = borrower, Submitted to lender = lender, Ready to fund = 
 Start: an approver tells Cora the borrower accepted the term sheet, e.g. "Mark accepted the term sheet, start the
 document chase" (tool `start_document_chase`; optional P2.2 `quote_id`, whose `INTEREST_RESERVE_FULL_TERM`
 condition adds a document). One open chase per phone; asking again keeps the open one. While texts with links are
-off, a borrower with no email is refused with the reason (no link could ever reach them).
+off, a borrower with no email is refused with the reason (no link could ever reach them); asking again with
+their email adds it to an open chase, and the step that could not be sent goes out by email.
 
 Where the documents are: on the lending-api server under `LENDING_DOC_UPLOAD_DIR`, one folder per chase, and
 copied to Josh's Drive folder `chase-<id>/` when `LENDING_DOC_UPLOAD_DRIVE_FOLDER_ID` is set (setup step 5). Cora's

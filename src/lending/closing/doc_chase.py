@@ -67,6 +67,11 @@ _OPEN_FOR_BORROWER = text("""
        AND (phone = CAST(:phone AS varchar)
             OR (CAST(:phone AS varchar) IS NULL AND phone IS NULL AND lower(email) = lower(CAST(:email AS varchar))))
 """)
+# A borrower's email given after their chase opened (it could not reach them while texts with links were off):
+# kept on the open chase, and the steps recorded with no message are cleared so the due step goes out by email.
+_ATTACH_EMAIL = text("UPDATE lending.doc_chases SET email = :email, updated_at = :now "
+                     "WHERE id = :c AND email IS NULL")
+_DROP_UNSENT_TOUCHES = text("DELETE FROM lending.doc_chase_touches WHERE chase_id = :c AND action_id IS NULL")
 _MISSING = text("SELECT label FROM lending.doc_chase_items WHERE chase_id = :c AND received_at IS NULL ORDER BY id")
 # Only an unambiguous match: a borrower with two deals in GHL is never guessed.
 _OPPORTUNITY = text("SELECT min(ghl_opportunity_id) FROM lending.ghl_opportunity_stage WHERE phone = :phone "
@@ -130,6 +135,10 @@ def start_chase(db, recipient: Recipient, *, lead_ref: str, accepted_by: str, le
     now = now or datetime.now(timezone.utc)
     existing = db.execute(_OPEN_FOR_BORROWER, {"phone": recipient.phone, "email": recipient.email}).scalar()
     if existing is not None:
+        if recipient.email and db.execute(_ATTACH_EMAIL, {"c": existing, "email": recipient.email,
+                                                          "now": now}).rowcount:
+            db.execute(_DROP_UNSENT_TOUCHES, {"c": existing})
+            logger.info("[doc-chase] chase %s: email added; its due step goes out by email", existing)
         return StartedChase(existing, _missing(db, existing), reused=True)
     conditions = _quote_conditions(db, quote_id) if quote_id else []
     checklist = build_checklist(lender_key, conditions)

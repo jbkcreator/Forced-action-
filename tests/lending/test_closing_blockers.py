@@ -218,6 +218,83 @@ def test_names_stages_and_labels_are_escaped_on_the_card(closing_db):
     assert "&lt;!channel&gt;" in card and "&lt;!here&gt;" in card and "&lt;@U123&gt;" in card
 
 
+class _Tx:
+    """A Session(engine) stand-in: every sweep transaction runs on the test's session (its begin() is a no-op that
+    keeps the test's transaction); ``fail_commit`` makes the next commit raise, like a connection lost after the
+    post. Everything else (savepoints, queries) goes to the real session."""
+
+    fail_commit = False
+
+    def __init__(self, db):
+        self._db = db
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def begin(self):
+        return _Commit()
+
+    def __getattr__(self, name):
+        return getattr(self._db, name)
+
+
+class _Commit:
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, *exc):
+        if exc_type is None and _Tx.fail_commit:
+            _Tx.fail_commit = False
+            raise ConnectionError("commit lost")
+        return False
+
+
+def _sweep_card(closing_db, monkeypatch, chat, now):
+    from types import SimpleNamespace
+
+    import src.lending.cora_agent as cora
+
+    monkeypatch.setattr(cora, "Session", lambda engine: _Tx(closing_db))
+    monkeypatch.setattr(cora, "datetime", SimpleNamespace(now=lambda tz=None: now))
+    monkeypatch.setattr(cora, "has_text_consent", lambda db, phone: True)
+    settings = SimpleNamespace(lending_closing_blockers_enabled=True, lending_doc_chase_enabled=False,
+                               lending_doc_upload_drive_folder_id="")
+    config = SimpleNamespace(approval_channel_id="C_APPROVALS", slack_channel_id="C_CORA")
+    card, _ = cora.build_closing_steps(settings, engine=None, chat=chat, gate=Gate(), config=config)
+    return card()
+
+
+def test_the_sweep_claims_the_day_before_posting_so_a_lost_commit_never_reposts(closing_db, monkeypatch):
+    _stage(closing_db, "opp-c", "Application", timedelta(days=4))
+    chat = FakeChatPort()
+    _Tx.fail_commit = False
+    original_post = chat.post
+
+    def post_then_lose_commit(**kwargs):
+        _Tx.fail_commit = True  # the post transaction's commit fails after Slack has the card
+        return original_post(**kwargs)
+
+    chat.post = post_then_lose_commit
+    with pytest.raises(ConnectionError):
+        _sweep_card(closing_db, monkeypatch, chat, AT_7_00)
+    assert len(chat.posts) == 1
+    assert not _sweep_card(closing_db, monkeypatch, chat, AT_7_00 + timedelta(minutes=1))  # still claimed
+    assert len(chat.posts) == 1
+
+
+def test_the_sweep_releases_the_day_when_nothing_was_posted(closing_db, monkeypatch):
+    _stage(closing_db, "opp-d", "Application", timedelta(days=4))
+    _Tx.fail_commit = False
+    with pytest.raises(RuntimeError):
+        _sweep_card(closing_db, monkeypatch, FailingChat(), AT_7_00)
+    chat = FakeChatPort()
+    assert _sweep_card(closing_db, monkeypatch, chat, AT_7_00 + timedelta(minutes=1))  # released: posts now
+    assert len(chat.posts) == 1
+
+
 def test_a_failure_to_save_the_slack_ts_never_reposts_the_card(closing_db, monkeypatch):
     import src.lending.closing.blockers as blockers
 

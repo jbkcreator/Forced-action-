@@ -48,7 +48,8 @@ def apply_to(conn: Connection, schema: str = LENDING_SCHEMA) -> None:
     # Columns added after the first release (doc_copies: the Drive copy of each upload).
     conn.execute(text(
         f'ALTER TABLE "{schema}".doc_chase_uploads ADD COLUMN IF NOT EXISTS drive_file_id varchar(100), '
-        "ADD COLUMN IF NOT EXISTS drive_attempts integer NOT NULL DEFAULT 0"))
+        "ADD COLUMN IF NOT EXISTS drive_attempts integer NOT NULL DEFAULT 0, "
+        "ADD COLUMN IF NOT EXISTS drive_retry_at timestamptz"))
     # Deals that moved before this table existed: their latest stage entry. Never overwrites a live row.
     conn.execute(text(
         f'INSERT INTO "{schema}".ghl_opportunity_stage (ghl_opportunity_id, stage_name, stage_key, entered_at, phone) '

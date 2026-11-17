@@ -48,22 +48,28 @@ _UPSERT_STAGE = text("""
                           THEN lending.ghl_opportunity_stage.entered_at ELSE EXCLUDED.entered_at END
      WHERE NOT (CAST(:repeat AS boolean)
                 AND lending.ghl_opportunity_stage.stage_key <> EXCLUDED.stage_key
-                AND EXISTS (SELECT 1 FROM lending.ghl_stage_events e
-                             WHERE e.ghl_opportunity_id = EXCLUDED.ghl_opportunity_id
-                               AND e.stage_key = EXCLUDED.stage_key AND e.event_at > :since))
+                AND lending.ghl_opportunity_stage.entered_at > :since)
 """)
+_CURRENT = text("SELECT stage_name, entered_at FROM lending.ghl_opportunity_stage WHERE ghl_opportunity_id = :opp")
 
 
 def upsert_current_stage(db, *, opportunity_id: str, stage_name: str, phone: Optional[str], now: datetime,
                          repeat: bool = False) -> bool:
     """Record that the opportunity is in ``stage_name``; a repeat of its current stage keeps the original entry time.
-    ``repeat``: this stage event was already recorded (``ghl_stage_events`` refused it as a duplicate). Within
-    REDELIVERY_WINDOW of that first delivery it is a redelivery and never moves the deal (e.g. "Application"
-    redelivered after "Funded"); later it is a real move, such as a Lost deal revived to Application. GHL sends no
-    event time, so a redelivery later than the window is applied as a move. False when the row was left unchanged."""
+    ``repeat``: this stage event was already recorded (``ghl_stage_events`` refused it as a duplicate). When the deal
+    entered its current stage less than REDELIVERY_WINDOW ago, such an event is a redelivery of the event before and
+    never moves the deal (e.g. "Application" redelivered just after "Funded"); otherwise it is a real move, such as
+    a Lost deal revived to Application. GHL sends no event time, so a real move back within the window is also held
+    (the caller raises an inbox item) and a redelivery later than the window is applied. False when unchanged."""
     return bool(db.execute(_UPSERT_STAGE, {
         "opp": opportunity_id, "stage": stage_name, "key": stage_name.strip().lower(), "now": now, "phone": phone,
         "repeat": repeat, "since": now - REDELIVERY_WINDOW}).rowcount)
+
+
+def current_stage(db, opportunity_id: str) -> Optional[tuple[str, datetime]]:
+    """(stage name, entered at) of the opportunity, or None."""
+    row = db.execute(_CURRENT, {"opp": opportunity_id}).first()
+    return (row.stage_name, row.entered_at) if row else None
 
 
 # ---- the 7 AM card -------------------------------------------------------------------------------------------------
@@ -90,6 +96,7 @@ _STUCK = text("""
 """)
 _CLAIM = text("INSERT INTO lending.closing_blocker_cards (card_day) VALUES (:day) "
               "ON CONFLICT (card_day) DO NOTHING RETURNING card_day")
+_RELEASE = text("DELETE FROM lending.closing_blocker_cards WHERE card_day = :day AND posted_at IS NULL")
 _RECORD_POST = text("UPDATE lending.closing_blocker_cards SET slack_channel = :channel, slack_ts = :ts, "
                     "posted_at = CURRENT_TIMESTAMP WHERE card_day = :day")
 
@@ -267,18 +274,34 @@ def render_blocker_card(day: date, lines: list[str]) -> list[tuple[str, list[dic
     return messages
 
 
+def claim_card_day(db, now: datetime) -> Optional[date]:
+    """Take today's card (in the caller's transaction); None when not due or already taken. The sweep commits the
+    claim on its own before posting, so a failed commit after the post can never lead to a second card."""
+    day = card_day(now)
+    if day is None or db.execute(_CLAIM, {"day": day}).scalar() is None:
+        return None
+    return day
+
+
+def release_card_day(db, day: date) -> None:
+    """Give back a claim whose card was never posted, so the next sweep tries again."""
+    db.execute(_RELEASE, {"day": day})
+
+
 def post_blocker_card(db, chat: ChatPort, gate: SendGate, *, channel: Optional[str], approvals_channel: str,
-                      now: Optional[datetime] = None, text_consent: Callable[[str], bool]) -> bool:
+                      now: Optional[datetime] = None, text_consent: Callable[[str], bool],
+                      claimed: bool = False) -> bool:
     """Post today's card if due and not yet posted; True when posted. Runs in a savepoint on ``db``: a refused first
     message raises and rolls the day's claim back, so the next sweep tries again (drafts are keyed, so a retry never
     queues a second check-in). Once the first message is up the day stays claimed: a refused continuation in its
-    thread is logged and not retried, so the card is never posted twice."""
+    thread is logged and not retried, so the card is never posted twice. ``claimed``: the caller already took the
+    day with ``claim_card_day`` (committed) and releases it if this raises."""
     now = now or datetime.now(timezone.utc)
     day = card_day(now)
     if day is None or not channel:
         return False
     with db.begin_nested():
-        if db.execute(_CLAIM, {"day": day}).scalar() is None:
+        if not claimed and db.execute(_CLAIM, {"day": day}).scalar() is None:
             return False
         deals = stuck_deals(db, now)
         messages = render_blocker_card(

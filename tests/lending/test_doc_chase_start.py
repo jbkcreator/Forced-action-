@@ -104,6 +104,24 @@ def test_no_chase_starts_without_an_absolute_upload_folder(closing_db, link_base
     assert AppSettings.model_fields["lending_doc_upload_dir"].default == ""
 
 
+def test_an_email_given_later_reaches_an_open_phone_only_chase(closing_db, link_base, monkeypatch):
+    """Opened phone-only while links were on, links turned off (nothing could be sent), then Josh gives the email."""
+    from config.settings import get_settings
+    monkeypatch.setattr(get_settings(), "lending_doc_chase_sms_links_enabled", True, raising=False)
+    ana = Recipient("Ana", "+18135550102", None, None)
+    chase_id = start_chase(closing_db, ana, lead_ref="web_lead:8", accepted_by="slack:U1", now=NOW).chase_id
+    closing_db.execute(text("INSERT INTO lending.doc_chase_touches (chase_id, chase_day, action_id, created_at) "
+                            "VALUES (:c, 0, NULL, :now)"), {"c": chase_id, "now": NOW})  # the unsent request
+    monkeypatch.setattr(get_settings(), "lending_doc_chase_sms_links_enabled", False, raising=False)
+    again = start_chase(closing_db, Recipient("Ana", "+18135550102", "ana@example.com", None), lead_ref="web_lead:8",
+                        accepted_by="slack:U1", now=NOW)
+    assert again.reused and again.chase_id == chase_id
+    assert closing_db.execute(text("SELECT email FROM lending.doc_chases WHERE id = :c"),
+                              {"c": chase_id}).scalar() == "ana@example.com"
+    assert closing_db.execute(text("SELECT count(*) FROM lending.doc_chase_touches WHERE chase_id = :c"),
+                              {"c": chase_id}).scalar() == 0  # the request goes out by email on the next sweep
+
+
 def test_a_phone_only_borrower_is_refused_while_texts_with_links_are_off(closing_db, link_base, monkeypatch):
     from config.settings import get_settings
     monkeypatch.setattr(get_settings(), "lending_doc_chase_sms_links_enabled", False, raising=False)
