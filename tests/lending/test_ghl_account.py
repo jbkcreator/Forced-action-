@@ -203,6 +203,79 @@ def test_any_other_refusal_still_fails_without_retrying(monkeypatch, body):
     assert len(calls) == 1
 
 
+@pytest.mark.parametrize("status,message", [
+    (403, "Not authorized to update permanent dnd setting for SMS"),
+    (401, "not authorized to update PERMANENT DND setting for sms"),
+])
+def test_a_permanent_refusal_is_read_from_a_403_and_in_any_case(monkeypatch, status, message):
+    _creds(monkeypatch, lending_key=LENDING_KEY, lending_location="lending-loc")
+    calls = []
+
+    def fake(method, url, **kwargs):
+        calls.append({"method": method, "url": url, **kwargs})
+        if url.endswith("/tags"):
+            return MagicMock(status_code=200)
+        refuse = "SMS" in kwargs["json"]["dndSettings"]
+        response = MagicMock(status_code=status if refuse else 200)
+        response.json.return_value = {"message": message} if refuse else {"contact": {"id": "c9"}}
+        return response
+
+    monkeypatch.setattr("src.services.ghl_webhook._ghl_request", fake)
+    assert ghl_dnd.set_ghl_dnd(PHONE) is True
+    assert "SMS" not in calls[1]["json"]["dndSettings"]
+
+
+@pytest.mark.parametrize("status", [400, 422, 500])
+def test_a_permanent_message_with_another_status_drops_nothing(monkeypatch, status):
+    _creds(monkeypatch, lending_key=LENDING_KEY, lending_location="lending-loc")
+    calls = _ghl_refusing_permanent_channels(monkeypatch, {"SMS"}, refusal_status=status)
+    assert ghl_dnd.set_ghl_dnd(PHONE) is False
+    assert len(calls) == 1
+
+
+def _ghl_refusing_through_the_global_flag(monkeypatch, *, flag_free_refused=False):
+    """Fake GHL where the global ``dnd`` flag also covers the permanently blocked SMS channel: an upsert with the
+    flag or with SMS is refused naming SMS. With ``flag_free_refused`` every upsert is refused."""
+    calls = []
+
+    def fake(method, url, **kwargs):
+        calls.append({"method": method, "url": url, **kwargs})
+        if url.endswith("/tags"):
+            return MagicMock(status_code=200)
+        body = kwargs["json"]
+        refuse = flag_free_refused or body.get("dnd") or "SMS" in body["dndSettings"]
+        response = MagicMock(status_code=401 if refuse else 200)
+        response.json.return_value = (
+            {"statusCode": 401, "message": "Not authorized to update permanent dnd setting for SMS"}
+            if refuse else {"contact": {"id": "c9"}})
+        return response
+
+    monkeypatch.setattr("src.services.ghl_webhook._ghl_request", fake)
+    return calls
+
+
+def test_when_the_global_flag_covers_the_permanent_channel_each_channel_is_set_without_it(monkeypatch):
+    _creds(monkeypatch, lending_key=LENDING_KEY, lending_location="lending-loc")
+    calls = _ghl_refusing_through_the_global_flag(monkeypatch)
+    assert ghl_dnd.set_ghl_dnd(PHONE) is True
+    upserts = [call["json"] for call in calls if call["url"].endswith("/contacts/upsert")]
+    assert len(upserts) == 3
+    assert upserts[1]["dnd"] is True and "SMS" not in upserts[1]["dndSettings"]
+    assert "dnd" not in upserts[2]
+    assert set(upserts[2]["dndSettings"]) == set(GHL_DND_CHANNELS) - {"SMS"}
+    assert all(s["status"] == "active" for s in upserts[2]["dndSettings"].values())
+    assert calls[-1]["url"].endswith("/contacts/c9/tags")
+
+
+def test_a_channel_refused_again_without_the_global_flag_fails_and_says_so(monkeypatch, caplog):
+    _creds(monkeypatch, lending_key=LENDING_KEY, lending_location="lending-loc")
+    calls = _ghl_refusing_through_the_global_flag(monkeypatch, flag_free_refused=True)
+    with caplog.at_level("WARNING"):
+        assert ghl_dnd.set_ghl_dnd(PHONE) is False
+    assert len(calls) == 3  # all channels, then without SMS, then without the flag: never loops
+    assert "refused sms again" in caplog.text and PHONE not in caplog.text
+
+
 def test_dnd_upsert_without_the_lending_account_makes_no_request(monkeypatch):
     _creds(monkeypatch)
     calls = _ghl_request(monkeypatch)

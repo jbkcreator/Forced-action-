@@ -25,7 +25,11 @@ def set_ghl_dnd(phone: str) -> bool:
 
     The upsert carries no ``tags``: GHL's upsert REPLACES the tag list, so sending the opt-out tag there wiped every
     other tag on the contact (lead source, consent, list tags). The tag is added afterwards with the add-tags call,
-    which keeps existing tags. A failed tag call does not undo the DND, which is what the opt-out needs."""
+    which keeps existing tags. A failed tag call does not undo the DND, which is what the opt-out needs.
+
+    A channel GHL has blocked permanently (a STOP reply) refuses any API change, which fails the whole upsert: it
+    is left out and the rest are sent again. If GHL still refuses it because the global ``dnd`` flag covers it,
+    the channels are sent once more without the flag. Any other refusal fails."""
     from src.services import ghl_webhook
 
     account = lending_ghl_account()
@@ -33,13 +37,16 @@ def set_ghl_dnd(phone: str) -> bool:
         return False
     headers = ghl_headers(account.api_key)
     channels = list(GHL_DND_CHANNELS)
+    left_out: set[str] = set()  # lower-case names of channels GHL has blocked permanently
+    global_flag = True
     while True:
-        body = {
+        body: dict = {
             "locationId": account.location_id,
             "phone": phone,
-            "dnd": True,
             "dndSettings": {channel: {"status": "active", "message": "Lending opt-out"} for channel in channels},
         }
+        if global_flag:
+            body["dnd"] = True
         try:
             response = ghl_webhook._ghl_request("POST", f"{ghl_webhook._GHL_BASE}/contacts/upsert",
                                                 headers=headers, json=body)
@@ -55,7 +62,19 @@ def set_ghl_dnd(phone: str) -> bool:
             # whole upsert fails while the opt-out is already in force there: send the other channels only.
             logger.info("[lending-ghl] DND already permanent in GHL for %s; setting the other channels", locked)
             channels.remove(locked)
+            left_out.add(refused)
             continue
+        if refused and refused in left_out and global_flag:
+            # Refused again for a channel already left out: the global dnd flag also covers it. The per-channel
+            # settings carry the opt-out on every other channel, so send those without the flag.
+            logger.info("[lending-ghl] DND refused again for %s through the global flag; setting each channel instead",
+                        refused)
+            global_flag = False
+            continue
+        if refused and refused in left_out:
+            logger.warning("[lending-ghl] DND upsert failed: GHL refused %s again with it and the global flag "
+                           "left out (HTTP %s)", refused, response.status_code)
+            return False
         logger.warning("[lending-ghl] DND upsert failed: HTTP %s", response.status_code)
         return False
     _add_opt_out_tag(ghl_webhook, headers, _contact_id(response))
