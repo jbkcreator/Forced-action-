@@ -8,8 +8,8 @@ FILE_URL = "https://files.example/conv/abc.pdf"
 
 
 class _Settings:
-    lending_email_from = "david.willis@nextdeallending.com"
-    lending_email_bcc = "josh@nextdeallending.com"
+    lending_lendingflow_email_from = "david.willis@nextdeallending.com"
+    lending_lendingflow_email_bcc = "josh@nextdeallending.com"
 
 
 class _Resp:
@@ -68,8 +68,8 @@ def test_nothing_uploaded_or_sent_without_david_and_josh(monkeypatch, sender, bc
     from src.lending import email_identity
 
     class S:
-        lending_email_from = sender
-        lending_email_bcc = bcc
+        lending_lendingflow_email_from = sender
+        lending_lendingflow_email_bcc = bcc
     monkeypatch.setattr(email_identity, "get_settings", lambda: S())
     sink = RecordingSink()
     with pytest.raises(DeliveryError) as refused:

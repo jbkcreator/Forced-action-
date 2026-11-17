@@ -441,9 +441,8 @@ def test_ghl_task_executor_registered(monkeypatch) -> None:
 
 
 class _RecordingInstantly:
-    def __init__(self, can_send: bool = True) -> None:
+    def __init__(self) -> None:
         self.sent: list[tuple] = []
-        self.can_send = can_send
 
     def send(self, to_email, subject, body):
         self.sent.append((to_email, subject, body))
@@ -459,13 +458,6 @@ def test_instantly_executor_registered_only_when_configured(monkeypatch) -> None
     executors = cora_agent.build_egress_executors()
     assert executors["instantly_cold_email"]({"to_email": "m@example.com", "subject": "S", "body": "B"}) == "lead-1"
     assert sender.sent == [("m@example.com", "S", "B")]
-
-
-def test_cold_email_executor_not_registered_without_david_and_josh(monkeypatch) -> None:
-    monkeypatch.setattr(cora_agent, "get_email_sender", lambda: None)
-    monkeypatch.setattr(cora_agent, "get_sender", lambda: None)
-    monkeypatch.setattr(cora_agent, "get_ndl_instantly_sender", lambda: _RecordingInstantly(can_send=False))
-    assert "instantly_cold_email" not in cora_agent.build_egress_executors()
 
 
 @pytest.mark.parametrize("channel", ["ghl_email", "instantly_email", "instantly_cold_email"])

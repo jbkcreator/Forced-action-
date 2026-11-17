@@ -20,21 +20,13 @@ Request and response fields checked against Instantly's OpenAPI spec (https://ap
 2026-11-12): ``POST /api/v2/leads/list`` (``campaign``, ``contacts``, ``limit`` <= 100; response ``items``),
 ``POST /api/v2/leads/add`` (``campaign_id``, ``leads[].custom_variables``; response ``leads_uploaded``,
 ``duplicated_leads``, ``skipped_count``, ``in_blocklist``, ``created_leads[].id``), ``DELETE /api/v2/leads/{id}``,
-``POST /api/v2/campaigns`` and ``/campaigns/{id}/pause|activate`` (no body). Sender and BCC (2026-11-17): the
-campaign's ``email_list`` (sending accounts) and ``bcc_list`` (BCC on every email), set on create and by
-``PATCH /api/v2/campaigns/{id}``, read back by ``GET /api/v2/campaigns/{id}``.
-
-Every cold email is From David (``LENDING_EMAIL_FROM``) with Josh in BCC (``LENDING_EMAIL_BCC``), never CC
-(src/lending/email_identity.py). Instantly sets both on the campaign, not per email, so ``--setup-campaign`` writes
-them and each send first reads the campaign back: a campaign that sends from anyone else, or without every BCC
-address, is refused (nothing sent) until ``--setup-campaign`` is run again.
+``POST /api/v2/campaigns`` and ``/campaigns/{id}/pause|activate`` (no body).
 
 Every send is one HTTP attempt per call, never retried: a duplicate email is worse than a missing one. Errors carry
 the HTTP status only, never an address. Every send and campaign change is refused while the lending emergency halt is
 on; the halt also pauses the campaign (src/lending/global_halt.py).
 
-Usage (once, after Muhammad provides the key and David's inbox is connected in NDL's Instantly workspace, and
-again whenever LENDING_EMAIL_FROM or LENDING_EMAIL_BCC changes):
+Usage (once, after Muhammad provides the key and the sending inbox):
     PYTHONPATH=. python -m src.lending.instantly_email --setup-campaign
 """
 from __future__ import annotations
@@ -48,7 +40,6 @@ from typing import Any, Callable, Optional
 import requests
 
 from config.settings import get_settings
-from src.lending.email_identity import LendingEmailIdentity, lending_email_identity
 from src.lending.global_halt import is_globally_halted
 from src.lending.instantly_client import lending_instantly_account
 
@@ -71,7 +62,7 @@ class NdlInstantly:
     api_key: str
     base_url: str
     campaign_id: str
-    identity: LendingEmailIdentity | None  # None = sends refused; the emergency halt can still pause the campaign
+    sender_email: str
     footer_brand: str
     footer_postal_address: str
     footer_phone: str
@@ -95,9 +86,7 @@ _warned_missing: Optional[tuple[str, ...]] = None
 def ndl_instantly() -> Optional[NdlInstantly]:
     """NDL's Instantly account for cold email, or None (logged once) unless the key (P1.3's
     LENDING_INSTANTLY_API_KEY, read through ``lending_instantly_account``), the campaign and the footer postal address
-    are all set. The lending email identity (LENDING_EMAIL_FROM / LENDING_EMAIL_BCC) is carried but not required
-    here: without it every send is refused (``can_send`` is False), while the emergency halt can still pause the
-    campaign."""
+    are all set."""
     global _warned_missing
     s = get_settings()
     account = lending_instantly_account()
@@ -105,13 +94,13 @@ def ndl_instantly() -> Optional[NdlInstantly]:
                                              ("LENDING_INSTANTLY_CAMPAIGN_ID", s.lending_instantly_campaign_id),
                                              ("LENDING_EMAIL_FOOTER_POSTAL_ADDRESS",
                                               s.lending_email_footer_postal_address)) if not value)
-    if missing or account is None:
+    if missing:
         if missing != _warned_missing:
             logger.warning("[lending-instantly] cold email is off; missing settings: %s", ", ".join(missing))
             _warned_missing = missing
         return None
     return NdlInstantly(api_key=account.api_key, base_url=account.base_url,
-                        campaign_id=s.lending_instantly_campaign_id, identity=lending_email_identity(),
+                        campaign_id=s.lending_instantly_campaign_id, sender_email=s.lending_instantly_sender_email,
                         footer_brand=s.lending_email_footer_brand,
                         footer_postal_address=s.lending_email_footer_postal_address,
                         footer_phone=s.lending_email_footer_phone)
@@ -161,30 +150,9 @@ class NdlInstantlySender:
                 self._call("previous lead removal", "DELETE", f"/api/v2/leads/{lead['id']}")
                 logger.info("%s removed the previous lead %s before a repeat send", self._log_prefix, lead["id"])
 
-    @property
-    def can_send(self) -> bool:
-        """False while LENDING_EMAIL_FROM / LENDING_EMAIL_BCC are not configured: every send is refused."""
-        return self._account.identity is not None
-
-    def _refuse_unless_sender_matches(self) -> None:
-        """Read the campaign back: it must send only from David and BCC every LENDING_EMAIL_BCC address."""
-        identity = self._account.identity
-        if identity is None:
-            raise InstantlySendError("lending email sender (LENDING_EMAIL_FROM / LENDING_EMAIL_BCC) not configured; "
-                                     "nothing sent")
-        campaign = self._call("campaign read", "GET", f"/api/v2/campaigns/{self._account.campaign_id}")
-        senders = {str(a).strip().lower() for a in campaign.get("email_list") or []}
-        bcc = {str(a).strip().lower() for a in campaign.get("bcc_list") or []}
-        if senders != {identity.from_address} or not set(identity.bcc) <= bcc:
-            logger.error("%s send refused: campaign %s sender/BCC differ from LENDING_EMAIL_FROM / LENDING_EMAIL_BCC; "
-                         "run --setup-campaign", self._log_prefix, self._account.campaign_id)
-            raise InstantlySendError("NDL Instantly campaign sender or BCC is not set to the lending email identity; "
-                                     "nothing sent (run --setup-campaign)")
-
     def send(self, to_email: str, subject: str, body: str) -> str:
         """Hand one approved email to Instantly; returns the Instantly lead id (or ``instantly:<campaign>``)."""
         self._refuse_if_halted("send")
-        self._refuse_unless_sender_matches()
         email = to_email.strip().lower()
         self._remove_previous_lead(email)
         self._refuse_if_halted("send")  # again: a halt can be set while the lookup runs
@@ -224,17 +192,13 @@ def get_ndl_instantly_sender() -> Optional[NdlInstantlySender]:
     return NdlInstantlySender(account) if account is not None else None
 
 
-def setup_campaign(api_key: str, base_url: str, identity: LendingEmailIdentity,
-                   request: Optional[Request] = None) -> str:
-    """Find or create the "NDL Cora Passthrough" campaign, set it to send from David with Josh in BCC, make sure it
-    is active, and return its id."""
-    sender = NdlInstantlySender(NdlInstantly(api_key, base_url.rstrip("/"), "", identity, "", "", ""), request)
-    sending = {"email_list": [identity.from_address], "bcc_list": list(identity.bcc)}
+def setup_campaign(api_key: str, base_url: str, sender_email: str, request: Optional[Request] = None) -> str:
+    """Find or create the "NDL Cora Passthrough" campaign, make sure it is active, and return its id."""
+    sender = NdlInstantlySender(NdlInstantly(api_key, base_url.rstrip("/"), "", sender_email, "", "", ""), request)
     listed = sender._call("campaign list", "GET", "/api/v2/campaigns")
     campaigns = listed if isinstance(listed, list) else listed.get("items") or listed.get("data") or []
     existing = next((c for c in campaigns if c.get("name") == CAMPAIGN_NAME), None)
     if existing:
-        sender._call("campaign sender update", "PATCH", f"/api/v2/campaigns/{existing['id']}", json=sending)
         # A run that died between create and activate left it inactive, and an inactive campaign sends nothing.
         sender._call("campaign activate", "POST", f"/api/v2/campaigns/{existing['id']}/activate")
         return str(existing["id"])
@@ -245,7 +209,7 @@ def setup_campaign(api_key: str, base_url: str, identity: LendingEmailIdentity,
             "days": {str(day): True for day in range(7)}, "timezone": SCHEDULE_TIMEZONE}]},
         "sequences": [{"steps": [{"type": "email", "delay": 0,
                                   "variants": [{"subject": "{{ra_subject}}", "body": "{{ra_body}}"}]}]}],
-        **sending,
+        "email_list": [sender_email],
         "insert_unsubscribe_header": True,  # List-Unsubscribe header, alongside the footer link
     })
     campaign_id = str(created["id"])
@@ -262,11 +226,11 @@ def main(argv: Optional[list[str]] = None) -> int:
         parser.print_help()
         return 2
     s = get_settings()
-    identity = lending_email_identity()
-    if not s.lending_instantly_api_key or identity is None:
-        logger.error("set LENDING_INSTANTLY_API_KEY, LENDING_EMAIL_FROM and LENDING_EMAIL_BCC first")
+    if not (s.lending_instantly_api_key and s.lending_instantly_sender_email):
+        logger.error("set LENDING_INSTANTLY_API_KEY and LENDING_INSTANTLY_SENDER_EMAIL first")
         return 2
-    campaign_id = setup_campaign(s.lending_instantly_api_key.get_secret_value(), s.lending_instantly_base_url, identity)
+    campaign_id = setup_campaign(s.lending_instantly_api_key.get_secret_value(), s.lending_instantly_base_url,
+                                 s.lending_instantly_sender_email)
     logger.info("Set this in .env, then restart fa-lending-cora:\n  LENDING_INSTANTLY_CAMPAIGN_ID=%s", campaign_id)
     return 0
 

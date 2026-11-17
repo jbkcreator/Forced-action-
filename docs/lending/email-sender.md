@@ -1,53 +1,50 @@
-# Lending email sender: From David, BCC Josh
+# LendingFlow email sender: From David, BCC Josh
 
-Every Next Deal Lending email, including the LendingFlow first touch, is sent **From
-`david.willis@nextdeallending.com`** with **`josh@nextdeallending.com` in BCC**. There is never a CC.
+Every email to a **LendingFlow lead**, including the first touch, is sent **From
+`david.willis@nextdeallending.com`** with **`josh@nextdeallending.com` in BCC**. There is never a CC. Other lending
+email (website leads, partners, cold Instantly email) is unchanged.
 
 ## Server (code)
 
-One identity, read only through `src/lending/email_identity.py`:
-
 | Setting | Value |
 |---|---|
-| `LENDING_EMAIL_FROM` | `david.willis@nextdeallending.com` |
-| `LENDING_EMAIL_BCC` | `josh@nextdeallending.com` (comma-separated if more are ever added) |
+| `LENDING_LENDINGFLOW_EMAIL_FROM` | `david.willis@nextdeallending.com` |
+| `LENDING_LENDINGFLOW_EMAIL_BCC` | `josh@nextdeallending.com` (comma-separated if more are ever added) |
 
-If either setting is unset or invalid, **no lending email is sent**. An ERROR is logged, and each sender refuses
-before any GHL or Instantly call. The settings it replaces (`LENDING_GHL_EMAIL_FROM`, `LENDING_PREQUAL_EMAIL_FROM`,
-`LENDING_INSTANTLY_SENDER_EMAIL`) are no longer read. They can be removed from `.env`.
+`src/lending/email_identity.py` reads both. `is_lendingflow_recipient` checks whether an address or phone belongs to a
+row in `lending.lendingflow_leads`.
 
-| Email | Code | How From / BCC are set |
+| Email | Code | Who gets David + BCC Josh |
 |---|---|---|
-| Cora-approved emails, document chase, booking reminders, gate-fail message | `ghl_email.py` | `emailFrom` + `emailBcc` on each GHL send |
-| Pre-qual letter, partner letter | `prequal_ghl.py`, `partner_ghl.py` | `emailFrom` + `emailBcc` on each GHL send |
-| Instantly thread replies | `instantly_client.send_reply` | `eaccount` = David, `bcc_address_email_list` = Josh |
-| Instantly cold email | `instantly_email.py` | Set on the campaign (`email_list`, `bcc_list`) by `--setup-campaign`. Each send reads the campaign back first and refuses if it differs. |
+| Cora-approved emails, document chase, booking reminders, gate-fail message | `ghl_email.py` | Recipient is a LendingFlow lead (by email or phone). Others keep `LENDING_GHL_EMAIL_FROM` and no BCC. |
+| Pre-qual letter | `prequal_ghl.py` | Always: pre-qual letters are only queued for LendingFlow leads |
+| Partner letter, Instantly cold email and replies | unchanged | Nobody: these are not LendingFlow email |
+
+A LendingFlow email is **not sent** while either setting is unset or invalid, or while the lead check cannot be read.
+An ERROR is logged and nothing reaches GHL. A pre-qual letter keeps its attempts and goes out once the settings are
+fixed.
 
 Deploy order:
 
-1. Set `LENDING_EMAIL_FROM` and `LENDING_EMAIL_BCC` in the production `.env`.
-2. Deploy, then restart `fa-lending-cora`, `fa-lending-reminder-worker`, `lending-api` and the lending crons' host.
-3. Connect David's mailbox in NDL's Instantly workspace, then run
-   `PYTHONPATH=. python -m src.lending.instantly_email --setup-campaign`.
-4. Run `python -m src.lending.ghl_email --send-test <your inbox>`. Check that it arrives From David and that Josh
-   received the hidden copy.
-
-Not yet confirmed with a live send: GHL's `emailBcc` (public API reference) and Instantly's `bcc_list` /
-`bcc_address_email_list`. The Instantly names were checked against its OpenAPI spec on 2026-11-17.
+1. Set `LENDING_LENDINGFLOW_EMAIL_FROM` and `LENDING_LENDINGFLOW_EMAIL_BCC` in the production `.env`.
+2. Deploy, then restart `fa-lending-cora`, `fa-lending-reminder-worker` and `lending-api`.
+3. Check once with a real LendingFlow test lead: the email arrives From David and Josh gets the hidden copy. GHL's
+   `emailBcc` follows its public API reference and has not yet been confirmed with a live send.
 
 ## GHL (by hand)
 
-GHL workflow emails are not sent by our code. Change them in the Next Deal Lending sub-account:
+LendingFlow's first-touch and follow-up emails are GHL workflow steps, not our code. Change them in the Next Deal
+Lending sub-account:
 
-1. Settings → Email Services: `david.willis@nextdeallending.com` is a verified sender on the domain.
-2. In every lending workflow with a **Send Email** step (the first-touch "60 Second Loan Match" email, the
-   14-day follow-up Emails 0 / 3 / 10, and any other), set:
-   - From Name: David Willis
+1. Settings → Email Services: the nextdeallending.com sending domain is verified.
+2. In every LendingFlow workflow with a **Send Email** step (the first-touch "60 Second Loan Match" email in
+   "NDL - LendingFlow Speed to Lead", "NDL - Josh LendingFlow 30 Day Cadence", "NDL – 14-Day Follow-Up" and any
+   other), set:
+   - From Name: David Willis, Next Deal Lending
    - From Email: `david.willis@nextdeallending.com`
    - BCC: `josh@nextdeallending.com`
    - CC: empty
-3. Save and **Publish** each workflow.
+3. Save each action, save the workflow, and check it is still **Published**.
 4. Put a test contact through each workflow and check the From and the BCC.
 
-The email bodies are still signed "Next Deal Lending" (client Q18/Q56). Changing the signature is a separate wording
-decision.
+Internal alerts to Josh (for example "Email alert to Josh") are not borrower email; leave them as they are.

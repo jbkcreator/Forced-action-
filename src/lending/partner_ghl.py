@@ -2,7 +2,7 @@
 
 The letter goes to the partner, never the borrower (the borrower gave no consent of their own). The partner's
 contact is upserted by email and the PDF is attached the same way as T-07 (upload, then an Email message with the
-file URL). From David with Josh in BCC, like every lending email (``with_lending_sender``).
+file URL).
 """
 from __future__ import annotations
 
@@ -11,8 +11,9 @@ from typing import Optional
 
 from config.lending_partners import PARTNER_LETTER_HTML, PARTNER_LETTER_SUBJECT
 from config.lending_prequal import BORROWER_CALLBACK_PHONE, BORROWER_SIGNER
+from config.settings import get_settings
 from src.lending.ghl_account import lending_ghl_account
-from src.lending.prequal_ghl import GhlPrequalAttachmentSink, with_lending_sender
+from src.lending.prequal_ghl import GhlPrequalAttachmentSink
 from src.lending.web_leads import DeliveryError
 
 logger = logging.getLogger(__name__)
@@ -21,7 +22,6 @@ logger = logging.getLogger(__name__)
 class PartnerLetterSink(GhlPrequalAttachmentSink):
     def send_letter(self, partner_email: str, partner_name: str, place: str, file_id: int, pdf: bytes) -> None:
         """Email the pre-qual PDF to the partner. Raises SendOutcomeUnknown when the send may have gone out."""
-        with_lending_sender({})  # refused before any GHL call when the sender is not configured
         data = self._call("partner upsert", "POST", "/contacts/upsert",
                           json={"locationId": self._account.location_id, "email": partner_email,
                                 "firstName": partner_name.split()[0]})
@@ -29,11 +29,14 @@ class PartnerLetterSink(GhlPrequalAttachmentSink):
         if not contact_id:
             raise DeliveryError("partner upsert: no contact id in response")
         url = self._upload(str(contact_id), pdf)
-        self._send_email(with_lending_sender({
-            "type": "Email", "contactId": str(contact_id),
-            "subject": PARTNER_LETTER_SUBJECT.format(place=place, file_id=file_id),
-            "html": PARTNER_LETTER_HTML.format(callback=BORROWER_CALLBACK_PHONE, signer=BORROWER_SIGNER),
-            "attachments": [url]}))
+        body = {"type": "Email", "contactId": str(contact_id),
+                "subject": PARTNER_LETTER_SUBJECT.format(place=place, file_id=file_id),
+                "html": PARTNER_LETTER_HTML.format(callback=BORROWER_CALLBACK_PHONE, signer=BORROWER_SIGNER),
+                "attachments": [url]}
+        email_from = get_settings().lending_prequal_email_from
+        if email_from:
+            body["emailFrom"] = email_from
+        self._send_email(body)
         logger.info("[partner-door] pre-qual letter sent file=%s", file_id)
 
 

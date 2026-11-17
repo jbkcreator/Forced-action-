@@ -7,7 +7,6 @@ import pytest
 
 from src.lending import cold_leads
 from src.lending.cold_leads import ColdSendBlock, SendChannel, cold_send_decision
-from src.lending.email_identity import LendingEmailIdentity
 from src.lending.ghl_email import GhlEmailSender
 from src.lending.ghl_sms import GhlAccount, GhlSendRefused, GhlSmsSender
 
@@ -159,7 +158,7 @@ def test_email_to_a_cold_lead_is_refused_before_anything_reaches_ghl(lead_db):
     lead_db(cold=True, consent=True)
     request = _sent_ok()
     with pytest.raises(GhlSendRefused) as err:
-        GhlEmailSender(ACCOUNT, LendingEmailIdentity("david.willis@nextdeallending.com", ("josh@nextdeallending.com",)), request=request)(TO, "s", "b", phone=PHONE)
+        GhlEmailSender(ACCOUNT, "hello@nextdeallending.com", request=request)(TO, "s", "b", phone=PHONE)
     assert request.calls == []
     assert err.value.reason == "cold_lead_no_email"
 
@@ -167,4 +166,4 @@ def test_email_to_a_cold_lead_is_refused_before_anything_reaches_ghl(lead_db):
 def test_email_to_a_warm_lead_is_sent(lead_db):
     lead_db(cold=False)
     request = _sent_ok()
-    assert GhlEmailSender(ACCOUNT, LendingEmailIdentity("david.willis@nextdeallending.com", ("josh@nextdeallending.com",)), request=request)(TO, "s", "b", phone=PHONE) == "m1"
+    assert GhlEmailSender(ACCOUNT, "hello@nextdeallending.com", request=request)(TO, "s", "b", phone=PHONE) == "m1"

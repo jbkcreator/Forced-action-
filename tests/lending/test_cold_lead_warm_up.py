@@ -10,7 +10,6 @@ import pytest
 from config.lending_compliance import COLD_LEAD_DND_MESSAGE, GHL_TAG_COLD_LEAD
 from src.lending import cold_leads
 from src.lending.cold_leads import SendChannel, cold_send_decision, reconcile_warm_contact, warm_dnd_reconciliation
-from src.lending.email_identity import LendingEmailIdentity
 from src.lending.ghl_email import GhlEmailSender
 from src.lending.ghl_sms import GhlAccount, GhlSmsSender
 
@@ -131,7 +130,7 @@ def test_sms_to_a_warmed_up_lead_that_opted_out_lifts_nothing(state):
 def test_email_to_a_warmed_up_lead_lifts_the_email_do_not_disturb(state):
     state(consent=False)
     request = _lift_then_send(_cold_dnd())
-    assert GhlEmailSender(ACCOUNT, LendingEmailIdentity("david.willis@nextdeallending.com", ("josh@nextdeallending.com",)), request=request)(
+    assert GhlEmailSender(ACCOUNT, "hello@nextdeallending.com", request=request)(
         "jane@example.com", "s", "b", phone=PHONE) == "m1"
     assert request.calls[2][2]["json"]["dndSettings"] == {"Email": {"status": "inactive"}}
 
@@ -262,7 +261,7 @@ def test_a_genuine_ghl_do_not_disturb_awaiting_local_sync_is_never_lifted_and_no
                        Resp(200, {"contact": {"id": "ct1", "dndSettings": _cold_dnd(**{
                            channel: {"status": "active", "message": "Opted out by reply"}})}}))
     send = (GhlSmsSender(ACCOUNT, "+18135550100", request=request) if sender == "sms"
-            else GhlEmailSender(ACCOUNT, LendingEmailIdentity("david.willis@nextdeallending.com", ("josh@nextdeallending.com",)), request=request))
+            else GhlEmailSender(ACCOUNT, "hello@nextdeallending.com", request=request))
     kwargs = {} if sender == "sms" else {"phone": PHONE}
     with pytest.raises(GhlSendRefused, match="ghl_dnd_not_cold_push"):
         send(*args, **kwargs)

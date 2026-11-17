@@ -237,10 +237,7 @@ class GhlResp:
 
 
 def _email_cora(store: AgentStore, request, send_check=lambda action: None) -> Cora:
-    from src.lending.email_identity import LendingEmailIdentity
-
-    identity = LendingEmailIdentity("david.willis@nextdeallending.com", ("josh@nextdeallending.com",))
-    sender = GhlEmailSender(GhlAccount(api_key="k", location_id="loc-ndl"), identity, request)
+    sender = GhlEmailSender(GhlAccount(api_key="k", location_id="loc-ndl"), "hello@nextdeallending.com", request)
     cora = Cora(store, FakeMessages(
         response(tool_block("toolu_e", "draft_email", {"lead_ref": "web_lead:7", "subject": "Your loan request",
                                                        "body": "Hi Sam,\nThanks for reaching out."}),
@@ -268,8 +265,7 @@ def test_approved_email_is_sent_through_ghl_exactly_as_approved(store: AgentStor
     action = cora.queue.get(1)
     assert action.status is ActionStatus.SENT and action.provider_ref == "m-77"
     send = request.calls[1][2]["json"]
-    assert send["subject"] == "Your loan request" and send["emailFrom"] == "david.willis@nextdeallending.com"
-    assert send["emailBcc"] == ["josh@nextdeallending.com"] and "emailCc" not in send
+    assert send["subject"] == "Your loan request" and send["emailFrom"] == "hello@nextdeallending.com"
     assert send["html"] == "Hi Sam,<br>Thanks for reaching out."
     assert request.calls[0][2]["json"]["email"] == "sam@example.com"
     assert request.calls[0][2]["json"]["phone"] == "+17275550100"

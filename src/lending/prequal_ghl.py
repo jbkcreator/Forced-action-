@@ -3,8 +3,10 @@
 Two calls: upload the PDF to the contact's conversation (GHL hosts the file and returns its URL),
 then send an Email message carrying that URL in ``attachments``. Verified live Oct 2026 with API
 Version 2021-07-28: upload 201, send 201, delivered with the PDF attached. Nothing is stored on our side.
-The email goes out From ``LENDING_EMAIL_FROM`` (David) with Josh in ``emailBcc`` (``LENDING_EMAIL_BCC``), never CC;
-either unset, nothing is sent and the letter keeps its attempts (src/lending/email_identity.py).
+Every pre-qual letter goes to a LendingFlow lead (only LendingFlow leads are queued), so it goes out From
+``LENDING_LENDINGFLOW_EMAIL_FROM`` (David) with Josh in ``emailBcc`` (``LENDING_LENDINGFLOW_EMAIL_BCC``), never CC;
+either unset, nothing is sent and the letter keeps its attempts (src/lending/email_identity.py). The partner letter
+(``partner_ghl``, not a LendingFlow email) keeps ``LENDING_PREQUAL_EMAIL_FROM``.
 """
 from __future__ import annotations
 
@@ -50,11 +52,11 @@ def _refuse_if_halted() -> None:
 
 
 def with_lending_sender(body: dict) -> dict:
-    """The email body From David with Josh in BCC. Raised as a setup failure when either is not configured, so the
-    letter keeps its attempts and is sent once the settings are fixed."""
+    """The email body From David with Josh in BCC (LendingFlow sender). Raised as a setup failure when either is not
+    configured, so the letter keeps its attempts and is sent once the settings are fixed."""
     identity = lending_email_identity()
     if identity is None:
-        raise DeliveryError("lending email sender (LENDING_EMAIL_FROM / LENDING_EMAIL_BCC) not configured; nothing sent",
+        raise DeliveryError("LendingFlow sender (LENDING_LENDINGFLOW_EMAIL_FROM / _BCC) not configured; nothing sent",
                             config_error=True)
     return {**body, "emailFrom": identity.from_address, "emailBcc": list(identity.bcc)}
 

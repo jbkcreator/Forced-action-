@@ -255,11 +255,11 @@ def sms_executor(sender: GhlSmsSender) -> EgressExecutor:
 
 
 def instantly_executor(account: InstantlyAccount) -> EgressExecutor:
-    """Sends an approved Instantly answer exactly as approved, inside the lead's thread from David's inbox with Josh
-    in BCC; returns Instantly's email id. Never retried (the relay records a failure instead of sending twice)."""
+    """Sends an approved Instantly answer exactly as approved, inside the lead's thread from the inbox the reply
+    reached; returns Instantly's email id. Never retried (the relay records a failure instead of sending twice)."""
 
     def send(payload: Mapping[str, Any]) -> Optional[str]:
-        return send_reply(account, reply_to_uuid=payload["reply_to_uuid"],
+        return send_reply(account, eaccount=payload["from_inbox"], reply_to_uuid=payload["reply_to_uuid"],
                           subject=payload["subject"], body=payload["body"])
 
     return send
@@ -284,8 +284,8 @@ def cold_email_executor(sender: NdlInstantlySender) -> EgressExecutor:
 
 def build_egress_executors() -> dict[str, EgressExecutor]:
     """Channels Cora may send through once approved: ``instantly_email`` (needs ``LENDING_INSTANTLY_API_KEY``),
-    ``ghl_email`` (needs the GHL account,
-    ``LENDING_EMAIL_FROM`` and ``LENDING_EMAIL_BCC``) and ``ghl_sms`` (needs the GHL account and ``LENDING_GHL_SMS_FROM_NUMBER``; texts
+    ``ghl_email`` (needs the GHL account and
+    ``LENDING_GHL_EMAIL_FROM``) and ``ghl_sms`` (needs the GHL account and ``LENDING_GHL_SMS_FROM_NUMBER``; texts
     also wait for LENDING_SMS_CARRIER_APPROVED in the send check), and the CRM writes ``ghl_stage``, ``ghl_tag``
     and ``ghl_note`` (need the GHL account; a stage move also needs LENDING_GHL_PIPELINE_ID)."""
     executors: dict[str, EgressExecutor] = {}
@@ -310,7 +310,7 @@ def build_egress_executors() -> dict[str, EgressExecutor]:
     else:
         executors.update(crm_executors(crm))
     cold = get_ndl_instantly_sender()
-    if cold is None or not cold.can_send:
+    if cold is None:
         logger.warning("[cora] NDL Instantly cold-email campaign not configured; approved cold emails will not be sent")
     else:
         executors[COLD_EMAIL_CHANNEL] = cold_email_executor(cold)
@@ -329,8 +329,7 @@ def build_agent_jobs(settings: AppSettings, *, engine: Engine, gate: SendGate, q
     if folders is None or crm is None:
         logger.error("[cora] agent job queue enabled but not configured (Drive folders or the GHL account missing)")
         return None
-    cold = get_ndl_instantly_sender()
-    instantly_ready = cold is not None and cold.can_send
+    instantly_ready = get_ndl_instantly_sender() is not None
     return JobQueueWorker(engine, folders, gate, queue, crm.read_contact, approval_channel=approval_channel,
                           check=make_check(engine, instantly_ready=instantly_ready), is_graduated=is_graduated)
 

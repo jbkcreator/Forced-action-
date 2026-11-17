@@ -14,26 +14,21 @@ from decimal import Decimal
 
 import pytest
 from fastapi import FastAPI
-from fastapi.testclient import TestClient
 from markupsafe import escape
+from fastapi.testclient import TestClient
 from sqlalchemy import create_engine, event, text
 from sqlalchemy.orm import Session
 from sqlalchemy.pool import StaticPool
 
-from config.lender_matrix import LenderRules
 from config.settings import get_settings
 from migrations.apply_lending_partner_door import apply_to
 from src.api import lending_partner_router
 from src.lending import partner_pipeline, partners
 from src.lending.contracts import LenderFit, LenderFitResult
 from src.lending.db import get_lending_db
-from src.lending.models import (
-    LendingLoanFile,
-    LendingPartner,
-    LendingPartnerFileUpload,
-    LendingPartnerSubmission,
-)
 from src.lending.prequal import FitLimits
+from config.lender_matrix import LenderRules
+from src.lending.models import LendingLoanFile, LendingPartner, LendingPartnerFileUpload, LendingPartnerSubmission
 
 CONSENT = "I confirm I have the borrower's permission to share this information with Next Deal Lending."
 
@@ -746,10 +741,8 @@ class _FakeGhl:
 def test_ghl_sink_emails_the_letter_to_the_partner(monkeypatch) -> None:
     from types import SimpleNamespace
 
-    from src.lending import email_identity, partner_ghl
+    from src.lending import partner_ghl
 
-    monkeypatch.setattr(email_identity, "get_settings", lambda: SimpleNamespace(
-        lending_email_from="david.willis@nextdeallending.com", lending_email_bcc="josh@nextdeallending.com"))
     sink = partner_ghl.PartnerLetterSink(SimpleNamespace(location_id="loc", api_key="k"))
     fake, sent = _FakeGhl(), []
     monkeypatch.setattr(sink, "_call", fake)
@@ -761,24 +754,6 @@ def test_ghl_sink_emails_the_letter_to_the_partner(monkeypatch) -> None:
     assert sent[0]["contactId"] == "c-1" and sent[0]["attachments"] == ["https://files/c-1.pdf"]
     assert sent[0]["subject"] == "Pre-qualification estimate for 412 Palm Ave (ref #7)"
     assert "non-binding" in sent[0]["html"] and "share it with the borrower" in sent[0]["html"]
-    assert sent[0]["emailFrom"] == "david.willis@nextdeallending.com"
-    assert sent[0]["emailBcc"] == ["josh@nextdeallending.com"] and "emailCc" not in sent[0]
-
-
-def test_partner_letter_makes_no_ghl_call_without_david_and_josh(monkeypatch) -> None:
-    from types import SimpleNamespace
-
-    from src.lending import email_identity, partner_ghl
-    from src.lending.web_leads import DeliveryError
-
-    monkeypatch.setattr(email_identity, "get_settings",
-                        lambda: SimpleNamespace(lending_email_from=None, lending_email_bcc="josh@nextdeallending.com"))
-    sink = partner_ghl.PartnerLetterSink(SimpleNamespace(location_id="loc", api_key="k"))
-    fake = _FakeGhl()
-    monkeypatch.setattr(sink, "_call", fake)
-    with pytest.raises(DeliveryError):
-        sink.send_letter("maria@example.com", "Maria Lopez", "412 Palm Ave", 7, b"%PDF")
-    assert fake.calls == []
 
 
 # -- review: per-channel retries, status notice retries, Postgres jsonb ---------------------------------
