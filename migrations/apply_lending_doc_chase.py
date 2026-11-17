@@ -12,8 +12,9 @@ from __future__ import annotations
 
 import logging
 
-from sqlalchemy import create_engine, text
+from sqlalchemy import Table, create_engine, text
 from sqlalchemy.engine import Connection, Engine
+from sqlalchemy.schema import CreateIndex
 
 from config.settings import get_settings
 from src.lending.models import (
@@ -38,6 +39,19 @@ def apply_to(conn: Connection, schema: str = LENDING_SCHEMA) -> None:
     translated = conn.execution_options(schema_translate_map={LENDING_SCHEMA: schema})
     for model in TABLES:
         model.__table__.create(translated, checkfirst=True)
+    # create(checkfirst=True) skips a table that already exists, so an index added after a first run (e.g. the
+    # one-open-chase-per-email unique index) would never reach it: every model index is created if missing.
+    for model in TABLES:
+        table: Table = model.__table__  # type: ignore[assignment]  # declarative tables are Table at runtime
+        for index in sorted(table.indexes, key=lambda i: str(i.name or "")):
+            translated.execute(CreateIndex(index, if_not_exists=True))
+    # Columns added after the first release (doc_copies: the Drive copy of each upload).
+    conn.execute(text(
+        f'ALTER TABLE "{schema}".doc_chase_uploads ADD COLUMN IF NOT EXISTS drive_file_id varchar(100), '
+        "ADD COLUMN IF NOT EXISTS drive_attempts integer NOT NULL DEFAULT 0, "
+        "ADD COLUMN IF NOT EXISTS drive_retry_at timestamptz"))
+    conn.execute(text(f'ALTER TABLE "{schema}".closing_blocker_cards '
+                      "ADD COLUMN IF NOT EXISTS claimed_at timestamptz DEFAULT now()"))
     # Deals that moved before this table existed: their latest stage entry. Never overwrites a live row.
     conn.execute(text(
         f'INSERT INTO "{schema}".ghl_opportunity_stage (ghl_opportunity_id, stage_name, stage_key, entered_at, phone) '

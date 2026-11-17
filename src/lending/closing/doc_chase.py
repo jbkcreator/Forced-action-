@@ -1,8 +1,10 @@
 """P2.4 document chase: started when an approver tells Cora the borrower accepted the term sheet.
 
 The chase holds the lender's checklist (config/lending_closing.py) plus any document a P2.2 quote condition adds.
-Each message carries its own upload link (only the token's SHA-256 is stored); every link of a chase works until it
-expires or the chase closes. Messages go out from the sweep (``run_chase_sweep``) as approval cards.
+Each message carries its own upload link; every link of a chase works until it expires or the chase closes.
+``doc_chase_links`` keeps only the token's SHA-256. The full link is in the drafted message itself, so it is also in
+that draft's ``pending_actions.payload`` until sent (needed to send it and to restore it after a lost sweep); the
+approval card in #approvals shows it masked. Messages go out from the sweep (``run_chase_sweep``) as approval cards.
 """
 from __future__ import annotations
 
@@ -37,6 +39,21 @@ TOKEN_BYTES = 32
 CENTRAL_LENDING = "central_lending"
 
 
+class UploadStorageNotConfigured(ValueError):
+    """LENDING_DOC_UPLOAD_DIR is unset or relative: borrower documents would land where a rebuild loses them."""
+
+
+def upload_dir() -> str:
+    """Where borrower documents are stored: an absolute path, else UploadStorageNotConfigured (fail closed)."""
+    from config.settings import get_settings
+
+    folder = (get_settings().lending_doc_upload_dir or "").strip()
+    if not folder or not os.path.isabs(folder):
+        raise UploadStorageNotConfigured("LENDING_DOC_UPLOAD_DIR must be an absolute path on persistent storage: "
+                                         "borrower documents cannot be stored")
+    return folder
+
+
 @dataclass(frozen=True)
 class StartedChase:
     chase_id: int
@@ -50,6 +67,11 @@ _OPEN_FOR_BORROWER = text("""
        AND (phone = CAST(:phone AS varchar)
             OR (CAST(:phone AS varchar) IS NULL AND phone IS NULL AND lower(email) = lower(CAST(:email AS varchar))))
 """)
+# A borrower's email given after their chase opened (it could not reach them while texts with links were off):
+# kept on the open chase, and the steps recorded with no message are cleared so the due step goes out by email.
+_ATTACH_EMAIL = text("UPDATE lending.doc_chases SET email = :email, updated_at = :now "
+                     "WHERE id = :c AND email IS NULL")
+_DROP_UNSENT_TOUCHES = text("DELETE FROM lending.doc_chase_touches WHERE chase_id = :c AND action_id IS NULL")
 _MISSING = text("SELECT label FROM lending.doc_chase_items WHERE chase_id = :c AND received_at IS NULL ORDER BY id")
 # Only an unambiguous match: a borrower with two deals in GHL is never guessed.
 _OPPORTUNITY = text("SELECT min(ghl_opportunity_id) FROM lending.ghl_opportunity_stage WHERE phone = :phone "
@@ -104,11 +126,19 @@ def start_chase(db, recipient: Recipient, *, lead_ref: str, accepted_by: str, le
     """Open a chase for the borrower (or return the open one). Does not commit; the first message goes from the sweep."""
     if link_base_url() is None:
         raise PartnerLinkNotConfigured("LENDING_PARTNER_LINK_BASE_URL is not set: upload links cannot be made")
+    upload_dir()  # no link goes out that could not store what the borrower uploads
     if not recipient.phone and not recipient.email:
         raise ValueError("the borrower has no phone or email on record")
+    if not recipient.email and not _sms_links_allowed():
+        raise ValueError("the borrower has no email on record and texts with upload links are off until the 10DLC "
+                         "campaign allows links (LENDING_DOC_CHASE_SMS_LINKS_ENABLED): add their email first")
     now = now or datetime.now(timezone.utc)
     existing = db.execute(_OPEN_FOR_BORROWER, {"phone": recipient.phone, "email": recipient.email}).scalar()
     if existing is not None:
+        if recipient.email and db.execute(_ATTACH_EMAIL, {"c": existing, "email": recipient.email,
+                                                          "now": now}).rowcount:
+            db.execute(_DROP_UNSENT_TOUCHES, {"c": existing})
+            logger.info("[doc-chase] chase %s: email added; its due step goes out by email", existing)
         return StartedChase(existing, _missing(db, existing), reused=True)
     conditions = _quote_conditions(db, quote_id) if quote_id else []
     checklist = build_checklist(lender_key, conditions)
@@ -202,6 +232,13 @@ def chase_id_of(deal_ref: Optional[str]) -> Optional[int]:
     return None
 
 
+def _sms_links_allowed() -> bool:
+    """Chase texts carry the upload link, so they go only once the 10DLC campaign declares embedded links."""
+    from config.settings import get_settings
+
+    return bool(get_settings().lending_doc_chase_sms_links_enabled)
+
+
 def _chase_step(db, gate: SendGate, chase: dict[str, Any], day: int, missing: tuple[str, ...], *,
                 approvals_channel: str, now: datetime, text_consent: Callable[[str], bool],
                 find_draft: Optional[Callable[[str], Any]]) -> bool:
@@ -215,12 +252,14 @@ def _chase_step(db, gate: SendGate, chase: dict[str, Any], day: int, missing: tu
             restore_link(db, chase["id"], queued.payload["upload_link"], now)
         db.execute(_INSERT_TOUCH, {"c": chase["id"], "day": day, "action": queued.action_id, "now": now})
         return False
-    text_ok = bool(chase["phone"]) and text_consent(chase["phone"])
+    links_by_text = _sms_links_allowed()
+    text_ok = bool(chase["phone"]) and links_by_text and text_consent(chase["phone"])
     if not text_ok and not chase["email"]:
         db.execute(_INSERT_TOUCH, {"c": chase["id"], "day": day, "action": None, "now": now})
+        why = "no text consent or email on file" if links_by_text else "no email on file (texts with links are off)"
         add_to_inbox_safely(db, event_type="doc_chase_no_channel", dedup_key=str(chase["id"]),
-                            summary=f"{_who(chase)}: documents still missing and no text consent or email on file. "
-                                    "Call them.", payload={"chase_id": chase["id"]})
+                            summary=f"{_who(chase)}: documents still missing and {why}. Call them.",
+                            payload={"chase_id": chase["id"]})
         return False
     recipient = Recipient(chase["first_name"], chase["phone"], chase["email"], chase["ghl_contact_id"])
     draft = chase_draft("request" if day == 0 else f"d{day}", recipient, link=issue_link(db, chase["id"], now),
@@ -274,6 +313,23 @@ _UPLOAD_COUNTS = text("SELECT count(*) AS chase_total, count(*) FILTER (WHERE it
                       "FROM lending.doc_chase_uploads WHERE chase_id = :c")
 _MARK_RECEIVED = text("UPDATE lending.doc_chase_items SET received_at = COALESCE(received_at, :now) "
                       "WHERE chase_id = :c AND item_code = :code")
+# Two uploads at once for one chase are counted one after the other, so the caps hold.
+_LOCK_CHASE = text("SELECT id FROM lending.doc_chases WHERE id = :c FOR UPDATE")
+
+# What each allowed file type starts with: the browser's extension and content type are only claims.
+_HEIC_BRANDS = (b"heic", b"heix", b"hevc", b"hevx", b"heim", b"heis", b"mif1", b"msf1")
+
+
+def _content_matches(extension: str, data: bytes) -> bool:
+    if extension == ".pdf":
+        return data.startswith(b"%PDF-")
+    if extension in (".jpg", ".jpeg"):
+        return data.startswith(b"\xff\xd8\xff")
+    if extension == ".png":
+        return data.startswith(b"\x89PNG\r\n\x1a\n")
+    if extension == ".heic":
+        return data[4:8] == b"ftyp" and data[8:12] in _HEIC_BRANDS
+    return False
 
 
 def chase_items(db, chase_id: int) -> list[dict[str, Any]]:
@@ -292,8 +348,10 @@ def _write_private(folder: str, extension: str, data: bytes) -> str:
 
 
 def record_upload(db, chase: dict[str, Any], item_code: str, upload: Upload, *, upload_dir: str,
-                  now: datetime) -> None:
-    """Store one document for one checklist item and tick it. Raises InvalidSubmission for a bad file or item."""
+                  now: datetime) -> str:
+    """Store one document for one checklist item and tick it; returns the stored path, so a caller whose commit
+    fails can remove the file. Raises InvalidSubmission for a bad file or item."""
+    db.execute(_LOCK_CHASE, {"c": chase["id"]})
     items = {item["item_code"]: item for item in chase_items(db, chase["id"])}
     if item_code not in items:
         raise InvalidSubmission("choose which document this is")
@@ -304,6 +362,8 @@ def record_upload(db, chase: dict[str, Any], item_code: str, upload: Upload, *, 
     if counts.item_total >= MAX_UPLOADS_PER_ITEM or counts.chase_total >= MAX_UPLOADS_PER_CHASE:
         raise InvalidSubmission("this document can't take more uploads; call (656) 221-1100 to replace one")
     extension = os.path.splitext(upload.original_name)[1].lower()  # one of UPLOAD_TYPES, checked above
+    if not _content_matches(extension, upload.data):
+        raise InvalidSubmission(f"{upload.original_name}: the file is not a real PDF, JPG, PNG or HEIC")
     path = _write_private(os.path.join(upload_dir, str(chase["id"])), extension, upload.data)
     try:
         with db.begin_nested():
@@ -317,8 +377,10 @@ def record_upload(db, chase: dict[str, Any], item_code: str, upload: Upload, *, 
     received = sum(1 for item in items.values() if item["received_at"] is not None or item["item_code"] == item_code)
     add_to_inbox_safely(db, event_type="doc_chase_upload", dedup_key=f"{chase['id']}:{item_code}",
                         summary=f"{_who(chase)} uploaded {items[item_code]['label']}: {received} of {len(items)} "
-                                "documents received.", payload={"chase_id": chase["id"], "item_code": item_code})
+                                f"documents received (chase {chase['id']}).",
+                        payload={"chase_id": chase["id"], "item_code": item_code})
     logger.info("[doc-chase] chase %s: %s uploaded (%s/%s)", chase["id"], item_code, received, len(items))
+    return path
 
 
 # ---- what Cora answers about open chases ---------------------------------------------------------------------------

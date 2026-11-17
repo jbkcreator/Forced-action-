@@ -29,7 +29,8 @@ from sqlalchemy import text
 from config.settings import get_settings
 from src.api.deps import get_db
 from src.lending.after_hours_intake import record_intake
-from src.lending.closing.blockers import upsert_current_stage
+from src.lending.closing.blockers import current_stage, upsert_current_stage
+from src.lending.cora_inbox import add_to_inbox_safely
 from src.lending.ghl_disposition_match import (
     InvalidDispositionEvent,
     attach_pending,
@@ -116,11 +117,29 @@ def _now() -> datetime:
     return datetime.now(timezone.utc)
 
 
-def _record_current_stage(db: Session, opportunity_id: str, stage: str, phone: Optional[str]) -> None:
-    """P2.4 current stage, in a savepoint: a failure is logged and never loses the scoreboard's stage event."""
+def _flag_held_stage(db: Session, opportunity_id: str, stage: str, now: datetime) -> None:
+    """A repeated stage event held as a redelivery: logged, and one Cora inbox item, because a real move back made
+    within the hour looks the same (GHL sends no event time)."""
+    current = current_stage(db, opportunity_id)
+    current_name = current[0] if current else "unknown"
+    logger.warning("[lending-ghl] repeated stage event held as a redelivery (deal moved stage within the hour)")
+    add_to_inbox_safely(
+        db, event_type="ghl_stage_repeat_held", dedup_key=f"{opportunity_id}:{stage.strip().lower()}:{now:%Y%m%d%H}",
+        summary=f"GHL sent \"{stage}\" again for deal {opportunity_id}, which moved to \"{current_name}\" less than an "
+                "hour ago. Treated as a repeat delivery. If the deal really went back, move it in GHL again after "
+                "the hour.", payload={"ghl_opportunity_id": opportunity_id, "stage": stage, "current": current_name})
+
+
+def _record_current_stage(db: Session, opportunity_id: str, stage: str, phone: Optional[str], *,
+                          repeat: bool) -> None:
+    """P2.4 current stage, in a savepoint: a failure is logged and never loses the scoreboard's stage event.
+    ``repeat``: the event was already recorded; a redelivery never moves the deal (blockers.upsert_current_stage)."""
     try:
         with db.begin_nested():
-            upsert_current_stage(db, opportunity_id=opportunity_id, stage_name=stage, phone=phone, now=_now())
+            now = _now()
+            if not upsert_current_stage(db, opportunity_id=opportunity_id, stage_name=stage, phone=phone, now=now,
+                                        repeat=repeat):
+                _flag_held_stage(db, opportunity_id, stage, now)
     except Exception as exc:  # class only: SQL errors embed bound parameters
         logger.error("[lending-ghl] current stage not recorded (%s)", type(exc).__name__)
 
@@ -149,7 +168,7 @@ def ghl_stage(
             {"opp": opportunity_id, "pipe": _field(body, "pipeline_id"), "stage": stage, "key": stage.strip().lower(),
              "phone": phone, "by": _resolved(body, "booked_by"), "raw": json.dumps(body)},
         ).rowcount
-        _record_current_stage(db, opportunity_id, stage, phone)
+        _record_current_stage(db, opportunity_id, stage, phone, repeat=not inserted)
         db.commit()
     except Exception as exc:
         db.rollback()

@@ -173,3 +173,161 @@ def test_every_stuck_deal_is_visible_however_long_the_card(closing_db):
     assert "…" not in "".join(b["text"]["text"][-2:] for p in chat.posts for b in p["blocks"] if b["type"] == "section")
     assert all(len(p["blocks"]) <= 50 for p in chat.posts)
     assert all(p["thread_ts"] == chat.posts[0]["ts"] for p in chat.posts[1:])
+
+
+class ThreadFailingChat(FakeChatPort):
+    """The first message posts; every thread continuation is refused."""
+
+    def post(self, **kwargs) -> PostResult:
+        if kwargs.get("thread_ts"):
+            self.refused = getattr(self, "refused", 0) + 1
+            return PostResult(ok=False, error="invalid_blocks")
+        return super().post(**kwargs)
+
+
+def test_a_failed_thread_message_keeps_the_day_claimed_and_never_reposts(closing_db, monkeypatch):
+    import src.lending.closing.blockers as blockers
+
+    monkeypatch.setattr(blockers, "SECTIONS_PER_MESSAGE", 1)  # one section per message: the card needs a thread
+    for i in range(60):
+        _stage(closing_db, f"opp-{i:02d}", "Submitted to lender", timedelta(days=4, minutes=i),
+               phone=f"+1813555{i:04d}")
+    chat = ThreadFailingChat()
+    chat.refused = 0
+    assert _post(closing_db, chat, Gate())
+    assert len(chat.posts) == 1 and chat.refused == 1          # stops at the first refused continuation
+    for minute in range(1, 4):                                  # the next sweeps post nothing
+        assert not _post(closing_db, chat, Gate(), now=AT_7_00 + timedelta(minutes=minute))
+    assert len(chat.posts) == 1 and chat.refused == 1
+    row = closing_db.execute(text("SELECT slack_ts FROM lending.closing_blocker_cards WHERE card_day = :d"),
+                             {"d": DAY}).one()
+    assert row.slack_ts == chat.posts[0]["ts"]
+
+
+def test_names_stages_and_labels_are_escaped_on_the_card(closing_db):
+    _stage(closing_db, "opp-x", "Application", timedelta(days=4))
+    _chase(closing_db, missing=("Photo <!here> ID",), received=())
+    closing_db.execute(text("UPDATE lending.doc_chases SET first_name = '<!channel>'"))
+    _stage(closing_db, "opp-l", "Submitted to lender", timedelta(days=5), phone="+18135550199")
+    closing_db.execute(text("UPDATE lending.ghl_opportunity_stage SET stage_name = 'Submitted <@U123> to lender' "
+                            "WHERE ghl_opportunity_id = 'opp-l'"))
+    chat = FakeChatPort()
+    _post(closing_db, chat, Gate())
+    card = _card_text(chat)
+    assert "<!channel>" not in card and "<!here>" not in card and "<@U123>" not in card
+    assert "&lt;!channel&gt;" in card and "&lt;!here&gt;" in card and "&lt;@U123&gt;" in card
+
+
+class _Tx:
+    """A Session(engine) stand-in: every sweep transaction runs on the test's session (its begin() is a no-op that
+    keeps the test's transaction); ``fail_commit`` makes the next commit raise, like a connection lost after the
+    post. Everything else (savepoints, queries) goes to the real session."""
+
+    fail_commit = False
+
+    def __init__(self, db):
+        self._db = db
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def begin(self):
+        return _Commit()
+
+    def __getattr__(self, name):
+        return getattr(self._db, name)
+
+
+class _Commit:
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, *exc):
+        if exc_type is None and _Tx.fail_commit:
+            _Tx.fail_commit = False
+            raise ConnectionError("commit lost")
+        return False
+
+
+_CLOCK = {"now": AT_7_00}
+
+
+def _sweep_card(closing_db, monkeypatch, chat, now):
+    """One sweep by a fresh process (no memory of earlier posts)."""
+    _CLOCK["now"] = now
+    return _card_step(closing_db, monkeypatch, chat)()
+
+
+def _card_step(closing_db, monkeypatch, chat):
+    """Cora's card step (one process) on the test's session, with the clock in _CLOCK."""
+    from types import SimpleNamespace
+
+    import src.lending.cora_agent as cora
+
+    monkeypatch.setattr(cora, "Session", lambda engine: _Tx(closing_db))
+    monkeypatch.setattr(cora, "datetime", SimpleNamespace(now=lambda tz=None: _CLOCK["now"]))
+    monkeypatch.setattr(cora, "has_text_consent", lambda db, phone: True)
+    settings = SimpleNamespace(lending_closing_blockers_enabled=True, lending_doc_chase_enabled=False,
+                               lending_doc_upload_drive_folder_id="")
+    config = SimpleNamespace(approval_channel_id="C_APPROVALS", slack_channel_id="C_CORA")
+    card, _ = cora.build_closing_steps(settings, engine=None, chat=chat, gate=Gate(), config=config)
+    return card
+
+
+def test_the_sweep_claims_the_day_before_posting_so_a_lost_commit_never_reposts(closing_db, monkeypatch):
+    _stage(closing_db, "opp-c", "Application", timedelta(days=4))
+    chat = FakeChatPort()
+    _Tx.fail_commit = False
+    original_post = chat.post
+
+    def post_then_lose_commit(**kwargs):
+        _Tx.fail_commit = True  # the post transaction's commit fails after Slack has the card
+        return original_post(**kwargs)
+
+    chat.post = post_then_lose_commit
+    from src.lending.closing.blockers import CLAIM_STALE
+    card = _card_step(closing_db, monkeypatch, chat)
+    _CLOCK["now"] = AT_7_00
+    assert card()  # posted; recording it failed (logged), the claim stays
+    assert len(chat.posts) == 1
+    for later in (timedelta(minutes=1), CLAIM_STALE + timedelta(minutes=1), 3 * CLAIM_STALE):
+        _CLOCK["now"] = AT_7_00 + later
+        assert not card()  # never posted again by this process, even once the claim looks stale
+    assert len(chat.posts) == 1
+
+
+def test_a_claim_left_unposted_by_a_crash_is_taken_again_once_stale(closing_db, monkeypatch):
+    from src.lending.closing.blockers import CLAIM_STALE, claim_card_day
+    _stage(closing_db, "opp-s", "Application", timedelta(days=4))
+    assert claim_card_day(closing_db, AT_7_00) == DAY  # Cora stops before posting: the claim stays
+    chat = FakeChatPort()
+    _Tx.fail_commit = False
+    assert not _sweep_card(closing_db, monkeypatch, chat, AT_7_00 + timedelta(minutes=5))  # still fresh
+    assert _sweep_card(closing_db, monkeypatch, chat, AT_7_00 + CLAIM_STALE + timedelta(minutes=1))
+    assert len(chat.posts) == 1
+    assert not _sweep_card(closing_db, monkeypatch, chat, AT_7_00 + 3 * CLAIM_STALE)  # posted: never again
+    assert len(chat.posts) == 1
+
+
+def test_the_sweep_releases_the_day_when_nothing_was_posted(closing_db, monkeypatch):
+    _stage(closing_db, "opp-d", "Application", timedelta(days=4))
+    _Tx.fail_commit = False
+    with pytest.raises(RuntimeError):
+        _sweep_card(closing_db, monkeypatch, FailingChat(), AT_7_00)
+    chat = FakeChatPort()
+    assert _sweep_card(closing_db, monkeypatch, chat, AT_7_00 + timedelta(minutes=1))  # released: posts now
+    assert len(chat.posts) == 1
+
+
+def test_a_failure_to_save_the_slack_ts_never_reposts_the_card(closing_db, monkeypatch):
+    import src.lending.closing.blockers as blockers
+
+    _stage(closing_db, "opp-r", "Application", timedelta(days=4))
+    monkeypatch.setattr(blockers, "_RECORD_POST", text("UPDATE lending.no_such_table SET x = 1"))
+    chat = FakeChatPort()
+    assert _post(closing_db, chat, Gate())
+    assert not _post(closing_db, chat, Gate(), now=AT_7_00 + timedelta(minutes=1))
+    assert len(chat.posts) == 1

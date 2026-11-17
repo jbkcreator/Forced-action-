@@ -22,11 +22,13 @@ from config.lending_closing import (
     CARD_TIME,
     LENDER_TITLE_DRAFTS,
     OWNER_LABELS,
+    REDELIVERY_WINDOW,
     STUCK_AFTER,
 )
 from config.lending_compliance import DEFAULT_TZ
 from packages.agent_core.briefing import BriefSection, render_brief_blocks
 from packages.agent_core.chatport import ChatPort
+from packages.agent_core.redaction import slack_safe
 from packages.agent_core.send_gate import SendGate
 from src.lending.closing.drafts import Recipient, chase_draft, submit_draft
 from src.lending.closing.rules import Owner, blame
@@ -44,13 +46,30 @@ _UPSERT_STAGE = text("""
         updated_at = EXCLUDED.updated_at,
         entered_at = CASE WHEN lending.ghl_opportunity_stage.stage_key = EXCLUDED.stage_key
                           THEN lending.ghl_opportunity_stage.entered_at ELSE EXCLUDED.entered_at END
+     WHERE NOT (CAST(:repeat AS boolean)
+                AND lending.ghl_opportunity_stage.stage_key <> EXCLUDED.stage_key
+                AND lending.ghl_opportunity_stage.entered_at > :since)
 """)
+_CURRENT = text("SELECT stage_name, entered_at FROM lending.ghl_opportunity_stage WHERE ghl_opportunity_id = :opp")
 
 
-def upsert_current_stage(db, *, opportunity_id: str, stage_name: str, phone: Optional[str], now: datetime) -> None:
-    """Record that the opportunity is in ``stage_name``; a repeat of its current stage keeps the original entry time."""
-    db.execute(_UPSERT_STAGE, {"opp": opportunity_id, "stage": stage_name, "key": stage_name.strip().lower(),
-                               "now": now, "phone": phone})
+def upsert_current_stage(db, *, opportunity_id: str, stage_name: str, phone: Optional[str], now: datetime,
+                         repeat: bool = False) -> bool:
+    """Record that the opportunity is in ``stage_name``; a repeat of its current stage keeps the original entry time.
+    ``repeat``: this stage event was already recorded (``ghl_stage_events`` refused it as a duplicate). When the deal
+    entered its current stage less than REDELIVERY_WINDOW ago, such an event is a redelivery of the event before and
+    never moves the deal (e.g. "Application" redelivered just after "Funded"); otherwise it is a real move, such as
+    a Lost deal revived to Application. GHL sends no event time, so a real move back within the window is also held
+    (the caller raises an inbox item) and a redelivery later than the window is applied. False when unchanged."""
+    return bool(db.execute(_UPSERT_STAGE, {
+        "opp": opportunity_id, "stage": stage_name, "key": stage_name.strip().lower(), "now": now, "phone": phone,
+        "repeat": repeat, "since": now - REDELIVERY_WINDOW}).rowcount)
+
+
+def current_stage(db, opportunity_id: str) -> Optional[tuple[str, datetime]]:
+    """(stage name, entered at) of the opportunity, or None."""
+    row = db.execute(_CURRENT, {"opp": opportunity_id}).first()
+    return (row.stage_name, row.entered_at) if row else None
 
 
 # ---- the 7 AM card -------------------------------------------------------------------------------------------------
@@ -75,8 +94,15 @@ _STUCK = text("""
      WHERE s.stage_key = ANY(:stages) AND s.entered_at < :cutoff
      ORDER BY s.entered_at, s.ghl_opportunity_id
 """)
-_CLAIM = text("INSERT INTO lending.closing_blocker_cards (card_day) VALUES (:day) "
-              "ON CONFLICT (card_day) DO NOTHING RETURNING card_day")
+# A claim never posted (Cora stopped between claim and post, or its release failed) is taken again once stale.
+_CLAIM = text("""
+    INSERT INTO lending.closing_blocker_cards (card_day, claimed_at) VALUES (:day, :now)
+    ON CONFLICT (card_day) DO UPDATE SET claimed_at = EXCLUDED.claimed_at
+     WHERE lending.closing_blocker_cards.posted_at IS NULL AND lending.closing_blocker_cards.claimed_at < :stale
+    RETURNING card_day
+""")
+CLAIM_STALE = timedelta(minutes=10)
+_RELEASE = text("DELETE FROM lending.closing_blocker_cards WHERE card_day = :day AND posted_at IS NULL")
 _RECORD_POST = text("UPDATE lending.closing_blocker_cards SET slack_channel = :channel, slack_ts = :ts, "
                     "posted_at = CURRENT_TIMESTAMP WHERE card_day = :day")
 
@@ -172,8 +198,9 @@ def card_day(now: datetime) -> Optional[date]:
 
 
 def _who(deal: StuckDeal) -> str:
+    """Names come from the web form, LendingFlow and partner files: escaped, so "<!channel>" is shown, not run."""
     last4 = f" (…{deal.phone_last4})" if deal.phone_last4 else ""
-    return f"{deal.first_name or 'Borrower'}{last4}"
+    return f"{slack_safe(deal.first_name or 'Borrower')}{last4}"
 
 
 def _nudge_key(deal: StuckDeal) -> str:
@@ -196,17 +223,17 @@ def _draft_nudge(deal: StuckDeal, gate: SendGate, approvals_channel: str,
 
 
 def _deal_line(deal: StuckDeal, action: str) -> str:
-    line = (f"🔴 *{_who(deal)}* · {deal.stage_name} · {deal.days} days · "
+    line = (f"🔴 *{_who(deal)}* · {slack_safe(deal.stage_name)} · {deal.days} days · "
             f"waiting on {OWNER_LABELS[deal.owner]}")
     if deal.missing:
-        line += f"\n      Missing: {', '.join(deal.missing)}"
+        line += f"\n      Missing: {', '.join(slack_safe(label) for label in deal.missing)}"
     return f"{line}\n      {action}"
 
 
 def _action(db, deal: StuckDeal, gate: SendGate, approvals_channel: str, text_consent: Callable[[str], bool]) -> str:
     if deal.owner in ("lender", "title"):
-        draft = LENDER_TITLE_DRAFTS[deal.owner].format(name=deal.first_name or "the borrower", stage=deal.stage_name,
-                                                       days=deal.days)
+        draft = LENDER_TITLE_DRAFTS[deal.owner].format(name=slack_safe(deal.first_name or "the borrower"),
+                                                       stage=slack_safe(deal.stage_name), days=deal.days)
         return f"Draft for you to send: _{draft}_"
     if deal.chase_id is not None:
         step = "request sent" if deal.last_chase_day in (None, 0) else f"day {deal.last_chase_day} reminder sent"
@@ -253,27 +280,63 @@ def render_blocker_card(day: date, lines: list[str]) -> list[tuple[str, list[dic
     return messages
 
 
+def claim_card_day(db, now: datetime) -> Optional[date]:
+    """Take today's card (in the caller's transaction); None when not due or already taken. The sweep commits the
+    claim on its own before posting, so a failed commit after the post can never lead to a second card."""
+    day = card_day(now)
+    if day is None or db.execute(_CLAIM, {"day": day, "now": now, "stale": now - CLAIM_STALE}).scalar() is None:
+        return None
+    return day
+
+
+def record_post(db, day: date, channel: str, ts: Optional[str]) -> None:
+    """Mark today's card posted (where it is). The sweep commits this on its own right after the Slack post."""
+    db.execute(_RECORD_POST, {"channel": channel, "ts": ts, "day": day})
+
+
+def release_card_day(db, day: date) -> None:
+    """Give back a claim whose card was never posted, so the next sweep tries again."""
+    db.execute(_RELEASE, {"day": day})
+
+
 def post_blocker_card(db, chat: ChatPort, gate: SendGate, *, channel: Optional[str], approvals_channel: str,
-                      now: Optional[datetime] = None, text_consent: Callable[[str], bool]) -> bool:
-    """Post today's card if due and not yet posted; True when posted. Runs in a savepoint on ``db``: a refused post
-    raises and rolls the day's claim back, so the next sweep tries again. Drafts are keyed, so a retry never
-    queues a second check-in."""
+                      now: Optional[datetime] = None, text_consent: Callable[[str], bool],
+                      claimed: bool = False, on_posted: Optional[Callable[[str, Optional[str]], None]] = None) -> bool:
+    """Post today's card if due and not yet posted; True when posted. Runs in a savepoint on ``db``: a refused first
+    message raises and rolls the day's claim back, so the next sweep tries again (drafts are keyed, so a retry never
+    queues a second check-in). Once the first message is up the day stays claimed: a refused continuation in its
+    thread is logged and not retried, so the card is never posted twice. ``claimed``: the caller already took the
+    day with ``claim_card_day`` (committed) and releases it if this raises. ``on_posted(channel, ts)``: records the
+    post in its own committed transaction as soon as Slack has the card (else it is recorded here)."""
     now = now or datetime.now(timezone.utc)
     day = card_day(now)
     if day is None or not channel:
         return False
     with db.begin_nested():
-        if db.execute(_CLAIM, {"day": day}).scalar() is None:
+        if not claimed and db.execute(_CLAIM, {"day": day, "now": now, "stale": now - CLAIM_STALE}).scalar() is None:
             return False
         deals = stuck_deals(db, now)
         messages = render_blocker_card(
             day, [_deal_line(deal, _action(db, deal, gate, approvals_channel, text_consent)) for deal in deals])
-        first = None
-        for header, blocks in messages:
-            result = chat.post(text=header, blocks=blocks, channel=channel, thread_ts=first.ts if first else None)
+        header, blocks = messages[0]
+        first = chat.post(text=header, blocks=blocks, channel=channel, thread_ts=None)
+        if not first.ok:
+            raise RuntimeError(f"closing blocker card not posted ({first.error or 'no Slack response'})")
+        try:  # the card is up: a failure to note where must not roll the claim back and post it again
+            if on_posted is not None:
+                on_posted(first.channel or channel, first.ts)
+            else:
+                with db.begin_nested():
+                    record_post(db, day, first.channel or channel, first.ts)
+        except Exception as exc:  # class only: SQL errors embed bound parameters
+            logger.error("[closing-blockers] card for %s posted but its Slack ts not saved (%s)", day.isoformat(),
+                         type(exc).__name__)
+        for number, (header, blocks) in enumerate(messages[1:], start=2):
+            result = chat.post(text=header, blocks=blocks, channel=channel, thread_ts=first.ts)
             if not result.ok:
-                raise RuntimeError(f"closing blocker card not posted ({result.error or 'no Slack response'})")
-            first = first or result
-        db.execute(_RECORD_POST, {"channel": first.channel or channel, "ts": first.ts, "day": day})
+                logger.error("[closing-blockers] card for %s: thread message %s of %s not posted (%s); the rest of "
+                             "the card is missing today", day.isoformat(), number, len(messages),
+                             result.error or "no Slack response")
+                break
     logger.info("[closing-blockers] card posted for %s with %s stuck deal(s)", day.isoformat(), len(deals))
     return True

@@ -11,6 +11,16 @@ _SEPARATORS = re.compile(r"[ -]")
 _EMAIL = re.compile(r"\b([A-Za-z0-9])[A-Za-z0-9._%+-]*@([A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*\.[A-Za-z]{2,})\b")
 
 
+# A link whose last path segment is a long random token is a credential (an upload or partner link): anyone holding
+# it can use it. 32+ URL-safe characters; ordinary ids and slugs are shorter or contain other characters.
+_URL_TOKEN = re.compile(r"(https?://[^\s<>|]*/)[A-Za-z0-9_-]{32,}(?=$|[\s<>|)\]}.,;:!?'\"])")
+
+
+def mask_url_tokens(value: str) -> str:
+    """``"https://x.test/api/lending/docs/<43-char token>"`` -> ``"https://x.test/api/lending/docs/[…]"``."""
+    return _URL_TOKEN.sub(r"\1[…]", value)
+
+
 def mask_long_digit_runs(value: str) -> str:
     """``"call 727-436-9951"`` -> ``"call […9951]"``; shorter numbers are left alone."""
     return _LONG_DIGITS.sub(lambda match: f"[…{_SEPARATORS.sub('', match.group())[-4:]}]", value)
