@@ -1,0 +1,47 @@
+{% extends "base.html" %}
+{% block title %}Deal Facts and Comps{% endblock %}
+{% block header_tag %}Deal Facts and Comps{% endblock %}
+{% block extra_head %}
+<style>
+  h1 { font-size: 20pt; font-weight: 850; margin: 0 0 4px; }
+  .address { font-size: 13pt; font-weight: 750; color: var(--green); margin: 0 0 18px; }
+  h2 { font-size: 12pt; margin: 22px 0 6px; letter-spacing: .04em; text-transform: uppercase; color: var(--ink-2); }
+  table { width: 100%; border-collapse: collapse; margin: 4px 0 12px; }
+  td, th { padding: 7px 4px; border-bottom: 1px solid var(--line); font-size: 10.5pt; text-align: left; }
+  td.num, th.num { text-align: right; }
+  .muted { color: var(--ink-2); font-size: 9.5pt; }
+</style>
+{% endblock %}
+{% block body %}
+<p class="muted">{{ generated_date }} · Ref {{ package_ref }}</p>
+<h1>Deal facts</h1>
+<p class="address">{{ address }}</p>
+
+<table>
+  {% for label, value in deal_rows %}<tr><td>{{ label }}</td><td class="num">{{ value }}</td></tr>{% endfor %}
+</table>
+
+<h2>Guarantors</h2>
+<table>
+  <tr><th>Name</th><th class="num">Owned rentals</th><th class="num">Flip exits (24 mo)</th><th class="num">Ground-up exits (24 mo)</th></tr>
+  {% for g in guarantors %}<tr><td>{{ g.name }}</td><td class="num">{{ g.owned_rentals }}</td><td class="num">{{ g.fix_flip_exits_24m }}</td><td class="num">{{ g.ground_up_exits_24m }}</td></tr>{% endfor %}
+</table>
+
+<h2>Comparable sales</h2>
+{% if comps %}
+<p class="muted">Value range {{ comps.low }} – {{ comps.high }} (point {{ comps.point }}), {{ comps.comp_count }} sales, confidence {{ comps.confidence }}. Forced Action estimate from public qualified sales.</p>
+<table>
+  <tr><th>Address</th><th>Sale date</th><th class="num">Sale price</th></tr>
+  {% for c in comps.comps %}<tr><td>{{ c.address }}</td><td>{{ c.sale_date }}</td><td class="num">{{ c.sale_price }}</td></tr>{% endfor %}
+</table>
+{% else %}
+<p class="muted">No comparable sales attached.</p>
+{% endif %}
+
+{% if extra_facts %}
+<h2>Other deal facts</h2>
+<table>
+  {% for label, value in extra_facts %}<tr><td>{{ label }}</td><td class="num">{{ value }}</td></tr>{% endfor %}
+</table>
+{% endif %}
+{% endblock %}
