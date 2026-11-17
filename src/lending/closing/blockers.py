@@ -18,6 +18,7 @@ from sqlalchemy import text
 
 from config.lending_closing import (
     ACTIVE_STAGE_KEYS,
+    CLOSED_STAGE_KEYS,
     CARD_LAST_TIME,
     CARD_TIME,
     LENDER_TITLE_DRAFTS,
@@ -44,13 +45,24 @@ _UPSERT_STAGE = text("""
         updated_at = EXCLUDED.updated_at,
         entered_at = CASE WHEN lending.ghl_opportunity_stage.stage_key = EXCLUDED.stage_key
                           THEN lending.ghl_opportunity_stage.entered_at ELSE EXCLUDED.entered_at END
+     WHERE NOT (CAST(:repeat AS boolean)
+                AND lending.ghl_opportunity_stage.stage_key = ANY(CAST(:final AS varchar[]))
+                AND lending.ghl_opportunity_stage.stage_key <> EXCLUDED.stage_key)
 """)
+# A deal never leaves these on a stage event already recorded once: a redelivered or late "Application" after
+# "Funded" would otherwise reopen a funded deal (chase reminders, the 7 AM card). GHL's stage webhook body carries
+# no event time, so delivery order is the only order available.
+FINAL_STAGE_KEYS = frozenset({"funded", "lost"}) & CLOSED_STAGE_KEYS
 
 
-def upsert_current_stage(db, *, opportunity_id: str, stage_name: str, phone: Optional[str], now: datetime) -> None:
-    """Record that the opportunity is in ``stage_name``; a repeat of its current stage keeps the original entry time."""
-    db.execute(_UPSERT_STAGE, {"opp": opportunity_id, "stage": stage_name, "key": stage_name.strip().lower(),
-                               "now": now, "phone": phone})
+def upsert_current_stage(db, *, opportunity_id: str, stage_name: str, phone: Optional[str], now: datetime,
+                         repeat: bool = False) -> bool:
+    """Record that the opportunity is in ``stage_name``; a repeat of its current stage keeps the original entry time.
+    ``repeat``: this stage event was already recorded (``ghl_stage_events`` refused it as a duplicate); such an event
+    never moves a deal out of Funded or Lost. Returns False when the row was left unchanged."""
+    return bool(db.execute(_UPSERT_STAGE, {
+        "opp": opportunity_id, "stage": stage_name, "key": stage_name.strip().lower(), "now": now, "phone": phone,
+        "repeat": repeat, "final": sorted(FINAL_STAGE_KEYS)}).rowcount)
 
 
 # ---- the 7 AM card -------------------------------------------------------------------------------------------------

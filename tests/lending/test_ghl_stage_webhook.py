@@ -79,3 +79,46 @@ def test_a_merge_field_that_did_not_resolve_is_refused_not_saved(client, lending
     r = client.post("/webhooks/lending/ghl-stage", headers=HEADERS, json=body)
     assert r.status_code == 422 and "did not resolve" in r.json()["detail"]
     assert _rows(lending_db) == []
+
+
+# ---- P2.4 current stage (lending.ghl_opportunity_stage) -------------------------------------------------------------
+
+def _current(db, opp="opp-9"):
+    return db.execute(text("SELECT stage_key FROM lending.ghl_opportunity_stage WHERE ghl_opportunity_id = :o"),
+                      {"o": opp}).scalar()
+
+
+def _stage(client, stage, opp="opp-9"):
+    response = client.post("/webhooks/lending/ghl-stage", headers=HEADERS,
+                           json={"opportunity_id": opp, "stage_name": stage, "phone": "(813) 555-0199"})
+    assert response.status_code == 200
+    return response.json()["recorded"]
+
+
+def test_a_late_redelivery_never_reopens_a_funded_deal(client, lending_db):
+    assert _stage(client, "Application") and _stage(client, "Funded")
+    assert _stage(client, "Application") is False      # GHL redelivers the earlier event after Funded
+    assert _current(lending_db) == "funded"
+
+
+def test_a_repeated_event_never_reopens_a_lost_deal(client, lending_db):
+    _stage(client, "Submitted to lender"), _stage(client, "Lost")
+    _stage(client, "Submitted to lender")
+    assert _current(lending_db) == "lost"
+
+
+def test_a_first_time_stage_after_funded_still_applies(client, lending_db):
+    _stage(client, "Funded")
+    assert _stage(client, "Application") is True        # never seen before for this deal: a real move
+    assert _current(lending_db) == "application"
+
+
+def test_a_repeated_event_still_moves_a_deal_between_active_stages(client, lending_db):
+    for stage in ("Application", "Submitted to lender", "Application"):
+        _stage(client, stage)
+    assert _current(lending_db) == "application"
+
+
+def test_a_redelivered_funded_keeps_funded(client, lending_db):
+    _stage(client, "Funded"), _stage(client, "Funded")
+    assert _current(lending_db) == "funded"

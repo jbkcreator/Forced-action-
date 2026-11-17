@@ -116,11 +116,15 @@ def _now() -> datetime:
     return datetime.now(timezone.utc)
 
 
-def _record_current_stage(db: Session, opportunity_id: str, stage: str, phone: Optional[str]) -> None:
-    """P2.4 current stage, in a savepoint: a failure is logged and never loses the scoreboard's stage event."""
+def _record_current_stage(db: Session, opportunity_id: str, stage: str, phone: Optional[str], *,
+                          repeat: bool) -> None:
+    """P2.4 current stage, in a savepoint: a failure is logged and never loses the scoreboard's stage event.
+    ``repeat``: the event was already recorded, so it cannot move a funded or lost deal back (blockers.py)."""
     try:
         with db.begin_nested():
-            upsert_current_stage(db, opportunity_id=opportunity_id, stage_name=stage, phone=phone, now=_now())
+            if not upsert_current_stage(db, opportunity_id=opportunity_id, stage_name=stage, phone=phone, now=_now(),
+                                        repeat=repeat):
+                logger.warning("[lending-ghl] repeated stage event ignored: the deal is funded or lost")
     except Exception as exc:  # class only: SQL errors embed bound parameters
         logger.error("[lending-ghl] current stage not recorded (%s)", type(exc).__name__)
 
@@ -149,7 +153,7 @@ def ghl_stage(
             {"opp": opportunity_id, "pipe": _field(body, "pipeline_id"), "stage": stage, "key": stage.strip().lower(),
              "phone": phone, "by": _resolved(body, "booked_by"), "raw": json.dumps(body)},
         ).rowcount
-        _record_current_stage(db, opportunity_id, stage, phone)
+        _record_current_stage(db, opportunity_id, stage, phone, repeat=not inserted)
         db.commit()
     except Exception as exc:
         db.rollback()
