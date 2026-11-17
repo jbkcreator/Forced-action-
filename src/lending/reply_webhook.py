@@ -26,10 +26,11 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/webhooks/lending", tags=["lending"])
 
 
-def _advance_after_hours_conversation(db: Session, event: ReplyEvent) -> bool:
+def _advance_after_hours_conversation(db: Session, event: ReplyEvent) -> Optional[bool]:
     """An inbound message from a lead in an open after-hours conversation is that conversation's next answer. True
-    when it made the next message or the booking due. A failure here never blocks the handoff below: GHL redelivers, and an
-    applied message is not applied twice."""
+    when it made the next message or the booking due, False when it changed nothing, None when it could not be
+    saved: the caller still runs the handoff, then answers with an error so GHL redelivers the message (an
+    applied message is never applied twice)."""
     if event.direction != "inbound" or not conversations_enabled():
         return False
     try:
@@ -41,7 +42,7 @@ def _advance_after_hours_conversation(db: Session, event: ReplyEvent) -> bool:
         logger.error("[reply-webhook] after-hours conversation for message %s failed (%s)", event.message_id,
                      type(exc).__name__)
         db.rollback()
-        return False
+        return None
 
 
 @router.post("/ghl-reply")
@@ -56,7 +57,8 @@ def ghl_reply(
     event = parse_event(body)
     if event is None:
         return {"status": "ignored", "reason": "no_message"}
-    if _advance_after_hours_conversation(db, event):
+    advanced = _advance_after_hours_conversation(db, event)
+    if advanced:
         background.add_task(run_send_cycle_now)  # the next question, right after the response
     try:
         outcome = handle_reply_event(db, event, poster=slack_poster())
@@ -66,4 +68,7 @@ def ghl_reply(
         raise HTTPException(status_code=502, detail="Could not post the handoff; it will be retried") from None
     if outcome == "not_configured":
         raise HTTPException(status_code=503, detail="Reply handoff channel is not configured; it will be retried")
+    if advanced is None:
+        # The answer is not saved and nothing else replays it: a 200 here would lose it for good.
+        raise HTTPException(status_code=503, detail="The reply could not be saved; it will be retried")
     return {"status": outcome}

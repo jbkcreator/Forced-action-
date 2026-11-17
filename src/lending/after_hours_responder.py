@@ -16,8 +16,10 @@ suppressed (email); it is 8am-8pm for the recipient; for a text, the carrier has
 message carries no Backflip name, number or domain. A recipient outside the window, or a text before carrier
 approval, waits and is tried again on the next pass. The lending emergency halt stops the whole pass.
 
-Each step is claimed first, so two workers never send the same message or book the same slot; a claim with no
-recorded result (a crash midway) is recorded as unknown and never repeated. Every send leaves a receipt on the row:
+Each step is claimed just before it runs, one at a time, so two workers never send the same message or book the
+same slot, and a slow step never leaves others waiting under a claim. A claim with no recorded result (a crash
+midway) is recorded as unknown and never repeated; every write a step makes checks it still holds its claim, so a
+step that outlived its claim changes nothing. Every send leaves a receipt on the row:
 state, template version, provider message id, status and time. Logs carry ids only, never phones, names or message
 text.
 
@@ -39,7 +41,7 @@ from config.lending_after_hours_conversation import (BOOKED, CHANNEL_EMAIL, CHAN
                                                      CLOSED_BOOKING_UNKNOWN, CLOSED_EXPIRED, CLOSED_NO_CONSENT,
                                                      CLOSED_NO_SLOTS, CLOSED_SEND_FAILED, CLOSED_SEND_REFUSED,
                                                      CONVERSATION_TTL_HOURS, EMAIL_SUBJECT, MAX_SEND_ATTEMPTS, OFFERED_SLOT_COUNT,
-                                                     OPEN_STATES, SEND_BATCH_SIZE, SEND_ROUNDS_PER_PASS,
+                                                     OPEN_STATES, SEND_BATCH_SIZE,
                                                      SENDABLE_STATES, SLOT_CHOICE, SLOT_CHOSEN, SLOT_OFFER,
                                                      SLOT_OFFER_AFTER_TAKEN, SLOT_OFFER_AGAIN, STALE_CLAIM_SECONDS,
                                                      TEMPLATE_VERSIONS)
@@ -63,6 +65,7 @@ NOT_CONFIGURED = "not_configured"
 RETRY_LATER = "retry_later"
 BOOKED_NOW = "booked"
 SLOT_TAKEN = "slot_taken"
+CLAIM_LOST = "claim_lost"
 # Outcomes that leave the step due: the conversation is not tried again in the same pass.
 _STILL_DUE = (WAITING_HOURS, WAITING_CARRIER, NOT_CONFIGURED, RETRY_LATER)
 
@@ -115,6 +118,7 @@ class DueStep:
     offered_slots: list  # ISO slot starts, in the order they were numbered for the lead
     chosen_slot_start: Optional[datetime]
     offered_before: bool  # a slot offer has already gone out in this conversation
+    claimed_at: datetime
 
     @property
     def template_version(self) -> str:
@@ -142,14 +146,15 @@ _SETTLE_STALE_BOOKINGS = text("""
      WHERE sending_claimed_at < :cutoff AND state = :slot_chosen
     RETURNING id
 """)
-# slot_chosen never has prompted_state = state, so a picked slot is always due for its booking.
+# The next due step, oldest first. slot_chosen never has prompted_state = state, so a picked slot is always due for
+# its booking.
 _CLAIM = text("""
     WITH picked AS (
         SELECT id FROM lending.after_hours_conversations
          WHERE state = ANY(:due_states) AND prompted_state IS DISTINCT FROM state
            AND sending_claimed_at IS NULL AND id <> ALL(CAST(:still_due AS bigint[]))
          ORDER BY updated_at
-         LIMIT :limit
+         LIMIT 1
            FOR UPDATE SKIP LOCKED)
     UPDATE lending.after_hours_conversations c
        SET sending_claimed_at = :now
@@ -157,17 +162,18 @@ _CLAIM = text("""
      WHERE c.id = picked.id
     RETURNING c.id, c.channel, c.phone, c.email, c.first_name, c.state, c.send_attempts, c.ghl_contact_id,
               c.answers, c.offered_slots, c.chosen_slot_start,
-              c.sent_messages @> CAST(:slot_offer_receipt AS jsonb)
+              c.sent_messages @> CAST(:slot_offer_receipt AS jsonb), c.sending_claimed_at
 """)
+# Every write below is the claim holder's: it changes nothing once the claim has been settled or taken over.
 _RELEASE = text("""
     UPDATE lending.after_hours_conversations
        SET sending_claimed_at = NULL, send_attempts = :send_attempts
-     WHERE id = :id
+     WHERE id = :id AND sending_claimed_at = :claimed_at
 """)
 _CLOSE = text("""
     UPDATE lending.after_hours_conversations
        SET state = :closed, closed_reason = :reason, closed_at = :now, updated_at = :now, sending_claimed_at = NULL
-     WHERE id = :id
+     WHERE id = :id AND sending_claimed_at = :claimed_at
 """)
 # The time to reply runs from the first message: one held overnight for the 8am window must not arrive already
 # close to expiry.
@@ -178,20 +184,20 @@ _RECORD_SEND = text("""
                              ELSE expires_at END,
            offered_slots = COALESCE(CAST(:offered_slots AS jsonb), offered_slots),
            sent_messages = sent_messages || CAST(:receipt AS jsonb)
-     WHERE id = :id
+     WHERE id = :id AND sending_claimed_at = :claimed_at
 """)
 _RECORD_BOOKING = text("""
     UPDATE lending.after_hours_conversations
        SET state = :booked, booking_ref = :booking_ref, closed_at = :now, updated_at = :now,
            sending_claimed_at = NULL, send_attempts = 0
-     WHERE id = :id
+     WHERE id = :id AND sending_claimed_at = :claimed_at
 """)
 # Back to the slot choice with nothing offered, so the next send reads the calendar again.
 _OFFER_FRESH_SLOTS = text("""
     UPDATE lending.after_hours_conversations
        SET state = :slot_choice, prompted_state = NULL, offered_slots = '[]'::jsonb, chosen_slot_start = NULL,
            slot_reprompts = 0, sending_claimed_at = NULL, updated_at = :now
-     WHERE id = :id
+     WHERE id = :id AND sending_claimed_at = :claimed_at
 """)
 
 
@@ -217,11 +223,22 @@ def settle_stale_claims(db, now: datetime) -> int:
     return len(sends) + len(bookings)
 
 
-def _claim(db, now: datetime, limit: int, still_due: Sequence[int]) -> list[DueStep]:
-    rows = db.execute(_CLAIM, {
-        "due_states": [*SENDABLE_STATES, SLOT_CHOSEN], "now": now, "limit": limit, "still_due": list(still_due),
-        "slot_offer_receipt": json.dumps([{"state": SLOT_CHOICE}])}).all()
-    return [DueStep(*row) for row in rows]
+class ClaimLost(Exception):
+    """The step ran past its claim: another pass has settled it, so its result is not written."""
+
+
+def _claim_next(db, now: datetime, still_due: Sequence[int]) -> Optional[DueStep]:
+    row = db.execute(_CLAIM, {
+        "due_states": [*SENDABLE_STATES, SLOT_CHOSEN], "now": now, "still_due": list(still_due),
+        "slot_offer_receipt": json.dumps([{"state": SLOT_CHOICE}])}).first()
+    return DueStep(*row) if row else None
+
+
+def _write(db, statement, item: DueStep, **values) -> None:
+    """One write by the holder of ``item``'s claim; raises ClaimLost when the claim is no longer its own."""
+    written = db.execute(statement, {"id": item.conversation_id, "claimed_at": item.claimed_at, **values}).rowcount
+    if not written:
+        raise ClaimLost()
 
 
 def _window_open(item: DueStep, now: datetime) -> bool:
@@ -277,9 +294,8 @@ def _receipt(item: DueStep, status: str, now: datetime, message_id: Optional[str
 
 def _record_send(db, item: DueStep, status: str, now: datetime, *, message_id: Optional[str] = None,
                  offered_slots: Optional[str] = None) -> None:
-    db.execute(_RECORD_SEND, {"id": item.conversation_id, "state": item.state, "now": now,
-                              "ttl_hours": CONVERSATION_TTL_HOURS, "offered_slots": offered_slots,
-                              "receipt": _receipt(item, status, now, message_id)})
+    _write(db, _RECORD_SEND, item, state=item.state, now=now, ttl_hours=CONVERSATION_TTL_HOURS,
+           offered_slots=offered_slots, receipt=_receipt(item, status, now, message_id))
 
 
 def _stop(db, item: DueStep, reason: str, now: datetime) -> str:
@@ -288,7 +304,7 @@ def _stop(db, item: DueStep, reason: str, now: datetime) -> str:
     if item.state == BOOKED:
         _record_send(db, item, reason, now)
     else:
-        db.execute(_CLOSE, {"id": item.conversation_id, "closed": CLOSED, "reason": reason, "now": now})
+        _write(db, _CLOSE, item, closed=CLOSED, reason=reason, now=now)
     return reason
 
 
@@ -301,7 +317,7 @@ def _send_one(db, item: DueStep, *, text_sender: Optional[TextSender], email_sen
     sender = text_sender if item.channel == CHANNEL_SMS else email_sender
     waiting = _waiting(item, now, carrier_approved=carrier_approved, has_sender=sender is not None)
     if waiting:
-        db.execute(_RELEASE, {"id": item.conversation_id, "send_attempts": item.send_attempts})
+        _write(db, _RELEASE, item, send_attempts=item.send_attempts)
         return waiting
     slots: list[datetime] = []
     if item.state == SLOT_CHOICE:
@@ -328,7 +344,7 @@ def _send_one(db, item: DueStep, *, text_sender: Optional[TextSender], email_sen
         attempts = item.send_attempts + 1
         if attempts >= MAX_SEND_ATTEMPTS:
             return _stop(db, item, CLOSED_SEND_FAILED, now)
-        db.execute(_RELEASE, {"id": item.conversation_id, "send_attempts": attempts})
+        _write(db, _RELEASE, item, send_attempts=attempts)
         return RETRY_LATER
     _record_send(db, item, SENT, now, message_id=message_id, offered_slots=offered_slots)
     return SENT
@@ -348,11 +364,10 @@ def _book_one(db, item: DueStep, *, booker: Optional[Booker], now: datetime) -> 
                      item.conversation_id, type(exc).__name__)
         return _stop(db, item, CLOSED_BOOKING_UNKNOWN, now)
     if outcome.status == BOOKING_BOOKED:
-        db.execute(_RECORD_BOOKING, {"id": item.conversation_id, "booked": BOOKED,
-                                     "booking_ref": outcome.booking_ref, "now": now})
+        _write(db, _RECORD_BOOKING, item, booked=BOOKED, booking_ref=outcome.booking_ref, now=now)
         return BOOKED_NOW
     if outcome.status == BOOKING_SLOT_TAKEN:
-        db.execute(_OFFER_FRESH_SLOTS, {"id": item.conversation_id, "slot_choice": SLOT_CHOICE, "now": now})
+        _write(db, _OFFER_FRESH_SLOTS, item, slot_choice=SLOT_CHOICE, now=now)
         return SLOT_TAKEN
     return _stop(db, item, CLOSED_BOOKING_REFUSED, now)
 
@@ -365,11 +380,11 @@ def process_due(db, *, text_sender: Optional[TextSender], email_sender: Optional
                 carrier_approved: bool, slot_finder: Optional[SlotFinder] = None, booker: Optional[Booker] = None,
                 now: Optional[datetime] = None, limit: int = SEND_BATCH_SIZE,
                 clock: Optional[Callable[[], datetime]] = None) -> dict[str, int]:
-    """Do every due step once. Commits: the claims first (so a crash cannot make a second worker repeat a step),
-    then each step's outcome on its own. A step that makes another due (a booking, then its confirmation) is
-    followed up in the same pass; a step left waiting is not tried twice in one pass. The window is checked
-    against the time each message is reached: ``clock`` is read per message unless ``now`` is injected. Slots are
-    offered only when both ``slot_finder`` and ``booker`` are given."""
+    """Do up to ``limit`` due steps, each once. A step is claimed just before it runs and the claim is committed
+    first (so a crash cannot make a second worker repeat it), then its outcome on its own. A step that makes
+    another due (a booking, then its confirmation) is followed up in the same pass; a step left waiting is not
+    tried twice in one pass. The claim and the window use the time each step is reached: ``clock`` is read per
+    step unless ``now`` is injected. Slots are offered only when both ``slot_finder`` and ``booker`` are given."""
     clock = clock or _utcnow
     started_at = now or clock()
     counts: dict[str, int] = {}
@@ -377,23 +392,24 @@ def process_due(db, *, text_sender: Optional[TextSender], email_sender: Optional
     if expired:
         counts[CLOSED_EXPIRED] = expired
     settle_stale_claims(db, started_at)
+    db.commit()
     still_due: list[int] = []
-    for _ in range(SEND_ROUNDS_PER_PASS):
-        items = _claim(db, started_at, limit, still_due)
+    for _ in range(limit):
+        reached_at = now or clock()
+        item = _claim_next(db, reached_at, still_due)
         db.commit()
-        if not items:
+        if item is None:
             break
-        for item in items:
-            outcome = _do_step(db, item, text_sender=text_sender, email_sender=email_sender,
-                               slot_finder=slot_finder if booker else None, booker=booker,
-                               carrier_approved=carrier_approved, now=now or clock())
-            if outcome is None:
-                continue
-            if outcome in _STILL_DUE:
-                still_due.append(item.conversation_id)
-            counts[outcome] = counts.get(outcome, 0) + 1
-            logger.info("[after-hours-responder] id=%s state=%s channel=%s outcome=%s", item.conversation_id,
-                        item.state, item.channel, outcome)
+        outcome = _do_step(db, item, text_sender=text_sender, email_sender=email_sender,
+                           slot_finder=slot_finder if booker else None, booker=booker,
+                           carrier_approved=carrier_approved, now=reached_at)
+        if outcome is None:
+            continue
+        if outcome in _STILL_DUE:
+            still_due.append(item.conversation_id)
+        counts[outcome] = counts.get(outcome, 0) + 1
+        logger.info("[after-hours-responder] id=%s state=%s channel=%s outcome=%s", item.conversation_id,
+                    item.state, item.channel, outcome)
     return counts
 
 
@@ -411,6 +427,11 @@ def _do_step(db, item: DueStep, *, text_sender: Optional[TextSender], email_send
                                 started=started)
         db.commit()
         return outcome
+    except ClaimLost:
+        db.rollback()
+        logger.error("[after-hours-responder] id=%s state=%s ran past its claim; its result was not written",
+                     item.conversation_id, item.state)
+        return CLAIM_LOST
     except Exception as exc:  # class only: SQL and HTTP errors can embed phones
         db.rollback()
         # A booking step raises here only on the write that records the booker's answer: the booking may exist.
@@ -424,7 +445,7 @@ def _release_unsent(db, item: DueStep) -> Optional[str]:
     """After an error BEFORE the sender was called nothing went out: free the claim so the next pass tries again.
     None when even that write failed (the claim then goes stale and settles as unknown)."""
     try:
-        db.execute(_RELEASE, {"id": item.conversation_id, "send_attempts": item.send_attempts})
+        _write(db, _RELEASE, item, send_attempts=item.send_attempts)
         db.commit()
         return RETRY_LATER
     except Exception as exc:  # class only

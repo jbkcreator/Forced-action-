@@ -425,3 +425,57 @@ def test_a_booking_stands_when_its_confirmation_cannot_be_sent(db):
     assert (row["state"], row["booking_ref"], row["closed_reason"]) == (BOOKED, "bk-1", None)
     assert row["sent_messages"][-1]["status"] == "no_consent" and len(sender.sent) == 4
     assert _calendar_pass(db, sender, calendar) == {}
+
+
+# --- a slow pass and a second pass at the same time ---
+
+SECOND_PHONE = "+18135550177"
+
+
+def test_a_slow_send_never_lets_another_pass_settle_steps_that_are_still_waiting_their_turn(db):
+    """Steps are claimed one at a time, just before they run. Two slow sends together outlast a claim; a second
+    pass running during the later one must find its claim fresh, not one taken when the pass began."""
+    db.execute(text("DELETE FROM lending.after_hours_conversations WHERE contact_key = :p"), {"p": SECOND_PHONE})
+    db.execute(text("DELETE FROM lending.text_consents WHERE phone = :p"), {"p": SECOND_PHONE})
+    db.execute(text("INSERT INTO lending.text_consents (phone, source) VALUES (:p, 'web_form')"), {"p": SECOND_PHONE})
+    first = _open(db)
+    second = _open(db, inquiry_key="after_hours:ghl_voicemail:vm-2", phone=SECOND_PHONE,
+                   opened_at=DAY + timedelta(seconds=1))
+    clock = {"now": DAY + timedelta(minutes=1)}
+    other_pass = []
+
+    class SlowSender(FakeSender):
+        def __call__(self, *args: Any, **kwargs: Any) -> str:
+            # Each send takes over half the life of a claim, and another pass runs while it is in flight.
+            clock["now"] += timedelta(seconds=STALE_CLAIM_SECONDS * 0.6)
+            other_pass.append(after_hours_responder.settle_stale_claims(db, clock["now"]))
+            return super().__call__(*args, **kwargs)
+
+    sender = SlowSender()
+    assert process_due(db, text_sender=sender, email_sender=None, carrier_approved=True,
+                       clock=lambda: clock["now"]) == {"sent": 2}
+    assert other_pass == [0, 0] and [call[0] for call in sender.sent] == [PHONE, SECOND_PHONE]
+    for conversation_id in (first, second):
+        assert [m["status"] for m in _row(db, conversation_id)["sent_messages"]] == ["sent"]
+    # Each step is claimed at the time it is reached, not when the pass began.
+    assert _row(db, second)["updated_at"] > _row(db, first)["updated_at"]
+
+
+def test_a_step_that_outlives_its_claim_writes_nothing(db):
+    """A send slower than a claim lasts is settled as unknown by another pass. Its own late result (here a
+    definite failure, which would otherwise free the claim for a retry) must not be written over that."""
+    conversation_id = _open(db)
+    clock = {"now": DAY + timedelta(minutes=1)}
+
+    class OutlivedSender(FakeSender):
+        def __call__(self, *args: Any, **kwargs: Any) -> str:
+            clock["now"] += timedelta(seconds=STALE_CLAIM_SECONDS + 1)
+            assert after_hours_responder.settle_stale_claims(db, clock["now"]) == 1
+            db.commit()
+            raise GhlSmsError("HTTP 400")
+
+    assert process_due(db, text_sender=OutlivedSender(), email_sender=None, carrier_approved=True,
+                       clock=lambda: clock["now"]) == {"claim_lost": 1}
+    row = _row(db, conversation_id)
+    assert (row["prompted_state"], row["send_attempts"], row["sending_claimed_at"]) == (QUESTION_STATES[0], 0, None)
+    assert [m["status"] for m in row["sent_messages"]] == ["send_unknown"]

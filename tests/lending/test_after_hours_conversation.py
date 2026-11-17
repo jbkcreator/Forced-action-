@@ -309,3 +309,30 @@ def test_the_reply_webhook_leaves_conversations_alone_while_off_and_for_outbound
     client.post("/webhooks/lending/ghl-reply", headers=HEADERS,
                 json={**_inbound("m-2", "Thanks, we will call you."), "direction": "outbound"})
     assert _row(db, conversation_id)["answers"] == []
+
+
+def test_an_answer_that_could_not_be_saved_is_refused_so_ghl_redelivers_it(db, client, enabled, monkeypatch,
+                                                                             night_responder_send_passes):
+    from src.lending import reply_webhook
+
+    conversation_id = _open(db, now=datetime.now(timezone.utc))
+    mark_prompted(db, conversation_id, QUESTION_STATES[0], now=NOW)
+    db.commit()  # the failed request rolls the session back: the conversation must already be saved
+    handoffs = []
+    monkeypatch.setattr(reply_webhook, "handle_reply_event",
+                        lambda db, event, poster: handoffs.append(event.message_id) or "ignored")
+
+    def database_down(*args, **kwargs):
+        raise RuntimeError("connection lost")
+
+    with monkeypatch.context() as outage:
+        outage.setattr(reply_webhook, "record_reply", database_down)
+        response = client.post("/webhooks/lending/ghl-reply", headers=HEADERS, json=_inbound("m-1", "Fix and flip"))
+    # The handoff still ran, but a 200 would lose the answer for good: nothing else replays it.
+    assert response.status_code == 503 and handoffs == ["m-1"] and night_responder_send_passes == []
+    assert _row(db, conversation_id)["answers"] == []
+
+    response = client.post("/webhooks/lending/ghl-reply", headers=HEADERS, json=_inbound("m-1", "Fix and flip"))
+    assert response.status_code == 200 and night_responder_send_passes == ["reply"]
+    row = _row(db, conversation_id)
+    assert (row["state"], row["answers"]) == (QUESTION_STATES[1], ["Fix and flip"])

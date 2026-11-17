@@ -70,13 +70,14 @@ SLOT_TIMEZONE = "America/New_York"
 MORNING_START_HOUR = 9
 MORNING_END_HOUR = 12
 SLOT_DURATION_MINUTES = 30  # also the grid the slot starts sit on: 9:00, 9:30, ...
-# A pass follows a booking with its confirmation, and an answer with the next message, without waiting a minute.
-SEND_ROUNDS_PER_PASS = 2
 
 MAX_SEND_ATTEMPTS = 3
 # A send claimed this long ago with no recorded result crashed mid-send: it may or may not have gone out, so it is
 # recorded as unknown and never sent again (a second copy of a question is worse than a missing one).
-STALE_CLAIM_SECONDS = 180
+# It must outlast the slowest single step: a booking makes several GHL calls, each with its own retries and
+# timeouts, and can take a few minutes when GHL is slow.
+STALE_CLAIM_SECONDS = 600
+# The most steps one pass does; each is claimed on its own, just before it runs.
 SEND_BATCH_SIZE = 20
 
 ANSWER_MAX_CHARS = 500
