@@ -58,7 +58,15 @@ def test_the_closing_board_posts_cleanly_on_a_day_with_no_calls():
     blocks = format_blocks(data, DAY)
     assert NO_CALLS in text_ and NO_CALLS in _all_text(blocks)
     assert "*0* dials" in _all_text(blocks) and "_no dials_" in text_  # no division error on 0 dials
-    assert "*Pipeline* — 7 active deal(s), 18 in total" in text_ and "*Pipeline* — 7 active" in _all_text(blocks)
+    assert "*Pipeline* — 7 active deal(s), 7 open" in text_ and "*Pipeline* — 7 active" in _all_text(blocks)
+
+
+def test_the_open_count_leaves_out_funded_lost_and_nurture_and_keeps_leads():
+    p = PipelineData(by_stage=[StageCount("application", "Application", 2), StageCount("booked", "Booked", 5),
+                               StageCount("funded", "Funded", 40), StageCount("lost", "Lost", 30),
+                               StageCount("nurture", "Nurture", 20)])
+    assert (p.active, p.open_deals) == (2, 7)
+    assert "2 active deal(s), 7 open (funded, lost and nurture left out)" in pipeline_text(p)
 
 
 def test_the_hourly_board_is_unchanged_no_zero_line_and_no_pipeline():
@@ -134,6 +142,7 @@ def test_the_csv_holds_the_totals_breakdowns_and_pipeline_counts():
     assert got[("total", "TOTAL", "dials")] == "12" and got[("total", "TOTAL", "booked_stage")] == "3"
     assert got[("caller", "Josh Kantor", "live")] == "4" and got[("campaign", "Website", "booked")] == "2"
     assert got[("pipeline", "pipeline", "active_deals")] == "7" and got[("stage", "Funded", "deals")] == "9"
+    assert got[("pipeline", "pipeline", "open_deals")] == "7" and ("pipeline", "pipeline", "total_deals") not in got
     assert got[("blockers", "blockers", "stuck_deals")] == "3" and got[("blockers", "lender", "stuck_deals")] == "1"
 
 
@@ -176,7 +185,7 @@ def test_a_borrower_typed_name_cannot_ping_the_channel_or_add_a_link():
 def test_leads_are_not_counted_as_active_deals():
     p = PipelineData(by_stage=[StageCount("new lead", "New lead", 300), StageCount("booked", "Booked", 40),
                                StageCount("application", "Application", 4), StageCount("closed won", "Closed won", 2)])
-    assert (p.active, p.total) == (4, 346)
+    assert (p.active, p.open_deals) == (4, 346)  # leads are open, not active
 
 
 def test_many_long_stages_and_escaped_names_still_fit_one_slack_section():

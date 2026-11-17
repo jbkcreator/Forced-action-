@@ -338,11 +338,11 @@ def test_a_failed_slack_post_still_exports_the_numbers(export_wired, monkeypatch
 
     monkeypatch.setattr("slack_sdk.WebClient", Boom)
     assert task.main([], now=SEVEN_PM_UTC) == 1  # nothing posted: run.sh retries the post
-    assert len(uploads) == 1  # the export ran first, so a Slack outage cannot lose the day's numbers
+    assert len(uploads) == 1  # exported after the failed post, so a Slack outage cannot lose the day's numbers
 
 
 
-def test_the_export_runs_before_the_post(export_wired, monkeypatch):
+def test_the_board_posts_before_the_export_so_a_slow_drive_never_delays_it(export_wired, monkeypatch):
     posted, uploads, _, _ = export_wired
     order = []
     monkeypatch.setattr("src.lending.drive_upload.DriveUploader", lambda: lambda *a: order.append("export"))
@@ -355,7 +355,17 @@ def test_the_export_runs_before_the_post(export_wired, monkeypatch):
             order.append("post")
 
     monkeypatch.setattr("slack_sdk.WebClient", Client)
-    assert task.main([], now=SEVEN_PM_UTC) == 0 and order == ["export", "post"]
+    assert task.main([], now=SEVEN_PM_UTC) == 0 and order == ["post", "export"]
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_a_broken_export_module_never_stops_the_board(export_wired, monkeypatch, caplog, enabled):
+    posted, uploads, _, _ = export_wired
+    monkeypatch.setattr(task, "get_settings", lambda: settings(lending_scoreboard_export_enabled=enabled,
+                                                               lending_ledger_export_folder_id="F1"))
+    monkeypatch.setitem(__import__("sys").modules, "src.lending.scoreboard_export", None)  # import raises
+    assert task.main([], now=SEVEN_PM_UTC) == 0 and len(posted) == 1 and uploads == []
+    assert ("scoreboard export for 2026-10-06 failed (ModuleNotFoundError)" in caplog.text) is enabled
 
 
 def test_the_scoreboard_does_not_import_the_ledger_export():

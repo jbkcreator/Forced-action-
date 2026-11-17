@@ -33,11 +33,12 @@ def test_counts_active_deals_per_stage_and_lists_the_stuck_ones(db):
     stage(db, "o3", "Submitted to lender", 5, "+18135550103")
     stage(db, "o4", "Funded", 40, "+18135550104")
     stage(db, "o5", "Lost", 10, None)
+    stage(db, "o6", "Booked", 1, "+18135550106")
     p = build_pipeline(db, NOW)
     assert p.available and {(s.stage_key, s.deals) for s in p.by_stage} == {
-        ("application", 2), ("submitted to lender", 1), ("funded", 1), ("lost", 1)}
+        ("application", 2), ("submitted to lender", 1), ("funded", 1), ("lost", 1), ("booked", 1)}
     assert p.by_stage[0].stage_key == "application"  # most deals first
-    assert (p.active, p.total) == (3, 5)  # Funded and Lost are closed
+    assert (p.active, p.open_deals) == (3, 4)  # Funded and Lost are closed; Booked is a lead, open but not active
     assert [(b.phone_last4, b.stage_name, b.days, b.owner) for b in p.blockers] == [
         ("0101", "Application", 6, "borrower"), ("0103", "Submitted to lender", 5, "lender")]  # oldest first
 
@@ -49,12 +50,12 @@ def test_test_deals_are_left_out_of_the_counts_and_the_blockers(db, table):
     db.execute(text(f"INSERT INTO lending.{table} (phone, is_test) VALUES ('+18135550199', true), "
                     "('+18135550101', false)"))
     p = build_pipeline(db, NOW)
-    assert p.total == 1 and [b.phone_last4 for b in p.blockers] == ["0101"]
+    assert p.open_deals == 1 and [b.phone_last4 for b in p.blockers] == ["0101"]
 
 
 def test_an_empty_pipeline_is_available_with_nothing_in_it(db):
     p = build_pipeline(db, NOW)
-    assert p.available and (p.total, p.active, p.blockers) == (0, 0, [])
+    assert p.available and (p.open_deals, p.active, p.blockers) == (0, 0, [])
 
 
 def test_a_missing_table_marks_the_pipeline_unavailable_and_keeps_the_session_usable(closing_db):

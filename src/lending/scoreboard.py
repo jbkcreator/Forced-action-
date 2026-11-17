@@ -372,7 +372,8 @@ def pipeline_text(pipeline: "PipelineData") -> str:
     (oldest first, up to SCOREBOARD_BLOCKER_LINES; first name and last 4 digits only)."""
     if not pipeline.available:
         return f"*Pipeline*\n{PIPELINE_UNAVAILABLE}"
-    lines = [f"*Pipeline* — {pipeline.active} active deal(s), {pipeline.total} in total", _stage_line(pipeline)]
+    lines = [(f"*Pipeline* — {pipeline.active} active deal(s), {pipeline.open_deals} open (funded, lost and nurture "
+              "left out)"), _stage_line(pipeline)]
     if not pipeline.blockers:
         return _fit(lines + ["*Stuck more than 3 days* — none"])
     owners = " · ".join(f"{OWNER_LABELS.get(owner, owner)} {n}" for owner, n in pipeline.blockers_by_owner)

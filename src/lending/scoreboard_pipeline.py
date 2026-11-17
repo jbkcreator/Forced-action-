@@ -3,8 +3,9 @@
 Read-only. Stages come from ``lending.ghl_opportunity_stage`` (P2.4: each deal's current stage, kept by the GHL stage
 webhook and backfilled once from ``ghl_stage_events``), so the counts are only as complete as the stage moves GHL posts.
 Active deals = P2.4's deal stages (``ACTIVE_STAGE_KEYS``: Application, Ready to fund, Submitted to lender; leads in
-New lead / Booked / Held / No show are not deals); the stage line still shows every stage. Blockers are P2.4's
-``stuck_deals()`` (active for more than 3 days).
+New lead / Booked / Held / No show are not deals); the stage line still shows every stage. Open = every stage but
+P2.4's closed ones (``CLOSED_STAGE_KEYS``: Funded, Lost, Nurture), so the backfilled history of closed deals does not
+inflate it. Blockers are P2.4's ``stuck_deals()`` (active for more than 3 days).
 Test deals (a phone flagged ``is_test`` on a contact or lead) are left out, as on every scoreboard.
 
 A failed read (P2.4's tables not migrated yet, a query error) returns ``PipelineData(available=False)``: the board still
@@ -20,7 +21,7 @@ from typing import Optional
 
 from sqlalchemy import text
 
-from config.lending_closing import ACTIVE_STAGE_KEYS
+from config.lending_closing import ACTIVE_STAGE_KEYS, CLOSED_STAGE_KEYS
 
 logger = logging.getLogger(__name__)
 
@@ -54,8 +55,9 @@ class PipelineData:
         return sum(s.deals for s in self.by_stage if s.stage_key in ACTIVE_STAGE_KEYS)
 
     @property
-    def total(self) -> int:
-        return sum(s.deals for s in self.by_stage)
+    def open_deals(self) -> int:
+        """Deals and leads still in play: every stage except the closed ones."""
+        return sum(s.deals for s in self.by_stage if s.stage_key not in CLOSED_STAGE_KEYS)
 
     @property
     def blockers_by_owner(self) -> list[tuple[str, int]]:

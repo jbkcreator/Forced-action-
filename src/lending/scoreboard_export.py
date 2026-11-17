@@ -1,7 +1,8 @@
 """P2.5: the 7:20pm closing scoreboard's numbers to Drive, ``NDL Ledger Exports/{ET date}/scoreboard.csv``.
 
-One CSV, long format (``day, section, name, metric, value``), built from the same data as the board and written just
-before it posts, so a Slack outage cannot lose the day's numbers. Counts only, plus caller (staff) and campaign names:
+One CSV, long format (``day, section, name, metric, value``), built from the same data as the board and written right
+after the post, also when the post failed, so a slow Drive never delays the board and a Slack outage cannot lose the
+day's numbers. Counts only, plus caller (staff) and campaign names:
 no borrower name, phone or email, the same rule as the nightly ledger (brief section 6). Names are free text (a caller
 can fall back to GHL's ``booked_by``), so they go through the ledger's ``redact`` like its own free-text columns.
 Stuck deals are counted per owner, never listed.
@@ -44,7 +45,7 @@ def metric_rows(data: ScoreboardData) -> Iterator[tuple[str, str, str, Any]]:
     if not pipeline.available:
         return
     yield "pipeline", "pipeline", "active_deals", pipeline.active
-    yield "pipeline", "pipeline", "total_deals", pipeline.total
+    yield "pipeline", "pipeline", "open_deals", pipeline.open_deals
     for stage in pipeline.by_stage:
         yield "stage", stage.stage_name, "deals", stage.deals
     yield "blockers", "blockers", "stuck_deals", len(pipeline.blockers)

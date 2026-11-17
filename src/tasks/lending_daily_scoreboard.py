@@ -6,8 +6,8 @@ every UTC hour; only the hours in HOURLY_POST_HOURS_ET act, so daylight saving n
 with no dials yet (a weekend, a day off) is not posted.
 
 P2.5: the closing board always posts, also on a day with no calls ("No calls logged today"), and carries the pipeline:
-active deals, deals per GHL stage and the deals stuck more than 3 days (scoreboard_pipeline). Just before the post its
-numbers go to Drive NDL Ledger Exports/{ET date}/scoreboard.csv (scoreboard_export; LENDING_SCOREBOARD_EXPORT_ENABLED,
+active deals, deals per GHL stage and the deals stuck more than 3 days (scoreboard_pipeline). Right after the post (also after a
+failed one) its numbers go to Drive NDL Ledger Exports/{ET date}/scoreboard.csv (scoreboard_export; LENDING_SCOREBOARD_EXPORT_ENABLED,
 default off). The brief says 7:00pm ET; the board stays at 7:20pm (after the dialer stops at 7:15pm) until Josh
 answers (PR Client blockers)."""
 from __future__ import annotations
@@ -87,31 +87,52 @@ def main(argv=None, *, now: Optional[datetime] = None) -> int:
         if args.hourly and not args.force and not data.total.dials:
             logger.info("[lending] hourly scoreboard skipped for %s: no dials yet", day)
             return 0
-        if not args.hourly:  # before the post: a Slack outage must not lose the day's numbers (the file is replaced on a retry)
-            export_to_drive(data, day)
-        from slack_sdk import WebClient
-        _post_with_retry(WebClient(token=s.lending_slack_bot_token.get_secret_value()), channel,
-                         format_slack(data, day, as_of=as_of), format_blocks(data, day, as_of=as_of))
     except Exception:
         logger.exception("[lending] scoreboard post failed for %s", day)
+        return 1
+    posted = _post(s, channel, data, day, as_of)
+    if not args.hourly:  # after the post, so a slow Drive never delays it; also after a failed one, so a Slack
+        export_to_drive(data, day)  # outage cannot lose the day's numbers (run.sh's retry replaces the file)
+    if not posted:
         return 1
     logger.info("[lending] scoreboard posted for %s (%d dials)", day, data.total.dials)
     return 0
 
 
+def _post(s, channel: str, data: ScoreboardData, day: date, as_of: Optional[datetime]) -> bool:
+    try:
+        from slack_sdk import WebClient
+        _post_with_retry(WebClient(token=s.lending_slack_bot_token.get_secret_value()), channel,
+                         format_slack(data, day, as_of=as_of), format_blocks(data, day, as_of=as_of))
+    except Exception:
+        logger.exception("[lending] scoreboard post failed for %s", day)
+        return False
+    return True
+
+
 def export_to_drive(data: ScoreboardData, day: date, *, upload: Optional["Uploader"] = None,
                     notify: Optional[Callable[[str], bool]] = None) -> bool:
-    """P2.5: the closing board's numbers to Drive, just before the post (LENDING_SCOREBOARD_EXPORT_ENABLED, default off).
-    Never raises and never fails the run: a failed export must not stop the post, and a non-zero exit after a posted
-    board would make run.sh post it again. A failure is logged and posted as an ops notice (``ops_alerts``). Returns
-    whether the file was written."""
-    from src.lending.ops_alerts import post_ops_notice
-    from src.lending.scoreboard_export import export
-
+    """P2.5: the closing board's numbers to Drive, right after the post (LENDING_SCOREBOARD_EXPORT_ENABLED, default off).
+    Never raises and never fails the run: a non-zero exit after a posted board would make run.sh post it again. The
+    switch is read before anything of the export is imported, so a broken export module cannot touch the board while
+    it is off, and any failure once it is on (an import included) is only logged. A Drive failure is also posted as an
+    ops notice (``ops_alerts``). Returns whether the file was written."""
     s = get_settings()
     if not s.lending_scoreboard_export_enabled:
         logger.info("[lending] scoreboard export off (LENDING_SCOREBOARD_EXPORT_ENABLED)")
         return False
+    try:
+        return _export(data, day, s, upload=upload, notify=notify)
+    except Exception as exc:  # class only
+        logger.error("[lending] scoreboard export for %s failed (%s)", day, type(exc).__name__)
+        return False
+
+
+def _export(data: ScoreboardData, day: date, s, *, upload: Optional["Uploader"],
+            notify: Optional[Callable[[str], bool]]) -> bool:
+    from src.lending.ops_alerts import post_ops_notice
+    from src.lending.scoreboard_export import export
+
     notify = notify or post_ops_notice
     if not s.lending_ledger_export_folder_id:
         logger.error("[lending] scoreboard export on but LENDING_LEDGER_EXPORT_FOLDER_ID is not set: %s not exported", day)
