@@ -12,7 +12,7 @@ from sqlalchemy.pool import StaticPool
 
 from packages.agent_core.chatport import FakeChatPort, PostResult
 from packages.agent_core.slack_session import InboundMessage
-from src.lending import global_halt, lendingflow, lendingflow_ghl, prequal_ghl
+from src.lending import global_halt, lendingflow, lendingflow_ghl
 from src.lending.dialer_load import LoadRefused, run_dialer_load
 from src.lending.ghl_account import GhlAccount
 from src.lending.ghl_sms import GhlSmsError, GhlSmsSender
@@ -192,7 +192,10 @@ def _recorded_ghl_posts(monkeypatch) -> list[str]:
 
     monkeypatch.setattr(ghl_webhook, "ghl_post_once", post_once)
     monkeypatch.setattr(ghl_webhook, "ghl_post_multipart", post_multipart)
-    monkeypatch.setattr(prequal_ghl, "get_settings", lambda: SimpleNamespace(lending_prequal_email_from=None))
+    from src.lending import email_identity
+
+    monkeypatch.setattr(email_identity, "get_settings", lambda: SimpleNamespace(
+        lending_lendingflow_email_from="lf-sender@nextdeallending.com", lending_lendingflow_email_bcc="lf-bcc@nextdeallending.com"))
     return calls
 
 

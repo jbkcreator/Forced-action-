@@ -1300,6 +1300,11 @@ class AppSettings(BaseSettings):
 		return self
 	# Verified GHL sending address for those emails (hello@nextdeallending.com). Unset = no email sender.
 	lending_ghl_email_from: Optional[str] = Field(default=None, env="LENDING_GHL_EMAIL_FROM")
+	# Emails to a LendingFlow lead (every one, first touch included) are From LENDING_LENDINGFLOW_EMAIL_FROM (David) with
+	# a blind copy to LENDING_LENDINGFLOW_EMAIL_BCC (Josh; comma-separated, never CC). Either unset or invalid = no
+	# email to a LendingFlow lead is sent (src/lending/email_identity.py). Other recipients keep LENDING_GHL_EMAIL_FROM.
+	lending_lendingflow_email_from: str | None = Field(default=None, env="LENDING_LENDINGFLOW_EMAIL_FROM")
+	lending_lendingflow_email_bcc: str = Field(default="", env="LENDING_LENDINGFLOW_EMAIL_BCC")
 	# Logs the key paths (never values) of each incoming lending GHL webhook, to confirm the real field names.
 	lending_ghl_log_payload_shape: bool = Field(default=False, env="LENDING_GHL_LOG_PAYLOAD_SHAPE")
 	# A failed caller check cancels the AI-booked GHL appointment (frees Josh's slot). Off until the end-to-end test.
