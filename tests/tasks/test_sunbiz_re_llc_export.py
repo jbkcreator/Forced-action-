@@ -276,7 +276,7 @@ def test_only_the_normal_morning_run_catches_up(wired, monkeypatch, args):
     assert date(2026, 11, 15) not in wired.source.days
 
 
-def test_a_failed_catch_up_day_exits_1_so_run_sh_tries_again(wired, monkeypatch):
+def test_a_failed_catch_up_day_is_notified_and_does_not_fail_the_run(wired, monkeypatch):
     monkeypatch.setattr(mod, "export_day", lambda now: date(2026, 11, 16))
 
     class Flaky(FakeSource):
@@ -287,8 +287,9 @@ def test_a_failed_catch_up_day_exits_1_so_run_sh_tries_again(wired, monkeypatch)
 
     wired.source = Flaky(_file(_record()))
     wired.upload.in_drive = set()
-    assert mod.main([]) == 1
-    assert "2026-11-16" in [c[1] for c in wired.upload.calls]  # the main day still went
+    assert mod.main([]) == 0  # today's file is done: run.sh must not redo it
+    assert [c[1] for c in wired.upload.calls] == ["2026-11-16", "2026-11-14", "2026-11-13"]
+    assert len(wired.notices) == 1 and "2026-11-15" in wired.notices[0] and "down" not in wired.notices[0]
 
 
 @pytest.mark.parametrize("error,words", [
@@ -300,20 +301,12 @@ def test_a_failed_catch_up_day_exits_1_so_run_sh_tries_again(wired, monkeypatch)
 def test_the_retry_notice_says_what_to_fix(wired, error, words):
     import paramiko
 
-    from src.scrappers.sunbiz.daily_filings import StateFolderMissing
-    errors = {"bad_host_key": _bad_host_key(), "auth": paramiko.AuthenticationException("no"),
+    from src.scrappers.sunbiz.daily_filings import HostKeyChanged, StateFolderMissing
+    errors = {"bad_host_key": HostKeyChanged("differs"), "auth": paramiko.AuthenticationException("no"),
               "folder": StateFolderMissing("gone"), "other": ConnectionError("down at host.example")}
     wired.source.error = errors[error]
     assert mod.main(["--day", "2026-11-15", "--retry"]) == 0
     assert len(wired.notices) == 1 and words in wired.notices[0] and "host.example" not in wired.notices[0]
-
-
-def _bad_host_key():
-    import paramiko
-
-    exc = paramiko.BadHostKeyException.__new__(paramiko.BadHostKeyException)
-    Exception.__init__(exc, "key mismatch")
-    return exc
 
 
 @pytest.mark.parametrize("value", ["=HYPERLINK(\"http://x\")", "+1+2", "-2+3", "@SUM(A1)", "\tTAB", "\rCR"])

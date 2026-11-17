@@ -23,20 +23,22 @@ Capital** lands in Google Drive, for the agents' outreach.
    re-run replaces the file.
 
 Data notes from the real file (Nov 15, 2026: 1357 filings, 22 matched): dates are `MMDDYYYY`; the principal-address
-state is blank in every record (the mailing, agent and officer states are filled); filing dates in one day's file span
-the past ~10 days plus some future-effective dates, so "new" means "in that day's file".
+state is blank in every record (the mailing, agent and officer states are filled); most filing dates in one day's file
+span the past ~10 days plus some future-effective dates, with a few older entities; "new" means filed within 30 days
+of the file's date (below).
 
 ## Schedule
 
-`scripts/cron/crontab.txt` (times in UTC): `0 11 * * *` (6 AM EST / 7 AM EDT) exports yesterday's ET date. A
-failure exits 1 and `run.sh` retries. It also exports any of the 3 days before that whose CSV is not in Drive yet,
-so a file the state posted late goes out the next morning by itself (`CATCH_UP_DAYS`). The `30 13 * * *` `--retry`
-run shares the `flock`, so it waits for the main run and its retries; it does nothing if the day's file is already in
-Drive, else runs again and, if it still fails, posts one notice to `LENDING_OPS_NOTICE_CHANNEL` in plain words
-(server key changed, login rejected, state folder not found, or the error type). If the state's file for the day is
-still missing at the `--retry` run, it posts a notice too. A missing state folder is reported as an error, never as
-a day without filings. Without the SFTP login the main run exits 0 (a retry cannot fix it) and `--retry` alerts.
-Warnings and errors reach `logs/cron/sunbiz_re_llc_export.log`.
+`scripts/cron/crontab.txt` (times in UTC): `0 11 * * *` (6 AM EST / 7 AM EDT) exports yesterday's ET date. A failure
+exits 1 and `run.sh` retries. It also exports any of the 3 days before that whose CSV is not in Drive yet, so a file
+the state posted late goes out the next morning by itself (`CATCH_UP_DAYS`). The `30 13 * * *` `--retry` run shares
+the `flock`, so it waits for the main run and its retries; it does nothing if the day's file is already in Drive, else
+runs again and, if it still fails, posts one notice to `LENDING_OPS_NOTICE_CHANNEL` in plain words (server key
+changed, login rejected, state folder not found, or the error type). A catch-up day that fails posts its own notice
+naming the day and is tried again the next morning; it does not fail the run. If the state's file for the day is still
+missing at the `--retry` run, it posts a notice too. A missing state folder is reported as an error, never as a day
+without filings. Without the SFTP login the main run exits 0 (a retry cannot fix it) and `--retry` alerts. Warnings
+and errors reach `logs/cron/sunbiz_re_llc_export.log`.
 
 "New": only filings dated within 30 days of the file's date (`MAX_FILING_AGE_DAYS`; future-effective dates count).
 Over 8 real days (Nov 9-16, 2026) the file carried 6 matched LLCs filed earlier than that, and no LLC appeared in two

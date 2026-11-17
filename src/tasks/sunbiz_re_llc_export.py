@@ -136,9 +136,9 @@ def _reason(exc: BaseException) -> str:
     errors can carry hosts and ids)."""
     import paramiko
 
-    from src.scrappers.sunbiz.daily_filings import StateFolderMissing
+    from src.scrappers.sunbiz.daily_filings import HostKeyChanged, StateFolderMissing
 
-    if isinstance(exc, paramiko.BadHostKeyException):
+    if isinstance(exc, (HostKeyChanged, paramiko.BadHostKeyException)):
         return "the state server's key changed: check it and set SUNBIZ_SFTP_HOST_KEY"
     if isinstance(exc, paramiko.AuthenticationException):
         return "the SFTP login was rejected: check SUNBIZ_SFTP_USERNAME / SUNBIZ_SFTP_PASSWORD"
@@ -197,7 +197,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if args.retry and not args.dry_run and not result.state_file:
         logger.warning("[sunbiz-re-llc] still no state file for %s at the retry run", day)
         _notify(f":information_source: No Florida filings file for {day.isoformat()} on the state server yet "
-                f"(no filings that day, or posted late). If it appears later: --day {day.isoformat()}.")
+                f"(no filings that day, or posted late). If it appears in the next {CATCH_UP_DAYS} days, the "
+                "morning run exports it by itself.")
     logger.info("[sunbiz-re-llc] %s%s state_file=%s filings=%d rejected=%d matched=%d uploaded=%s",
                 "dry run: " if args.dry_run else "", day, result.state_file, result.filings, result.rejected,
                 result.matched, result.uploaded)
@@ -208,8 +209,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
 def _catch_up(day: date, *, source: DailyFileSource, folder_id: str, uploader: Any) -> int:
     """Export the CATCH_UP_DAYS before ``day`` whose CSV is not in Drive yet and whose state file is there now (a
-    file the state posted after that day's retry). A failure exits 1, so run.sh tries again (done days are skipped)."""
-    failed = False
+    file the state posted after that day's retry). Today's export is already done, so a failed earlier day posts one
+    ops notice naming it and is tried again the next morning; it never fails the run (run.sh would redo today)."""
     for back in range(1, CATCH_UP_DAYS + 1):
         earlier = day - timedelta(days=back)
         try:
@@ -218,11 +219,12 @@ def _catch_up(day: date, *, source: DailyFileSource, folder_id: str, uploader: A
             result = run(earlier, source=source, folder_id=folder_id, upload=uploader)
         except Exception as exc:  # reason only
             logger.error("[sunbiz-re-llc] catch-up %s failed (%s)", earlier, _reason(exc))
-            failed = True
+            _notify(f":warning: Florida real estate LLC file for {earlier.isoformat()} (a late state file) not "
+                    f"exported: {_reason(exc)}. The morning run tries again.")
             continue
         if result.uploaded:
             logger.warning("[sunbiz-re-llc] %s exported late: its state file arrived after that day's runs", earlier)
-    return 1 if failed else 0
+    return 0
 
 
 if __name__ == "__main__":

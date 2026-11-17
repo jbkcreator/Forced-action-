@@ -160,6 +160,10 @@ class DailyFileSource(Protocol):
     def fetch(self, day: date) -> Optional[bytes]: ...
 
 
+class HostKeyChanged(ConnectionError):
+    """The state server presented a different SSH key than the pinned one (rotated by the state, or not the state)."""
+
+
 class StateFolderMissing(ConnectionError):
     """The state's daily-files folder is not on the SFTP server (moved, renamed, or the login's home changed)."""
 
@@ -194,8 +198,14 @@ class SunbizSftp:
         try:
             transport.banner_timeout = SFTP_TIMEOUT_SECONDS
             transport.auth_timeout = SFTP_TIMEOUT_SECONDS
-            # hostkey: paramiko refuses a server whose key differs (SSHException), before sending the login
-            transport.connect(hostkey=host_key, username=self._username, password=self._password)
+            # Our own key check, before the login is sent: Transport.connect(hostkey=...) reports a mismatch only as a
+            # generic SSHException. Ask for the pinned key's type so the comparison is like for like.
+            transport.get_security_options().key_types = [host_key.get_name()]
+            transport.start_client(timeout=SFTP_TIMEOUT_SECONDS)
+            presented = transport.get_remote_server_key()
+            if presented is None or presented.asbytes() != host_key.asbytes():
+                raise HostKeyChanged("the state server's SSH key differs from the pinned SFTP_HOST_KEY")
+            transport.auth_password(self._username, self._password)
             sftp = paramiko.SFTPClient.from_transport(transport)
             if sftp is None:
                 raise ConnectionError("SFTP session not opened")

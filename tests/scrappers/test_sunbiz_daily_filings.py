@@ -192,15 +192,52 @@ class _FakeSftp:
         buffer.write(self.files[path])
 
 
+def _pkey(spec: str):
+    import base64
+
+    import paramiko
+
+    key_type, data = spec.split(" ")
+    return paramiko.PKey.from_type_string(key_type, base64.b64decode(data))
+
+
+def _other_ed25519_key():
+    """A real ed25519 public key that is not the pinned one (made up for the test)."""
+    import base64
+
+    import paramiko
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+    from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
+
+    raw = Ed25519PrivateKey.generate().public_key().public_bytes(Encoding.Raw, PublicFormat.Raw)
+    blob = paramiko.Message()
+    blob.add_string("ssh-ed25519")
+    blob.add_string(raw)
+    return _pkey("ssh-ed25519 " + base64.b64encode(blob.asbytes()).decode())
+
+
 class _FakeTransport:
+    """paramiko.Transport as the adapter uses it: key types, handshake, server key, password login."""
+
     instances: list["_FakeTransport"] = []
+    server_key = None  # set per test; None = the pinned key
 
     def __init__(self, sock):
-        self.sock, self.closed, self.login = sock, False, None
+        self.sock, self.closed, self.login, self.started = sock, False, None, False
+        self.options = type("Options", (), {"key_types": ()})()
         _FakeTransport.instances.append(self)
 
-    def connect(self, hostkey, username, password):
-        self.login, self.hostkey = (username, password), hostkey
+    def get_security_options(self):
+        return self.options
+
+    def start_client(self, timeout):
+        self.started = timeout
+
+    def get_remote_server_key(self):
+        return _FakeTransport.server_key or _pkey(SFTP_HOST_KEY)
+
+    def auth_password(self, username, password):
+        self.login = (username, password)
 
     def close(self):
         self.closed = True
@@ -215,6 +252,7 @@ def fake_paramiko(monkeypatch):
     connects = []
     files: dict[str, bytes] = {}
     _FakeTransport.instances = []
+    _FakeTransport.server_key = None
     _FakeSftp.folder_exists = True
     monkeypatch.setattr(socket, "create_connection", lambda addr, timeout: connects.append((addr, timeout)) or "sock")
     monkeypatch.setattr(paramiko, "Transport", _FakeTransport)
@@ -235,11 +273,19 @@ def test_sftp_fetch_reads_the_days_file_with_a_timeout_and_closes(fake_paramiko)
     assert _FakeTransport.instances[0].closed
 
 
-def test_sftp_checks_the_pinned_host_key(fake_paramiko):
+def test_sftp_asks_for_the_pinned_key_type_and_logs_in_when_it_matches(fake_paramiko):
     fake_paramiko[1]["doc/cor/20261115c.txt"] = b"data"
-    _sftp().fetch(date(2026, 11, 15))
-    hostkey = _FakeTransport.instances[0].hostkey
-    assert f"{hostkey.get_name()} {hostkey.get_base64()}" == SFTP_HOST_KEY
+    assert _sftp().fetch(date(2026, 11, 15)) == b"data"
+    transport = _FakeTransport.instances[0]
+    assert transport.options.key_types == ["ssh-ed25519"] and transport.started == 60
+    assert transport.login == ("user", "pw")
+
+
+def test_a_different_server_key_is_refused_before_the_login_is_sent(fake_paramiko):
+    _FakeTransport.server_key = _other_ed25519_key()
+    with pytest.raises(mod.HostKeyChanged):
+        _sftp().fetch(date(2026, 11, 15))
+    assert _FakeTransport.instances[0].login is None and _FakeTransport.instances[0].closed
 
 
 def test_a_malformed_host_key_fails_before_connecting(fake_paramiko):
@@ -261,10 +307,10 @@ def test_a_missing_state_folder_is_an_error_not_a_quiet_day(fake_paramiko):
 
 
 def test_sftp_login_failure_raises_and_closes(fake_paramiko, monkeypatch):
-    def refuse(self, hostkey, username, password):
+    def refuse(self, username, password):
         raise PermissionError("denied")
 
-    monkeypatch.setattr(_FakeTransport, "connect", refuse)
+    monkeypatch.setattr(_FakeTransport, "auth_password", refuse)
     with pytest.raises(PermissionError):
         _sftp().fetch(date(2026, 11, 15))
     assert _FakeTransport.instances[0].closed
