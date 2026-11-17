@@ -16,8 +16,12 @@ on `lending-api`, settings and copy in `config/lending_closing.py`. Both parts r
    the upload links; already set for the partner door). Cora needs `LENDING_CORA_CHANNEL` and
    `LENDING_CORA_APPROVALS_CHANNEL` (already required).
 4. The upload folder holds borrowers' financial documents: folder `0700`, files `0600`, never served by nginx,
-   never copied to Drive or Slack. Include it in the server backup. There is no automatic deletion yet: it is built
-   once Josh sets the retention period.
+   never sent to Slack. Include it in the server backup. There is no automatic deletion yet: it is built once Josh
+   sets the retention period.
+5. So Josh can open them: `LENDING_DOC_UPLOAD_DRIVE_FOLDER_ID` = a Drive folder **only Josh** (and whoever he names)
+   can open, shared with the lending service account as Content manager; never FA Exports, NDL Jobs, the ledger or
+   the LLC folders. Cora's sweep copies each upload to `chase-<id>/<item>-<upload id>.<ext>` (no borrower name in
+   Drive) once; a failure retries, and after 5 tries one ops notice. Empty = documents stay on the server only.
 
 Current stage: each GHL stage webhook updates `lending.ghl_opportunity_stage` (time = when it arrived; GHL sends
 no event time). The same stage event for the same deal repeated within an hour of its first delivery is treated as
@@ -45,16 +49,18 @@ document chase" (tool `start_document_chase`; optional P2.2 `quote_id`, whose `I
 condition adds a document). One open chase per phone; asking again keeps the open one. While texts with links are
 off, a borrower with no email is refused with the reason (no link could ever reach them).
 
-Where the documents are: on the lending-api server under `LENDING_DOC_UPLOAD_DIR`, one folder per chase; Cora's
-inbox says what arrived. There is no way yet for Josh to open them without server access (open item below).
+Where the documents are: on the lending-api server under `LENDING_DOC_UPLOAD_DIR`, one folder per chase, and
+copied to Josh's Drive folder `chase-<id>/` when `LENDING_DOC_UPLOAD_DRIVE_FOLDER_ID` is set (setup step 5). Cora's
+inbox says what arrived and the chase number, e.g. "Mark (…0101) uploaded Photo ID: 1 of 6 documents received
+(chase 12).".
 
 Checklist: Central Lending's list from Josh's Term Sheet Intake Checklist (Nov 2). Backflip has none (blocked).
 
 Messages (approval cards in #approvals; text with consent, else email; the relay still checks consent, the 8 AM to
 8 PM window, suppression, the lane deny list and the halt). Chase texts carry the upload link, so they go only once
 `LENDING_DOC_CHASE_SMS_LINKS_ENABLED=true` (off until the 10DLC campaign declares embedded links); while it is off
-the request and reminders go by email, or to Cora's inbox as "call them" when there is no email. Steps: the request on acceptance day, reminders on ET days 2, 5
-and 8 while anything is missing. After an outage only the latest due step goes out. Each message carries its own
+the request and reminders go by email, or to Cora's inbox as "call them" when there is no email. Steps: the
+request on acceptance day, reminders on ET days 2, 5 and 8 while anything is missing. After an outage only the latest due step goes out. Each message carries its own
 upload link; every link works for 30 days or until the chase closes. `doc_chase_links` keeps only the token's
 SHA-256; the full link is in the drafted message (so in `pending_actions.payload` until sent), and the approval card
 shows it masked (`…/api/lending/docs/[…]`). Template versions `DOCS-*` and `BLOCKER-*`
@@ -68,5 +74,5 @@ sweep, but only when the borrower's phone has exactly one GHL opportunity (never
 
 ## Open with Josh
 
-Active stages, the owner per stage, the message wording (`TEMPLATES`), the document retention period, and how
-Josh opens uploaded documents (a restricted Drive folder, a private download link from Cora, or on request).
+Active stages, the owner per stage, the message wording (`TEMPLATES`), the document retention period, and Josh's
+restricted Drive folder for uploaded documents (`LENDING_DOC_UPLOAD_DRIVE_FOLDER_ID`).

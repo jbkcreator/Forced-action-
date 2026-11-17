@@ -51,6 +51,7 @@ from src.lending.attempt_log import lending_ghl_readers
 from src.lending.compliance import text_window_open
 from src.lending.closing.blockers import post_blocker_card
 from src.lending.closing.doc_chase import chase_id_of, run_chase_sweep
+from src.lending.closing.doc_copies import copy_uploads_to_drive, live_copier
 from src.lending.consent import has_text_consent
 from src.lending.cora_channels import ChannelDirectory
 from src.lending.cora_inbox import format_inbox_context, items_on_post, surface_new_items
@@ -649,12 +650,23 @@ def build_closing_steps(settings: AppSettings, *, engine: Engine, chat: ChatPort
             return post_blocker_card(db, chat, gate, channel=config.slack_channel_id, approvals_channel=approvals,
                                      text_consent=lambda phone: has_text_consent(db, phone))
 
+    copier = (live_copier() if settings.lending_doc_chase_enabled and settings.lending_doc_upload_drive_folder_id
+              else None)
+
     def chase_sweep() -> int:
         with Session(engine) as db, db.begin():
-            return run_chase_sweep(db, gate, approvals_channel=approvals,
-                                   text_consent=lambda phone: has_text_consent(db, phone),
-                                   find_draft=queue.find_by_idempotency_key if queue is not None else None,
-                                   block_draft=queue.block_pending if queue is not None else None)
+            queued = run_chase_sweep(db, gate, approvals_channel=approvals,
+                                     text_consent=lambda phone: has_text_consent(db, phone),
+                                     find_draft=queue.find_by_idempotency_key if queue is not None else None,
+                                     block_draft=queue.block_pending if queue is not None else None)
+        if copier is not None:  # its own transaction: a Drive problem never touches the chase
+            try:
+                with Session(engine) as db, db.begin():
+                    copy_uploads_to_drive(db, folder_id=settings.lending_doc_upload_drive_folder_id, copier=copier,
+                                          notify=post_ops_notice)
+            except Exception as exc:  # class only
+                logger.error("[cora] document copy to Drive skipped this sweep (%s)", type(exc).__name__)
+        return queued
 
     return (blocker_card if settings.lending_closing_blockers_enabled else None,
             chase_sweep if settings.lending_doc_chase_enabled else None)

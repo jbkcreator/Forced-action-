@@ -942,6 +942,9 @@ class AppSettings(BaseSettings):
 	# Borrower documents (link host = LENDING_PARTNER_LINK_BASE_URL). An absolute path on persistent, backed-up
 	# storage; unset or relative = no chase starts and no upload is stored (a rebuild could lose them).
 	lending_doc_upload_dir: str = Field(default="", env="LENDING_DOC_UPLOAD_DIR")
+	# Josh's restricted Drive folder for borrower documents (only Josh, plus the lending service account as Content
+	# manager; never a team-wide folder). Empty = documents stay on the server only.
+	lending_doc_upload_drive_folder_id: str = Field(default="", env="LENDING_DOC_UPLOAD_DRIVE_FOLDER_ID")
 	# Shared secret the GHL "DND changed" workflow sends in X-Webhook-Secret. Unset = endpoint closed.
 	lending_ghl_webhook_secret: Optional[SecretStr] = Field(default=None, env="LENDING_GHL_WEBHOOK_SECRET")
 	lending_ghl_sms_from_number: Optional[str] = Field(default=None, env="LENDING_GHL_SMS_FROM_NUMBER")  # E.164; the GHL SMS number (texting only). Calls run through BatchDialer on a different number

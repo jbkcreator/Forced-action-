@@ -45,6 +45,10 @@ def apply_to(conn: Connection, schema: str = LENDING_SCHEMA) -> None:
         table: Table = model.__table__  # type: ignore[assignment]  # declarative tables are Table at runtime
         for index in sorted(table.indexes, key=lambda i: str(i.name or "")):
             translated.execute(CreateIndex(index, if_not_exists=True))
+    # Columns added after the first release (doc_copies: the Drive copy of each upload).
+    conn.execute(text(
+        f'ALTER TABLE "{schema}".doc_chase_uploads ADD COLUMN IF NOT EXISTS drive_file_id varchar(100), '
+        "ADD COLUMN IF NOT EXISTS drive_attempts integer NOT NULL DEFAULT 0"))
     # Deals that moved before this table existed: their latest stage entry. Never overwrites a live row.
     conn.execute(text(
         f'INSERT INTO "{schema}".ghl_opportunity_stage (ghl_opportunity_id, stage_name, stage_key, entered_at, phone) '

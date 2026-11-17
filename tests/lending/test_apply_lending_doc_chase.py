@@ -52,3 +52,15 @@ def test_a_rerun_adds_indexes_created_after_the_first_run(closing_db):
             closing_db.execute(text("INSERT INTO lending.doc_chases (lead_ref, email, lender_key, accepted_at, "
                                     "accepted_by) VALUES ('web_lead:2', 'sam@example.com', 'central_lending', now(), "
                                     "'slack:U1')"))
+
+
+def test_a_rerun_adds_the_drive_copy_columns(closing_db):
+    schema = closing_db.info["schema"]
+    closing_db.execute(text(f'ALTER TABLE "{schema}".doc_chase_uploads DROP COLUMN drive_file_id, '
+                            "DROP COLUMN drive_attempts"))
+    apply_to(closing_db.connection(), schema)
+    apply_to(closing_db.connection(), schema)
+    columns = set(closing_db.execute(text(
+        "SELECT column_name FROM information_schema.columns WHERE table_schema = :s AND table_name = "
+        "'doc_chase_uploads'"), {"s": schema}).scalars())
+    assert {"drive_file_id", "drive_attempts"} <= columns

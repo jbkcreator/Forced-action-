@@ -1620,6 +1620,8 @@ class LendingDocChaseUpload(LendingBase):
     content_type: Mapped[str] = mapped_column(String(100), nullable=False)
     size_bytes: Mapped[int] = mapped_column(Integer, nullable=False)
     uploaded_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_now, server_default=text("now()"))
+    drive_file_id: Mapped[Optional[str]] = mapped_column(String(100))  # set once copied to Josh's folder (doc_copies)
+    drive_attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default=text("0"))
 
     __table_args__ = (Index("idx_lending_doc_chase_uploads_chase", "chase_id"),)
 

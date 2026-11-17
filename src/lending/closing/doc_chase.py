@@ -368,7 +368,8 @@ def record_upload(db, chase: dict[str, Any], item_code: str, upload: Upload, *, 
     received = sum(1 for item in items.values() if item["received_at"] is not None or item["item_code"] == item_code)
     add_to_inbox_safely(db, event_type="doc_chase_upload", dedup_key=f"{chase['id']}:{item_code}",
                         summary=f"{_who(chase)} uploaded {items[item_code]['label']}: {received} of {len(items)} "
-                                "documents received.", payload={"chase_id": chase["id"], "item_code": item_code})
+                                f"documents received (chase {chase['id']}).",
+                        payload={"chase_id": chase["id"], "item_code": item_code})
     logger.info("[doc-chase] chase %s: %s uploaded (%s/%s)", chase["id"], item_code, received, len(items))
     return path
 
