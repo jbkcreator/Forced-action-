@@ -19,8 +19,6 @@ from config.lending_lendingflow import (
     GHL_TAG_INTRO_READY,
     GHL_TAG_LENDINGFLOW,
     INTRO_NAME_FALLBACK,
-    GHL_TAG_NO_LEAD_ID,
-    is_missing_lead_id,
 )
 from config.settings import get_settings
 from src.lending.cold_leads import reconcile_warm_contact
@@ -32,10 +30,7 @@ logger = logging.getLogger(__name__)
 
 
 def _tags(lead: Mapping[str, Any]) -> list[str]:
-    tags = [GHL_TAG_LENDINGFLOW]
-    if is_missing_lead_id(lead.get("vendor_lead_id") or ""):
-        tags.append(GHL_TAG_NO_LEAD_ID)
-    return tags
+    return [GHL_TAG_LENDINGFLOW]
 
 
 def _intro_ready_tags(lead: Mapping[str, Any]) -> list[str]:
