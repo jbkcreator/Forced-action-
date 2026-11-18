@@ -40,7 +40,7 @@ from packages.agent_core.memory import AgentMemory
 from packages.agent_core.pending_actions import PendingAction, PendingActionQueue
 from packages.agent_core.relay import EgressExecutor, Relay, SendCheck, SendDeferred
 from packages.agent_core.revision import DraftReviser, RevisionFailed
-from packages.agent_core.send_gate import SendGate
+from packages.agent_core.send_gate import SendGate, lane_checked_enqueue
 from packages.agent_core.slack_session import InboundMessage, SlackSession, run_socket_mode
 from packages.agent_core.store import AgentStore
 from packages.agent_core.thread_history import build_history
@@ -217,7 +217,8 @@ def make_send_check(engine: Engine, *, carrier_approved: bool = False,
                 return "recipient is suppressed or marked do-not-contact"
             if action.channel in SMS_CHANNELS and not (phone and has_text_consent(conn, phone)):
                 return "no text consent on record for this number"
-            if auto_approval_lapsed(conn, action.decided_by, action.payload.get("template_version")):
+            if auto_approval_lapsed(conn, action.decided_by, action.payload.get("template_version"),
+                                    channel=action.channel):
                 # P1.4: its template was revoked after the automatic approval. Held, never sent; the next sweep
                 # sends it back for a person's approval (standing_sends.return_ungraduated_auto_approvals).
                 return SendDeferred("its message type no longer auto-sends; going back for approval")
@@ -319,7 +320,7 @@ def build_egress_executors() -> dict[str, EgressExecutor]:
 
 def build_agent_jobs(settings: AppSettings, *, engine: Engine, gate: SendGate, queue: PendingActionQueue,
                      approval_channel: str,
-                     is_graduated: Callable[[str], bool] = lambda _: False) -> Optional[JobQueueWorker]:
+                     is_graduated: Callable[..., bool] = lambda *_: False) -> Optional[JobQueueWorker]:
     """The P1.1 Drive job queue worker, or None (logged) while it is switched off or not configured."""
     if not settings.lending_agent_jobs_enabled:
         logger.info("[cora] agent job queue off (LENDING_AGENT_JOBS_ENABLED=false)")
@@ -632,7 +633,7 @@ def make_instantly_replies(engine: Engine, store: AgentStore, config: AgentCoreC
     memory = AgentMemory(store)
     instantly = lending_instantly_account()
     processor = ReplyProcessor(
-        session_factory=lambda: Session(engine), client=messages_client, model=config.model, enqueue=queue.enqueue,
+        session_factory=lambda: Session(engine), client=messages_client, model=config.model, enqueue=lane_checked_enqueue(queue),
         post_card=gate.post_card, post_triage=post_replies_notice, post_notice=post_ops_notice,
         rules=lambda: [rule.rule_text for rule in memory.active_rules()],
         block_address=(lambda email: block_address(instantly, email)) if instantly else (lambda email: False))

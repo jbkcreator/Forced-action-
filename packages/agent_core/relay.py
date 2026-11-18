@@ -94,6 +94,14 @@ class Relay:
             self._queue.mark_failed(action_id, reason)
             return DispatchResult(DispatchOutcome.NOT_ENABLED, reason)
 
+        # The Backflip check runs before every other send-time check, so a blocked send always writes the SECURITY log.
+        rule = lane_violation(action.payload)
+        if rule is not None:
+            reason = lane_block_reason(rule)
+            logger.error("relay SECURITY: action %s blocked by lane deny rule %s; nothing sent", action_id, rule)
+            self._queue.mark_blocked(action_id, reason)
+            return DispatchResult(DispatchOutcome.BLOCKED, reason)
+
         # An expired draft never sends, whatever the send check says (a deferred send may clear only after it).
         now = self._queue.now()
         deadline = payload_deadline(action)
@@ -107,14 +115,6 @@ class Relay:
             return DispatchResult(DispatchOutcome.DEFERRED, reason)
         if reason is not None:
             logger.warning("relay: action %s blocked at send time: %s", action_id, reason)
-            self._queue.mark_blocked(action_id, reason)
-            return DispatchResult(DispatchOutcome.BLOCKED, reason)
-
-        # Last stop before egress: the frozen payload is exactly what would go out.
-        rule = lane_violation(action.payload)
-        if rule is not None:
-            reason = lane_block_reason(rule)
-            logger.error("relay SECURITY: action %s blocked by lane deny rule %s; nothing sent", action_id, rule)
             self._queue.mark_blocked(action_id, reason)
             return DispatchResult(DispatchOutcome.BLOCKED, reason)
 

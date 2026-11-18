@@ -98,10 +98,12 @@ The relay's own send-time checks still run after Josh approves: opt-out, text co
 ```json
 {"job_id": "…", "status": "edited_sent", "action_id": 1234, "provider_message_id": "…",
  "edited_body": "…", "rail": "ghl", "reason": null, "template_version": "LF-D2-SMS-v1",
- "created_by": "LendingFlow follow up", "timestamp": "2026-11-12T14:05:11-05:00"}
+ "created_by": "LendingFlow follow up", "approval": "approved", "timestamp": "2026-11-12T14:05:11-05:00"}
 ```
 
 - **`status`:** `sent`, `edited_sent` (Josh revised it; `edited_body` is what went out), `rejected`, `blocked_consent`, `blocked_hours`, `blocked_lane`, `blocked_cap`, `expired` or `error` (`reason` says why).
+- **`approval`:** `approved` (a person tapped Approve or Revise), `automatic` (a graduated template: sent with no card) or null (nobody decided: blocked at the check). Added by us, not in the brief.
+- **Backflip:** a job naming Backflip is `blocked_lane` whether the job check, the send gate or the relay catches it; all three use the same rules.
 - **Instantly emails:** `sent` means Instantly accepted the email for its next sending slot, and `provider_message_id` is the Instantly lead id.
 - **No personal data:** no phone number or email address is ever written to a receipt.
 

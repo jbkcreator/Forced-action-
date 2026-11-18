@@ -144,3 +144,29 @@ def test_block_pending_moves_only_pending_rows(queue: PendingActionQueue) -> Non
     queue.approve(action_id, APPROVER)
     assert queue.block_pending(action_id, "BACKFLIP_LANE: blocked_name") is False
     assert queue.get(action_id).status is ActionStatus.APPROVED
+
+
+def test_checked_enqueue_blocks_a_backflip_draft_so_the_sweep_never_cards_it(queue: PendingActionQueue,
+                                                                             harness: Harness) -> None:
+    from packages.agent_core.lane_guard import LaneViolation
+    from packages.agent_core.send_gate import lane_checked_enqueue
+
+    enqueue = lane_checked_enqueue(queue)
+    with pytest.raises(LaneViolation):
+        enqueue(tool_name="draft_instantly_reply", channel="instantly_email",
+                payload={"body": "Backflip can fund this"}, summary="s", recipient_email="a@b.com")
+    blocked = [a for a in (queue.get(i) for i in range(1, 5)) if a is not None]
+    assert blocked and blocked[0].status is ActionStatus.BLOCKED
+    assert harness.gate.retry_missing_cards() == 0
+    clean = enqueue(tool_name="t", channel="ghl_sms", payload={"body": "Hi"}, summary="s", recipient_phone="+17275550100")
+    assert queue.get(clean).status is ActionStatus.PENDING
+
+
+def test_relay_block_always_writes_the_security_log(queue: PendingActionQueue, relay: Relay,
+                                                       executor: RecordingExecutor, caplog) -> None:
+    action_id = enqueue_sms(queue, "Reply to backflip.com")
+    queue.approve(action_id, APPROVER)
+    with caplog.at_level(logging.ERROR):
+        result = relay.dispatch(action_id)
+    assert result.outcome is DispatchOutcome.BLOCKED and result.reason == lane_block_reason("blocked_domain")
+    assert "SECURITY" in caplog.text and executor.sent == []

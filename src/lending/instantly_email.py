@@ -40,6 +40,7 @@ from typing import Any, Callable, Optional
 import requests
 
 from config.settings import get_settings
+from packages.agent_core.lane_guard import lane_violation
 from src.lending.global_halt import is_globally_halted
 from src.lending.instantly_client import lending_instantly_account
 
@@ -154,12 +155,17 @@ class NdlInstantlySender:
         """Hand one approved email to Instantly; returns the Instantly lead id (or ``instantly:<campaign>``)."""
         self._refuse_if_halted("send")
         email = to_email.strip().lower()
+        html = self.footer_body(body, email)
+        if lane_violation({"subject": subject, "body": html}) is not None:  # the footer added here is scanned too
+            logger.error("%s SECURITY: email blocked by the Backflip check (footer included); nothing sent",
+                         self._log_prefix)
+            raise InstantlySendError("the email, with its footer, names Backflip; nothing sent")
         self._remove_previous_lead(email)
         self._refuse_if_halted("send")  # again: a halt can be set while the lookup runs
         result = self._call("send", "POST", "/api/v2/leads/add", json={
             "campaign_id": self._account.campaign_id,
             "leads": [{"email": email, "custom_variables": {"ra_subject": subject,
-                                                            "ra_body": self.footer_body(body, email)}}],
+                                                            "ra_body": html}}],
         })
         if result.get("in_blocklist"):
             raise InstantlySendError("Instantly refused the email: the address is on the Instantly block list")

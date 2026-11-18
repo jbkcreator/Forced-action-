@@ -599,3 +599,19 @@ def test_an_event_is_stored_once(lending_db):
     stop = InstantlyEvent(event_type="reply_received", lead_email=LEAD, dedup_key="reply:test-em-2", reply_text="STOP")
     assert instantly_replies.record_event(lending_db, stop).stop_request is True
     apply_to(lending_db.connection())  # idempotent
+
+
+def test_a_draft_blocked_by_the_backflip_check_gets_no_card_and_is_recorded_as_an_error():
+    from packages.agent_core.lane_guard import LaneViolation
+
+    session = FakeSession([row()])
+    proc, calls = processor(session, FakeModel(DEAL))
+
+    def refused(**kwargs):
+        raise LaneViolation("blocked")
+
+    proc._enqueue = refused
+    result = proc.run()
+    assert result.drafted == 0 and result.triaged == 1 and calls.cards == []
+    done = session.params("SET status = 'done'")[0]
+    assert done["action_id"] is None and "Backflip" in done["error"]

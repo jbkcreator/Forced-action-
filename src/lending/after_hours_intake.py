@@ -31,6 +31,7 @@ from sqlalchemy import text
 from config.lending_after_hours import (BUSINESS_DAYS, DEFAULT_SOURCE, DRAFT_FORBIDDEN, DRAFT_MAX_CHARS, DRAFT_PROMPT,
                                         DRAFT_TOOL_NAME, FALLBACK_REPLY, INTAKE_MARKER, MORNING_POST_ET, PIN_UNTIL_ET)
 from config.lending_reminders import TIMEZONE
+from packages.agent_core.lane_guard import LaneViolation
 from src.lending.consent import has_text_consent
 from src.lending.cora_tools import borrower_draft_problem
 from src.lending.ghl_consent_events import InvalidEvent
@@ -244,7 +245,12 @@ def draft_morning_replies(db, pins: list[PinnedCall], queue: DraftQueue, drafter
         if pin.event.call_key in drafted:
             replies.append(MorningReply(pin, drafted[pin.event.call_key]))
         elif has_text_consent(db, pin.event.phone):
-            replies.append(MorningReply(pin, _queue_reply(queue, pin, drafter, names.get(pin.event.phone))))
+            try:
+                replies.append(MorningReply(pin, _queue_reply(queue, pin, drafter, names.get(pin.event.phone))))
+            except LaneViolation:  # the send gate blocked a draft naming Backflip: no card, call-only
+                logger.error("[after-hours] the voicemail reply for call %s was blocked by the Backflip check",
+                             pin.event.call_key[:8])
+                replies.append(MorningReply(pin, None))
         else:
             replies.append(MorningReply(pin, None))
     return replies

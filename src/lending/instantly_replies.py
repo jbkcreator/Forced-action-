@@ -34,6 +34,7 @@ from sqlalchemy import text
 
 from config.lending_compliance import OptOutChannel
 from config.lending_standing_sends import INSTANTLY_REPLY_TEMPLATE
+from packages.agent_core.lane_guard import LaneViolation
 from packages.agent_core.redaction import mask_emails
 from src.lending.compliance import propagate_opt_out
 from src.lending.cora_inbox import add_to_inbox_safely, slack_safe
@@ -68,6 +69,15 @@ _STOP_PHRASES = re.compile(
     r"no (?:more|further) (?:e-?mails?|messages|contact))\b",
     re.IGNORECASE,
 )
+# Words that could mean "stop" in wording the phrases above miss ("please remove", "this is spam", "leave us alone").
+# The webhook treats any of them as a STOP on the spot (the safe default: missing an opt-out is the bigger risk), so a
+# STOP never waits for Cora's sweep or the AI model; the model still sorts every other reply.
+_POSSIBLE_STOP = re.compile(
+    r"\b(?:cease\w*|unsubscrib\w*|harass\w*|leave (?:me|us) alone|(?:please |pls )?stop (?:it|this|that|now)|"
+    r"(?:remove|delete|take) (?:me|us|my|our) (?:\w+ )?(?:name|email|e-?mail|address|number|info|details|from)|"
+    r"(?:this (?:is|was)|it'?s|reported? (?:as|you as)|mark(?:ed|ing)? (?:as|you as)) spam|spammer|"
+    r"no longer (?:want|wish) to (?:receive|hear|get)|"
+    r"never (?:email|contact|call|text|message)|not (?:email|contact) (?:me|us))\b", re.IGNORECASE)
 # A line that is only a stop word, with at most a short lead-in or tail ("STOP", "Please stop", "No thanks, stop",
 # "Remove"), so "can't stop thinking about it" is not one. Checked word by word, not with a regex: the reply is text
 # anyone can send, and a nested-quantifier pattern here backtracks exponentially (PR #428 re-review).
@@ -149,6 +159,11 @@ def is_stop_request(reply: str) -> bool:
     return bool(_STOP_PHRASES.search(own) or any(is_stop_line(line) for line in own.splitlines()))
 
 
+def could_mean_stop(reply: str) -> bool:
+    """A stop request, or any wording that could be one. Decided in the webhook, before anything else runs."""
+    return is_stop_request(reply) or bool(_POSSIBLE_STOP.search(new_reply_text(reply)))
+
+
 def parse_event(body: Mapping[str, Any]) -> Optional[InstantlyEvent]:
     """The event, or None when it is not one this module handles or carries no lead address."""
     event_type = (_pick(body, "event_type", "event", "type") or "").lower()
@@ -189,7 +204,7 @@ _INSERT = text("""
 
 def record_event(db, event: InstantlyEvent) -> RecordResult:
     """Store the event once. Does not commit."""
-    stop = event.event_type == EVENT_UNSUBSCRIBED or is_stop_request(event.reply_text)
+    stop = event.event_type == EVENT_UNSUBSCRIBED or could_mean_stop(event.reply_text)
     reply_id = db.execute(_INSERT, {
         "dedup_key": event.dedup_key[:200], "event_type": event.event_type, "lead_email": event.lead_email[:320],
         "first_name": (event.first_name or None) and event.first_name[:100], "campaign_id": event.campaign_id,
@@ -447,8 +462,11 @@ class ReplyProcessor:
         error = None
         if triage.intent in DRAFT_INTENTS:
             if row["email_account"] and row["reply_to_uuid"]:
-                action_id = self._draft(row, triage)
-                result.drafted += 1
+                try:
+                    action_id = self._draft(row, triage)
+                    result.drafted += 1
+                except LaneViolation:  # blocked by the send gate's Backflip check: no card, the team sees the error
+                    error = "the drafted answer names Backflip, so the send gate blocked it"
             else:
                 error = "reply has no Instantly inbox or email id, so it cannot be answered in the thread"
         self._finish(db, row, triage, action_id, error, result)

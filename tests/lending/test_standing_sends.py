@@ -168,7 +168,7 @@ def stats(approved, edited, rejected=0, auto_sent=0, **kw):
     (25, 3, 0, False),   # 12% edited
     (30, 3, 0, False),   # exactly 10%: "under 10%" means strictly under
     (31, 3, 0, True),    # 9.7%
-    (25, 1, 20, True),   # rejections neither help nor block (client decision, literal brief)
+    (25, 1, 20, True),   # rejections neither help nor block (team decision, literal brief)
     (10, 0, 30, False),  # rejections never count as approvals
 ])
 def test_graduation_needs_25_approvals_with_under_10_percent_edited(approved, edited, rejected, ready):
@@ -231,13 +231,13 @@ def test_the_morning_card_has_the_standing_sends_section():
 
 # ── against Postgres (shared database; skipped without one) ──────────────────
 
-def _approve(db, template, *, status="sent", decided_by="U_JOSH", revised=False):
+def _approve(db, template, *, status="sent", decided_by="U_JOSH", revised=False, channel="ghl_sms"):
     from sqlalchemy import text
 
     db.execute(text("""
         INSERT INTO lending.pending_actions (tool_name, channel, payload, status, decided_by, revisions)
-        VALUES ('agent_job', 'ghl_sms', CAST(:payload AS jsonb), :status, :decided_by, CAST(:revisions AS jsonb))
-    """), {"payload": json.dumps({"template_version": template, "body": "Hi"}), "status": status,
+        VALUES ('agent_job', :channel, CAST(:payload AS jsonb), :status, :decided_by, CAST(:revisions AS jsonb))
+    """), {"channel": channel, "payload": json.dumps({"template_version": template, "body": "Hi"}), "status": status,
            "decided_by": decided_by, "revisions": json.dumps([{"payload": {"body": "x"}}] if revised else [])})
 
 
@@ -276,6 +276,9 @@ def test_counts_and_graduation_on_postgres(lending_db):
     assert "P14-TEST-v1" in graduated and "P14-OTHER-v1" not in graduated
     assert "P14-TEST-v1" not in [s.template_version for s in standing_sends.evaluate_graduations(engine)]  # once
     assert standing_sends.make_is_graduated(engine)("P14-TEST-v1") is True
+    # per channel: the 25 approvals were on ghl_sms, so the same template does not auto-send on another channel
+    assert standing_sends.make_is_graduated(engine)("P14-TEST-v1", "ghl_sms") is True
+    assert standing_sends.make_is_graduated(engine)("P14-TEST-v1", "instantly_cold_email") is False
     assert standing_sends.set_revoked(engine, "P14-TEST-v1", revoked=True, by="test") is True
     assert standing_sends.make_is_graduated(engine)("P14-TEST-v1") is False
     assert "P14-TEST-v1" not in [s.template_version for s in standing_sends.evaluate_graduations(engine)]
@@ -483,3 +486,13 @@ def test_a_revoke_between_automatic_approval_and_send_never_sends_unapproved_on_
 
     assert queue.approve(held, "U_JOSH")  # only a person's approval sends it
     assert relay.run().sent == (held,) and len(sent) == 1
+
+
+def test_graduation_check_passes_the_channel_and_the_rule_to_the_query():
+    engine = CaptureEngine(returning=True)
+    assert standing_sends.make_is_graduated(engine)("LF-D2-SMS-v1", "instantly_cold_email") is True
+    params = engine.params[0]
+    assert params["channel"] == "instantly_cold_email" and params["min_approvals"] == 25
+    assert params["max_edit_rate"] == 0.10
+    standing_sends.make_is_graduated(engine)("LF-D2-SMS-v1")
+    assert engine.params[1]["channel"] is None

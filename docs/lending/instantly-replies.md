@@ -15,6 +15,23 @@ everywhere.
 | ...dead | Triage only. Never a suppression: only a STOP or unsubscribe suppresses | |
 | any other event | Answered 200 and ignored | |
 
+**Decided in the webhook, not the sweep.** The webhook also treats any wording that could mean stop as a STOP on the
+spot (`instantly_replies.could_mean_stop`: cease, unsubscribe, harass, "leave us alone", "stop this/it/now", "remove /
+delete / take me|us|my ... name|email|number|from", "this is spam", "no longer want to receive", "never email me", on top
+of the phrases above). The wording is specific on purpose, so ordinary replies ("we no longer have that property",
+"please stop by Tuesday", "remove the prepayment penalty", an out-of-office) are not suppressed; they go to the model.
+A possible STOP is suppressed within seconds and never waits for Cora's sweep or the AI model (it also works while the
+model is down). If one is wrong, lift the suppression by hand.
+
+**Which phones an email-only STOP reaches** (`compliance._with_linked_phones`): phones on lending contacts, website and
+LendingFlow leads, partners, and the traced emails in the cold calling lists (`lending.calling_pool_staging`); then,
+for a cold contact held only in GHL and the dialer, the GHL contact found by that email and every dialer load of that
+GHL contact id (`ghl_email_lookup.py`, read only, one attempt per email, 4 s timeout, 30 s for the batch, at most 10 emails; every email is asked, even one already linked to a phone). Each phone
+gets its own opt-out event, so the dialer removal retry and the GHL do-not-disturb sync cover it. If the GHL search
+fails the email is still suppressed; only the phone link is missed (logged `[ghl-email-lookup] GHL search failed`) and
+a `stop_phone_link_failed` item goes to Cora's inbox (no address in it), so a person checks the dialer and GHL for that
+contact by hand.
+
 Only the lead's own words count for STOP: the quoted earlier email (which may say "Reply STOP to unsubscribe") is
 ignored. A line that is only "stop" with a short lead-in ("Please stop", "No thanks, stop") counts; "can't stop
 thinking about this deal" does not. The model is told to choose **stop** whenever a reply could be read as asking

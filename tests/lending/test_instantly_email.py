@@ -219,3 +219,12 @@ def test_setup_campaign_adds_the_unsubscribe_header() -> None:
     instantly_email.setup_campaign("ndl-key", "https://api.instantly.ai", "josh@ndl-mail.com", fake)
     created = next(kwargs["json"] for method, path, kwargs in fake.calls if (method, path) == ("POST", "/api/v2/campaigns"))
     assert created["insert_unsubscribe_header"] is True
+
+
+def test_a_footer_naming_backflip_stops_the_send() -> None:
+    account = NdlInstantly(**{**ACCOUNT.__dict__, "footer_brand": "Backflip Lending"}) if hasattr(ACCOUNT, "__dict__") \
+        else ACCOUNT._replace(footer_brand="Backflip Lending")
+    fake = FakeInstantly(_routes())
+    with pytest.raises(InstantlySendError, match="Backflip"):
+        NdlInstantlySender(account, fake).send("m@example.com", "S", "clean body")
+    assert fake.calls == []

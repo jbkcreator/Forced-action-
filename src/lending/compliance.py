@@ -1231,13 +1231,30 @@ _LINKED_PHONES = text(
     "UNION SELECT lower(email), phone FROM lending.web_leads WHERE lower(email) = ANY(:emails) AND phone IS NOT NULL "
     "UNION SELECT lower(email), phone FROM lending.lendingflow_leads "
     "WHERE lower(email) = ANY(:emails) AND phone IS NOT NULL "
-    "UNION SELECT lower(email), phone FROM lending.partners WHERE lower(email) = ANY(:emails) AND phone IS NOT NULL"
+    "UNION SELECT lower(email), phone FROM lending.partners WHERE lower(email) = ANY(:emails) AND phone IS NOT NULL "
+    "UNION SELECT lower(email), normalized_phone FROM lending.calling_pool_staging "
+    "WHERE lower(email) = ANY(:emails) AND normalized_phone IS NOT NULL"
 )
+
+
+def _alert_unlinked_stop(db, emails: list[str]) -> None:
+    """An email-only STOP whose phones could not be looked up in GHL: the email is suppressed, but its phone may
+    still be dialed. Raised to Cora's inbox (no address in it) so a person checks the dialer and GHL by hand."""
+    from src.lending.cora_inbox import add_to_inbox_safely
+
+    digest = hashlib.sha256("|".join(sorted(emails)).encode()).hexdigest()[:16]
+    add_to_inbox_safely(
+        db, event_type="stop_phone_link_failed", dedup_key=f"stop-link:{digest}", target_channel="ops",
+        summary=(f"{len(emails)} email-only STOP(s) could not be linked to a phone (GHL lookup failed or was cut "
+                 "short). The email is suppressed; check the dialer and GHL for that contact by hand."),
+        payload={"emails_unlinked": len(emails)})
 
 
 def _with_linked_phones(db, opt_outs: list[_OptOut]) -> list[_OptOut]:
     """An email-only opt-out also blocks every phone that email is on file with in lending (ADR 0028: an opt-out
-    blocks every channel; the web form tells leads to email optout@ to stop calls). Every linked phone gets its own
+    blocks every channel; the web form tells leads to email optout@ to stop calls). Phones come from lending's
+    contacts, leads and partners, the traced emails in the cold calling lists, then the GHL contact and its dialer
+    loads (``ghl_email_lookup``). Every linked phone gets its own
     event, so the dialer-removal retry and the GHL DND sync (both keyed on the event's phone) cover each one. Only
     the first keeps the FA row id (one event per FA row: the poller's dedup key). FA's stores get the phones too
     (source DIALER_OPT_OUT_SOURCE, which the poller skips, so nothing loops)."""
@@ -1251,6 +1268,16 @@ def _with_linked_phones(db, opt_outs: list[_OptOut]) -> list[_OptOut]:
         phone = normalize_phone(raw)
         if phone:
             by_email[email].add(phone)
+    from src.lending.ghl_email_lookup import phones_for_emails
+
+    # A cold contact held only in GHL and the dialer is on none of those tables: ask GHL (and the dialer loads of the
+    # GHL contact) for the emails that found no phone above.
+    # An email already on a lending row is asked too: the GHL contact and its dialer loads can hold another phone.
+    unlinked: list[str] = []
+    for email, found in phones_for_emails(db, emails, unlinked).items():
+        by_email[email] |= found
+    if unlinked:
+        _alert_unlinked_stop(db, unlinked)
     resolved: list[_OptOut] = []
     for o in opt_outs:
         linked = sorted(by_email.get(o.email, ())) if o.email and not o.phone else []

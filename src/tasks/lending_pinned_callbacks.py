@@ -27,6 +27,7 @@ from config.lending_after_hours import BUSINESS_DAYS, MORNING_POST_HOUR_ET
 from config.lending_reminders import TIMEZONE
 from config.settings import AppSettings, get_settings
 from packages.agent_core.pending_actions import PendingActionQueue
+from packages.agent_core.send_gate import lane_checked_enqueue
 from packages.agent_core.store import AgentStore
 from src.lending.after_hours_intake import MorningReply, draft_morning_replies, model_drafter, pins_to_call
 from src.lending.db import lending_session
@@ -109,7 +110,7 @@ def main(argv=None, *, now: Optional[datetime] = None) -> int:
             if pins:
                 queue = PendingActionQueue(AgentStore(db.get_bind(), LENDING_SCHEMA),
                                            default_ttl=timedelta(hours=settings.lending_cora_pending_action_ttl_hours))
-                replies = draft_morning_replies(db, pins, queue, _drafter(settings))
+                replies = draft_morning_replies(db, pins, _LaneCheckedQueue(queue), _drafter(settings))
             message = format_slack(replies, names_by_phone(db, [pin.event.phone for pin in pins]), leads)
         from slack_sdk import WebClient
         WebClient(token=token.get_secret_value()).chat_postMessage(channel=channel, text=message)
@@ -119,6 +120,13 @@ def main(argv=None, *, now: Optional[datetime] = None) -> int:
         return 1
     logger.info("[pinned-callbacks] posted %s pinned caller(s), %s after-hours lead(s)", len(pins), len(leads))
     return 0
+
+
+class _LaneCheckedQueue:
+    """The draft queue with the send gate's Backflip check, so a voicemail reply naming Backflip is blocked, not carded."""
+
+    def __init__(self, queue: PendingActionQueue) -> None:
+        self.enqueue = lane_checked_enqueue(queue)
 
 
 if __name__ == "__main__":
