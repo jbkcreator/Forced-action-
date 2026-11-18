@@ -93,6 +93,13 @@ def _slack_test_posts_on(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _not_a_lendingflow_recipient(monkeypatch):
+    """The GHL email sender asks whether each recipient is a LendingFlow lead; tests never read the shared database
+    for it. Tests that cover the LendingFlow sender patch their own answer."""
+    monkeypatch.setattr("src.lending.email_identity.is_lendingflow_recipient", lambda email, phone: False)
+
+
+@pytest.fixture(autouse=True)
 def _no_live_web_lead_sink(monkeypatch):
     """A test must never push a website lead into the real Next Deal Lending GHL account."""
     monkeypatch.setattr("src.lending.web_lead_ghl.get_live_sink", lambda: None)

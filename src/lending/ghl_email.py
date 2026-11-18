@@ -6,6 +6,12 @@ HTTP status only. The sending address is ``LENDING_GHL_EMAIL_FROM`` (hello@nextd
 it must be a verified sender on the sub-account's email domain, so the sender stays unconfigured
 until both the address and a GHL account are set.
 
+An email to a LendingFlow lead (``email_identity.is_lendingflow_recipient``, by address or phone) goes From
+``LENDING_LENDINGFLOW_EMAIL_FROM`` (David) with ``emailBcc`` = ``LENDING_LENDINGFLOW_EMAIL_BCC`` (Josh), never CC
+(client request, Nov 17). It is refused, before any GHL call, while either setting is missing or the lead check
+cannot be read. Every other recipient keeps ``LENDING_GHL_EMAIL_FROM`` and no BCC. ``emailBcc`` (a list of addresses)
+follows the public GHL v2 API reference and is NOT yet confirmed against a live round trip.
+
 The message shape (conversations/messages, type Email, html + subject + emailFrom) follows the
 public GHL v2 API reference and is NOT yet confirmed against a live round trip. Run
 ``--send-test`` once with real credentials before enabling ``BOOKING_REMINDER_EMAIL_ENABLED``.
@@ -22,6 +28,7 @@ from datetime import datetime, timezone
 from typing import Optional
 
 from config.settings import get_settings
+from src.lending import email_identity
 from src.lending.cold_leads import SendChannel
 from src.lending.ghl_sms import GhlAccount, GhlSmsError, GhlSmsSender, Request, lending_ghl_account
 
@@ -49,6 +56,7 @@ class GhlEmailSender(GhlSmsSender):
         """Upsert the contact by email (and phone when known, so it stays one GHL contact), then send.
         Past ``deadline`` (UTC) nothing is sent and a non-ambiguous GhlSmsError is raised."""
         decision = self._cold_lead_check(phone, SendChannel.EMAIL, email=to)
+        email_from, bcc = self._sender_for(to, phone)
         contact: dict = {"locationId": self._account.location_id, "email": to}
         if phone:
             contact["phone"] = phone
@@ -62,14 +70,34 @@ class GhlEmailSender(GhlSmsSender):
             self._lift_cold_dnd(contact_id, identity, decision.lift_dnd)
         if deadline is not None and datetime.now(timezone.utc) > deadline:
             raise GhlSmsError("deadline passed before send")
-        sent = self._post(self._http(), "/conversations/messages",
-                          {"type": "Email", "contactId": contact_id, "subject": subject, "html": _as_html(body),
-                           "emailFrom": self._from},
-                          "email send", version="2021-04-15", is_send=True)
+        message: dict = {"type": "Email", "contactId": contact_id, "subject": subject, "html": _as_html(body),
+                         "emailFrom": email_from}
+        if bcc:
+            message["emailBcc"] = bcc
+        sent = self._post(self._http(), "/conversations/messages", message, "email send", version="2021-04-15",
+                          is_send=True)
         message_id = sent.get("messageId") or sent.get("emailMessageId") or sent.get("id")
         if not message_id:
             raise GhlSmsError("GHL email send returned no message id", ambiguous=True)
         return str(message_id)
+
+    def _sender_for(self, to: str, phone: str | None) -> tuple[str, list[str]]:
+        """``(from, bcc)``: David with Josh in BCC for a LendingFlow lead, else the usual sender and no BCC. Raises a
+        non-ambiguous GhlSmsError (nothing sent) when the lead check is unreadable or the LendingFlow sender is not
+        configured."""
+        try:
+            lendingflow = email_identity.is_lendingflow_recipient(to, phone)
+        except Exception as exc:  # class only: SQL errors embed bound parameters
+            logger.error("%s LendingFlow lead check unreadable (%s); send refused", self._log_prefix,
+                         type(exc).__name__)
+            raise GhlSmsError("LendingFlow lead check unavailable; nothing sent") from None
+        if not lendingflow:
+            return self._from, []
+        identity = email_identity.lending_email_identity()
+        if identity is None:
+            logger.error("%s email to a LendingFlow lead refused: LendingFlow sender not configured", self._log_prefix)
+            raise GhlSmsError("LendingFlow sender (LENDING_LENDINGFLOW_EMAIL_FROM / _BCC) not configured; nothing sent")
+        return identity.from_address, list(identity.bcc)
 
 
 def get_email_sender() -> Optional[GhlEmailSender]:
@@ -77,6 +105,7 @@ def get_email_sender() -> Optional[GhlEmailSender]:
     account, address = lending_ghl_account(), email_from_address()
     if account is None or not address:
         return None
+    email_identity.lending_email_identity()  # reports a missing LendingFlow sender (log + Sentry) when a service starts
     return GhlEmailSender(account, address)
 
 
