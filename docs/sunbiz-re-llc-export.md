@@ -1,7 +1,7 @@
 # Florida real estate LLC daily export
 
-Every morning a CSV of the **Florida LLCs registered the day before** whose name contains **REI, Homes, Investments or
-Capital** lands in Google Drive, for the agents' outreach.
+Every morning a CSV of the **active Florida LLCs filed in the last 30 days** (taken from the state's daily filings
+file) whose name contains **REI, Homes, Investments or Capital** lands in Google Drive, for the agents' outreach.
 
 ## How it works
 

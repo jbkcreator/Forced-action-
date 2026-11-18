@@ -480,7 +480,7 @@ COUNTY_ID=hillsborough
 # Logs status distribution, enriched count, multi-property LLC group gauge.
 50 7 * * 1-6 $PROJECT/scripts/cron/run.sh src.tasks.sunbiz_anomaly_check
 
-# Florida real estate LLC export (Cora brief, Sunbiz feed) — 11:00 UTC daily (6 AM EST / 7 AM EDT): yesterday's (ET)
+# Florida real estate LLC export (Sunbiz feed) — 11:00 UTC daily (6 AM EST / 7 AM EDT): yesterday's (ET)
 # state filings file (posted ~11:30 PM ET) -> active Florida LLCs filed in the last 30 days named REI / Homes /
 # Investments / Capital -> Drive LENDING_SUNBIZ_LLC_EXPORT_FOLDER_ID/{date}/; also exports the 3 earlier days still
 # missing from Drive (a file posted late). run.sh retries a failure; the 13:30 UTC --retry run shares the flock (waits
