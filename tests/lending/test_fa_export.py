@@ -121,6 +121,45 @@ def test_contact_gates_blank_suppressed_and_georgia_people_in_the_file_and_keep_
     assert status["P6"] == ("no_phone", "", "")
 
 
+def test_an_opted_out_email_is_left_out_of_the_file_and_the_push_while_the_phone_is_kept():
+    pushed = []
+    rows = [
+        _row(email="optout@y.co"),
+        _row(radar_id="P2", phone="+18135550111", email="Keep@Y.co"),
+        _row(radar_id="P3", phone="+18135550144", email="optout@y.co"),
+    ]
+    fx.apply_contact_gates(rows, {"+18135550144": fx.GATE_WARM}, {"optout@y.co"})
+    status = {r["radar_id"]: (r["contact_status"], r["phone"], r["email"]) for r in rows}
+    assert status["P1"] == ("ok", "+18135550100", "")
+    assert status["P2"] == ("ok", "+18135550111", "Keep@Y.co")
+    assert status["P3"] == ("warm", "+18135550144", "")
+    fx.push_to_ghl(rows, lambda contact, tags: pushed.append(contact), _never_halted)
+    assert [(c["phone"], c["email"]) for c in pushed] == [("+18135550100", None), ("+18135550111", "Keep@Y.co")]
+
+
+def test_blocked_emails_asks_once_per_chunk_in_lower_case_and_returns_the_matches():
+    class _Session:
+        def __init__(self):
+            self.asked = []
+
+        def execute(self, statement, params):
+            self.asked.append(params["emails"])
+            outer = self
+
+            class _Result:
+                def scalars(self):
+                    return [e for e in outer.asked[-1] if e.startswith("optout")]
+
+            return _Result()
+
+    session = _Session()
+    rows = [_row(email="OptOut@y.co"), _row(radar_id="P2", email="keep@y.co"), _row(radar_id="P3", email=None),
+            _row(radar_id="P4", email="optout@y.co")]
+    assert fx.blocked_emails(session, rows) == {"optout@y.co"}
+    assert session.asked == [["keep@y.co", "optout@y.co"]]
+    assert fx.blocked_emails(session, [_row(email=None)]) == set() and len(session.asked) == 1
+
+
 def test_ghl_push_sends_only_gated_rows_once_per_phone_with_every_signal():
     pushed = []
     rows = _gated([
@@ -169,6 +208,7 @@ def test_run_uploads_one_file_and_reports_counts(monkeypatch):
     rows = [_row(), _row(radar_id="P2", signals="cash_purchase", phone="")]
     monkeypatch.setattr(fx, "collect", lambda session, day, backfill=False: rows)
     monkeypatch.setattr(fx, "contact_gates", lambda session, rows: {})
+    monkeypatch.setattr(fx, "blocked_emails", lambda session, rows: set())
     uploads = []
     summary = task.run(None, day=DAY, folder_id="F", upload=lambda *a: uploads.append(a), push=None)
     assert [(u[0], u[1]) for u in uploads] == [("F", "fa_export_2026-11-18.csv")]

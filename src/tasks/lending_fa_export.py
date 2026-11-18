@@ -34,7 +34,7 @@ def run(session, *, day: date, folder_id: str, upload: Optional[Upload], push: O
         backfill: bool = False) -> dict:
     """Build the day's rows; upload the CSV when ``upload`` is given, push contacts when ``push`` is."""
     rows = fx.collect(session, day, backfill=backfill)
-    fx.apply_contact_gates(rows, fx.contact_gates(session, rows))
+    fx.apply_contact_gates(rows, fx.contact_gates(session, rows), fx.blocked_emails(session, rows))
     by_signal = Counter(s for row in rows for s in row["signals"].split(fx.SIGNAL_SEPARATOR))
     summary: dict = {"day": day.isoformat(), "rows": len(rows), "with_phone": sum(1 for r in rows if r["phone"]),
                      **by_signal, "by_state": dict(Counter(str(row["state"]) for row in rows))}

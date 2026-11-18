@@ -15,11 +15,12 @@ it crosses it. A re-run of a day therefore builds the same file. The backfill is
 as of a day, for the one-time starter file.
 
 Contact gates (``contact_gates``): a suppressed or do-not-contact number, and a Georgia owner who is a natural
-person, has its phone and email left out of the file (``contact_status`` says why). GHL gets the same cold-lead
+person, has its phone and email left out of the file (``contact_status`` says why); an opted-out, suppressed or
+do-not-contact email (``blocked_emails``) is left out of the file and the GHL push on its own. GHL gets the same cold-lead
 checks as src.lending.ghl_load_sync: warm numbers (website / LendingFlow leads) and numbers already pushed by the
 dialer load sync are never pushed, and nothing is pushed while the emergency halt is set.
 
-Pure functions take no database; ``collect`` and ``contact_gates`` do the reads.
+Pure functions take no database; ``collect``, ``contact_gates`` and ``blocked_emails`` do the reads.
 """
 from __future__ import annotations
 
@@ -233,14 +234,19 @@ def _is_ga_natural_person(row: Mapping[str, Any]) -> bool:
     return str(row.get("state") or "").upper() == "GA" and entity not in GA_CONTACT_ENTITY_TYPES
 
 
-def apply_contact_gates(rows: list[dict[str, Any]], gates: Mapping[str, str]) -> None:
-    """Leave out the phone and email of a suppressed number or a Georgia natural person; say why."""
+def apply_contact_gates(rows: list[dict[str, Any]], gates: Mapping[str, str],
+                        blocked_emails: frozenset[str] | set[str] = frozenset()) -> None:
+    """Leave out the phone and email of a suppressed number or a Georgia natural person; say why. An opted-out
+    email is left out on its own: the phone, if it passes its gates, is still used."""
     for row in rows:
         reason = GATE_GA_NATURAL_PERSON if _is_ga_natural_person(row) else gates.get(row["phone"])
         if reason in BLANKED_GATES:
             row.update(phone="", email="", contact_status=reason)
-        elif reason:
+            continue
+        if reason:
             row["contact_status"] = reason
+        if row.get("email") and row["email"].lower() in blocked_emails:
+            row["email"] = ""
 
 
 def contacts_by_phone(rows: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
@@ -464,3 +470,23 @@ def contact_gates(session: Session, rows: list[dict[str, Any]]) -> dict[str, str
             elif r["already_in_ghl"]:
                 gates[r["phone"]] = GATE_ALREADY_IN_GHL
     return gates
+
+
+# The same email checks as the cold-lead rule in src.lending.cold_leads: an email opt-out, a suppressed email,
+# or a do-not-contact lending contact.
+_BLOCKED_EMAILS_SQL = """
+    SELECT e.email
+      FROM unnest(CAST(:emails AS text[])) AS e(email)
+     WHERE EXISTS (SELECT 1 FROM email_opt_outs o WHERE lower(o.email) = e.email)
+        OR EXISTS (SELECT 1 FROM lending.suppression_list s WHERE lower(s.email) = e.email)
+        OR EXISTS (SELECT 1 FROM lending.contacts c WHERE lower(c.email) = e.email AND c.do_not_contact)
+"""
+
+
+def blocked_emails(session: Session, rows: list[dict[str, Any]]) -> set[str]:
+    """The rows' emails (lower case) that must not be used: opted out, suppressed or do-not-contact."""
+    emails = sorted({str(r["email"]).lower() for r in rows if r.get("email")})
+    blocked: set[str] = set()
+    for chunk in _chunks(emails):
+        blocked.update(session.execute(text(_BLOCKED_EMAILS_SQL), {"emails": chunk}).scalars())
+    return blocked
