@@ -93,9 +93,14 @@ class LendingFlowGhlSink:
 
     def _upsert_contact(self, lead: Mapping[str, Any]) -> str:
         body: dict[str, Any] = {"locationId": self._account.location_id, "phone": lead["phone"]}
-        intro_name_field = get_settings().lending_ghl_cf_intro_name
-        if intro_name_field:  # set before the ready tag is added, so the workflow never reads an empty greeting
-            body["customFields"] = [{"id": intro_name_field, "value": _intro_name(lead)}]
+        settings = get_settings()
+        custom_fields: list[dict[str, str]] = []
+        if settings.lending_ghl_cf_intro_name:  # set before the ready tag is added, so the workflow never reads an empty greeting
+            custom_fields.append({"id": settings.lending_ghl_cf_intro_name, "value": _intro_name(lead)})
+        if settings.lending_ghl_cf_lead_id:  # our lead_uuid; LendingFlow's own id has its own field (not filled yet)
+            custom_fields.append({"id": settings.lending_ghl_cf_lead_id, "value": str(lead["lead_uuid"])})
+        if custom_fields:
+            body["customFields"] = custom_fields
         if lead.get("first_name"):
             body["firstName"] = lead["first_name"]
         if lead.get("last_name"):

@@ -980,6 +980,8 @@ class AppSettings(BaseSettings):
 	# Carrier (10DLC) approval for lending texts Cora sends after Approve; until true an approved text waits (then blocks at expiry)
 	lending_sms_carrier_approved: bool = Field(default=False, env="LENDING_SMS_CARRIER_APPROVED")
 	lending_ghl_cf_intro_name: Optional[str] = Field(default=None, env="LENDING_GHL_CF_INTRO_NAME")
+	# GHL contact custom field "lead_id": every LendingFlow push writes our lendingflow_leads.lead_uuid; unset = not written
+	lending_ghl_cf_lead_id: Optional[str] = Field(default=None, env="LENDING_GHL_CF_LEAD_ID")
 	# T-12 background enrichment card + routing. Off: no card is built, the deal-facts webhook returns 503.
 	lending_enrichment_enabled: bool = Field(default=False, env="LENDING_ENRICHMENT_ENABLED")
 	# Street View Static API (metadata lookup only; the key is never put in a posted link). Unset = no Street View.

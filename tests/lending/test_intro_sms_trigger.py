@@ -438,3 +438,18 @@ def test_an_overnight_lead_is_still_released_when_its_window_opens(lf_db, ghl_ca
     assert _tagged_at(lf_db, lead_id) is None
     assert release_held_intro_sms(lf_db, LendingFlowGhlSink(GhlAccount("k", "loc")), now=opens) == 1
     assert _tagged_at(lf_db, lead_id) == opens
+
+
+# ------------------------------------------------------------------ the lead_id custom field: our lead_uuid (no database)
+
+def test_upsert_sets_the_lead_id_field_to_our_lead_uuid(ghl_calls, monkeypatch):
+    monkeypatch.setattr(get_settings(), "lending_ghl_cf_lead_id", "cf-lead-id")
+    LendingFlowGhlSink(GhlAccount("k", "loc")).push({**_lead("present"), "first_name": "Maria"})
+    assert {"id": "cf-lead-id", "value": "u-1"} in _upsert_body(ghl_calls)["customFields"]
+
+
+def test_upsert_sends_no_lead_id_field_when_it_is_not_configured(ghl_calls, monkeypatch):
+    monkeypatch.setattr(get_settings(), "lending_ghl_cf_lead_id", None)
+    LendingFlowGhlSink(GhlAccount("k", "loc")).push(_lead("present"))
+    fields = _upsert_body(ghl_calls).get("customFields", [])
+    assert all(f["value"] != "u-1" for f in fields)
