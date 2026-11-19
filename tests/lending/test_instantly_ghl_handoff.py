@@ -18,15 +18,37 @@ ACCOUNT = GhlAccount(api_key="k", location_id="loc-1")
 
 
 class RecordingHandoff(ho.InstantlyGhlHandoff):
-    def __init__(self, cards: list[dict[str, Any]] | None = None) -> None:
+    """A small fake GHL: contacts by id, a search that matches the query against email and phone, an upsert that
+    creates a contact, and a card list. Every call is recorded."""
+
+    def __init__(self, contacts: list[dict[str, Any]] | None = None, cards: list[dict[str, Any]] | None = None) -> None:
         super().__init__(ACCOUNT)
         self.calls: list[tuple[str, str, str, dict[str, Any]]] = []
+        self.contacts = {c["id"]: dict(c) for c in (contacts or [])}
         self._cards = cards or []
 
     def _call(self, step: str, method: str, path: str, **kwargs: Any) -> dict[str, Any]:
         self.calls.append((step, method, path, kwargs))
+        body = kwargs.get("json", {})
+        if step == "contact search":
+            query = body["query"].lower()
+            digits = "".join(ch for ch in query if ch.isdigit())
+            return {"contacts": [c for c in self.contacts.values()
+                                 if query == (c.get("email") or "").lower()
+                                 or (digits and digits in "".join(ch for ch in (c.get("phone") or "") if ch.isdigit()))]}
         if step == "contact upsert":
-            return {"contact": {"id": "c-1"}, "new": True}
+            self.contacts["c-new"] = {"id": "c-new", "email": body["email"], "tags": []}
+            return {"contact": {"id": "c-new"}, "new": True}
+        if step == "contact read":
+            return {"contact": self.contacts[path.rsplit("/", 1)[1]]}
+        if step == "contact phone":
+            self.contacts[path.rsplit("/", 1)[1]]["phone"] = body["phone"]
+        if step == "remove cold tag":
+            cid = path.split("/")[2]
+            self.contacts[cid]["tags"] = [t for t in self.contacts[cid].get("tags", []) if t not in body["tags"]]
+        if step == "add tags":
+            cid = path.split("/")[2]
+            self.contacts[cid]["tags"] = [*self.contacts[cid].get("tags", []), *body["tags"]]
         if step == "opportunity search":
             return {"opportunities": self._cards}
         return {}
@@ -37,36 +59,50 @@ class RecordingHandoff(ho.InstantlyGhlHandoff):
     def body(self, step: str) -> dict[str, Any]:
         return next(c[3].get("json", {}) for c in self.calls if c[0] == step)
 
+    def writes(self) -> list[tuple[str, str]]:
+        return [(c[1], c[2]) for c in self.calls if c[1] != "GET" and c[0] not in {"contact search"}]
+
+
+COLD_CONTACT = {"id": "c-cold", "email": "mark.lee@example.com", "phone": "+18135550100", "tags": ["ndl-cold", "ndl-src-x"],
+                "dndSettings": {"Email": {"status": "active", "message": "Cold lead: calls only"},
+                                "SMS": {"status": "active"}}}
+WARM_CONTACT = {"id": "c-warm", "email": "mark.lee@example.com", "tags": ["ndl-cold"]}
+
 
 @pytest.fixture
 def pipeline(monkeypatch):
     settings = SimpleNamespace(lending_ghl_pipeline_id="pipe-1", lending_ghl_stage_new_lead="stage-1",
                                lending_instantly_ghl_handoff_enabled=True)
     monkeypatch.setattr(ho, "get_settings", lambda: settings)
+    monkeypatch.setattr(ho, "is_globally_halted", lambda: False)
     return settings
 
 
-def test_a_deal_reply_creates_contact_card_tag_swap_and_note(pipeline):
+def test_a_deal_reply_from_a_new_address_creates_the_contact_card_and_note(pipeline):
     handoff = RecordingHandoff()
-    assert handoff(row()) == "c-1"
-    assert handoff.steps() == ["contact upsert", "add tags", "remove cold tag", "opportunity search",
+    assert handoff(row()) == "c-new"
+    assert handoff.steps() == ["contact search", "contact upsert", "contact read", "add tags", "opportunity search",
                                "opportunity create", "note"]
-    upsert = handoff.body("contact upsert")
-    assert upsert == {"locationId": "loc-1", "email": "mark.lee@example.com", "firstName": "Mark"}
+    assert handoff.body("contact upsert") == {"locationId": "loc-1", "email": "mark.lee@example.com", "firstName": "Mark"}
     assert handoff.body("add tags") == {"tags": [GHL_TAG_INSTANTLY_INTERESTED]}
-    assert handoff.body("remove cold tag") == {"tags": [GHL_TAG_COLD_LEAD]}
     card = handoff.body("opportunity create")
-    assert card["pipelineId"] == "pipe-1" and card["pipelineStageId"] == "stage-1" and card["contactId"] == "c-1"
+    assert card["pipelineId"] == "pipe-1" and card["pipelineStageId"] == "stage-1" and card["contactId"] == "c-new"
 
 
-def test_the_upsert_never_carries_dnd_tags_source_or_phone(pipeline):
+def test_the_upsert_never_carries_dnd_tags_source_or_phone_even_when_the_lead_gave_a_phone(pipeline):
     handoff = RecordingHandoff()
-    handoff(row())
+    handoff(row(reply_text="Interested, call me on 813-555-0142"))
     assert not {"dnd", "dndSettings", "tags", "source", "phone"} & set(handoff.body("contact upsert"))
 
 
+def test_an_existing_contact_is_found_by_email_not_upserted(pipeline):
+    handoff = RecordingHandoff(contacts=[WARM_CONTACT])
+    assert handoff(row()) == "c-warm"
+    assert "contact upsert" not in handoff.steps()
+
+
 def test_an_existing_card_is_never_moved_or_duplicated(pipeline):
-    handoff = RecordingHandoff(cards=[{"id": "opp-1", "pipelineStageId": "booked"}])
+    handoff = RecordingHandoff(contacts=[WARM_CONTACT], cards=[{"id": "opp-1", "pipelineStageId": "booked"}])
     handoff(row())
     assert "opportunity create" not in handoff.steps()
     assert not any(c[1] == "PUT" for c in handoff.calls)
@@ -78,6 +114,116 @@ def test_without_a_pipeline_the_lead_is_contact_only(pipeline):
     handoff(row())
     assert "opportunity search" not in handoff.steps() and "opportunity create" not in handoff.steps()
     assert "add tags" in handoff.steps()
+
+
+# ── review finding 1: a cold contact keeps its Instantly route while its email do-not-disturb is on ─────────
+
+def test_a_cold_contact_with_email_do_not_disturb_keeps_ndl_cold_and_its_do_not_disturb(pipeline):
+    handoff = RecordingHandoff(contacts=[COLD_CONTACT])
+    handoff(row())
+    assert "remove cold tag" not in handoff.steps()
+    assert "ndl-cold" in handoff.contacts["c-cold"]["tags"] and GHL_TAG_INSTANTLY_INTERESTED in handoff.contacts["c-cold"]["tags"]
+    assert handoff.contacts["c-cold"]["dndSettings"]["Email"]["status"] == "active"  # never lifted here
+    assert "follow-up emails stay on Instantly" in handoff.body("note")["body"]
+
+
+def test_a_follow_up_agent_email_to_that_contact_still_takes_the_instantly_route_not_a_blocked_ghl_one(pipeline):
+    from src.lending.agent_jobs.checks import rail_for
+    from src.lending.ghl_crm import _contact_from
+
+    handoff = RecordingHandoff(contacts=[COLD_CONTACT])
+    handoff(row())
+    after = _contact_from(handoff.contacts["c-cold"])
+    assert rail_for(SimpleNamespace(type="send_email"), after) == "instantly"
+
+
+def test_a_contact_with_open_email_loses_ndl_cold_so_later_emails_go_through_ghl(pipeline):
+    handoff = RecordingHandoff(contacts=[WARM_CONTACT])
+    handoff(row())
+    assert handoff.body("remove cold tag") == {"tags": [GHL_TAG_COLD_LEAD]}
+
+
+def test_a_contact_without_ndl_cold_has_nothing_removed(pipeline):
+    handoff = RecordingHandoff(contacts=[{"id": "c-x", "email": "mark.lee@example.com", "tags": []}])
+    handoff(row())
+    assert "remove cold tag" not in handoff.steps()
+
+
+# ── review finding 2: the contact is chosen by email; a phone can never select another contact ─────────────
+
+OTHER = {"id": "c-office", "email": "front.desk@example.com", "phone": "+18135550142", "tags": ["ndl-cold"]}
+LEAD_CONTACT = {"id": "c-lead", "email": "mark.lee@example.com", "tags": []}
+
+
+def test_a_phone_owned_by_another_contact_never_redirects_the_handoff(pipeline):
+    handoff = RecordingHandoff(contacts=[LEAD_CONTACT, OTHER])
+    assert handoff(row(reply_text="Interested, our office line is 813-555-0142")) == "c-lead"
+    assert all("/c-office" not in path for _, path in handoff.writes())  # the other contact is untouched
+    assert handoff.contacts["c-office"]["tags"] == ["ndl-cold"]
+    assert "phone" not in handoff.contacts["c-lead"]  # not attached to the lead either
+    assert "already on another GHL contact" in handoff.body("note")["body"]
+    assert handoff.body("opportunity create")["contactId"] == "c-lead"
+
+
+def test_a_free_phone_is_attached_to_the_contact_found_by_email(pipeline):
+    handoff = RecordingHandoff(contacts=[LEAD_CONTACT])
+    handoff(row(reply_text="Interested, call 813-555-0142"))
+    assert handoff.contacts["c-lead"]["phone"] == "+18135550142"
+    assert handoff.body("contact phone") == {"phone": "+18135550142"}
+
+
+def test_a_contact_that_already_has_a_different_phone_is_left_alone(pipeline):
+    handoff = RecordingHandoff(contacts=[{**LEAD_CONTACT, "phone": "+18135550199"}])
+    handoff(row(reply_text="Interested, call 813-555-0142"))
+    assert "contact phone" not in handoff.steps()
+    assert "different phone number" in handoff.body("note")["body"]
+
+
+def test_the_same_phone_already_on_the_contact_changes_nothing(pipeline):
+    handoff = RecordingHandoff(contacts=[{**LEAD_CONTACT, "phone": "+18135550142"}])
+    handoff(row(reply_text="Interested, call 813-555-0142"))
+    assert "contact phone" not in handoff.steps()
+
+
+def test_a_number_in_the_quoted_earlier_email_is_not_taken(pipeline):
+    handoff = RecordingHandoff(contacts=[LEAD_CONTACT])
+    handoff(row(reply_text="Interested\n\nOn Mon, Josh wrote:\n> Call us at (656) 221-1100"))
+    assert "contact phone" not in handoff.steps()
+
+
+def test_two_contacts_sharing_the_email_use_the_lowest_id_every_time_and_say_so(pipeline):
+    twin = {**LEAD_CONTACT, "id": "c-zzz"}
+    first = RecordingHandoff(contacts=[twin, LEAD_CONTACT])
+    second = RecordingHandoff(contacts=[LEAD_CONTACT, twin])
+    assert first(row()) == second(row()) == "c-lead"
+    assert "share this email" in first.body("note")["body"]
+
+
+def test_a_failing_phone_write_does_not_stop_the_tag_card_and_note(pipeline):
+    class RejectsPhone(RecordingHandoff):
+        def _call(self, step, method, path, **kwargs):
+            if step == "contact phone":
+                raise DeliveryError("contact phone: HTTP 400")
+            return super()._call(step, method, path, **kwargs)
+
+    handoff = RejectsPhone(contacts=[LEAD_CONTACT])
+    assert handoff(row(reply_text="Interested, call 813-555-0142")) == "c-lead"
+    assert {"add tags", "opportunity create", "note"} <= set(handoff.steps())
+    assert "could not be added" in handoff.body("note")["body"]
+
+
+def test_a_contact_with_global_do_not_disturb_keeps_ndl_cold(pipeline):
+    handoff = RecordingHandoff(contacts=[{**WARM_CONTACT, "dnd": True}])
+    handoff(row())
+    assert "remove cold tag" not in handoff.steps()
+
+
+def test_nothing_is_written_while_the_emergency_halt_is_on(pipeline, monkeypatch):
+    monkeypatch.setattr(ho, "is_globally_halted", lambda: True)
+    handoff = RecordingHandoff(contacts=[LEAD_CONTACT])
+    with pytest.raises(DeliveryError, match="halt"):
+        handoff(row())
+    assert handoff.calls == []
 
 
 def test_the_handoff_is_off_by_default(monkeypatch):
@@ -178,10 +324,10 @@ def test_a_partial_handoff_stops_at_the_failing_step(pipeline):
                 raise DeliveryError("remove cold tag: HTTP 500")
             return super()._call(step, method, path, **kwargs)
 
-    handoff = Failing()
+    handoff = Failing(contacts=[WARM_CONTACT])
     with pytest.raises(DeliveryError):
         handoff(row())
-    assert handoff.steps() == ["contact upsert", "add tags"]
+    assert handoff.steps() == ["contact search", "contact read", "add tags"]
 
 
 def test_the_optout_read_covers_the_suppression_list_too():
@@ -191,19 +337,7 @@ def test_the_optout_read_covers_the_suppression_list_too():
     assert "email_opt_outs" in sql
 
 
-# ── the recommended flow, point by point ────────────────────────────────────
-
-def test_a_phone_number_in_the_reply_goes_on_the_contact_so_the_conversation_can_move_to_ghl(pipeline):
-    handoff = RecordingHandoff()
-    handoff(row(reply_text="Yes, call me at (813) 555-0142 tomorrow"))
-    assert handoff.body("contact upsert")["phone"] == "+18135550142"
-
-
-def test_a_number_in_the_quoted_earlier_email_is_not_taken(pipeline):
-    handoff = RecordingHandoff()
-    handoff(row(reply_text="Interested\n\nOn Mon, Josh wrote:\n> Call us at (656) 221-1100"))
-    assert "phone" not in handoff.body("contact upsert")
-
+# ── the first answer ────────────────────────────────────────────────────────
 
 def test_the_first_answer_is_still_a_draft_in_the_same_instantly_thread():
     session, drafts = Session([row()]), []
@@ -213,12 +347,3 @@ def test_the_first_answer_is_still_a_draft_in_the_same_instantly_thread():
     proc.run()
     assert drafts[0]["channel"] == "instantly_email" and drafts[0]["payload"]["reply_to_uuid"] == "em-1"
     assert drafts[0]["payload"]["from_inbox"] == "josh@ndl-mail.com"
-
-
-def test_the_whole_recommendation_in_one_pass(pipeline):
-    handoff = RecordingHandoff()
-    handoff(row(reply_text="Interested, my number is 813-555-0142"))
-    assert handoff.body("add tags") == {"tags": ["ndl-instantly-interested"]}
-    assert handoff.body("remove cold tag") == {"tags": ["ndl-cold"]}
-    assert handoff.body("opportunity create")["pipelineStageId"] == "stage-1"
-    assert handoff.body("contact upsert")["email"] == "mark.lee@example.com"

@@ -88,15 +88,20 @@ field names (never values), and check the first approved answer lands in the thr
 Cold emails and the first answer stay in Instantly. When the model reads a reply as **Deal** (and only then), Cora's sweep
 hands the lead to the Next Deal Lending GHL account (`src/lending/instantly_ghl_handoff.py`):
 
-- the GHL contact is upserted by email (never duplicated; the upsert carries no do-not-disturb, tags, source or phone, so
-  nothing an earlier STOP or the dialer set is overwritten);
-- the tag `ndl-instantly-interested` is added and `ndl-cold` removed, so the agents' later emails to this contact go through
-  GHL instead of Instantly (the first answer is a Cora draft sent inside the Instantly thread, so it is not affected);
+- the GHL contact is **found by email** (a contact search, exact match) and used as it is; only when there is none is it created,
+  from the email alone (no do-not-disturb, tags, source or phone in the create, so nothing an earlier STOP or the dialer set is
+  overwritten);
+- the tag `ndl-instantly-interested` is added. `ndl-cold` is removed (so the agents' later emails to this contact go through GHL)
+  **only when GHL email is open for the contact**. A cold-imported contact carries Email do-not-disturb, which the GHL email rail
+  refuses (`blocked_consent`), so it **keeps `ndl-cold` and its Instantly route** for follow-up emails; its do-not-disturb is never lifted
+  here, and a note on the contact says so. The first answer is a Cora draft sent inside the Instantly thread, so it is not affected;
 - a pipeline card is created at the new-lead stage (`LENDING_GHL_PIPELINE_ID`, `LENDING_GHL_STAGE_NEW_LEAD`) when the contact
   has none; a card already in any stage is never moved. Without those two settings the lead is contact-only;
 - a note says the contact came from an Instantly reply;
-- if the lead gives a phone number in the reply (their own words, not the quoted email), it is put on the contact so the conversation
-  can move to calls in GHL. That number is not consent to text.
+- if the lead gives a phone number in the reply (their own words, not the quoted email), it is put on the contact, but only when no
+  other GHL contact owns that number and this contact has no phone of its own; otherwise it is left off and the note says why (a
+  shared office line can never redirect the hand-over to another contact). That number is not consent to text;
+- nothing is written while the lending emergency halt is on.
 
 An address that opted out is never handed over. Do-not-disturb is never lifted: texts still need consent. A failed hand-over
 never blocks the triage or the answer; it raises a `instantly_ghl_handoff_failed` item in Cora's inbox (no address in it) so
@@ -109,11 +114,13 @@ Limits to know before switching it on (read at Cora's start-up: restart `fa-lend
   contact is created. Check the first few hand-overs.
 - A failure part-way (for example the tag step) leaves a **partly built** contact. The reply is not retried; the inbox item names the
   step that failed, and the team finishes the contact, tag and card by hand.
-- Removing `ndl-cold` moves the agents' later emails to this contact from Instantly to GHL (the rail follows the tag). The cold-push
-  do-not-disturb stays on the contact until consent is recorded, and the GHL rail does not add the cold-email footer. Confirm this is
-  what Josh wants (open question P1.3 #1) before switching it on.
-- An address in `lending.suppression_list` or `email_opt_outs` is never handed over.
-- The hand-over runs inside Cora's sweep and makes about six GHL calls; a GHL outage can slow that sweep by up to a few minutes.
+- Moving a cold-imported contact fully to GHL email (removing `ndl-cold` and lifting its Email do-not-disturb) is **not done here**: it
+  needs Josh's decision on the client rule that a cold lead gets no GHL email. Until then those contacts keep getting follow-up emails
+  through Instantly. A contact whose GHL email is open does move to the GHL rail (the rail follows the tag, and the GHL rail does not add
+  the cold-email footer).
+- An address in `lending.suppression_list` or `email_opt_outs` is never handed over. A phone number the lead types in the reply is not checked against the
+  suppression lists before it is put on the contact (the call gate tags suppressed numbers afterwards); several contacts sharing one email use the lowest id.
+- The hand-over runs inside Cora's sweep and makes about eight GHL calls; a GHL outage can slow that sweep by up to a few minutes.
 
 ## Only NDL campaigns, the block list and the unsubscribe link
 
