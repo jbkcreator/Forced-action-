@@ -686,7 +686,11 @@ def test_the_claim_and_the_starting_mark_are_written_before_any_cascade_tag(gate
     assert order.index("claim committed") < order.index(("starting committed", 9, NOW)) < first_cascade_tag
 
 
-def test_a_failed_starting_mark_sends_no_cascade_tag(gates):
+def test_a_failed_starting_mark_sends_no_cascade_tag(gates, monkeypatch):
+    # start_safely reads the wall clock: outside business hours the lead is queued and never reaches mark_starting, so
+    # without a fixed clock this test failed whenever CI ran at night (09:25 UTC).
+    monkeypatch.setattr(speed_to_lead, "_utcnow", lambda: NOW)
+
     class Broken(RecordingClaims):
         def mark_starting(self, row_id, at):
             raise RuntimeError("db down")
