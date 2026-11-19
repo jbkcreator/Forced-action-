@@ -486,3 +486,23 @@ def test_rejected_job_receipt_says_no_approval(h: Harness) -> None:
     h.worker.run_once()
     assert h.folders.results[JOB_ID]["status"] == "rejected"
     assert h.folders.results[JOB_ID]["approval"] is None
+
+
+def test_a_graduated_job_with_unapproved_wording_gets_a_card(h: Harness) -> None:
+    h.graduated.add("LF-D2-SMS-v1")
+    seen = []
+    h.worker._wording_ok = lambda *args: seen.append(args) or False
+    h.drop(requires_approval=False)
+    h.worker.run_once()
+    action = h.queue.get(h.row()["action_id"])
+    assert action.status is ActionStatus.PENDING and action.card_ts is not None
+    assert seen[0][0] == "LF-D2-SMS-v1" and seen[0][1] == "ghl_sms" and "Mark" in seen[0][3]
+
+
+def test_a_graduated_job_with_approved_wording_still_sends_automatically(h: Harness) -> None:
+    h.graduated.add("LF-D2-SMS-v1")
+    h.worker._wording_ok = lambda *args: True
+    h.drop(requires_approval=False)
+    h.worker.run_once()
+    action = h.queue.get(h.row()["action_id"])
+    assert (action.status, action.decided_by) == (ActionStatus.APPROVED, "auto:graduated") and action.card_ts is None

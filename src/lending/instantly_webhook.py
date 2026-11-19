@@ -45,6 +45,28 @@ def _verify_secret(provided: Optional[str]) -> None:
         raise HTTPException(status_code=403, detail="Invalid webhook secret")
 
 
+def _ndl_campaign_ids() -> frozenset[str]:
+    """The NDL campaign ids whose events Cora handles; empty = not configured (no filtering)."""
+    settings = get_settings()
+    ids = {settings.lending_instantly_campaign_id.strip(),
+           *(c.strip() for c in settings.lending_instantly_extra_campaign_ids.split(","))}
+    return frozenset(i for i in ids if i)
+
+
+def _is_ndl_event(campaign_id: Optional[str]) -> bool:
+    """False for an event from a campaign that is not NDL's: the workspace is shared with other campaigns, and their
+    replies and unsubscribes are not Cora's. An event that names no campaign cannot be told apart and is accepted
+    (a STOP must never be dropped); the delivery's field names are logged by ``log_shape`` to confirm they are sent."""
+    allowed = _ndl_campaign_ids()
+    if not allowed:
+        logger.warning("[instantly-webhook] no NDL campaign id is configured (LENDING_INSTANTLY_CAMPAIGN_ID): "
+                       "events from every campaign in the workspace reach Cora")
+        return True
+    if not campaign_id:
+        return True
+    return campaign_id.strip().casefold() in {a.casefold() for a in allowed}
+
+
 def _suppress_now(db: Session, reply_id: int, email: str, *, via_unsubscribe_link: bool) -> None:
     """Record the opt-out, then announce it and block the address in Instantly. Never raises: a failure is left
     for Cora's sweep to retry."""
@@ -74,6 +96,10 @@ def instantly_event(
     log_shape("instantly", body)
     event = parse_event(body)
     if event is None:
+        return {"status": "ignored"}
+    if not _is_ndl_event(event.campaign_id):
+        logger.warning("[instantly-webhook] %s from campaign %s ignored: not an NDL campaign", event.event_type,
+                       (event.campaign_id or "")[:64])
         return {"status": "ignored"}
     try:
         recorded = record_event(db, event)

@@ -1051,6 +1051,12 @@ class AppSettings(BaseSettings):
 	# LENDING_DRIVE_SERVICE_ACCOUNT_KEY_PATH (else the Sheets key) with the drive scope; the folder is "NDL Ledger Exports", shared with that account
 	lending_ledger_export_enabled: bool = Field(default=False, env="LENDING_LEDGER_EXPORT_ENABLED")
 	lending_ledger_export_folder_id: str = Field(default="", env="LENDING_LEDGER_EXPORT_FOLDER_ID")
+	# P1.3: a "Deal" reply to an NDL cold email creates the GHL contact + pipeline card and swaps ndl-cold for
+	# ndl-instantly-interested (src/lending/instantly_ghl_handoff.py). Off until Josh confirms (open question P1.3 #1).
+	lending_instantly_ghl_handoff_enabled: bool = Field(default=False, env="LENDING_INSTANTLY_GHL_HANDOFF_ENABLED")
+	# P1.4: when true, a rejection counts against graduation: (edited + rejected) / (approved + rejected) must be under 10%
+	# (src/lending/standing_sends.py). Off until Josh confirms (open question P1.4 #1); off = the brief's rule.
+	lending_graduation_count_rejections: bool = Field(default=False, env="LENDING_GRADUATION_COUNT_REJECTIONS")
 	# Drive service account (shared with the P1.1 job queue); blank = LENDING_SHEETS_SERVICE_ACCOUNT_KEY_PATH
 	lending_drive_service_account_key_path: str = Field(default="", env="LENDING_DRIVE_SERVICE_ACCOUNT_KEY_PATH")
 	# Opt-out mailbox listener (src/lending/email_opt_out.py): reads mail sent to LENDING_OPTOUT_ADDRESS over IMAP.
@@ -1097,6 +1103,15 @@ class AppSettings(BaseSettings):
 	# (defined above). Cold email stays off until the key, the passthrough campaign id and the footer postal address
 	# (CAN-SPAM) are all set.
 	lending_instantly_campaign_id: str = Field(default="", env="LENDING_INSTANTLY_CAMPAIGN_ID")
+	# More NDL campaign ids (comma separated) whose replies reach Cora, besides the passthrough campaign above. Events from
+	# any other campaign in the shared Instantly workspace are ignored (src/lending/instantly_webhook.py).
+	lending_instantly_extra_campaign_ids: str = Field(default="", env="LENDING_INSTANTLY_EXTRA_CAMPAIGN_IDS")
+	# Public host of NDL's cold-email unsubscribe link, e.g. https://api.nextdeallending.com (served by lending-api at
+	# /api/lending/email/unsubscribe). Unset = cold email stays off: the link must never point at the Forced Action host.
+	lending_unsubscribe_base_url: str = Field(default="", env="LENDING_UNSUBSCRIBE_BASE_URL")
+	# P1.4 (Q19): a graduated agent message sends without a card only when its wording matches wording Josh approved for that
+	# template (names and numbers filled in); anything else gets an approval card. Off until Josh confirms.
+	lending_graduated_approved_wording_only: bool = Field(default=False, env="LENDING_GRADUATED_APPROVED_WORDING_ONLY")
 	lending_instantly_sender_email: str = Field(default="", env="LENDING_INSTANTLY_SENDER_EMAIL")
 	lending_email_footer_brand: str = Field(default="Next Deal Lending", env="LENDING_EMAIL_FOOTER_BRAND")
 	lending_email_footer_postal_address: str = Field(default="", env="LENDING_EMAIL_FOOTER_POSTAL_ADDRESS")

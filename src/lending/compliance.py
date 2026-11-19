@@ -1361,6 +1361,9 @@ def _propagate(db, opt_outs: list[_OptOut], dialer_remover: Optional[DialerRemov
             ),
             {"phones": phones, "hashes": [phone_hash(p) for p in phones]},
         )
+    from src.lending.instantly_blocklist import enqueue as queue_block_list_entries
+
+    queue_block_list_entries(db, sorted({o.email for o in opt_outs if o.email}))  # Cora's sweep sends them to Instantly
     stores_at = datetime.now(timezone.utc)
 
     removed_at = _remove_from_dialer(phones, dialer_remover, RemovalReason.OPT_OUT)

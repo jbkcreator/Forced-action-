@@ -11,7 +11,7 @@ its wording. The tracker counts **each template version separately**:
 |---|---|
 | Approved | Cards of this type Josh approved (sent, or approved and then stopped by a send check) |
 | Edited | Of those, the ones he revised before approving |
-| Rejected | Cards he rejected (shown only: they neither help nor block graduation) |
+| Rejected | Cards he rejected (shown only: they neither help nor block graduation, unless `LENDING_GRADUATION_COUNT_REJECTIONS=true`, below) |
 | Sent automatically | Sent after graduation, without a card (not counted as approvals) |
 
 A new wording means a new version (`...-v2`), which starts again from 0.
@@ -59,6 +59,32 @@ re-approve them; they stay on their cards.
 ## Setup
 
 Run `PYTHONPATH=. python migrations/apply_lending_standing_sends.py` before deploying.
+
+## Rejections count against graduation (off until Josh confirms)
+
+The brief's rule ignores rejections, so a type with 25 approvals and 20 rejections could still graduate. With
+`LENDING_GRADUATION_COUNT_REJECTIONS=true` (default false; restart `fa-lending-cora` and the sweep to change it) a type graduates
+only when **(edited + rejected) / (approved + rejected) is under 10%**, still after 25 approvals. The per-channel send-time check
+uses the same rule on that channel's own cards, and the morning card shows "edited or rejected". This is the team's
+recommendation for open question P1.4 #1, not Josh's answer.
+
+Turning the switch on does not revoke a type that already graduated: only the send-time check becomes stricter. A type that graduated
+under the old rule but is over the limit once rejections count goes back to approval cards for new jobs (the tracker still shows it as
+graduated until it is revoked with `--revoke`), and an action already approved automatically but not yet sent goes back for a person's approval on the next sweep. The rate stored with a graduation (`edit_rate`) is the rate the decision used.
+
+## A graduated message sends only approved wording (off until Josh confirms)
+
+With `LENDING_GRADUATED_APPROVED_WORDING_ONLY=true` (default false; restart `fa-lending-cora` to change) a graduated agent message goes
+out without a card only when its wording matches wording Josh approved for the same template version and channel. The comparison
+ignores case and spacing and takes out what an agent fills in: the contact's names and places (the words of the job's `contact_label`)
+and every run of digits. Any other change of words, or no approved card to compare with (including cards approved before this
+change, which carry no `contact_label`), gets a normal approval card, never a block. It looks at the 200 most recent person-approved cards (approved, sending, sent or failed). Digits are ignored, so a changed amount or term does not change the match: that is the point (amounts are filled in), and the reason this stays off until Josh agrees.
+This is the team's recommendation for Q19, not Josh's answer.
+
+The wording check also runs when the message is sent, not only when its draft is created: an automatically approved message that was
+queued (for example waiting for its send window) before the switch was turned on is re-checked just before it goes out, and one whose
+wording is not approved wording is sent back for a person's approval instead of sending: the relay has claimed it, the send check returns
+it to pending with no decision, and the card retry posts a fresh approval card on the next sweep.
 
 The recovery sweep and the send-time check use the same rule: an automatically approved, still unsent action goes back for a person's
 approval (no decision, no card; the card retry posts a fresh approval card) when its template has no active graduation **or its

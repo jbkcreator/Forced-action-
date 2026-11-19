@@ -33,6 +33,7 @@ Code: `src/lending/agent_jobs/` (`job.py` parse, `checks.py` rules and rail, `dr
 | `LENDING_INSTANTLY_SENDER_EMAIL` | NDL's cold sending inbox in Instantly |
 | `LENDING_INSTANTLY_CAMPAIGN_ID` | Printed by the setup command below |
 | `LENDING_EMAIL_FOOTER_POSTAL_ADDRESS` | NDL's postal address for the CAN-SPAM footer (**required**: cold email stays off without it) |
+| `LENDING_UNSUBSCRIBE_BASE_URL` | Public host of the cold-email unsubscribe link, e.g. `https://api.nextdeallending.com` (**required**: cold email stays off without it, so the link never points at the Forced Action host) |
 | `LENDING_EMAIL_FOOTER_BRAND` / `_PHONE` | Default "Next Deal Lending" / "(656) 221-1100" |
 
 A folder id is the last part of the folder's Drive URL (`.../folders/<id>`).
@@ -49,7 +50,7 @@ A folder id is the last part of the folder's Drive URL (`.../folders/<id>`).
 4. **Cold email (once Muhammad gives the key and sending inbox, and the client gives the postal address).**
    - Set `LENDING_INSTANTLY_API_KEY` and `LENDING_INSTANTLY_SENDER_EMAIL`.
    - Run `PYTHONPATH=. python -m src.lending.instantly_email --setup-campaign`. It finds or creates the "NDL Cora Passthrough" campaign (one step: `{{ra_subject}}` / `{{ra_body}}`, sending 09:00–20:00 America/Detroit) and prints `LENDING_INSTANTLY_CAMPAIGN_ID`.
-   - Set that id and `LENDING_EMAIL_FOOTER_POSTAL_ADDRESS`.
+   - Set that id, `LENDING_EMAIL_FOOTER_POSTAL_ADDRESS` and `LENDING_UNSUBSCRIBE_BASE_URL`.
 5. **Switch on.** After Josh approves, set `LENDING_AGENT_JOBS_ENABLED=true` and deploy (`deploy.sh` restarts `fa-lending-cora`). The log shows `agent job queue off` or `not configured` if something is missing.
 
 ## Job file format

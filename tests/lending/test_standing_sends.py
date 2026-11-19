@@ -591,3 +591,63 @@ def test_a_queued_send_on_a_channel_that_still_qualifies_is_not_returned_on_post
         "('agent_job', 'ghl_sms', CAST(:p AS jsonb), 'approved', 'auto:graduated') RETURNING action_id"),
         {"p": json.dumps({"template_version": "P14-KEEP-v1", "body": "Hi"})}).scalar()
     assert action not in standing_sends.return_ungraduated_auto_approvals(conn)
+
+
+
+# ── rejections counted (open question P1.4 #1, switch off by default) ───────
+
+@pytest.mark.parametrize("approved, edited, rejected, ready", [
+    (25, 1, 20, False),  # the case in the question: 25 approvals and 20 rejections must not graduate
+    (25, 1, 0, True),    # no rejections: the same as the brief's rule
+    (25, 0, 2, True),    # 2 / 27 = 7.4%
+    (25, 0, 3, False),   # 3 / 28 = 10.7%
+    (24, 0, 0, False),   # still needs 25 approvals
+    (27, 0, 3, False),   # exactly 10%: strictly under
+])
+def test_with_rejections_counted_the_rate_is_edited_plus_rejected_over_approved_plus_rejected(
+        approved, edited, rejected, ready):
+    assert stats(approved, edited, rejected, count_rejections=True).meets_rule is ready
+
+
+def test_rejections_are_not_counted_unless_the_switch_is_on():
+    assert stats(25, 1, 20).meets_rule is True and stats(25, 1, 20).graduation_rate == stats(25, 1, 20).edit_rate
+
+
+def test_the_switch_is_off_by_default(monkeypatch):
+    from config.settings import get_settings
+    assert get_settings().lending_graduation_count_rejections is False
+
+
+def test_the_graduation_check_passes_the_switch_to_the_query(monkeypatch):
+    monkeypatch.setattr(standing_sends, "get_settings", lambda: SimpleNamespace(lending_graduation_count_rejections=True))
+    engine = CaptureEngine(returning=True)
+    standing_sends.make_is_graduated(engine)("LF-D2-SMS-v1", "ghl_sms")
+    assert engine.params[0]["count_rejections"] is True
+
+
+def test_the_tracker_line_says_edited_or_rejected_when_rejections_count():
+    assert "edited or rejected" in standing_sends.tracker_line(stats(10, 1, 2, count_rejections=True))
+    assert "edited or rejected" not in standing_sends.tracker_line(stats(10, 1, 2))
+
+
+def test_rejections_count_against_the_channel_check_on_postgres(lending_db, monkeypatch):
+    from migrations.apply_lending_cora_agent_core import apply_to as apply_core
+    from migrations.apply_lending_cora_inbox import apply_to as apply_inbox
+    from migrations.apply_lending_pending_action_safeguards import apply_to as apply_safeguards
+    from migrations.apply_lending_standing_sends import apply_to
+
+    conn = lending_db.connection()
+    apply_core(conn)
+    apply_safeguards(conn)
+    apply_inbox(conn)
+    apply_to(conn)
+    for _ in range(25):
+        _approve(lending_db, "P14-REJ-v1")
+    for _ in range(5):
+        _approve(lending_db, "P14-REJ-v1", status="rejected")
+    engine = SimpleNamespace(begin=lambda: _same(conn), connect=lambda: _same(conn))
+    assert "P14-REJ-v1" in [s.template_version for s in standing_sends.evaluate_graduations(engine)]  # switch off
+    assert standing_sends.make_is_graduated(engine)("P14-REJ-v1", "ghl_sms") is True
+    monkeypatch.setattr(standing_sends, "get_settings", lambda: SimpleNamespace(lending_graduation_count_rejections=True))
+    assert standing_sends.make_is_graduated(engine)("P14-REJ-v1", "ghl_sms") is False  # 5 / 30 = 17%
+    assert standing_sends.template_stats(conn, ["P14-REJ-v1"])[0].meets_rule is False
