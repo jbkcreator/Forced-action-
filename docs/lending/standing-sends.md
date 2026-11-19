@@ -59,3 +59,14 @@ re-approve them; they stay on their cards.
 ## Setup
 
 Run `PYTHONPATH=. python migrations/apply_lending_standing_sends.py` before deploying.
+
+The recovery sweep and the send-time check use the same rule: an automatically approved, still unsent action goes back for a person's
+approval (no decision, no card; the card retry posts a fresh approval card) when its template has no active graduation **or its
+channel no longer meets the rule** (25 person approvals on that channel, under 10% edited). So a draft whose channel lapsed while it
+was queued is not deferred until it expires.
+
+**Backflip block alerts (`src/lending/backflip_alerts.py`).** Cora's minute sweep raises each Backflip block once in her inbox (event type
+`backflip_block`, deduplicated against the inbox): a draft stored as `blocked` with the `BACKFLIP_LANE` reason (at submit, at send time, or
+by an executor that finds the name only in what it adds, such as the cold-email footer), and an agent job refused by the job check before
+any draft existed. A job the send gate blocked is raised as its draft only. It reads the last 7 days, so the first deploy raises the
+blocks of that week at once (the digest posts up to 20 per sweep).

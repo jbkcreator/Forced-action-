@@ -13,7 +13,7 @@ Evaluating a job reads the contact from GHL and runs the checks: a block finishe
 parks it, and a go submits a normal Cora draft through the send gate (an #approvals card). The draft's idempotency key
 is ``agent_job:{job_id}``, so a crash between the card and the row update never makes a second draft or card. A job
 whose template has graduated (P1.4, ``is_graduated``) and that does not require approval is approved here as
-``auto:graduated``; the relay sends it with all its send-time checks. Until P1.4 nothing has graduated.
+``auto:graduated`` with no approval card; the relay sends it with all its send-time checks. Until P1.4 nothing has graduated.
 
 Cora runs as exactly one instance, so rows are not locked; every state change is a conditional UPDATE.
 """
@@ -23,7 +23,7 @@ import argparse
 import json
 import logging
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Iterator, Mapping, NamedTuple, Optional
 
@@ -33,6 +33,7 @@ from sqlalchemy.orm import Session
 
 from config.lending_agent_jobs import COLD_EMAIL_CHANNEL, MAX_JOBS_PER_SWEEP, REQUESTED_BY, STUCK_SENDING_AFTER
 from config.lending_standing_sends import AUTO_GRADUATED_ACTOR
+from packages.agent_core.lane_guard import LaneViolation
 from packages.agent_core.pending_actions import ActionStatus, PendingActionQueue
 from packages.agent_core.send_gate import SendGate
 from packages.agent_core.store import utc_now
@@ -90,7 +91,7 @@ def make_check(engine: Engine, *, instantly_ready: bool) -> Check:
 class JobQueueWorker:
     def __init__(self, engine: Engine, folders: JobFolders, gate: SendGate, queue: PendingActionQueue,
                  read_contact: ReadContact, *, approval_channel: str, check: Check,
-                 is_graduated: Callable[[str], bool] = lambda _: False,
+                 is_graduated: Callable[..., bool] = lambda *_: False,
                  clock: Callable[[], datetime] = utc_now, jobs_table: str = "lending.agent_jobs",
                  raise_alert: Optional[Callable[..., Any]] = None) -> None:
         self._engine = engine
@@ -246,9 +247,16 @@ class JobQueueWorker:
         draft = build_draft(job, contact, verdict.rail or "ghl")
         context = ToolContext(user_id=REQUESTED_BY, is_approver=False, channel=self._approval_channel, thread_ts="",
                               tool_use_id=_draft_key(job))
-        queued = self._gate.submit(draft, tool_name=f"agent_job:{job.type}", context=context,
-                                   ttl=job.expires_at - now)
-        if not job.requires_approval and self._is_graduated(job.template_version):
+        automatic = not job.requires_approval and self._is_graduated(job.template_version, draft.channel)
+        try:
+            queued = self._gate.submit(draft, tool_name=f"agent_job:{job.type}", context=context,
+                                       ttl=job.expires_at - now, post_card=not automatic)
+        except LaneViolation:
+            self._finish_row(row["job_id"], ("held",), "blocked_lane", reason="the send gate blocked the draft "
+                             "(lane deny list)", rail=verdict.rail)
+            self._count("blocked")
+            return
+        if automatic:
             self._queue.approve(queued.action_id, AUTO_GRADUATED_ACTOR)
         self._update(row["job_id"], ("held",), state="carded", action_id=queued.action_id, rail=verdict.rail,
                      release_at=None)

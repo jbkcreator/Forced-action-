@@ -58,7 +58,7 @@ class Harness:
         self.graduated: set[str] = set()
         self.worker = JobQueueWorker(
             self.engine, self.folders, self.gate, self.queue, self.contacts.get, approval_channel="C_APPROVALS",
-            check=self._check, is_graduated=lambda version: version in self.graduated, clock=self.clock,
+            check=self._check, is_graduated=lambda version, channel=None: version in self.graduated, clock=self.clock,
             jobs_table="agent_jobs")
 
     def _check(self, job, contact, now) -> Verdict:
@@ -428,3 +428,61 @@ def test_revised_job_cannot_run_past_its_deadline(h: Harness) -> None:
     h.queue.expire_stale()
     h.worker.run_once()
     assert h.folders.results[JOB_ID]["status"] == "expired"
+
+
+def test_graduated_job_gets_no_card_and_receipt_says_automatic(h: Harness) -> None:
+    h.graduated.add("LF-D2-SMS-v1")
+    h.drop(requires_approval=False)
+    h.worker.run_once()
+    action_id = h.row()["action_id"]
+    assert h.queue.get(action_id).card_ts is None
+    assert h.chat.posts == []
+    assert h.queue.claim_for_send(action_id) and h.queue.mark_sent(action_id, "ghl-msg-9")
+    h.worker.run_once()
+    assert h.folders.results[JOB_ID]["status"] == "sent"
+    assert h.folders.results[JOB_ID]["approval"] == "automatic"
+
+
+def test_person_approved_receipt_says_approved(h: Harness) -> None:
+    h.drop()
+    h.worker.run_once()
+    h.send(h.row()["action_id"])
+    h.worker.run_once()
+    assert h.folders.results[JOB_ID]["approval"] == "approved"
+
+
+def test_job_without_a_decision_has_no_approval_value(h: Harness) -> None:
+    h.contacts["ghl-123"] = None
+    h.drop()
+    h.worker.run_once()
+    assert h.folders.results[JOB_ID]["approval"] is None
+
+
+def test_send_gate_backflip_block_is_blocked_lane_not_error(h: Harness) -> None:
+    h.drop(body="Backflip can fund this")
+    h.worker.run_once()
+    assert h.folders.results[JOB_ID]["status"] == "blocked_lane"
+    assert h.row()["state"] == "done"
+    assert h.chat.posts == []
+
+
+def test_graduated_backflip_job_is_blocked_lane_and_never_approved(h: Harness) -> None:
+    h.graduated.add("LF-D2-SMS-v1")
+    h.drop(requires_approval=False, body="Call (656) 209-6700")
+    h.worker.run_once()
+    assert h.folders.results[JOB_ID]["status"] == "blocked_lane"
+    assert h.queue.approved_ids() == []
+
+
+def test_relay_time_lane_block_maps_to_blocked_lane() -> None:
+    from src.lending.agent_jobs.receipts import _blocked_status
+    assert _blocked_status("BACKFLIP_LANE: blocked_name") == "blocked_lane"
+
+
+def test_rejected_job_receipt_says_no_approval(h: Harness) -> None:
+    h.drop()
+    h.worker.run_once()
+    assert h.queue.reject(h.row()["action_id"], "U_JOSH")
+    h.worker.run_once()
+    assert h.folders.results[JOB_ID]["status"] == "rejected"
+    assert h.folders.results[JOB_ID]["approval"] is None
