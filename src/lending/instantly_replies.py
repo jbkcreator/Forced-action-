@@ -27,12 +27,13 @@ import json
 import logging
 import re
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Optional
 
 from sqlalchemy import text
 
 from config.lending_compliance import OptOutChannel
+from config.lending_text_back import BOOKING_LINK
 from config.lending_standing_sends import INSTANTLY_REPLY_TEMPLATE
 from packages.agent_core.lane_guard import LaneViolation
 from packages.agent_core.redaction import mask_emails
@@ -254,6 +255,8 @@ def queue_suppression_for_cora(db, reply_id: int, email: str, event_id: Optional
 
 # ── Cora's sweep: classify, draft, triage ────────────────────────────────────
 
+SIGN_OFF = "Next Deal Lending"
+
 CLASSIFY_PROMPT = """You triage replies to Next Deal Lending's cold emails. Next Deal Lending funds real-estate \
 investors (fix and flip, bridge, ground-up, DSCR rental loans). Josh is the loan officer.
 
@@ -267,10 +270,11 @@ wrong person, out-of-office or other auto-reply, no reply needed).
 - "subject": the reply subject, normally "Re: " plus their subject. Empty string for "dead" and "stop".
 - "body": the answer to send, from Next Deal Lending. Empty string for "dead" and "stop".
 
-Rules for the body: short, plain and friendly; answer what they asked; invite a quick call with Josh and ask for a \
-day and time that works; sign off "Next Deal Lending". Never quote or promise any number: no rates, terms, points, \
-fees, LTV, amounts or timelines; anything about pricing is "indicative, subject to underwriting" and for the call \
-with Josh. Never say a loan is approved or committed. Never mention any other company."""
+Rules for the body: short (a few sentences), plain and friendly; answer what they asked; invite a quick call with \
+Josh and include his booking link exactly as written here: """ + BOOKING_LINK + """ ; sign off "Next Deal Lending". \
+Never quote or promise any number: no rates, terms, points, fees, LTV, amounts or timelines; anything about pricing \
+is "indicative, subject to underwriting" and for the call with Josh. Never say a loan is approved or committed. \
+Never mention Backflip or any other company."""
 
 
 @dataclass(frozen=True)
@@ -305,6 +309,18 @@ def _parse_triage(raw: str) -> Triage:
     return Triage(intent, summary, subject, body)
 
 
+def with_booking_link(body: str) -> str:
+    """The body with Josh's booking link: kept as is when the model included it, else added on its own line before
+    the "Next Deal Lending" sign-off (or at the end when there is none)."""
+    if BOOKING_LINK in body:
+        return body
+    line = f"Pick a time that works for you: {BOOKING_LINK}"
+    head, _, last = body.rstrip().rpartition("\n")
+    if head and last.strip().lower() == SIGN_OFF.lower():
+        return f"{head.rstrip()}\n\n{line}\n\n{last.strip()}"
+    return f"{body.rstrip()}\n\n{line}"
+
+
 def classify_reply(client: Any, model: str, *, subject: Optional[str], reply: str,
                    rules: tuple[str, ...] = ()) -> Triage:
     """One model call; a draft that quotes numbers is redrafted once, then refused."""
@@ -318,7 +334,7 @@ def classify_reply(client: Any, model: str, *, subject: Optional[str], reply: st
         triage = _parse_triage(raw)
         problem = borrower_draft_problem({"subject": triage.subject, "body": triage.body}) if triage.body else None
         if problem is None:
-            return triage
+            return replace(triage, body=with_booking_link(triage.body)) if triage.body else triage
         messages += [{"role": "assistant", "content": raw},
                      {"role": "user", "content": f"Redraft: {problem}. Return the same JSON shape."}]
     raise TriageError("the draft kept quoting numbers")
