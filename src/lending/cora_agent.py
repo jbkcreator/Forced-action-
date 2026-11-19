@@ -51,6 +51,7 @@ from src.lending.agent_jobs.worker import JobQueueWorker, make_check
 from src.lending.attempt_log import lending_ghl_readers
 from src.lending.compliance import text_window_open
 from src.lending.consent import has_text_consent
+from src.lending.backflip_alerts import raise_backflip_blocks
 from src.lending.cora_channels import ChannelDirectory
 from src.lending.cora_inbox import format_inbox_context, items_on_post, surface_new_items
 from src.lending.cora_prompt import CORA_BASE_PROMPT, REVISION_PROMPT
@@ -125,6 +126,7 @@ class CoraServices(NamedTuple):
     agent_jobs: Optional[Callable[[], Any]] = None  # P1.1: one pass of the Drive job queue worker
     standing_sends: Optional[Callable[[], Any]] = None  # P1.4: graduates templates that meet the rule
     block_list: Optional[Callable[[], Any]] = None  # P1.3: sends queued opt-out addresses to Instantly's block list
+    backflip_alerts: Optional[Callable[[], int]] = None  # queues each new Backflip block for the inbox digest
 
 
 def lending_channel_ids(settings: AppSettings) -> dict[str, str]:
@@ -157,6 +159,16 @@ def make_inbox_digest(engine: Engine, chat: ChatPort, channel: str,
             return surface_new_items(db, chat, channel=channel, channel_ids=channel_ids)
 
     return digest
+
+
+def make_backflip_alerts(engine: Engine) -> Callable[[], int]:
+    """One sweep's Backflip block alerts, committed on their own so a failure never touches the digest."""
+
+    def alerts() -> int:
+        with Session(engine) as db, db.begin():
+            return raise_backflip_blocks(db)
+
+    return alerts
 
 
 def make_inbox_context(engine: Engine) -> Callable[[str, str], str]:
@@ -504,7 +516,7 @@ def build_session(config: AgentCoreConfig, store: AgentStore, chat: ChatPort, bo
 
 def run_sweep(services: CoraServices) -> None:
     """One pass: expire stale drafts, triage new Instantly replies, retry missing approval cards, run the agent job
-    queue, graduate templates (P1.4), post the inbox digest and the 7:30 AM
+    queue, graduate templates (P1.4), raise new Backflip blocks, post the inbox digest and the 7:30 AM
     morning digest (always, even while halted: the halt stops sends to borrowers, not Cora's own channel), then
     send approved actions."""
     expired = services.session.expire_stale_actions()
@@ -544,6 +556,11 @@ def run_sweep(services: CoraServices) -> None:
             services.block_list()
         except Exception as exc:  # class only; the rows stay pending and are retried next sweep
             logger.error("[cora] Instantly block list step failed (%s); retrying next sweep", type(exc).__name__)
+    if services.backflip_alerts is not None:
+        try:
+            services.backflip_alerts()
+        except Exception as exc:  # class only; the blocks are found again next sweep
+            logger.error("[cora] Backflip block alerts failed (%s); retrying next sweep", type(exc).__name__)
     if services.inbox_digest is not None:
         try:
             surfaced = services.inbox_digest()
@@ -634,7 +651,7 @@ def build_live_services(settings: AppSettings) -> Optional[CoraServices]:
     worker = build_agent_jobs(settings, engine=engine, gate=services.gate, queue=services.queue,
                               approval_channel=config.approval_channel_id or "",
                               is_graduated=make_is_graduated(engine))
-    return services._replace(web_client=web, inbox_digest=digest,
+    return services._replace(web_client=web, inbox_digest=digest, backflip_alerts=make_backflip_alerts(engine),
                              morning_digest=make_morning_digest(engine, store, chat, config),
                              instantly_replies=make_instantly_replies(engine, store, config, messages_client,
                                                                       services.gate),
