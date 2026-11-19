@@ -82,7 +82,16 @@ def phones_for_emails(db, emails: Iterable[str], failed: Optional[list[str]] = N
     all_ids = sorted({i for found in ids.values() for i in found})
     if all_ids:
         by_id: dict[str, set[str]] = defaultdict(set)
-        for contact_id, raw in db.execute(_LOAD_PHONES, {"ids": all_ids}).fetchall():
+        try:
+            with db.begin_nested():  # a missing column (migration not run) must never abort the opt-out
+                rows = db.execute(_LOAD_PHONES, {"ids": all_ids}).fetchall()
+        except Exception as exc:  # class only
+            logger.error("[ghl-email-lookup] the dialer load lookup failed (%s); those phones are not linked",
+                         type(exc).__name__)
+            if failed is not None:
+                failed.extend(sorted(ids))
+            rows = []
+        for contact_id, raw in rows:
             if phone := normalize(raw):
                 by_id[contact_id].add(phone)
         for email, found in ids.items():

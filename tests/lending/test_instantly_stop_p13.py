@@ -53,6 +53,11 @@ def test_record_event_marks_a_possible_stop_as_suppressed():
 
 
 class _LookupDb:
+    @staticmethod
+    def begin_nested():
+        from contextlib import nullcontext
+        return nullcontext()
+
     def __init__(self, loads):
         self.loads, self.params = loads, []
 
@@ -113,7 +118,7 @@ def test_cold_contact_only_in_ghl_and_the_dialer_is_suppressed_and_removed(monke
 
 
 def test_traced_cold_list_email_is_searched_for_phones():
-    assert "lending.calling_pool_staging" in str(compliance._LINKED_PHONES)
+    assert "lending.calling_pool_staging" in str(compliance._LINKED_PHONES_COLD_LISTS)
 
 
 def _with_loads(db, loads):
@@ -190,3 +195,40 @@ def test_a_clear_stop_is_recorded_as_an_unsubscribe_for_immediate_suppression():
     db = SimpleNamespace(execute=lambda statement, params: SimpleNamespace(scalar=lambda: 9))
     result = instantly_replies.record_event(db, instantly_replies.parse_event(reply_body(text="Please remove me from your list")))
     assert result.stop_request is True
+
+
+@pytest.mark.parametrize("reply", ["we ceased operations last year", "the offices have ceased trading"])
+def test_ordinary_uses_of_the_word_cease_are_not_a_stop(reply):
+    assert not instantly_replies.could_mean_stop(reply)
+
+
+@pytest.mark.parametrize("reply", ["cease and desist", "Please cease all contact", "cease emailing me", "cease communications"])
+def test_cease_wording_that_asks_for_no_contact_is_still_a_stop(reply):
+    assert instantly_replies.could_mean_stop(reply)
+
+
+def test_an_opt_out_still_completes_when_the_linked_phone_tables_are_missing(caplog):
+    from contextlib import contextmanager
+
+    from src.lending import compliance
+
+    class Db:
+        def __init__(self):
+            self.calls = []
+
+        @contextmanager
+        def begin_nested(self):
+            yield
+
+        def execute(self, statement, params=None):
+            self.calls.append(str(statement))
+            if "calling_pool_staging" in str(statement) or "dialer_load_records" in str(statement):
+                raise RuntimeError("relation does not exist: cold@example.com")
+            return SimpleNamespace(fetchall=lambda: [("cold@example.com", "+18135550142")])
+
+    db = Db()
+    opt_outs = [compliance._OptOut(compliance.OptOutChannel.EMAIL, None, "cold@example.com", None, None,
+                                   datetime(2026, 11, 19, tzinfo=timezone.utc))]
+    resolved = compliance._with_linked_phones(db, opt_outs)  # must not raise
+    assert [o.phone for o in resolved] == ["+18135550142"]  # the tables every deployment has still link the phone
+    assert "cold@example.com" not in caplog.text

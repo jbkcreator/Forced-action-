@@ -199,7 +199,7 @@ _CONSENTS = text("""
            w.received_at, NULL, w.ghl_contact_id
       FROM lending.web_leads w WHERE NOT w.is_test AND (w.sms_consent OR w.call_consent OR w.deal_drop_optin)
     UNION ALL
-    SELECT w.phone, 'email_opt_out', o.source, o.opted_out_at, NULL, w.ghl_contact_id
+    SELECT w.phone, 'email_opt_out', o.source, o.opted_out_at AT TIME ZONE 'UTC', NULL, w.ghl_contact_id
       FROM public.email_opt_outs o
       LEFT JOIN LATERAL (SELECT phone, ghl_contact_id FROM lending.web_leads
                           WHERE lower(email) = lower(o.email) AND NOT is_test

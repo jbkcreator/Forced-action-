@@ -23,7 +23,7 @@ import argparse
 import json
 import logging
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Iterator, Mapping, NamedTuple, Optional
 
@@ -259,8 +259,8 @@ class JobQueueWorker:
             queued = self._gate.submit(draft, tool_name=f"agent_job:{job.type}", context=context,
                                        ttl=job.expires_at - now, post_card=not automatic)
         except LaneViolation:
-            self._finish_row(row["job_id"], ("held",), "blocked_lane", reason="the send gate found a Backflip name, "
-                             "number or domain", rail=verdict.rail)
+            self._finish_row(row["job_id"], ("held",), "blocked_lane", reason="the send gate blocked the draft "
+                             "(lane deny list)", rail=verdict.rail)
             self._count("blocked")
             return
         if automatic:

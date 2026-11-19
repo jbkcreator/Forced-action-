@@ -31,7 +31,7 @@ from sqlalchemy import text
 from config.lending_after_hours import (BUSINESS_DAYS, DEFAULT_SOURCE, DRAFT_FORBIDDEN, DRAFT_MAX_CHARS, DRAFT_PROMPT,
                                         DRAFT_TOOL_NAME, FALLBACK_REPLY, INTAKE_MARKER, MORNING_POST_ET, PIN_UNTIL_ET)
 from config.lending_reminders import TIMEZONE
-from packages.agent_core.lane_guard import LaneViolation
+from packages.agent_core.lane_guard import LANE_BLOCK_PREFIX, LaneViolation
 from src.lending.consent import has_text_consent
 from src.lending.cora_tools import borrower_draft_problem
 from src.lending.ghl_consent_events import InvalidEvent
@@ -179,8 +179,8 @@ _PINS = text("""
                         WHERE o.phone = c.phone AND o.direction = 'outbound' AND o.call_ended_at >= c.pinned_at)
      ORDER BY c.id, d.call_ended_at DESC
 """)
-_DRAFTED = text("SELECT idempotency_key, action_id, status FROM lending.pending_actions "
-                "WHERE idempotency_key = ANY(:keys)")
+_DRAFTED = text("SELECT idempotency_key, action_id, status, COALESCE(error, '') LIKE :lane_prefix AS lane_blocked "
+                "FROM lending.pending_actions WHERE idempotency_key = ANY(:keys)")
 
 
 def pins_to_call(db, now: datetime) -> list[PinnedCall]:
@@ -240,14 +240,18 @@ def _queue_reply(queue: DraftQueue, pin: PinnedCall, drafter: Drafter, full_name
 def draft_morning_replies(db, pins: list[PinnedCall], queue: DraftQueue, drafter: Drafter) -> list[MorningReply]:
     """Queue a reply for Approve for each pin with text consent; a voicemail already drafted keeps its draft (no
     second model call). The rest are call-only."""
-    drafted = {key: (action_id, status) for key, action_id, status in
-               db.execute(_DRAFTED, {"keys": [pin.event.call_key for pin in pins]}).all()}
+    drafted = {key: (action_id, status, lane_blocked) for key, action_id, status, lane_blocked in
+               db.execute(_DRAFTED, {"keys": [pin.event.call_key for pin in pins],
+                                     "lane_prefix": f"{LANE_BLOCK_PREFIX}%"}).all()}
     names = names_by_phone(db, [pin.event.phone for pin in pins if pin.event.call_key not in drafted])
     replies = []
     for pin in pins:
         if pin.event.call_key in drafted:
-            action_id, status = drafted[pin.event.call_key]
-            replies.append(MorningReply(pin, None, blocked=True) if status == "blocked" else MorningReply(pin, action_id))
+            action_id, status, lane_blocked = drafted[pin.event.call_key]
+            if status == "blocked":  # blocked at send time: a Backflip block says so, any other block is call-only
+                replies.append(MorningReply(pin, None, blocked=bool(lane_blocked)))
+            else:
+                replies.append(MorningReply(pin, action_id))
         elif has_text_consent(db, pin.event.phone):
             try:
                 replies.append(MorningReply(pin, _queue_reply(queue, pin, drafter, names.get(pin.event.phone))))

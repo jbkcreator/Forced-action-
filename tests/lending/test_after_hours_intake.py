@@ -277,7 +277,7 @@ def test_a_blocked_draft_found_on_a_repost_is_still_blocked_not_waiting_for_appr
         def execute(self, statement, params=None):
             sql = str(statement)
             if "idempotency_key" in sql:
-                return SimpleNamespace(all=lambda: [(key, 41, "blocked")])
+                return SimpleNamespace(all=lambda: [(key, 41, "blocked", True)])
             raise AssertionError("no other query is needed for an already drafted call")
 
     replies = draft_morning_replies(Db(), [pin], queue=None, drafter=lambda *a: "x")
@@ -291,7 +291,20 @@ def test_an_existing_pending_draft_is_still_waiting_for_approval():
 
     class Db:
         def execute(self, statement, params=None):
-            return SimpleNamespace(all=lambda: [(pin.event.call_key, 41, "pending")])
+            return SimpleNamespace(all=lambda: [(pin.event.call_key, 41, "pending", False)])
 
     replies = draft_morning_replies(Db(), [pin], queue=None, drafter=lambda *a: "x")
     assert [(r.action_id, r.blocked) for r in replies] == [(41, False)]
+
+
+def test_a_draft_blocked_for_another_reason_is_call_only_not_a_backflip_block():
+    from types import SimpleNamespace
+
+    pin = _pin()
+
+    class Db:
+        def execute(self, statement, params=None):
+            return SimpleNamespace(all=lambda: [(pin.event.call_key, 41, "blocked", False)])
+
+    replies = draft_morning_replies(Db(), [pin], queue=None, drafter=lambda *a: "x")
+    assert [(r.action_id, r.blocked) for r in replies] == [(None, False)]
