@@ -86,6 +86,12 @@ def raw_held_by_other_lists(db, list_key: str, radar_ids: Sequence[str]) -> dict
     return {r.radar_id: dict(r.raw) for r in rows}
 
 
+def stored_transfer_dates(db, list_key: str) -> dict[str, Optional[date]]:
+    """RadarID -> the sale (transfer recording) date stored for it on this list."""
+    return {r[0]: r[1] for r in db.execute(text(
+        "SELECT radar_id, last_transfer_date FROM lending.pr_list_records WHERE list_key = :k"), {"k": list_key})}
+
+
 def stored_radar_ids(db, list_key: str) -> set[str]:
     return {r[0] for r in db.execute(text(
         "SELECT radar_id FROM lending.pr_list_records WHERE list_key = :k"), {"k": list_key})}

@@ -203,6 +203,9 @@ class MemoryStore:
     def stored_radar_ids(self, db, list_key):
         return set(self.stored)
 
+    def stored_transfer_dates(self, db, list_key):
+        return {i: date(2026, 10, 15) for i in self.stored}  # inside the CASH_ARGS window
+
     held_elsewhere: dict = {}
 
     def raw_held_by_other_lists(self, db, list_key, ids):
@@ -342,7 +345,7 @@ def test_paid_exports_never_pass_the_cap_when_the_free_balance_drops_mid_run(har
 
     def preview_with_other_usage(criteria):
         calls["n"] += 1
-        if calls["n"] > 1:  # after planning, another job takes one free export per check
+        if calls["n"] > 2:  # after planning (before and under the lock), another job takes one per check
             port.canned_allowance.quantity_free_remaining = max(0, port.canned_allowance.quantity_free_remaining - 1)
         return real_preview(criteria)
 

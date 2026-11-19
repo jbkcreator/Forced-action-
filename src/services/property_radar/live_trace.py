@@ -114,10 +114,16 @@ def trace_staged_leads(
             logger.error("[pr-live-trace] Tracerfy returned no rows for %d address(es); not ledgered, "
                          "run stopped", len(batch_keys))
             break
-        hits = {_core(trace_key(r.get("address"), "")): r for r in results if r.get("address")}
+        hits: dict[str, list[dict]] = {}
+        for result in results:
+            if result.get("address"):
+                hits.setdefault(_core(trace_key(result.get("address"), "")), []).append(result)
+        streets_sent: dict[str, int] = {}
+        for key in batch_keys:
+            streets_sent[_core(key)] = streets_sent.get(_core(key), 0) + 1
         entries, traced = [], {}
         for key in batch_keys:
-            row = hits.get(_core(key))
+            row = result_for(hits.get(_core(key), []), by_key[key][0], sent_once=streets_sent[_core(key)] == 1)
             contacts = _contacts_from_row(row) if row else LeadContacts()
             # The ledger key is building-level and the row sent names the first lead's owner,
             # so only leads with that owner get the contacts (other units' owners stay untraced).
@@ -134,6 +140,20 @@ def trace_staged_leads(
         write_ledger(entries)
         outcome.contacts.update(traced)
     return outcome
+
+
+def result_for(rows: Sequence[dict], lead: Any, *, sent_once: bool) -> Optional[dict]:
+    """The returned row for one address sent. Tracerfy returns the street and the city it was sent, not the ZIP:
+    when the street was sent once in the batch its row is taken; when the same street was sent for two cities,
+    only a row with the lead's city is taken, and anything still ambiguous is no result (never another city's
+    contacts)."""
+    if not rows:
+        return None
+    if sent_once:
+        return rows[0]
+    city = (getattr(lead, "city", None) or "").strip().upper()
+    same_city = [row for row in rows if city and (row.get("city") or "").strip().upper() == city]
+    return same_city[0] if len(same_city) == 1 else None
 
 
 def _submit_row(lead: Any) -> dict:

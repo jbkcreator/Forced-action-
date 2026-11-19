@@ -38,6 +38,7 @@ from src.core.database import get_db_context
 from src.lending import pr_calling_list_store as store
 from src.lending import pr_list_landing as landing
 from src.lending.pr_calling_lists import CriteriaSet, PullWindow, build_criteria_sets, pull_window, shape_record
+from src.services.property_radar_normalizer import parse_date
 from src.services.property_radar_port import PropertyRadarPort, get_property_radar_port
 
 logger = logging.getLogger(__name__)
@@ -107,6 +108,56 @@ def plan_pull(port: PropertyRadarPort, sets: Sequence[CriteriaSet], stored: set[
     free_remaining = port.cost_preview(sets[0].criteria).quantity_free_remaining
     return PullPlan(to_buy=to_buy, matching=matching, already_stored=already, free_remaining=free_remaining,
                     reused=reused)
+
+
+def _current(sold: Optional[date], window: PullWindow) -> bool:
+    """A copy describes this search's sale unless its sale date is known and outside the window (a copy with
+    no date cannot be shown stale, and buying it again would pay twice)."""
+    return sold is None or window.start <= sold <= window.end
+
+
+def bought_for_window(list_key: str, window: PullWindow, stored: dict[str, Optional[date]],
+                      landed: dict[str, Optional[date]]) -> set[str]:
+    """RadarIDs already bought for this search. On a list searched by sale date (cash buyers, wholesalers) a
+    stored or landed copy whose sale date is known and outside this window does not count: the property sold
+    again since, so it is a new record (new seller, new date) and is bought again, inside the confirmed plan. Other lists: any copy counts."""
+    if list_key not in WINDOWED_LISTS:
+        return set(stored) | set(landed)
+    return {rid for copies in (stored, landed) for rid, sold in copies.items() if _current(sold, window)}
+
+
+def landed_transfer_dates(list_key: str) -> dict[str, Optional[date]]:
+    """RadarID -> the newest sale date in this list's landing files."""
+    found: dict[str, Optional[date]] = {}
+    for page in landing.iter_pages(list_key):
+        for raw in page.records:
+            if raw.get("RadarID"):
+                sold = parse_date(raw.get("LastTransferRecDate"))
+                rid = str(raw["RadarID"])
+                if rid not in found or (sold and (found[rid] is None or sold > found[rid])):
+                    found[rid] = sold
+    return found
+
+
+def reusable_elsewhere(list_key: str, window: PullWindow,
+                       held: Callable[[list[str]], dict[str, dict]]) -> Callable[[list[str]], dict[str, dict]]:
+    """Another list's stored record is copied instead of bought only when it describes the sale this search
+    found (on a list searched by sale date, not a copy whose known sale date is outside the window)."""
+    if list_key not in WINDOWED_LISTS:
+        return held
+
+    def current(ids: list[str]) -> dict[str, dict]:
+        return {rid: raw for rid, raw in held(ids).items()
+                if _current(parse_date(raw.get("LastTransferRecDate")), window)}
+
+    return current
+
+
+def make_plan(db, port: PropertyRadarPort, list_key: str, sets: Sequence[CriteriaSet], window: PullWindow) -> PullPlan:
+    bought = bought_for_window(list_key, window, store.stored_transfer_dates(db, list_key),
+                               landed_transfer_dates(list_key))
+    return plan_pull(port, sets, bought, held_elsewhere=reusable_elsewhere(
+        list_key, window, lambda ids: store.raw_held_by_other_lists(db, list_key, ids)))
 
 
 class PaidCapReached(RuntimeError):
@@ -186,6 +237,17 @@ def _exports_spent(port: PropertyRadarPort, plan: PullPlan, sets: Sequence[Crite
     return max(free_used, fallback)
 
 
+def _refusal_after_lock(args: argparse.Namespace, plan: PullPlan) -> Optional[str]:
+    """The plan rebuilt under the lock may only shrink (another run bought some of it); it never buys more
+    than was approved or goes further past the free allowance."""
+    if plan.total > args.confirm_exports:
+        return (f"the plan grew to {plan.total} exports since it was approved ({args.confirm_exports}); "
+                "run the dry run again")
+    if plan.paid > args.max_paid_exports:
+        return f"{plan.paid} exports now go past the free allowance; --max-paid-exports is {args.max_paid_exports}"
+    return None
+
+
 def _refusal(args: argparse.Namespace, plan: PullPlan) -> Optional[str]:
     if args.confirm_exports != plan.total:
         return f"this pull buys {plan.total} exports; re-run with --confirm-exports {plan.total} once approved"
@@ -223,9 +285,7 @@ def main(argv: Optional[list[str]] = None) -> int:
             return EXIT_OK
 
         port = get_property_radar_port()
-        bought = store.stored_radar_ids(db, args.list_key) | landing.landed_radar_ids(args.list_key)
-        plan = plan_pull(port, sets, bought,
-                         held_elsewhere=lambda ids: store.raw_held_by_other_lists(db, args.list_key, ids))
+        plan = make_plan(db, port, args.list_key, sets, window)
         logger.info("[calling-list] %s window %s..%s: %s", args.list_key, window.start, window.end,
                     json.dumps(plan.summary()))
         if not args.live:
@@ -243,6 +303,16 @@ def main(argv: Optional[list[str]] = None) -> int:
             logger.error("[calling-list] refused: %s", exc)
             return EXIT_REFUSED
         try:
+            # Planned again under the lock: a run that finished between our plan and the lock may have bought
+            # part of it already, and those records must not be bought twice.
+            plan = make_plan(db, port, args.list_key, sets, window)
+            refusal = _refusal_after_lock(args, plan)
+            if refusal:
+                logger.error("[calling-list] refused: %s", refusal)
+                return EXIT_REFUSED
+            if plan.total == 0 and not plan.reused:
+                logger.info("[calling-list] %s: nothing left to buy; another run bought it", args.list_key)
+                return EXIT_OK
             return _run_live(db, port, args, sets, window, plan, as_of)
         finally:
             landing.release_pull_lock(lock)

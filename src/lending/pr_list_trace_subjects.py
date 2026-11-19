@@ -133,6 +133,15 @@ def subject_for_company(list_key: str, contact_key: str, record: Mapping[str, An
 
 # --- I/O -------------------------------------------------------------------------------------------------
 
+# The key a subject's traced contacts are stored under in property_radar_traced_contacts.radar_id (``s`` = the
+# subject row). Never the property's RadarID: that row holds the current OWNER's phones (owner lists, the
+# maturity handoff), and a seller's phones must never be read as the owner's, or the other way round. The hash
+# of the name and address makes a rebuilt subject who is now a different person start untraced.
+SUBJECT_TRACE_KEY_SQL = ("'subject:' || s.id || ':' || left(md5(lower(coalesce(s.first_name, '') || '|' || "
+                         "coalesce(s.last_name, '') || '|' || coalesce(s.address, ''))), 12)")
+SUBJECT_KEY_PREFIX = "subject:"
+
+
 _SELLERS_SQL = text("""
     SELECT DISTINCT ON (contact_key) contact_key, radar_id, last_transfer_seller, property_address, city, state, zip
       FROM lending.pr_list_records

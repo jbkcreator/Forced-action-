@@ -28,6 +28,8 @@ from config.lending_calling_lists import (
 )
 from config.lending_queues import SOURCE_TAG_QUEUES
 from src.core.database import get_db_context
+from src.lending.compliance import fresh_scrubs
+from src.lending.pr_list_trace_subjects import SUBJECT_TRACE_KEY_SQL
 from src.services.phone_utils import normalize as normalize_phone
 
 logger = logging.getLogger(__name__)
@@ -48,13 +50,14 @@ _PEOPLE_SQL = text("""
 """)
 
 
-# Wholesalers: the person traced is the trace subject (the seller, or the person behind a company seller).
-_SUBJECT_PEOPLE_SQL = text("""
+# Wholesalers: the person traced is the trace subject (the seller, or the person behind a company seller), whose
+# contacts are stored under the subject's own key, never the property's RadarID (that row is the owner's).
+_SUBJECT_PEOPLE_SQL = text(f"""
     SELECT s.contact_key, s.radar_id, r.list_key, r.qualifies, r.match_strength, s.first_name, s.last_name,
            s.source, r.last_transfer_seller, r.property_address, r.city, r.state, r.zip, r.county, r.apn, t.phones
       FROM lending.pr_list_trace_subjects s
       JOIN lending.pr_list_records r ON r.list_key = s.list_key AND r.radar_id = s.radar_id
-      JOIN property_radar_traced_contacts t ON t.radar_id = s.radar_id AND cardinality(t.phones) > 0
+      JOIN property_radar_traced_contacts t ON t.radar_id = {SUBJECT_TRACE_KEY_SQL} AND cardinality(t.phones) > 0
      WHERE s.list_key = :k AND s.untraceable_reason IS NULL AND r.qualifies
 """)
 
@@ -165,10 +168,9 @@ def build(db, list_key: str) -> tuple[list[dict], dict[str, int]]:
     sql, make_record, queue = LIST_EXPORTS[list_key]
     people = [dict(r._mapping) for r in db.execute(sql, {"k": list_key})]
     all_phones = {p["contact_key"]: _phones(p["phones"]) for p in people}
-    scrubs = {r.phone: r for r in db.execute(text(
-        "SELECT DISTINCT ON (phone) phone, national_dnc, state_dnc, litigator FROM lending.dnc_scrubs "
-        "WHERE phone = ANY(:p) ORDER BY phone, checked_at DESC"),
-        {"p": list({p for ps in all_phones.values() for p in ps})})}
+    # The same view of each phone's do-not-call check as the dialer gate and the trace step: freshest across
+    # both caches, stale counted as not checked.
+    scrubs = fresh_scrubs(db, sorted({p for ps in all_phones.values() for p in ps}))
     phones = {key: _phone_to_load(ps, scrubs) for key, ps in all_phones.items()}
     records, counts = [], {"people_with_phone": len(people), "not_checked": 0, "blocked": 0, "load_ready": 0}
     for person in people:

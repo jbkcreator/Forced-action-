@@ -34,6 +34,7 @@ from sqlalchemy import text
 
 from config.lending_calling_lists import CALLING_LISTS, LANDING_ROOT, WHOLESALER
 from src.core.database import get_db_context
+from src.lending.pr_list_trace_subjects import SUBJECT_KEY_PREFIX, SUBJECT_TRACE_KEY_SQL
 from src.services.phone_utils import normalize as normalize_phone
 from src.services.property_radar.live_trace import trace_staged_leads
 from src.services.skip_trace_ledger import ADVANCED, NORMAL, RunSpendCap, already_traced, trace_key
@@ -81,18 +82,36 @@ class Lead:
 
 
 # Lists whose people come as a name only: traced from lending.pr_list_trace_subjects (who + where, with source).
-_SUBJECT_LEADS_SQL = text("""
-    SELECT s.radar_id, s.address AS property_address, s.city, s.state, s.zip,
+# The lead's radar_id is the subject's own trace key, so the seller's contacts never share a row with the
+# property owner's (src/lending/pr_list_trace_subjects.py, SUBJECT_TRACE_KEY_SQL).
+_SUBJECT_LEADS_SQL = text(f"""
+    SELECT {SUBJECT_TRACE_KEY_SQL} AS radar_id, s.address AS property_address, s.city, s.state, s.zip,
            s.first_name || ' ' || s.last_name AS owner_name, NULL AS principal_name, 'confirmed' AS match_strength
       FROM lending.pr_list_trace_subjects s
       JOIN lending.pr_list_records r ON r.list_key = s.list_key AND r.radar_id = s.radar_id
      WHERE s.list_key = :k AND s.untraceable_reason IS NULL
        AND (CAST(:resold_from AS date) IS NULL OR r.last_transfer_date >= CAST(:resold_from AS date))
        AND (CAST(:resold_before AS date) IS NULL OR r.last_transfer_date < CAST(:resold_before AS date))
-       AND NOT EXISTS (SELECT 1 FROM property_radar_traced_contacts t WHERE t.radar_id = s.radar_id)
+       AND NOT EXISTS (SELECT 1 FROM property_radar_traced_contacts t WHERE t.radar_id = {SUBJECT_TRACE_KEY_SQL})
      ORDER BY r.last_transfer_date DESC NULLS LAST, s.id
 """)
+# The subjects' contact keys, for the do-not-call step of a name-only list.
+_SUBJECT_KEYS_SQL = text(f"""
+    SELECT {SUBJECT_TRACE_KEY_SQL} FROM lending.pr_list_trace_subjects s
+      JOIN lending.pr_list_records r ON r.list_key = s.list_key AND r.radar_id = s.radar_id
+     WHERE s.list_key = :k AND s.untraceable_reason IS NULL AND r.qualifies
+""")
 SUBJECT_LISTS = frozenset({WHOLESALER})
+
+
+def build_list_subjects(db, list_key: str) -> dict[str, int]:
+    """Who to trace on a name-only list (the seller, or the person behind a company seller), from the list's
+    records and its Sunbiz lookups. Idempotent; run before leads are selected, so a fresh deployment never
+    traces an empty subject table."""
+    from src.lending.pr_list_trace_subjects import build_subjects
+    from src.tasks.lending_pr_list_sunbiz import lookups_path
+
+    return build_subjects(db, list_key, lookups_path(list_key))
 
 
 def load_leads(db, list_key: str, resold_from: Optional[date] = None,
@@ -146,30 +165,61 @@ STABLE_ROUNDS = 6
 SETTLE_SECONDS = 120
 
 
+PENDING_PREFIX = "pending"  # a queue Tracerfy accepted whose results are not on disk yet
+
+
+def _call_number(folder: Path, prefix: str) -> int:
+    """Next file number for ``prefix``, counting the calls still pending too, so a resumed queue keeps its own."""
+    return (len(list(folder.glob(f"{prefix}_*.json"))) + len(list(folder.glob(f"{PENDING_PREFIX}_{prefix}_*.json")))
+            + 1)
+
+
 def recorded_submit(folder: Path, api_key: str, *, address_only: bool = False) -> Callable[[list[dict]], list[dict]]:
-    """Tracerfy batch submit that waits for the queue to settle and writes what was sent and received, with the
-    queue id, to disk before returning (so the queue can be fetched again for free and reconciled)."""
+    """Tracerfy batch submit. The accepted queue id, the rows sent and the mode are written to disk BEFORE
+    polling (``pending_<prefix>_NNNN.json``), so a run stopped or failing while it waits leaves the paid queue to
+    be resumed (``resume_pending``) instead of submitted again. Once the queue settles the results are written
+    (``<prefix>_NNNN.json``) and the pending file is removed."""
     from src.services.tracerfy_batch import _poll_trace_queue, _submit_trace_batch
 
     def submit(rows: list[dict]) -> list[dict]:
+        # Advanced (address-only) results are kept apart: replay applies the name check they need.
+        prefix = "advanced" if address_only else "trace"
         queue_id, wait = _submit_trace_batch(rows, api_key, address_only=address_only)
+        name = f"{prefix}_{_call_number(folder, prefix):04d}.json"
+        pending = write_landing(folder, f"{PENDING_PREFIX}_{name}",
+                                {"queue_id": queue_id, "sent": rows, "mode": ADVANCED if address_only else NORMAL})
         received = _poll_trace_queue(queue_id, api_key, wait, stable_rounds_required=STABLE_ROUNDS,
                                      min_settle_seconds=SETTLE_SECONDS)
-        # Advanced results are kept apart: the replay and late-hit steps read trace_* files and know
-        # nothing of the name check an address-only hit needs.
-        prefix = "advanced" if address_only else "trace"
-        number = len(list(folder.glob(f"{prefix}_*.json"))) + 1
-        write_landing(folder, f"{prefix}_{number:04d}.json", {"queue_id": queue_id, "sent": rows, "received": received})
+        write_landing(folder, name, {"queue_id": queue_id, "sent": rows, "received": received})
+        pending.unlink(missing_ok=True)
         return received
 
     submit.lands_on_disk = True  # type: ignore[attr-defined]
     return submit
 
 
+def _place(row: dict) -> tuple[str, str]:
+    """Street and city of a row sent or returned. Tracerfy returns the city it was sent, not the ZIP, so the
+    street alone cannot tell the same street number and name in two cities apart."""
+    from src.services.property_radar.live_trace import _core
+
+    return _core(trace_key(row.get("address"), "")), (row.get("city") or "").strip().upper()
+
+
+def match_sent(sent: Sequence[dict], row: dict) -> Optional[dict]:
+    """The one row sent that a returned row answers: same street and city. A returned row with no city
+    matches only when that street was sent once; anything ambiguous matches nothing (left unresolved)."""
+    street, city = _place(row)
+    same_street = [s for s in sent if _place(s)[0] == street]
+    if city:
+        same_street = [s for s in same_street if _place(s)[1] == city]
+    return same_street[0] if len(same_street) == 1 else None
+
+
 def reconcile_queues(db, folder: Path, *, fetch, write_ledger, write_contacts) -> dict[str, int]:
     """Fetch every queue of this run again (free) and store hits that arrived after the batch was accepted:
     contacts for a lead that has none yet, plus a ledger row for the paid hit. On disk before the database."""
-    from src.services.property_radar.live_trace import _contacts_from_row, _core
+    from src.services.property_radar.live_trace import _contacts_from_row
 
     found: dict[str, tuple] = {}  # radar_id -> (contacts, ledger entry)
     checked = 0
@@ -178,14 +228,13 @@ def reconcile_queues(db, folder: Path, *, fetch, write_ledger, write_contacts) -
         if not call.get("queue_id"):
             continue
         checked += 1
-        seen = {_core(trace_key(r.get("address"), "")) for r in call["received"]}
-        late = [r for r in fetch(call["queue_id"]) if _core(trace_key(r.get("address"), "")) not in seen]
+        seen = {_place(r) for r in call["received"]}
+        late = [r for r in fetch(call["queue_id"]) if _place(r) not in seen]
         if not late:
             continue
         write_landing(folder, f"reconcile_{call['queue_id']}.json", {"queue_id": call["queue_id"], "late": late})
-        sent = {_core(trace_key(r.get("address"), "")): r for r in call["sent"]}
         for row in late:
-            lead = sent.get(_core(trace_key(row.get("address"), "")))
+            lead = match_sent(call["sent"], row)
             contacts = _contacts_from_row(row)
             if not lead or not lead.get("label") or contacts.is_empty:
                 continue
@@ -203,26 +252,56 @@ def reconcile_queues(db, folder: Path, *, fetch, write_ledger, write_contacts) -
     return {"queues_checked": checked, "late_hits_stored": len(found)}
 
 
+def resume_pending(list_key: str, *, fetch: Callable[[str], list[dict]]) -> int:
+    """Fetch (free) every queue a stopped run left pending and land its results, so replay stores them and
+    nothing is submitted twice. A queue that returns nothing yet stays pending for the next run."""
+    resumed = 0
+    for pending in sorted((LANDING_ROOT / list_key / "tracerfy").glob(f"*/{PENDING_PREFIX}_*.json")):
+        call = json.loads(pending.read_text(encoding="utf-8"))
+        received = fetch(str(call["queue_id"]))
+        if not received:
+            logger.warning("[list-trace] queue %s is still empty; left pending", call["queue_id"])
+            continue
+        write_landing(pending.parent, pending.name[len(PENDING_PREFIX) + 1:],
+                      {"queue_id": call["queue_id"], "sent": call["sent"], "received": received})
+        pending.unlink(missing_ok=True)
+        resumed += 1
+    return resumed
+
+
 def replay_landed(db, list_key: str, *, write_ledger, write_contacts) -> dict[str, int]:
     """Write every landed Tracerfy result for the list to the database from disk, without calling
-    Tracerfy. Addresses already in the ledger are skipped, so replaying twice writes nothing new.
-    This is what makes an interrupted run safe: a result paid for is never paid for again."""
-    replayed = found = 0
-    for path in sorted((LANDING_ROOT / list_key / "tracerfy").glob("*/trace_*.json")):
+    Tracerfy: normal results, and address-only (advanced) ones with their name check. Addresses already in
+    the ledger for that mode are skipped, so replaying twice writes nothing new. This is what makes an
+    interrupted run safe: a result paid for is never paid for again."""
+    replayed = found = skipped_legacy = 0
+    folder = LANDING_ROOT / list_key / "tracerfy"
+    calls = [(path, NORMAL) for path in folder.glob("*/trace_*.json")]
+    calls += [(path, ADVANCED) for path in folder.glob("*/advanced_*.json")]
+    for path, mode in sorted(calls):
         with path.open(encoding="utf-8") as handle:
             call = json.load(handle)
+        rows = [row for row in call["sent"] if row.get("label")]
+        if list_key in SUBJECT_LISTS:
+            # A seller result filed under a bare RadarID (before subject keys) cannot be told from the owner's.
+            legacy = [row for row in rows if not str(row["label"]).startswith(SUBJECT_KEY_PREFIX)]
+            skipped_legacy += len(legacy)
+            rows = [row for row in rows if str(row["label"]).startswith(SUBJECT_KEY_PREFIX)]
         leads = [Lead(radar_id=str(row["label"]), property_address=row.get("address"), city=row.get("city"),
                       state=row.get("state"), zip=row.get("zip"),
                       owner_name=" ".join(p for p in (row.get("first_name"), row.get("last_name")) if p) or None,
                       principal_name=None)
-                 for row in call["sent"] if row.get("label")]
+                 for row in rows]
         keys = {trace_key(lead.property_address, lead.zip) for lead in leads}
         outcome = trace_staged_leads(
             leads, ledger=already_traced(db, "tracerfy", keys), submit=lambda rows, got=call["received"]: got,
-            write_ledger=write_ledger, write_contacts=write_contacts, cap=RunSpendCap(10 ** 9),
+            write_ledger=write_ledger, write_contacts=write_contacts, cap=RunSpendCap(10 ** 9), mode=mode,
         )
         replayed += outcome.submitted
         found += len(outcome.contacts)
+    if skipped_legacy:
+        logger.warning("[list-trace] %d landed %s result(s) under a bare RadarID were not replayed", skipped_legacy,
+                       list_key)
     return {"replayed_addresses": replayed, "replayed_found": found}
 
 
@@ -262,11 +341,11 @@ def _next_phones(db, radar_ids: Sequence[str]) -> dict[str, str]:
     people = {row.radar_id: [p for p in dict.fromkeys(normalize_phone(x) for x in row.phones or []) if p]
               for row in rows}
     every_phone = list({p for phones in people.values() for p in phones})
+    from src.lending.compliance import fresh_scrubs
+
     blocked, clean = set(), set()
-    for phone, is_blocked in db.execute(text(
-            "SELECT phone, bool_or(national_dnc OR state_dnc OR litigator) FROM lending.dnc_scrubs "
-            "WHERE phone = ANY(:p) GROUP BY phone"), {"p": every_phone}):
-        (blocked if is_blocked else clean).add(phone)
+    for phone, scrub in fresh_scrubs(db, every_phone, fresh_only=False).items():
+        (blocked if scrub.national_dnc or scrub.state_dnc or scrub.litigator else clean).add(phone)
     chosen = {rid: next_unchecked_phone(phones, blocked, clean) for rid, phones in people.items()}
     return {rid: phone for rid, phone in chosen.items() if phone}
 
@@ -395,8 +474,10 @@ def _run_live(args: argparse.Namespace, run_id: str, folder: Path) -> int:
         write_contacts = lambda contacts: _write_traced_contacts(db, contacts)  # noqa: E731
         start_balance = _balance()
         if args.dnc_only:
-            radar_ids = [r[0] for r in db.execute(text(
-                "SELECT radar_id FROM lending.pr_list_records WHERE list_key = :k AND qualifies"), {"k": args.list_key})]
+            radar_ids = [r[0] for r in db.execute(
+                _SUBJECT_KEYS_SQL if args.list_key in SUBJECT_LISTS else
+                text("SELECT radar_id FROM lending.pr_list_records WHERE list_key = :k AND qualifies"),
+                {"k": args.list_key})]
             dnc = run_dnc(db, radar_ids, folder=folder, run_id=run_id, scrubber=tracerfy_scrub,
                           max_phones=max(0, start_balance - args.reserve_credits), next_phone=args.next_phone)
             db.commit()
@@ -413,6 +494,13 @@ def _run_live(args: argparse.Namespace, run_id: str, folder: Path) -> int:
             logger.error("[list-trace] refused: TRACERFY_API_KEY is not set, so nothing can be traced")
             return 3
         api_key = secret.get_secret_value()
+        if args.list_key in SUBJECT_LISTS:
+            built = build_list_subjects(db, args.list_key)
+            db.commit()
+            logger.info("[list-trace] %s: trace subjects built: %s", args.list_key, json.dumps(built))
+        resumed = resume_pending(args.list_key, fetch=_fetch_queue(api_key))
+        if resumed:
+            logger.info("[list-trace] resumed %d queue(s) a stopped run left pending", resumed)
         replay = replay_landed(db, args.list_key, write_ledger=write_ledger, write_contacts=write_contacts)
         db.commit()
         logger.info("[list-trace] replayed landed results from disk: %s", json.dumps(replay))
