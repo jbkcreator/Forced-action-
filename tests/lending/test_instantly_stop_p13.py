@@ -18,7 +18,7 @@ PHONE = "+18135550177"
 
 @pytest.mark.parametrize("reply", [
     "Please remove my name from this", "this is spam", "leave us alone", "please stop this",
-    "we no longer want to receive these", "never email me again", "STOP", "Please delete my email address",
+    "we no longer want to receive these", "never email me again", "STOP", "Please delete my email address from your list",
 ])
 def test_wording_that_could_mean_stop_is_a_stop_in_the_webhook(reply):
     assert instantly_replies.could_mean_stop(reply)
@@ -137,3 +137,56 @@ def test_failed_ghl_lookup_is_raised_to_the_inbox(monkeypatch):
     compliance._alert_unlinked_stop(None, [EMAIL])
     assert raised[0]["event_type"] == "stop_phone_link_failed"
     assert EMAIL not in str(raised[0])
+
+
+@pytest.mark.parametrize("reply", [
+    "Could you remove my old number and call me at the new one?",
+    "Please remove my old number, my new number is 813-555-0142, call me tomorrow",
+    "Delete my old phone number and give me a call",
+    "remove my old number and text me the details",
+    "I changed offices, my new number is 813-555-0142",
+    "please remove my info from the old file and phone me",
+])
+def test_a_number_correction_or_a_callback_request_is_not_suppressed_on_the_spot(reply):
+    assert not instantly_replies.could_mean_stop(reply)
+
+
+@pytest.mark.parametrize("reply", [
+    "remove me", "Please remove my email address from your list", "delete my name from your mailing list",
+    "Stop emailing me", "unsubscribe", "never call me again", "do not contact me, call me never",
+    "this is spam, don't call me",
+    # the review's probes: a real opt-out must never be waved through because the reply also mentions calling
+    "Please remove my number and don't call me", "remove my email from your list and call me",
+    "please remove my email address from your list, text me at my new number", "Take my number off",
+    "delete my info, don't call me", "take my email off your list, call me about X",
+])
+def test_clear_stop_requests_are_still_suppressed_on_the_spot(reply):
+    assert instantly_replies.could_mean_stop(reply)
+
+
+def test_a_clear_stop_is_still_a_stop_even_when_the_reply_also_mentions_calling():
+    assert instantly_replies.could_mean_stop("Unsubscribe me, do not call me")
+    assert instantly_replies.could_mean_stop("remove me from your list, you can call me never")
+
+
+def test_a_number_correction_is_stored_for_triage_not_recorded_as_an_unsubscribe():
+    from types import SimpleNamespace
+
+    from tests.lending.test_instantly_replies import reply_body
+
+    stored = []
+    db = SimpleNamespace(execute=lambda statement, params: stored.append(dict(params)) or SimpleNamespace(scalar=lambda: 9))
+    event = instantly_replies.parse_event(reply_body(text="Could you remove my old number and call me at the new one?"))
+    result = instantly_replies.record_event(db, event)
+    assert (result.status, result.stop_request) == ("recorded", False)
+    assert stored[0]["status"] == "new" and stored[0]["intent"] is None and stored[0]["stop"] is False
+
+
+def test_a_clear_stop_is_recorded_as_an_unsubscribe_for_immediate_suppression():
+    from types import SimpleNamespace
+
+    from tests.lending.test_instantly_replies import reply_body
+
+    db = SimpleNamespace(execute=lambda statement, params: SimpleNamespace(scalar=lambda: 9))
+    result = instantly_replies.record_event(db, instantly_replies.parse_event(reply_body(text="Please remove me from your list")))
+    assert result.stop_request is True

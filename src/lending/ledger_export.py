@@ -9,8 +9,9 @@ lead carries one), the internal ``contact_id`` and the last 4 digits of the phon
 * contacts carry the first-contact rank and time (``lending.first_contact_snapshots``).
 * consents include email-only opt-outs (matched to a website lead's contact by email, else keyless) and the boxes
   ticked on the website form.
-* touches include booking reminders and the LendingFlow intro text; outcomes include partner-file status changes and
-  their routing events.
+* touches include booking reminders and the LendingFlow intro text; outcomes include every partner-file status change
+  (``lending.loan_file_status_events``, one row per change, so two changes in a day are both exported) and their routing
+  events.
 * touches, dispositions, outcomes: the ET calendar day being exported (yesterday, run after midnight ET).
 * scores: the borrower score (``borrower_score.py``) worked out at export time per LendingFlow / website lead, with
   the inputs it was missing. ``lead_scoring.score_lead`` is not wired to stored inputs, so it is not exported.
@@ -244,8 +245,9 @@ _OUTCOMES = text("""
           FROM lending.file_routing_events e JOIN lending.lendingflow_leads l ON l.id = e.lead_id
          WHERE NOT l.is_test
         UNION ALL
-        SELECT borrower_phone, status_at, 'partner_file', status, id::text
-          FROM lending.loan_files WHERE partner_id IS NOT NULL AND NOT is_test
+        SELECT f.borrower_phone, e.at, 'partner_file', e.status, e.loan_file_id::text
+          FROM lending.loan_file_status_events e JOIN lending.loan_files f ON f.id = e.loan_file_id
+         WHERE f.partner_id IS NOT NULL AND NOT f.is_test
         UNION ALL
         SELECT f.borrower_phone, e.created_at, 'partner_routing', e.action, e.loan_file_id::text
           FROM lending.file_routing_events e JOIN lending.loan_files f ON f.id = e.loan_file_id

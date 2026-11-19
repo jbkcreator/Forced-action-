@@ -228,3 +228,14 @@ def test_a_footer_naming_backflip_stops_the_send() -> None:
     with pytest.raises(InstantlySendError, match="Backflip"):
         NdlInstantlySender(account, fake).send("m@example.com", "S", "clean body")
     assert fake.calls == []
+
+
+def test_a_footer_block_is_a_lane_block_the_relay_stores_as_blocked_and_the_digest_finds() -> None:
+    from packages.agent_core.lane_guard import LaneViolation
+
+    account = NdlInstantly(**{**ACCOUNT.__dict__, "footer_brand": "Backflip Lending"})
+    fake = FakeInstantly(_routes())
+    with pytest.raises(instantly_email.InstantlyLaneBlock) as raised:
+        NdlInstantlySender(account, fake).send("m@example.com", "S", "clean body")
+    assert isinstance(raised.value, InstantlySendError) and isinstance(raised.value, LaneViolation)
+    assert fake.calls == []  # no request went to Instantly

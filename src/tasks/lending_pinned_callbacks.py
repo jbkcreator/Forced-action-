@@ -43,7 +43,12 @@ logger = logging.getLogger(__name__)
 def _line(reply: MorningReply, names: Mapping[str, str]) -> str:
     event = reply.pin.event
     left = event.received_at.astimezone(TIMEZONE)
-    status = "reply draft waiting for Approve" if reply.action_id else "no text consent, call only"
+    if reply.action_id:
+        status = "reply draft waiting for Approve"
+    elif reply.blocked:
+        status = "reply blocked by the Backflip check, no card: call back"
+    else:
+        status = "no text consent, call only"
     # Full name from the lead record when known, else the name the caller gave; escaped (caller-supplied).
     who = name_and_ref(names.get(event.phone) or event.first_name, readable_ref(reply.pin.lead_ref))
     return (f"• {who} (…{event.phone[-4:]}): voicemail {left:%a} "

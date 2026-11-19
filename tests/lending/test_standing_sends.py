@@ -356,14 +356,52 @@ class RecordingConn:
         return SimpleNamespace(rowcount=self.changed)
 
 
-def test_a_revoke_sends_the_templates_queued_automatic_sends_back_for_approval():
-    conn = RecordingConn()
-    assert standing_sends.set_revoked(conn, "LF-D2-SMS-v1", revoked=True, by="josh") is True
-    (_, returned_params), = [(s, p) for s, p in conn.sql if "RETURNING p.action_id" in s]
-    assert returned_params == {"auto_actor": "auto:graduated", "template_version": "LF-D2-SMS-v1"}
-    sql = conn.sql[-1][0]
-    assert "status = 'pending'" in sql and "decided_by = NULL" in sql and "card_ts = NULL" in sql
-    assert "p.status = 'approved'" in sql  # never a claimed ('sending') or finished action
+class _Rows:
+    def __init__(self, rows):
+        self._rows = rows
+
+    def mappings(self):
+        return self
+
+    def all(self):
+        return self._rows
+
+    def __iter__(self):
+        return iter(self._rows)
+
+
+def test_a_revoke_checks_only_that_templates_queued_sends_and_returns_the_ineligible_ones():
+    calls = []
+
+    class Conn:
+        def execute(self, statement, params=None):
+            sql = str(statement)
+            calls.append((sql, dict(params or {})))
+            if "SELECT action_id" in sql:
+                return _Rows([{"action_id": 5, "template_version": "LF-D2-SMS-v1", "channel": "ghl_sms"}])
+            if "UPDATE lending.pending_actions" in sql:
+                return _Rows([(5,)])
+            return SimpleNamespace(scalar=lambda: False)  # no active graduation / channel not eligible
+
+    assert standing_sends.return_ungraduated_auto_approvals(Conn(), "LF-D2-SMS-v1") == [5]
+    select = next(p for sql, p in calls if "SELECT action_id" in sql)
+    assert select == {"auto_actor": "auto:graduated", "template_version": "LF-D2-SMS-v1"}
+    update_sql, update = next((sql, p) for sql, p in calls if "UPDATE lending.pending_actions" in sql)
+    assert update["ids"] == [5]
+    assert "status = 'pending'" in update_sql and "decided_by = NULL" in update_sql and "card_ts = NULL" in update_sql
+    assert "status = 'approved'" in update_sql  # never a claimed ('sending') or finished action
+
+
+def test_an_eligible_queued_send_is_left_alone():
+    class Conn:
+        def execute(self, statement, params=None):
+            if "SELECT action_id" in str(statement):
+                return _Rows([{"action_id": 5, "template_version": "LF-D2-SMS-v1", "channel": "ghl_sms"}])
+            if "UPDATE lending.pending_actions" in str(statement):
+                raise AssertionError("an eligible send must not be returned for approval")
+            return SimpleNamespace(scalar=lambda: True)
+
+    assert standing_sends.return_ungraduated_auto_approvals(Conn()) == []
 
 
 def test_a_restore_or_a_revoke_that_changed_nothing_returns_nothing():
@@ -496,3 +534,60 @@ def test_graduation_check_passes_the_channel_and_the_rule_to_the_query():
     assert params["max_edit_rate"] == 0.10
     standing_sends.make_is_graduated(engine)("LF-D2-SMS-v1")
     assert engine.params[1]["channel"] is None
+
+
+def test_a_queued_send_whose_channel_lost_eligibility_gets_a_human_approval_card_on_postgres(lending_db):
+    """Review finding: 2 edited approvals out of 29 became 3 of 30 while an automatic draft was queued; the relay deferred
+    it every sweep and the template-level recovery never returned it, so it expired with no card."""
+    from migrations.apply_lending_cora_agent_core import apply_to as apply_core
+    from migrations.apply_lending_cora_inbox import apply_to as apply_inbox
+    from migrations.apply_lending_pending_action_safeguards import apply_to as apply_safeguards
+    from migrations.apply_lending_standing_sends import apply_to
+    from sqlalchemy import text as sql_text
+
+    conn = lending_db.connection()
+    apply_core(conn)
+    apply_safeguards(conn)
+    apply_inbox(conn)
+    apply_to(conn)
+    for i in range(30):
+        _approve(lending_db, "P14-LAPSE-v1", revised=i < 3)  # 3 of 30 edited: 10%, not under
+    for _ in range(2):
+        _approve(lending_db, "P14-LAPSE-v1", revised=False, channel="instantly_cold_email")
+    conn.execute(sql_text("INSERT INTO lending.template_graduations (template_version, approvals, edited, rejected, edit_rate) "
+                          "VALUES ('P14-LAPSE-v1', 29, 2, 0, 0.069)"))  # graduated while it still met the rule
+    queued = []
+    for channel in ("ghl_sms", "instantly_cold_email"):
+        queued.append(lending_db.execute(sql_text(
+            "INSERT INTO lending.pending_actions (tool_name, channel, payload, status, decided_by) VALUES "
+            "('agent_job', :c, CAST(:p AS jsonb), 'approved', 'auto:graduated') RETURNING action_id"),
+            {"c": channel, "p": json.dumps({"template_version": "P14-LAPSE-v1", "body": "Hi"})}).scalar())
+    returned = standing_sends.return_ungraduated_auto_approvals(conn)
+    assert sorted(returned) == sorted(queued)  # both channels are below the rule now: both go to a person
+    states = [tuple(lending_db.execute(sql_text("SELECT status, decided_by, card_ts FROM lending.pending_actions "
+                                                "WHERE action_id = :i"), {"i": i}).one()) for i in queued]
+    assert states == [("pending", None, None)] * 2  # pending with no card: the card retry posts the approval card
+    assert standing_sends.return_ungraduated_auto_approvals(conn) == []  # nothing left to return
+
+
+def test_a_queued_send_on_a_channel_that_still_qualifies_is_not_returned_on_postgres(lending_db):
+    from migrations.apply_lending_cora_agent_core import apply_to as apply_core
+    from migrations.apply_lending_cora_inbox import apply_to as apply_inbox
+    from migrations.apply_lending_pending_action_safeguards import apply_to as apply_safeguards
+    from migrations.apply_lending_standing_sends import apply_to
+    from sqlalchemy import text as sql_text
+
+    conn = lending_db.connection()
+    apply_core(conn)
+    apply_safeguards(conn)
+    apply_inbox(conn)
+    apply_to(conn)
+    for i in range(30):
+        _approve(lending_db, "P14-KEEP-v1", revised=i < 2)  # 2 of 30: under 10%
+    conn.execute(sql_text("INSERT INTO lending.template_graduations (template_version, approvals, edited, rejected, edit_rate) "
+                          "VALUES ('P14-KEEP-v1', 30, 2, 0, 0.066)"))
+    action = lending_db.execute(sql_text(
+        "INSERT INTO lending.pending_actions (tool_name, channel, payload, status, decided_by) VALUES "
+        "('agent_job', 'ghl_sms', CAST(:p AS jsonb), 'approved', 'auto:graduated') RETURNING action_id"),
+        {"p": json.dumps({"template_version": "P14-KEEP-v1", "body": "Hi"})}).scalar()
+    assert action not in standing_sends.return_ungraduated_auto_approvals(conn)

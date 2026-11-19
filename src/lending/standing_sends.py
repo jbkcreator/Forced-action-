@@ -380,30 +380,48 @@ def make_is_graduated(engine: Engine) -> Callable[..., bool]:
     return is_graduated
 
 
-# An action approved automatically (graduation) that has not been claimed for sending yet, whose template no longer
-# has an active graduation (revoked, or the row is gone): back to pending with no decision and no card, so the
-# card retry posts a fresh "Approval needed" card and only a person can approve it. ``template_version`` narrows it to
-# one template (the revoke).
+# Automatically approved, still unsent actions (optionally of one template): the candidates the recovery sweep checks.
+_AUTO_APPROVED_UNSENT = text("""
+    SELECT action_id, payload->>'template_version' AS template_version, channel
+      FROM lending.pending_actions
+     WHERE status = 'approved' AND decided_by = :auto_actor
+       AND (CAST(:template_version AS text) IS NULL OR payload->>'template_version' = :template_version)
+""")
+# Back to pending with no decision and no card, so the card retry posts a fresh "Approval needed" card and only a
+# person can approve it.
 _RETURN_FOR_APPROVAL = text("""
-    UPDATE lending.pending_actions p
+    UPDATE lending.pending_actions
        SET status = 'pending', decided_by = NULL, decided_at = NULL, card_channel = NULL, card_ts = NULL,
            updated_at = now()
-     WHERE p.status = 'approved' AND p.decided_by = :auto_actor
-       AND (CAST(:template_version AS text) IS NULL OR p.payload->>'template_version' = :template_version)
-       AND NOT EXISTS (SELECT 1 FROM lending.template_graduations g
-                        WHERE g.template_version = p.payload->>'template_version' AND g.revoked_at IS NULL)
-    RETURNING p.action_id
+     WHERE action_id = ANY(:ids) AND status = 'approved' AND decided_by = :auto_actor
+    RETURNING action_id
 """)
 
 
 def return_ungraduated_auto_approvals(conn: Any, template_version: Optional[str] = None) -> list[int]:
-    """Send automatically approved, still unsent actions of a template that no longer auto-sends back for a
-    person's approval. Returns their action ids. Runs in the caller's transaction."""
-    returned = [int(row[0]) for row in conn.execute(_RETURN_FOR_APPROVAL, {
-        "auto_actor": AUTO_GRADUATED_ACTOR, "template_version": template_version})]
+    """Send automatically approved, still unsent actions that no longer qualify for automatic sending back for a
+    person's approval. Qualifying is the send-time rule exactly (``_IS_GRADUATED`` with the action's own channel): the
+    template has an active graduation AND the channel still meets the rule, so a draft the relay keeps deferring
+    because its channel lapsed gets a human card instead of sitting until it expires. ``template_version`` narrows it to
+    one template (the revoke). Returns their action ids. Runs in the caller's transaction."""
+    candidates = conn.execute(_AUTO_APPROVED_UNSENT, {"auto_actor": AUTO_GRADUATED_ACTOR,
+                                                       "template_version": template_version}).mappings().all()
+    eligible: dict[tuple[Optional[str], str], bool] = {}
+    ids = []
+    for row in candidates:
+        key = (row["template_version"], row["channel"])
+        if key not in eligible:
+            eligible[key] = bool(row["template_version"]) and bool(
+                conn.execute(_IS_GRADUATED, _graduated_params(row["template_version"], row["channel"])).scalar())
+        if not eligible[key]:
+            ids.append(int(row["action_id"]))
+    if not ids:
+        return []
+    returned = [int(row[0]) for row in conn.execute(_RETURN_FOR_APPROVAL, {"auto_actor": AUTO_GRADUATED_ACTOR,
+                                                                           "ids": ids})]
     if returned:
         logger.warning("[standing-sends] %d automatically approved action(s) sent back for approval "
-                       "(template no longer auto-sends): %s", len(returned), returned)
+                       "(template or channel no longer auto-sends): %s", len(returned), returned)
     return returned
 
 

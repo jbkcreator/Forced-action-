@@ -10,7 +10,7 @@ and `LENDING_LEDGER_EXPORT_FOLDER_ID` is set. Read-only on the database.
 | `consents.csv` | Text consents, suppressions, **website-form boxes ticked** (`web_form_consent`) and **email-only opt-outs** (`email_opt_out`; matched to a website lead's contact by email, else no contact columns) |
 | `touches.csv` | The exported ET day: calls, missed-call texts, Cora sends (SMS, email, GHL actions), **booking reminders** (`booking_text` / `booking_email`) and the **LendingFlow intro text** (`intro_text`) |
 | `dispositions.csv` | The exported day's calls |
-| `outcomes.csv` | The exported day's GHL stage entries, LendingFlow routing events, **partner-file status changes** (`partner_file`) and **partner routing events** (`partner_routing`) |
+| `outcomes.csv` | The exported day's GHL stage entries, LendingFlow routing events, **every partner-file status change** (`partner_file`, one row per change from `lending.loan_file_status_events`, so an approval and a funding on the same day are both exported) and **partner routing events** (`partner_routing`) |
 | `scores.csv` | Borrower score per LendingFlow / website lead, with missing inputs |
 | `cohorts.csv` | One row per LendingFlow batch (`cohort_report.cohorts`): bought, delivered, funded at 30/60/90 days (blank while a window is open), fees, replacements. No contact columns |
 
@@ -25,3 +25,8 @@ are not logged anywhere in our database, so they cannot be exported.
 Setup: set the two settings, share the folder with the service account and with Josh and the agents' account, then check
 `manifest.json` in the day's folder (row counts per file). Test: `tests/lending/test_ledger_export_db.py` runs every query
 on Postgres.
+
+Partner-file history: `partners.record_status_change` (the one writer of a file's status) and `save_submission` add a row to
+`lending.loan_file_status_events` in the same transaction as the change; a failed write is logged and never undoes the change.
+Run `migrations/apply_lending_loan_file_status_events.py` before deploying (it also gives each existing partner file one starting
+row). Files that changed before the table existed show one `partner_file` row (their status then), not their earlier history.

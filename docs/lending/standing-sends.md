@@ -59,3 +59,8 @@ re-approve them; they stay on their cards.
 ## Setup
 
 Run `PYTHONPATH=. python migrations/apply_lending_standing_sends.py` before deploying.
+
+The recovery sweep and the send-time check use the same rule: an automatically approved, still unsent action goes back for a person's
+approval (no decision, no card; the card retry posts a fresh approval card) when its template has no active graduation **or its
+channel no longer meets the rule** (25 person approvals on that channel, under 10% edited). So a draft whose channel lapsed while it
+was queued is not deferred until it expires.

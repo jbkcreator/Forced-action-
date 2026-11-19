@@ -82,3 +82,10 @@ Instantly's webhook field names (`lead_email`, `email_account`, `email_id`, `rep
 (`POST /api/v2/emails/reply` with `eaccount`, `reply_to_uuid`, `subject`, `body`) follow Instantly's public
 reference, not a captured delivery. Turn on `LENDING_GHL_LOG_PAYLOAD_SHAPE` for the first test reply to log the
 field names (never values), and check the first approved answer lands in the thread.
+
+**A callback request or a number correction is not a STOP.** Wording that only *could* mean stop ("remove my number", "delete my info", "take my
+email off") is not suppressed on the spot when the same reply asks us to call, text or reach the lead ("call me at my new number", "give me a
+call", "my new number is ..."): it goes to triage, where the model decides (a real stop in wording the phrases miss is still suppressed by
+Cora's sweep). The guard never applies to a clear stop: a strict phrase ("remove me", "remove my email address from your list", "take my number
+off your list", "unsubscribe", "this is spam"), or a negated contact verb in the same reply ("delete my info, don't call me", "never call me
+again"), is still suppressed within seconds, whatever else the reply says.

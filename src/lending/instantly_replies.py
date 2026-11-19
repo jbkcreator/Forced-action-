@@ -67,6 +67,8 @@ _STOP_PHRASES = re.compile(
     r"(?:do not|don'?t) (?:email|e-mail|contact|message)|"
     r"(?:do not|don'?t) send (?:me |us )?(?:any ?more|more|further|another)|"
     r"(?:do not|don'?t) want (?:any ?more|more|further|your) (?:e-?mails?|messages)|"
+    r"(?:remove|delete|take) (?:my|our) (?:\w+ ){0,3}(?:from|off) (?:your|the|this|that|any|all) (?:\w+ )?"
+    r"(?:list|lists|mailing|database|records|system)|"
     r"no (?:more|further) (?:e-?mails?|messages|contact))\b",
     re.IGNORECASE,
 )
@@ -75,10 +77,22 @@ _STOP_PHRASES = re.compile(
 # STOP never waits for Cora's sweep or the AI model; the model still sorts every other reply.
 _POSSIBLE_STOP = re.compile(
     r"\b(?:cease\w*|unsubscrib\w*|harass\w*|leave (?:me|us) alone|(?:please |pls )?stop (?:it|this|that|now)|"
-    r"(?:remove|delete|take) (?:me|us|my|our) (?:\w+ )?(?:name|email|e-?mail|address|number|info|details|from)|"
+    r"(?:remove|delete|take) (?:me|us|my|our) (?:\w+ )?(?:name|email|e-?mail|address|number|info|details|from|off)|"
     r"(?:this (?:is|was)|it'?s|reported? (?:as|you as)|mark(?:ed|ing)? (?:as|you as)) spam|spammer|"
     r"no longer (?:want|wish) to (?:receive|hear|get)|"
     r"never (?:email|contact|call|text|message)|not (?:email|contact) (?:me|us))\b", re.IGNORECASE)
+# "don't call me", "never text me", "stop emailing me": a negated contact verb. It switches the callback guard below off,
+# so "delete my info, don't call me" is still a stop even though it says "call me".
+_NEGATED_CONTACT = re.compile(
+    r"\b(?:don'?t|do not|never|stop|quit|no more)\s+(?:\w+\s+){0,2}(?:call|text|phone|ring|reach|contact|e-?mail|message)\w*\b",
+    re.IGNORECASE)
+# A lead asking us to call, text or reach them ("call me at my new number", "give me a call"). Wording that only *could*
+# mean stop is not suppressed on the spot when the same reply asks for contact: it goes to triage, where the model
+# decides (and a real stop is still suppressed by the sweep). Clear stop requests are not affected.
+_ASKS_FOR_CONTACT = re.compile(
+    r"\b(?:(?<!not )(?<!n't )(?<!never )(?:call|phone|text|ring|reach) (?:me|us)|give (?:me|us) a (?:call|ring)|"
+    r"call(?:ing)? (?:me )?back|callback|my (?:new|updated|correct|current|cell|mobile|direct) (?:number|phone|cell))\b",
+    re.IGNORECASE)
 # A line that is only a stop word, with at most a short lead-in or tail ("STOP", "Please stop", "No thanks, stop",
 # "Remove"), so "can't stop thinking about it" is not one. Checked word by word, not with a regex: the reply is text
 # anyone can send, and a nested-quantifier pattern here backtracks exponentially (PR #428 re-review).
@@ -162,7 +176,12 @@ def is_stop_request(reply: str) -> bool:
 
 def could_mean_stop(reply: str) -> bool:
     """A stop request, or any wording that could be one. Decided in the webhook, before anything else runs."""
-    return is_stop_request(reply) or bool(_POSSIBLE_STOP.search(new_reply_text(reply)))
+    if is_stop_request(reply):
+        return True
+    own = new_reply_text(reply)
+    if not _POSSIBLE_STOP.search(own):
+        return False
+    return bool(_NEGATED_CONTACT.search(own)) or not _ASKS_FOR_CONTACT.search(own)
 
 
 def parse_event(body: Mapping[str, Any]) -> Optional[InstantlyEvent]:

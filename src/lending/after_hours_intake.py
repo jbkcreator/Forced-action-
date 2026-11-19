@@ -76,7 +76,8 @@ class PinnedCall:
 @dataclass(frozen=True)
 class MorningReply:
     pin: PinnedCall
-    action_id: Optional[int]  # None: no text consent, call only
+    action_id: Optional[int]  # None: no text consent, or blocked, call only
+    blocked: bool = False  # the Backflip check blocked the reply: no card will ever appear
 
 
 class DraftQueue(Protocol):
@@ -178,7 +179,8 @@ _PINS = text("""
                         WHERE o.phone = c.phone AND o.direction = 'outbound' AND o.call_ended_at >= c.pinned_at)
      ORDER BY c.id, d.call_ended_at DESC
 """)
-_DRAFTED = text("SELECT idempotency_key, action_id FROM lending.pending_actions WHERE idempotency_key = ANY(:keys)")
+_DRAFTED = text("SELECT idempotency_key, action_id, status FROM lending.pending_actions "
+                "WHERE idempotency_key = ANY(:keys)")
 
 
 def pins_to_call(db, now: datetime) -> list[PinnedCall]:
@@ -238,19 +240,21 @@ def _queue_reply(queue: DraftQueue, pin: PinnedCall, drafter: Drafter, full_name
 def draft_morning_replies(db, pins: list[PinnedCall], queue: DraftQueue, drafter: Drafter) -> list[MorningReply]:
     """Queue a reply for Approve for each pin with text consent; a voicemail already drafted keeps its draft (no
     second model call). The rest are call-only."""
-    drafted = dict(db.execute(_DRAFTED, {"keys": [pin.event.call_key for pin in pins]}).all())
+    drafted = {key: (action_id, status) for key, action_id, status in
+               db.execute(_DRAFTED, {"keys": [pin.event.call_key for pin in pins]}).all()}
     names = names_by_phone(db, [pin.event.phone for pin in pins if pin.event.call_key not in drafted])
     replies = []
     for pin in pins:
         if pin.event.call_key in drafted:
-            replies.append(MorningReply(pin, drafted[pin.event.call_key]))
+            action_id, status = drafted[pin.event.call_key]
+            replies.append(MorningReply(pin, None, blocked=True) if status == "blocked" else MorningReply(pin, action_id))
         elif has_text_consent(db, pin.event.phone):
             try:
                 replies.append(MorningReply(pin, _queue_reply(queue, pin, drafter, names.get(pin.event.phone))))
             except LaneViolation:  # the send gate blocked a draft naming Backflip: no card, call-only
                 logger.error("[after-hours] the voicemail reply for call %s was blocked by the Backflip check",
                              pin.event.call_key[:8])
-                replies.append(MorningReply(pin, None))
+                replies.append(MorningReply(pin, None, blocked=True))
         else:
             replies.append(MorningReply(pin, None))
     return replies
