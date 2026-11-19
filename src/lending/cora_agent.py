@@ -18,6 +18,7 @@ Usage:
 from __future__ import annotations
 
 import logging
+import re
 import signal
 import threading
 from collections.abc import Callable, Mapping
@@ -67,6 +68,7 @@ from src.lending.standing_sends import (
     auto_approval_lapsed,
     make_edit_recorder,
     make_is_graduated,
+    make_wording_ok,
 )
 from src.lending.ops_alerts import post_ops_notice, post_replies_notice
 from src.lending.cora_morning_digest import post_morning_digest
@@ -333,7 +335,8 @@ def build_agent_jobs(settings: AppSettings, *, engine: Engine, gate: SendGate, q
         return None
     instantly_ready = get_ndl_instantly_sender() is not None
     return JobQueueWorker(engine, folders, gate, queue, crm.read_contact, approval_channel=approval_channel,
-                          check=make_check(engine, instantly_ready=instantly_ready), is_graduated=is_graduated)
+                          check=make_check(engine, instantly_ready=instantly_ready), is_graduated=is_graduated,
+                          wording_ok=make_wording_ok(engine) if get_settings().lending_graduated_approved_wording_only else None)
 
 
 def _ts_seconds(ts: Optional[str]) -> float:

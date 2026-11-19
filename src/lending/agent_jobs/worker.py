@@ -44,6 +44,7 @@ from src.lending.agent_jobs.drive import DriveFile, FakeJobFolders, JobFolders
 from src.lending.agent_jobs.job import AgentJob, JobFormatError, parse_job
 from src.lending.agent_jobs.receipts import build_receipt, receipt_for
 from src.lending.ghl_crm import GhlContact
+from src.lending.standing_sends import label_names
 
 logger = logging.getLogger(__name__)
 
@@ -92,6 +93,7 @@ class JobQueueWorker:
     def __init__(self, engine: Engine, folders: JobFolders, gate: SendGate, queue: PendingActionQueue,
                  read_contact: ReadContact, *, approval_channel: str, check: Check,
                  is_graduated: Callable[..., bool] = lambda *_: False,
+                 wording_ok: Optional[Callable[..., bool]] = None,
                  clock: Callable[[], datetime] = utc_now, jobs_table: str = "lending.agent_jobs",
                  raise_alert: Optional[Callable[..., Any]] = None) -> None:
         self._engine = engine
@@ -102,6 +104,7 @@ class JobQueueWorker:
         self._approval_channel = approval_channel
         self._check = check
         self._is_graduated = is_graduated
+        self._wording_ok = wording_ok
         self._clock = clock
         self._table = jobs_table
         self._postgres = engine.dialect.name == "postgresql"
@@ -248,6 +251,10 @@ class JobQueueWorker:
         context = ToolContext(user_id=REQUESTED_BY, is_approver=False, channel=self._approval_channel, thread_ts="",
                               tool_use_id=_draft_key(job))
         automatic = not job.requires_approval and self._is_graduated(job.template_version, draft.channel)
+        if automatic and self._wording_ok is not None and not self._wording_ok(
+                job.template_version, draft.channel, draft.payload, label_names(job.contact_label)):
+            automatic = False  # graduated, but this wording is not one Josh approved: it gets a card
+            logger.info("[agent-jobs] job %s: wording differs from the approved wording; approval card", job.job_id)
         try:
             queued = self._gate.submit(draft, tool_name=f"agent_job:{job.type}", context=context,
                                        ttl=job.expires_at - now, post_card=not automatic)

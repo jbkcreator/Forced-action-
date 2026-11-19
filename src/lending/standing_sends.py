@@ -31,10 +31,11 @@ import argparse
 import difflib
 import json
 import logging
+import re
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from typing import Any, Optional
+from typing import Any, Optional, Sequence
 
 from sqlalchemy import create_engine, text
 from sqlalchemy.engine import Engine
@@ -380,6 +381,73 @@ def _graduated_params(template_version: str, channel: Optional[str]) -> dict[str
     return {"template_version": template_version, "channel": channel, "min_approvals": GRADUATION_MIN_APPROVALS,
             "max_edit_rate": GRADUATION_MAX_EDIT_RATE, "auto_prefix": f"{AUTO_APPROVER_PREFIX}%",
             "count_rejections": get_settings().lending_graduation_count_rejections}
+
+
+# ── approved wording (Q19) ────────────────────────────────────────────────────
+
+APPROVED_WORDING_SAMPLE = 200  # the most recent approved cards of a template version compared against
+_NAME_MARK = "<name>"
+_NUMBER_MARK = "<number>"
+
+
+def label_names(contact_label: Optional[str]) -> list[str]:
+    """The words of a card's contact label ("Mark T., Tampa"): the names and places an agent fills into a message."""
+    return re.findall(r"[A-Za-z]{2,}", contact_label or "")[:6]  # a long label cannot mask a whole sentence
+
+
+def wording_key(fields: Mapping[str, str], names: Sequence[str] = ()) -> str:
+    """The message's wording with what an agent fills in taken out: the contact's names and every run of digits (an
+    amount, a date, an address number). Case and spacing are ignored. Two messages with the same key say the same
+    thing to different people; any other change of words changes the key."""
+    parts = []
+    for field in EDIT_FIELDS:
+        value = fields.get(field)
+        if not value:
+            continue
+        value = value.casefold()
+        for name in sorted({n.casefold() for n in names if len(n) >= 2}, key=len, reverse=True):
+            value = re.sub(rf"(?<!\w){re.escape(name)}(?!\w)", _NAME_MARK, value)
+        value = re.sub(r"\d+(?:[.,]\d+)*", _NUMBER_MARK, value)
+        parts.append(f"{field}={' '.join(value.split())}")
+    return "\n".join(parts)
+
+
+_APPROVED_PAYLOADS = text("""
+    SELECT payload FROM lending.pending_actions
+     WHERE payload->>'template_version' = :template_version AND channel = :channel
+       AND decided_by IS NOT NULL AND decided_by NOT LIKE :auto_prefix
+       AND status IN ('approved', 'sending', 'sent', 'failed')
+     ORDER BY action_id DESC LIMIT :limit
+""")
+
+
+def make_wording_ok(engine: Engine) -> Callable[[str, str, Mapping[str, Any], Sequence[str]], bool]:
+    """``wording_ok(template_version, channel, payload, names)`` for the job worker: True only when this message's
+    wording (``wording_key``) matches the wording of a card Josh approved for the same template version and channel.
+    Fails closed: an unreadable answer is "no", so the message gets an approval card."""
+
+    def wording_ok(template_version: str, channel: str, payload: Mapping[str, Any], names: Sequence[str] = ()) -> bool:
+        wanted = wording_key(_message_fields(payload), names)
+        if not wanted:
+            return False
+        try:
+            with engine.connect() as conn:
+                rows = conn.execute(_APPROVED_PAYLOADS, {
+                    "template_version": template_version, "channel": channel,
+                    "auto_prefix": f"{AUTO_APPROVER_PREFIX}%", "limit": APPROVED_WORDING_SAMPLE}).scalars().all()
+        except Exception as exc:  # class only
+            logger.error("[standing-sends] approved-wording check failed (%s); %s gets a card", type(exc).__name__,
+                         template_version)
+            return False
+        for row in rows:
+            approved = json.loads(row) if isinstance(row, str) else row
+            if not isinstance(approved, Mapping) or not approved.get("contact_label"):
+                continue  # an older card without its contact label cannot be compared: it never matches
+            if wording_key(_message_fields(approved), label_names(approved["contact_label"])) == wanted:
+                return True
+        return False
+
+    return wording_ok
 
 
 def make_is_graduated(engine: Engine) -> Callable[..., bool]:

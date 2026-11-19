@@ -1103,6 +1103,15 @@ class AppSettings(BaseSettings):
 	# (defined above). Cold email stays off until the key, the passthrough campaign id and the footer postal address
 	# (CAN-SPAM) are all set.
 	lending_instantly_campaign_id: str = Field(default="", env="LENDING_INSTANTLY_CAMPAIGN_ID")
+	# More NDL campaign ids (comma separated) whose replies reach Cora, besides the passthrough campaign above. Events from
+	# any other campaign in the shared Instantly workspace are ignored (src/lending/instantly_webhook.py).
+	lending_instantly_extra_campaign_ids: str = Field(default="", env="LENDING_INSTANTLY_EXTRA_CAMPAIGN_IDS")
+	# Public host of NDL's cold-email unsubscribe link, e.g. https://api.nextdeallending.com (served by lending-api at
+	# /api/lending/email/unsubscribe). Unset = cold email stays off: the link must never point at the Forced Action host.
+	lending_unsubscribe_base_url: str = Field(default="", env="LENDING_UNSUBSCRIBE_BASE_URL")
+	# P1.4 (Q19): a graduated agent message sends without a card only when its wording matches wording Josh approved for that
+	# template (names and numbers filled in); anything else gets an approval card. Off until Josh confirms.
+	lending_graduated_approved_wording_only: bool = Field(default=False, env="LENDING_GRADUATED_APPROVED_WORDING_ONLY")
 	lending_instantly_sender_email: str = Field(default="", env="LENDING_INSTANTLY_SENDER_EMAIL")
 	lending_email_footer_brand: str = Field(default="Next Deal Lending", env="LENDING_EMAIL_FOOTER_BRAND")
 	lending_email_footer_postal_address: str = Field(default="", env="LENDING_EMAIL_FOOTER_POSTAL_ADDRESS")

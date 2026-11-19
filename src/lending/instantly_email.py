@@ -39,10 +39,12 @@ from typing import Any, Callable, Optional
 
 import requests
 
+from config.lending_compliance import UNSUBSCRIBE_PATH
 from config.settings import get_settings
 from packages.agent_core.lane_guard import lane_violation
 from src.lending.global_halt import is_globally_halted
 from src.lending.instantly_client import lending_instantly_account
+from src.services.email_unsubscribe import unsubscribe_url
 
 logger = logging.getLogger(__name__)
 
@@ -67,6 +69,7 @@ class NdlInstantly:
     footer_brand: str
     footer_postal_address: str
     footer_phone: str
+    unsubscribe_base_url: str = ""
 
 
 def _single_attempt(method: str, url: str, **kwargs: Any) -> requests.Response:
@@ -94,7 +97,8 @@ def ndl_instantly() -> Optional[NdlInstantly]:
     missing = tuple(name for name, value in (("LENDING_INSTANTLY_API_KEY", account),
                                              ("LENDING_INSTANTLY_CAMPAIGN_ID", s.lending_instantly_campaign_id),
                                              ("LENDING_EMAIL_FOOTER_POSTAL_ADDRESS",
-                                              s.lending_email_footer_postal_address)) if not value)
+                                              s.lending_email_footer_postal_address),
+                                             ("LENDING_UNSUBSCRIBE_BASE_URL", s.lending_unsubscribe_base_url)) if not value)
     if missing:
         if missing != _warned_missing:
             logger.warning("[lending-instantly] cold email is off; missing settings: %s", ", ".join(missing))
@@ -104,7 +108,8 @@ def ndl_instantly() -> Optional[NdlInstantly]:
                         campaign_id=s.lending_instantly_campaign_id, sender_email=s.lending_instantly_sender_email,
                         footer_brand=s.lending_email_footer_brand,
                         footer_postal_address=s.lending_email_footer_postal_address,
-                        footer_phone=s.lending_email_footer_phone)
+                        footer_phone=s.lending_email_footer_phone,
+                        unsubscribe_base_url=s.lending_unsubscribe_base_url)
 
 
 class NdlInstantlySender:
@@ -141,7 +146,10 @@ class NdlInstantlySender:
         venture = SimpleNamespace(brand_name=self._account.footer_brand,
                                   postal_address=self._account.footer_postal_address,
                                   outbound_contact_phone=self._account.footer_phone, outbound_disclaimer=None)
-        return build_passthrough_body(body, recipient, venture)
+        if not self._account.unsubscribe_base_url:  # never fall back to the Forced Action host
+            raise InstantlySendError("no unsubscribe host is configured (LENDING_UNSUBSCRIBE_BASE_URL); nothing sent")
+        link = unsubscribe_url(recipient, base_url=self._account.unsubscribe_base_url, path=UNSUBSCRIBE_PATH)
+        return build_passthrough_body(body, recipient, venture, unsubscribe_link=link)
 
     def _remove_previous_lead(self, email: str) -> None:
         data = self._call("lead lookup", "POST", "/api/v2/leads/list",

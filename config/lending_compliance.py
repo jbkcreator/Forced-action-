@@ -47,6 +47,8 @@ GHL_OPT_OUT_TAG = "lending-opt-out"
 # messaging channel is do-not-disturb, calls stay open. The SMS sender lifts SMS once consent is recorded.
 COLD_LEAD_DND_CHANNELS = tuple(channel for channel in GHL_DND_CHANNELS if channel != "Call")
 GHL_TAG_COLD_LEAD = "ndl-cold"
+# The cold-email unsubscribe link lives on NDL's own host (settings.lending_unsubscribe_base_url), served by lending-api.
+UNSUBSCRIBE_PATH = "/api/lending/email/unsubscribe"
 # Added when a cold lead replies with interest and is handed to GHL (src/lending/instantly_ghl_handoff.py).
 GHL_TAG_INSTANTLY_INTERESTED = "ndl-instantly-interested"
 # The do-not-disturb message set on a cold push. Warming up lifts only do-not-disturb carrying this message, so a

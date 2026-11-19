@@ -72,3 +72,12 @@ Turning the switch on does not revoke a type that already graduated: only the se
 under the old rule but is over the limit once rejections count goes back to approval cards for new jobs (the tracker still shows it as
 graduated until it is revoked with `--revoke`), and an action already approved automatically but not yet sent is held until its draft
 expires. The rate stored with a graduation (`edit_rate`) is the rate the decision used.
+
+## A graduated message sends only approved wording (off until Josh confirms)
+
+With `LENDING_GRADUATED_APPROVED_WORDING_ONLY=true` (default false; restart `fa-lending-cora` to change) a graduated agent message goes
+out without a card only when its wording matches wording Josh approved for the same template version and channel. The comparison
+ignores case and spacing and takes out what an agent fills in: the contact's names and places (the words of the job's `contact_label`)
+and every run of digits. Any other change of words, or no approved card to compare with (including cards approved before this
+change, which carry no `contact_label`), gets a normal approval card, never a block. It looks at the 200 most recent person-approved cards (approved, sending, sent or failed). Digits are ignored, so a changed amount or term does not change the match: that is the point (amounts are filled in), and the reason this stays off until Josh agrees.
+This is the team's recommendation for Q19, not Josh's answer.
