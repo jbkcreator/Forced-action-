@@ -109,3 +109,26 @@ def test_fake_folders_round_trip() -> None:
     assert fake.list_inbox(10) == []
     fake.write_result("job-1", {"status": "sent"})
     assert fake.results["job-1"] == {"status": "sent"}
+
+
+def test_list_continues_past_stray_files_to_find_jobs() -> None:
+    class Paged(StubFiles):
+        def list(self, **kwargs):
+            self.calls.append(("list", kwargs))
+            if kwargs.get("pageToken") is None:
+                return _Request({"files": [{"id": f"s{i}", "name": f"note{i}.txt", "size": "1",
+                                            "createdTime": "2026-11-12T10:00:00Z"} for i in range(3)],
+                                 "nextPageToken": "p2"})
+            return _Request({"files": [{"id": "j", "name": "1_lf_j.json", "size": "9",
+                                        "createdTime": "2026-11-12T11:00:00Z"}]})
+
+    files = Paged()
+    assert [f.file_id for f in _folders(files).list_inbox(limit=1)] == ["j"]
+    assert len(files.calls) == 2
+
+
+def test_fake_inbox_ignores_non_json_files() -> None:
+    fake = FakeJobFolders()
+    fake.add("notes.txt", b"x")
+    job = fake.add("1_lf_a.json", b"{}")
+    assert [f.file_id for f in fake.list_inbox(10)] == [job]

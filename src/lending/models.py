@@ -1360,6 +1360,24 @@ class LendingLoanFile(LendingBase):
     )
 
 
+class LendingLoanFileStatusEvent(LendingBase):
+    """One row per status change of a loan file (``partners.record_status_change``); the nightly ledger export reads
+    these, because ``loan_files.status`` and ``status_at`` hold only the latest change."""
+
+    __tablename__ = "loan_file_status_events"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    loan_file_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("lending.loan_files.id", ondelete="CASCADE"), nullable=False)
+    status: Mapped[str] = mapped_column(String(20), nullable=False)
+    reason: Mapped[Optional[str]] = mapped_column(String(200))
+    at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_now, server_default=text("now()"))
+
+    __table_args__ = (
+        Index("ix_lending_loan_file_status_events_at", "at"),
+        Index("ix_lending_loan_file_status_events_file", "loan_file_id", "at"),
+    )
+
+
 class LendingPartner(LendingBase):
     """A wholesaler, broker or referral partner who may submit files through their own link (P-1).
 

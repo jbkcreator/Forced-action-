@@ -31,10 +31,11 @@ import argparse
 import difflib
 import json
 import logging
+import re
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from typing import Any, Optional
+from typing import Any, Optional, Sequence
 
 from sqlalchemy import create_engine, text
 from sqlalchemy.engine import Engine
@@ -48,6 +49,7 @@ from config.lending_standing_sends import (
     GRADUATION_MIN_APPROVALS,
     MORNING_CARD_LIMIT,
 )
+from config.settings import get_settings
 from src.lending.cora_inbox import add_to_inbox_safely, slack_safe
 
 logger = logging.getLogger(__name__)
@@ -180,10 +182,20 @@ class TemplateStats:
     auto_sent: int
     graduated: bool = False
     revoked: bool = False
+    count_rejections: bool = False
 
     @property
     def edit_rate(self) -> float:
         return self.edited / self.approved if self.approved else 0.0
+
+    @property
+    def graduation_rate(self) -> float:
+        """The rate that must stay under the limit: edited over approved (the brief), or, with rejections counted,
+        (edited + rejected) over (approved + rejected)."""
+        if not self.count_rejections:
+            return self.edit_rate
+        decided = self.approved + self.rejected
+        return (self.edited + self.rejected) / decided if decided else 0.0
 
     @property
     def approval_only(self) -> bool:
@@ -193,7 +205,7 @@ class TemplateStats:
     @property
     def meets_rule(self) -> bool:
         return (not self.approval_only and self.approved >= GRADUATION_MIN_APPROVALS
-                and self.edit_rate < GRADUATION_MAX_EDIT_RATE)
+                and self.graduation_rate < GRADUATION_MAX_EDIT_RATE)
 
     @property
     def state(self) -> str:
@@ -235,14 +247,18 @@ def template_stats(conn: Any, versions: Optional[list[str]] = None) -> list[Temp
     """Counts per template version: every one, or only ``versions``."""
     rows = conn.execute(_STATS, {"auto_actor": AUTO_GRADUATED_ACTOR, "auto_prefix": f"{AUTO_APPROVER_PREFIX}%",
                                  "versions": versions}).mappings()
+    count_rejections = get_settings().lending_graduation_count_rejections
     return [TemplateStats(template_version=row["template_version"], approved=int(row["approved"]),
                           edited=int(row["edited"]), rejected=int(row["rejected"]), auto_sent=int(row["auto_sent"]),
-                          graduated=bool(row["graduated"]), revoked=bool(row["revoked"])) for row in rows]
+                          graduated=bool(row["graduated"]), revoked=bool(row["revoked"]),
+                          count_rejections=count_rejections) for row in rows]
 
 
 def tracker_line(stats: TemplateStats) -> str:
     label = slack_safe(stats.template_version)
-    counts = (f"{stats.approved}/{GRADUATION_MIN_APPROVALS} approvals · {stats.edit_rate:.0%} edited"
+    rate = (f"{stats.graduation_rate:.0%} edited or rejected" if stats.count_rejections
+            else f"{stats.edit_rate:.0%} edited")
+    counts = (f"{stats.approved}/{GRADUATION_MIN_APPROVALS} approvals · {rate}"
               + (f" · {stats.rejected} rejected" if stats.rejected else ""))
     if stats.state == "approval_only":
         return f"• {label}: drafted by Cora, always needs approval · {stats.approved} approved · {stats.edit_rate:.0%} edited" + (
@@ -298,7 +314,7 @@ def evaluate_graduations(engine: Engine, since: Optional[Any] = None) -> list[Te
                 continue
             new = conn.execute(_GRADUATE, {"template_version": stats.template_version, "approvals": stats.approved,
                                            "edited": stats.edited, "rejected": stats.rejected,
-                                           "edit_rate": round(stats.edit_rate, 4)}).scalar()
+                                           "edit_rate": round(stats.graduation_rate, 4)}).scalar()
             if new is None:
                 continue
             graduated.append(stats)
@@ -308,7 +324,7 @@ def evaluate_graduations(engine: Engine, since: Optional[Any] = None) -> list[Te
                          f"{stats.edit_rate:.0%} edited. Agent jobs of this type that don't require approval now send "
                          "without a card (every send check still runs)."),
                 payload={"template_version": stats.template_version, "approvals": stats.approved,
-                         "edited": stats.edited, "rejected": stats.rejected, "edit_rate": round(stats.edit_rate, 4)},
+                         "edited": stats.edited, "rejected": stats.rejected, "edit_rate": round(stats.graduation_rate, 4)},
             )
             logger.info("[standing-sends] %s graduated approvals=%s edited=%s", stats.template_version,
                         stats.approved, stats.edited)
@@ -340,21 +356,110 @@ class StandingSendsStep:
         return graduated
 
 
+# With a ``channel`` the template must also meet the rule on that channel's own approvals (25 approved, under 10%
+# edited), so warm-email approvals can never graduate the same template's cold Instantly emails. Without one it is
+# the template-level check.
 _IS_GRADUATED = text("""
     SELECT EXISTS (SELECT 1 FROM lending.template_graduations
                     WHERE template_version = :template_version AND revoked_at IS NULL)
+       AND (CAST(:channel AS text) IS NULL OR COALESCE((
+            SELECT c.approved >= :min_approvals
+                   AND CASE WHEN :count_rejections THEN c.edited + c.rejected < :max_edit_rate * (c.approved + c.rejected)
+                            ELSE c.edited < :max_edit_rate * c.approved END
+              FROM (SELECT count(*) FILTER (WHERE decided_by IS NOT NULL AND decided_by NOT LIKE :auto_prefix
+                                              AND status <> 'rejected') AS approved,
+                           count(*) FILTER (WHERE decided_by IS NOT NULL AND decided_by NOT LIKE :auto_prefix
+                                              AND status <> 'rejected'
+                                              AND jsonb_array_length(COALESCE(revisions, '[]'::jsonb)) > 0) AS edited,
+                           count(*) FILTER (WHERE status = 'rejected') AS rejected
+                      FROM lending.pending_actions
+                     WHERE payload->>'template_version' = :template_version AND channel = :channel) c), FALSE))
 """)
 
 
-def make_is_graduated(engine: Engine) -> Callable[[str], bool]:
-    """``JobQueueWorker``'s graduation check. Fails closed: an unreadable answer means not graduated (a card)."""
+def _graduated_params(template_version: str, channel: Optional[str]) -> dict[str, Any]:
+    return {"template_version": template_version, "channel": channel, "min_approvals": GRADUATION_MIN_APPROVALS,
+            "max_edit_rate": GRADUATION_MAX_EDIT_RATE, "auto_prefix": f"{AUTO_APPROVER_PREFIX}%",
+            "count_rejections": get_settings().lending_graduation_count_rejections}
 
-    def is_graduated(template_version: str) -> bool:
+
+# ── approved wording (Q19) ────────────────────────────────────────────────────
+
+APPROVED_WORDING_SAMPLE = 200  # the most recent approved cards of a template version compared against
+_NAME_MARK = "<name>"
+_NUMBER_MARK = "<number>"
+
+
+def label_names(contact_label: Optional[str]) -> list[str]:
+    """The words of a card's contact label ("Mark T., Tampa"): the names and places an agent fills into a message."""
+    return re.findall(r"[A-Za-z]{2,}", contact_label or "")[:6]  # a long label cannot mask a whole sentence
+
+
+def wording_key(fields: Mapping[str, str], names: Sequence[str] = ()) -> str:
+    """The message's wording with what an agent fills in taken out: the contact's names and every run of digits (an
+    amount, a date, an address number). Case and spacing are ignored. Two messages with the same key say the same
+    thing to different people; any other change of words changes the key."""
+    parts = []
+    for field in EDIT_FIELDS:
+        value = fields.get(field)
+        if not value:
+            continue
+        value = value.casefold()
+        for name in sorted({n.casefold() for n in names if len(n) >= 2}, key=len, reverse=True):
+            value = re.sub(rf"(?<!\w){re.escape(name)}(?!\w)", _NAME_MARK, value)
+        value = re.sub(r"\d+(?:[.,]\d+)*", _NUMBER_MARK, value)
+        parts.append(f"{field}={' '.join(value.split())}")
+    return "\n".join(parts)
+
+
+_APPROVED_PAYLOADS = text("""
+    SELECT payload FROM lending.pending_actions
+     WHERE payload->>'template_version' = :template_version AND channel = :channel
+       AND decided_by IS NOT NULL AND decided_by NOT LIKE :auto_prefix
+       AND status IN ('approved', 'sending', 'sent', 'failed')
+     ORDER BY action_id DESC LIMIT :limit
+""")
+
+
+def make_wording_ok(engine: Engine) -> Callable[[str, str, Mapping[str, Any], Sequence[str]], bool]:
+    """``wording_ok(template_version, channel, payload, names)`` for the job worker: True only when this message's
+    wording (``wording_key``) matches the wording of a card Josh approved for the same template version and channel.
+    Fails closed: an unreadable answer is "no", so the message gets an approval card."""
+
+    def wording_ok(template_version: str, channel: str, payload: Mapping[str, Any], names: Sequence[str] = ()) -> bool:
+        wanted = wording_key(_message_fields(payload), names)
+        if not wanted:
+            return False
+        try:
+            with engine.connect() as conn:
+                rows = conn.execute(_APPROVED_PAYLOADS, {
+                    "template_version": template_version, "channel": channel,
+                    "auto_prefix": f"{AUTO_APPROVER_PREFIX}%", "limit": APPROVED_WORDING_SAMPLE}).scalars().all()
+        except Exception as exc:  # class only
+            logger.error("[standing-sends] approved-wording check failed (%s); %s gets a card", type(exc).__name__,
+                         template_version)
+            return False
+        for row in rows:
+            approved = json.loads(row) if isinstance(row, str) else row
+            if not isinstance(approved, Mapping) or not approved.get("contact_label"):
+                continue  # an older card without its contact label cannot be compared: it never matches
+            if wording_key(_message_fields(approved), label_names(approved["contact_label"])) == wanted:
+                return True
+        return False
+
+    return wording_ok
+
+
+def make_is_graduated(engine: Engine) -> Callable[..., bool]:
+    """``JobQueueWorker``'s graduation check, ``is_graduated(template_version, channel=None)``. Fails closed: an
+    unreadable answer means not graduated (a card)."""
+
+    def is_graduated(template_version: str, channel: Optional[str] = None) -> bool:
         if not template_version:
             return False
         try:
             with engine.connect() as conn:
-                return bool(conn.execute(_IS_GRADUATED, {"template_version": template_version}).scalar())
+                return bool(conn.execute(_IS_GRADUATED, _graduated_params(template_version, channel)).scalar())
         except Exception as exc:  # class only
             logger.error("[standing-sends] graduation check failed (%s); treating %s as not graduated",
                          type(exc).__name__, template_version)
@@ -363,41 +468,82 @@ def make_is_graduated(engine: Engine) -> Callable[[str], bool]:
     return is_graduated
 
 
-# An action approved automatically (graduation) that has not been claimed for sending yet, whose template no longer
-# has an active graduation (revoked, or the row is gone): back to pending with no decision and no card, so the
-# card retry posts a fresh "Approval needed" card and only a person can approve it. ``template_version`` narrows it to
-# one template (the revoke).
+# Automatically approved, still unsent actions (optionally of one template): the candidates the recovery sweep checks.
+_AUTO_APPROVED_UNSENT = text("""
+    SELECT action_id, payload->>'template_version' AS template_version, channel
+      FROM lending.pending_actions
+     WHERE status = 'approved' AND decided_by = :auto_actor
+       AND (CAST(:template_version AS text) IS NULL OR payload->>'template_version' = :template_version)
+""")
+# Back to pending with no decision and no card, so the card retry posts a fresh "Approval needed" card and only a
+# person can approve it.
 _RETURN_FOR_APPROVAL = text("""
-    UPDATE lending.pending_actions p
+    UPDATE lending.pending_actions
        SET status = 'pending', decided_by = NULL, decided_at = NULL, card_channel = NULL, card_ts = NULL,
            updated_at = now()
-     WHERE p.status = 'approved' AND p.decided_by = :auto_actor
-       AND (CAST(:template_version AS text) IS NULL OR p.payload->>'template_version' = :template_version)
-       AND NOT EXISTS (SELECT 1 FROM lending.template_graduations g
-                        WHERE g.template_version = p.payload->>'template_version' AND g.revoked_at IS NULL)
-    RETURNING p.action_id
+     WHERE action_id = ANY(:ids) AND status = 'approved' AND decided_by = :auto_actor
+    RETURNING action_id
 """)
 
 
 def return_ungraduated_auto_approvals(conn: Any, template_version: Optional[str] = None) -> list[int]:
-    """Send automatically approved, still unsent actions of a template that no longer auto-sends back for a
-    person's approval. Returns their action ids. Runs in the caller's transaction."""
-    returned = [int(row[0]) for row in conn.execute(_RETURN_FOR_APPROVAL, {
-        "auto_actor": AUTO_GRADUATED_ACTOR, "template_version": template_version})]
+    """Send automatically approved, still unsent actions that no longer qualify for automatic sending back for a
+    person's approval. Qualifying is the send-time rule exactly (``_IS_GRADUATED`` with the action's own channel): the
+    template has an active graduation AND the channel still meets the rule, so a draft the relay keeps deferring
+    because its channel lapsed gets a human card instead of sitting until it expires. ``template_version`` narrows it to
+    one template (the revoke). Returns their action ids. Runs in the caller's transaction."""
+    candidates = conn.execute(_AUTO_APPROVED_UNSENT, {"auto_actor": AUTO_GRADUATED_ACTOR,
+                                                       "template_version": template_version}).mappings().all()
+    eligible: dict[tuple[Optional[str], str], bool] = {}
+    ids = []
+    for row in candidates:
+        key = (row["template_version"], row["channel"])
+        if key not in eligible:
+            eligible[key] = bool(row["template_version"]) and bool(
+                conn.execute(_IS_GRADUATED, _graduated_params(row["template_version"], row["channel"])).scalar())
+        if not eligible[key]:
+            ids.append(int(row["action_id"]))
+    if not ids:
+        return []
+    returned = [int(row[0]) for row in conn.execute(_RETURN_FOR_APPROVAL, {"auto_actor": AUTO_GRADUATED_ACTOR,
+                                                                           "ids": ids})]
     if returned:
         logger.warning("[standing-sends] %d automatically approved action(s) sent back for approval "
-                       "(template no longer auto-sends): %s", len(returned), returned)
+                       "(template or channel no longer auto-sends): %s", len(returned), returned)
     return returned
 
 
-def auto_approval_lapsed(conn: Any, decided_by: Optional[str], template_version: Optional[str]) -> bool:
+_RETURN_ONE_FOR_APPROVAL = text("""
+    UPDATE lending.pending_actions
+       SET status = 'pending', decided_by = NULL, decided_at = NULL, card_channel = NULL, card_ts = NULL,
+           updated_at = now()
+     WHERE action_id = :action_id AND status IN ('approved', 'sending') AND decided_by = :auto_actor
+    RETURNING action_id
+""")
+
+
+def return_for_approval(engine: Engine, action_id: int) -> bool:
+    """Send one automatically approved, still unsent action back for a person's approval (no decision, no card: the
+    card retry posts a fresh "Approval needed" card). True when it was returned. The relay has already claimed the action
+    ("sending") when its send check runs, so both states match; the relay's release of the claim then finds it pending
+    and changes nothing."""
+    with engine.begin() as conn:
+        returned = conn.execute(_RETURN_ONE_FOR_APPROVAL, {"action_id": action_id,
+                                                           "auto_actor": AUTO_GRADUATED_ACTOR}).first() is not None
+    if returned:
+        logger.warning("[standing-sends] action %s sent back for approval (its wording is not approved wording)", action_id)
+    return returned
+
+
+def auto_approval_lapsed(conn: Any, decided_by: Optional[str], template_version: Optional[str],
+                         channel: Optional[str] = None) -> bool:
     """For the relay's send-time check: True when the action was approved automatically but its template no
     longer auto-sends, so it must not be sent without a person's approval."""
     if decided_by != AUTO_GRADUATED_ACTOR:
         return False
     if not template_version:
         return True
-    return not conn.execute(_IS_GRADUATED, {"template_version": template_version}).scalar()
+    return not conn.execute(_IS_GRADUATED, _graduated_params(template_version, channel)).scalar()
 
 
 _REVOKE = text("""

@@ -35,6 +35,7 @@ from config.lending_after_hours_conversation import CHANNEL_SMS
 from config.lending_after_hours import (BUSINESS_DAYS, DEFAULT_SOURCE, DRAFT_FORBIDDEN, DRAFT_MAX_CHARS, DRAFT_PROMPT,
                                         DRAFT_TOOL_NAME, FALLBACK_REPLY, INTAKE_MARKER, MORNING_POST_ET, PIN_UNTIL_ET)
 from config.lending_reminders import TIMEZONE
+from packages.agent_core.lane_guard import LANE_BLOCK_PREFIX, LaneViolation
 from src.lending.after_hours_conversation import conversations_enabled, open_conversation
 from src.lending.consent import has_text_consent
 from src.lending.cora_tools import borrower_draft_problem
@@ -80,7 +81,8 @@ class PinnedCall:
 @dataclass(frozen=True)
 class MorningReply:
     pin: PinnedCall
-    action_id: Optional[int]  # None: no reply draft (no text consent, or the night responder already texted)
+    action_id: Optional[int]  # None: no reply draft (no text consent, blocked, or the night responder already texted)
+    blocked: bool = False  # the Backflip check blocked the reply: no card will ever appear
     night_responder_texted: bool = False
 
 
@@ -191,7 +193,8 @@ _PINS = text("""
                         WHERE o.phone = c.phone AND o.direction = 'outbound' AND o.call_ended_at >= c.pinned_at)
      ORDER BY c.id, d.call_ended_at DESC
 """)
-_DRAFTED = text("SELECT idempotency_key, action_id FROM lending.pending_actions WHERE idempotency_key = ANY(:keys)")
+_DRAFTED = text("SELECT idempotency_key, action_id, status, COALESCE(error, '') LIKE :lane_prefix AS lane_blocked "
+                "FROM lending.pending_actions WHERE idempotency_key = ANY(:keys)")
 _NIGHT_RESPONDER_TEXTED = text("SELECT inquiry_key FROM lending.after_hours_conversations "
                                "WHERE inquiry_key = ANY(:keys) AND prompted_state IS NOT NULL")
 
@@ -255,18 +258,28 @@ def draft_morning_replies(db, pins: list[PinnedCall], queue: DraftQueue, drafter
     second model call). A caller the night responder already texted gets no draft: a second message saying their
     voicemail arrived would follow the questions they were sent overnight. The rest are call-only."""
     keys = [pin.event.call_key for pin in pins]
-    drafted = dict(db.execute(_DRAFTED, {"keys": keys}).all())
+    drafted = {key: (action_id, status, lane_blocked) for key, action_id, status, lane_blocked in
+               db.execute(_DRAFTED, {"keys": keys, "lane_prefix": f"{LANE_BLOCK_PREFIX}%"}).all()}
     texted = (set(db.execute(_NIGHT_RESPONDER_TEXTED, {"keys": keys}).scalars())
               if conversations_enabled() else set())
     names = names_by_phone(db, [pin.event.phone for pin in pins if pin.event.call_key not in drafted])
     replies = []
     for pin in pins:
         if pin.event.call_key in drafted:
-            replies.append(MorningReply(pin, drafted[pin.event.call_key]))
+            action_id, status, lane_blocked = drafted[pin.event.call_key]
+            if status == "blocked":  # blocked at send time: a Backflip block says so, any other block is call-only
+                replies.append(MorningReply(pin, None, blocked=bool(lane_blocked)))
+            else:
+                replies.append(MorningReply(pin, action_id))
         elif pin.event.call_key in texted:
             replies.append(MorningReply(pin, None, night_responder_texted=True))
         elif has_text_consent(db, pin.event.phone):
-            replies.append(MorningReply(pin, _queue_reply(queue, pin, drafter, names.get(pin.event.phone))))
+            try:
+                replies.append(MorningReply(pin, _queue_reply(queue, pin, drafter, names.get(pin.event.phone))))
+            except LaneViolation:  # the send gate blocked a draft naming Backflip: no card, call-only
+                logger.error("[after-hours] the voicemail reply for call %s was blocked by the Backflip check",
+                             pin.event.call_key[:8])
+                replies.append(MorningReply(pin, None, blocked=True))
         else:
             replies.append(MorningReply(pin, None))
     return replies
