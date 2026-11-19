@@ -9,9 +9,8 @@ from __future__ import annotations
 import hashlib
 import hmac
 import logging
-from dataclasses import asdict
 from decimal import Decimal
-from typing import Any, Optional
+from typing import Optional
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Request
 from pydantic import BaseModel, Field
@@ -26,7 +25,7 @@ from config.lending_instant_quote import (
 from config.settings import get_settings
 from src.lending.instant_quote import Guarantor, QuoteRequest, QuoteResult, quote
 from src.lending.instant_quote.engine import BorrowerType, Purpose, QuoteStatus
-from src.lending.instant_quote.store import QuoteRecord, QuoteStore, SqlQuoteStore
+from src.lending.instant_quote.store import QuoteStore, SqlQuoteStore, audit_record
 from src.services.rate_limit import enforce_bucket_or_429
 
 logger = logging.getLogger(__name__)
@@ -138,28 +137,6 @@ def get_quote_store() -> QuoteStore:
     return SqlQuoteStore()
 
 
-def _json_safe(value: Any) -> Any:
-    if isinstance(value, Decimal):
-        return str(value)
-    if isinstance(value, dict):
-        return {k: _json_safe(v) for k, v in value.items()}
-    if isinstance(value, (list, tuple)):
-        return [_json_safe(v) for v in value]
-    return value
-
-
-def _record(request: QuoteRequest, result: QuoteResult, key_bucket: str) -> QuoteRecord:
-    return QuoteRecord(
-        status=result.status,
-        reason=result.reason,
-        request=_json_safe(asdict(request)),
-        result=_json_safe(asdict(result)),
-        rules_fired=list(result.rules_fired),
-        unconfirmed=result.unconfirmed,
-        api_key_label=key_bucket,
-    )
-
-
 @router.post("/instant-quote", response_model=QuoteOut)
 def instant_quote(
     body: QuoteIn,
@@ -169,7 +146,7 @@ def instant_quote(
     quote_request = _to_request(body)
     result = quote(quote_request, new_construction_exit_rule=get_settings().lending_instant_quote_exit_rule_enabled)
     try:
-        quote_id = store.save(_record(quote_request, result, key_bucket))
+        quote_id = store.save(audit_record(quote_request, result, key_bucket))
     except Exception as exc:
         logger.error("[instant-quote] audit write failed, quote withheld: %s state=%s purpose=%s status=%s key=%s",
                      type(exc).__name__, quote_request.state, quote_request.purpose, result.status, key_bucket)

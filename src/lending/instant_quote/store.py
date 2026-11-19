@@ -2,7 +2,8 @@
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
+from decimal import Decimal
 from typing import Any, Optional, Protocol
 
 from sqlalchemy import text
@@ -19,6 +20,29 @@ class QuoteRecord:
     rules_fired: list[str]
     unconfirmed: bool
     api_key_label: str
+
+
+def _json_safe(value: Any) -> Any:
+    if isinstance(value, Decimal):
+        return str(value)
+    if isinstance(value, dict):
+        return {k: _json_safe(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(v) for v in value]
+    return value
+
+
+def audit_record(request: Any, result: Any, caller_label: str) -> QuoteRecord:
+    """The audit row for one quote: the request and result as JSON, and who asked (an API key bucket, or "cora")."""
+    return QuoteRecord(
+        status=result.status,
+        reason=result.reason,
+        request=_json_safe(asdict(request)),
+        result=_json_safe(asdict(result)),
+        rules_fired=list(result.rules_fired),
+        unconfirmed=result.unconfirmed,
+        api_key_label=caller_label,
+    )
 
 
 class QuoteStore(Protocol):
