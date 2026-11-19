@@ -486,3 +486,29 @@ def test_rejected_job_receipt_says_no_approval(h: Harness) -> None:
     h.worker.run_once()
     assert h.folders.results[JOB_ID]["status"] == "rejected"
     assert h.folders.results[JOB_ID]["approval"] is None
+
+
+# ── team decision Q18: cold and partner messages keep their card until Q14 and Q19 are on ───────────────────────
+
+def test_a_graduated_message_to_a_partner_still_gets_a_card(h: Harness) -> None:
+    h.contacts["ghl-123"] = GhlContact("ghl-123", "+18135550142", "mark@example.com", frozenset(),
+                                       frozenset({"ndl-partner"}))
+    h.graduated.add("LF-D2-SMS-v1")
+    h.drop(requires_approval=False)
+    h.worker.run_once()
+    assert h.queue.get(h.row()["action_id"]).status is ActionStatus.PENDING
+
+
+def test_a_graduated_cold_email_still_gets_a_card(h: Harness) -> None:
+    from src.lending.agent_jobs.worker import may_send_without_card
+
+    assert not may_send_without_card("instantly_cold_email", CONTACT)
+    assert may_send_without_card("ghl_email", CONTACT)
+
+
+def test_cold_and_partner_messages_can_graduate_once_switched_on(h: Harness, monkeypatch) -> None:
+    from src.lending.agent_jobs import worker
+
+    monkeypatch.setattr(worker, "COLD_AND_PARTNER_AUTO_SEND", True)
+    partner = GhlContact("ghl-123", "+18135550142", "mark@example.com", frozenset(), frozenset({"ndl-partner"}))
+    assert worker.may_send_without_card("instantly_cold_email", partner)

@@ -129,3 +129,7 @@ SELECT job_id, result_status FROM lending.agent_jobs WHERE state = 'done' AND re
 - **A file has no readable `job_id`.** It is moved to `processed` without a receipt, and the log shows `could not be read as a job`.
 - **An action stays `sending` for more than 15 minutes.** The outcome is unknown, and it is never retried (a duplicate send is worse than a missing one). Check GHL or Instantly by hand; the log line `has been sending for` names the action.
 - **A repeat cold email** first removes the address's previous lead from the campaign (exact-email lookup), then adds the new one. An address on the Instantly block list is refused and the receipt says `error`.
+
+## Sharing the format with the agents' owner
+
+The job and receipt format above is ours to share (team decisions Q31, Q32): it is the brief's format plus `subject`, `task_due_at`, `task_assignee`, the `blocked_cap` status and the receipt fields `rail` and `approval`. After pickup the job file moves to `inbox/processed` and its receipt is written to `done/{job_id}.json`, so a job is never taken twice. Send this page to the agents' owner once they are named.

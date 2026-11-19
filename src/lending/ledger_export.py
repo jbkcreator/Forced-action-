@@ -6,6 +6,8 @@ lead carries one), the internal ``contact_id`` and the last 4 digits of the phon
 
 * contacts, consents, scores, cohorts: full snapshot each night. ``cohorts.csv`` is one row per LendingFlow batch
   (``cohort_report.cohorts``), with no contact columns.
+* audiences: the retargeting audiences as daily counts only (rows per platform, contacts per source), never the
+  hashed files, which stay on our server (team decision Q33).
 * contacts carry the first-contact rank and time (``lending.first_contact_snapshots``).
 * consents include email-only opt-outs (matched to a website lead's contact by email, else keyless) and the boxes
   ticked on the website form.
@@ -53,8 +55,9 @@ TABLES: dict[str, tuple[str, ...]] = {
     "cohorts": ("batch_id", "name", "purchased_at", "leads_bought", "leads_delivered", "funded_30d", "funded_60d",
                 "funded_90d", "funded_to_date", "fees_recorded", "fees_total", "revenue_per_lead",
                 "replacements_requested", "replacements_credited", "replacements_denied"),
+    "audiences": ("day", "platform", "rows", "lendingflow_contacts", "web_contacts"),
 }
-NO_KEY_TABLES = frozenset({"cohorts"})  # batch-level rows: no contact columns
+NO_KEY_TABLES = frozenset({"cohorts", "audiences"})  # batch- or day-level rows: no contact columns
 
 # Columns that hold text a dialer, GHL or a person typed (not our own codes or ids): phone-like digit runs and email
 # addresses in them are redacted, since nothing upstream whitelists these values.
@@ -82,6 +85,7 @@ class LedgerData:
     outcomes: list[dict] = field(default_factory=list)
     scores: list[dict] = field(default_factory=list)
     cohorts: list[dict] = field(default_factory=list)
+    audiences: list[dict] = field(default_factory=list)
 
 
 def export_day(now: datetime) -> date:
@@ -332,4 +336,17 @@ def collect(db, day: date) -> LedgerData:
         outcomes=_rows(db, _OUTCOMES, test, test_ghl, start=start, end=end),
         scores=[_score(lead) for lead in _rows(db, _SCORE_LEADS, test, test_ghl)],
         cohorts=_cohort_rows(db),
+        audiences=_audience_rows(db, day),
     )
+
+
+def _audience_rows(db, day: date) -> list[dict]:
+    """The retargeting audiences as counts only (team decision Q33): rows per platform and contacts per source, from
+    the same rules the nightly audience export uses. The hashed files themselves stay on our server."""
+    from src.tasks.lending_audience_export import export as audience_export
+
+    counts = audience_export(db, None, day=day, dry_run=True)
+    by_source = counts.contacts_by_source
+    return [{"day": day.isoformat(), "platform": platform, "rows": rows,
+             "lendingflow_contacts": by_source.get("lendingflow", 0), "web_contacts": by_source.get("web", 0)}
+            for platform, rows in (("google", counts.google_rows), ("meta", counts.meta_rows))]

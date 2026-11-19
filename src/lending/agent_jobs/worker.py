@@ -31,8 +31,9 @@ from sqlalchemy import bindparam, text
 from sqlalchemy.engine import Engine
 from sqlalchemy.orm import Session
 
-from config.lending_agent_jobs import COLD_EMAIL_CHANNEL, MAX_JOBS_PER_SWEEP, REQUESTED_BY, STUCK_SENDING_AFTER
-from config.lending_standing_sends import AUTO_GRADUATED_ACTOR
+from config.lending_agent_jobs import (COLD_EMAIL_CHANNEL, MAX_JOBS_PER_SWEEP, PARTNER_TAG, REQUESTED_BY,
+                                      STUCK_SENDING_AFTER)
+from config.lending_standing_sends import AUTO_GRADUATED_ACTOR, COLD_AND_PARTNER_AUTO_SEND
 from packages.agent_core.lane_guard import LaneViolation
 from packages.agent_core.pending_actions import ActionStatus, PendingActionQueue
 from packages.agent_core.send_gate import SendGate
@@ -86,6 +87,15 @@ def make_check(engine: Engine, *, instantly_ready: bool) -> Check:
                 db.rollback()
 
     return check
+
+
+def may_send_without_card(channel: str, contact: Optional[GhlContact]) -> bool:
+    """Whether a graduated job may send without a card. Cold emails and partner messages may not until
+    ``COLD_AND_PARTNER_AUTO_SEND`` is on (team decision Q18)."""
+    if COLD_AND_PARTNER_AUTO_SEND:
+        return True
+    partner = contact is not None and PARTNER_TAG in (contact.tags or ())
+    return channel != COLD_EMAIL_CHANNEL and not partner
 
 
 class JobQueueWorker:
@@ -247,7 +257,8 @@ class JobQueueWorker:
         draft = build_draft(job, contact, verdict.rail or "ghl")
         context = ToolContext(user_id=REQUESTED_BY, is_approver=False, channel=self._approval_channel, thread_ts="",
                               tool_use_id=_draft_key(job))
-        automatic = not job.requires_approval and self._is_graduated(job.template_version, draft.channel)
+        automatic = (not job.requires_approval and may_send_without_card(draft.channel, contact)
+                     and self._is_graduated(job.template_version, draft.channel))
         try:
             queued = self._gate.submit(draft, tool_name=f"agent_job:{job.type}", context=context,
                                        ttl=job.expires_at - now, post_card=not automatic)

@@ -28,3 +28,9 @@ CORA_SMS_TEMPLATE = "CORA-SMS-v1"
 CORA_EMAIL_TEMPLATE = "CORA-EMAIL-v1"
 INSTANTLY_REPLY_TEMPLATE = "INSTANTLY-REPLY-v1"
 APPROVAL_ONLY_TEMPLATES = frozenset({CORA_SMS_TEMPLATE, CORA_EMAIL_TEMPLATE, INSTANTLY_REPLY_TEMPLATE})
+
+# Team decision Q18: cold first-touch emails (the Instantly rail) and messages to partners (GHL tag ndl-partner)
+# graduate on the same rule as every other type, but only together with the exact-approved-wording check (Q19) and
+# the rejections rule (Q14). Until both are built and on, they always wait for Josh's Approve tap, graduated or not.
+# Switch this on in the change that turns on Q14 and Q19.
+COLD_AND_PARTNER_AUTO_SEND = False
