@@ -103,7 +103,7 @@ hands the lead to the Next Deal Lending GHL account (`src/lending/instantly_ghl_
   shared office line can never redirect the hand-over to another contact). That number is not consent to text;
 - nothing is written while the lending emergency halt is on.
 
-An address that opted out is never handed over. Do-not-disturb is never lifted: texts still need consent. A failed hand-over
+An address that opted out is never handed over, and neither is a GHL contact that already carries the `lending-opt-out` tag or Call do-not-disturb. Do-not-disturb is never lifted: texts still need consent. A failed hand-over
 never blocks the triage or the answer; it raises a `instantly_ghl_handoff_failed` item in Cora's inbox (no address in it) so
 the team adds the contact by hand. Built from the team's recommendation for open question P1.3 #1: switch it on once Josh
 confirms.
@@ -127,14 +127,22 @@ Limits to know before switching it on (read at Cora's start-up: restart `fa-lend
 - **Only NDL campaigns reach Cora.** The Instantly workspace is shared with other campaigns. The webhook ignores (answers 200, stores
   nothing) an event whose `campaign_id` is not the NDL passthrough campaign (`LENDING_INSTANTLY_CAMPAIGN_ID`) or one of
   `LENDING_INSTANTLY_EXTRA_CAMPAIGN_IDS` (comma separated). An event that names no campaign is accepted, so a STOP is never dropped; with
-  no NDL campaign configured nothing is filtered. Instantly's field names are unverified: check `campaign_id` in the first delivery's
+  no NDL campaign configured nothing is filtered. **If NDL runs a second campaign, add its id to `LENDING_INSTANTLY_EXTRA_CAMPAIGN_IDS`: an opt-out from a campaign that is not listed is ignored.** Instantly's field names are unverified: check `campaign_id` in the first delivery's
   logged payload shape. Ids are compared case-insensitively; an ignored event is logged as a warning with the campaign id.
 - **Every opt-out goes onto Instantly's block list.** Any opt-out that carries an email (the unsubscribe link, the opt-out mailbox, an
   Instantly STOP, an email opt-out from Forced Action) is added to the NDL workspace block list by `compliance._propagate`, best effort:
   at most 10 per batch and 15 s (each call can take up to 20 s), never raises; it runs inside the opt-out's transaction, so it also
   covers Forced Action unsubscribes (the shared-unsubscribe design). Test and internal addresses are not excluded. A phone-only opt-out has no address to add.
 - **The unsubscribe link is on NDL's own host.** The cold-email footer link points at `LENDING_UNSUBSCRIBE_BASE_URL` +
-  `/api/lending/email/unsubscribe?token=...` (served by `lending-api`: GET only shows an Unsubscribe button, POST opts out and is the RFC 8058 one-click target, rate limited per IP), never at the Forced Action app. Cold email
+  `/api/lending/email/unsubscribe?token=...` (served by `lending-api`: GET only shows an Unsubscribe button, POST opts out and is the RFC 8058 one-click target; a valid signed link is never rate limited, requests with an invalid token are, per IP), never at the Forced Action app. Cold email
   stays off until the setting is set (for example `https://api.nextdeallending.com`, which nginx already routes `/api/lending/` to
   lending-api). A valid link is an opt-out on every channel (`propagate_opt_out`). Instantly's own `List-Unsubscribe` header
   (`insert_unsubscribe_header`) stays on Instantly's domain; its unsubscribes arrive as `lead_unsubscribed` events.
+
+**Block-list retry.** An opt-out does not call Instantly inside its own transaction any more: `compliance._propagate` queues each
+opted-out address in `lending.instantly_block_queue` (idempotent per address; a failed write is logged and never breaks the opt-out),
+and Cora's minute sweep (`BlockListSweep`) sends up to 10 pending addresses per pass to Instantly's block list. A failed attempt is
+retried with a growing wait (1 minute doubling to 1 hour); an address Instantly already holds (HTTP 409) counts as done; after 12 failed
+tries the row is marked `failed` and an `instantly_block_failed` item (no address) goes to Cora's inbox so a person adds it by hand.
+A `failed` row, or one `done` more than a day ago, is queued again by a new opt-out for the same address. Rows stay pending while `LENDING_INSTANTLY_API_KEY` is unset. **Run `migrations/apply_lending_instantly_block_queue.py` before
+deploying**: without the table an opt-out is still recorded, but its address is not queued.

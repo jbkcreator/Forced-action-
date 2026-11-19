@@ -1,3 +1,4 @@
+# ruff: noqa: F811  (the `client` fixture is imported from another test module)
 """Dev 1 cold-email and auto-send rules: only NDL campaigns reach Cora, every opt-out goes onto Instantly's block list,
 the unsubscribe link lives on NDL's own host, and a graduated message sends only wording Josh approved."""
 from __future__ import annotations
@@ -10,7 +11,7 @@ from fastapi.testclient import TestClient
 
 from config.lending_compliance import UNSUBSCRIBE_PATH
 from src.api import lending_email_unsubscribe_router as unsub_router
-from src.lending import compliance, standing_sends
+from src.lending import standing_sends
 from src.services.email_unsubscribe import mint_unsubscribe_token
 from tests.lending.test_instantly_replies import client, post, reply_body  # noqa: F401  (client is a fixture)
 
@@ -70,68 +71,6 @@ def test_with_no_ndl_campaign_configured_nothing_is_filtered(client, monkeypatch
     assert _stored(client)
 
 
-# ── every opt-out goes onto Instantly's block list ──────────────────────────
-
-def test_every_opted_out_address_is_added_to_the_block_list(monkeypatch):
-    blocked = []
-    monkeypatch.setattr("src.lending.instantly_client.lending_instantly_account", lambda: object())
-    monkeypatch.setattr("src.lending.instantly_client.block_address", lambda account, email: blocked.append(email) or True)
-    compliance._block_in_instantly(["a@x.com", "b@x.com"])
-    assert blocked == ["a@x.com", "b@x.com"]
-
-
-def test_without_an_instantly_account_the_block_list_step_is_a_no_op(monkeypatch):
-    called = []
-    monkeypatch.setattr("src.lending.instantly_client.lending_instantly_account", lambda: None)
-    monkeypatch.setattr("src.lending.instantly_client.block_address", lambda *a: called.append(a))
-    compliance._block_in_instantly(["a@x.com"])
-    assert called == []
-
-
-def test_a_block_list_failure_never_raises_and_the_rest_are_still_tried(monkeypatch):
-    seen = []
-
-    def block(account, email):
-        seen.append(email)
-        if email == "a@x.com":
-            raise RuntimeError("boom for a@x.com")
-        return True
-
-    monkeypatch.setattr("src.lending.instantly_client.lending_instantly_account", lambda: object())
-    monkeypatch.setattr("src.lending.instantly_client.block_address", block)
-    compliance._block_in_instantly(["a@x.com", "b@x.com"])
-    assert seen == ["a@x.com", "b@x.com"]
-
-
-def test_the_block_list_step_is_bounded_in_count_and_time(monkeypatch):
-    seen = []
-    monkeypatch.setattr("src.lending.instantly_client.lending_instantly_account", lambda: object())
-    monkeypatch.setattr("src.lending.instantly_client.block_address", lambda account, email: seen.append(email) or True)
-    compliance._block_in_instantly([f"u{i}@x.com" for i in range(50)])
-    assert len(seen) == compliance.BLOCKLIST_MAX_PER_BATCH
-    seen.clear()
-    monkeypatch.setattr(compliance, "BLOCKLIST_BUDGET_SECONDS", -1.0)
-    compliance._block_in_instantly(["a@x.com"])
-    assert seen == []
-
-
-def test_propagate_adds_every_opted_out_email_to_the_block_list_on_postgres(lending_db, monkeypatch):
-    from sqlalchemy import text
-
-    from config.lending_compliance import OptOutChannel
-    try:
-        lending_db.execute(text("SELECT 1 FROM lending.opt_out_events LIMIT 1"))
-        lending_db.execute(text("SELECT 1 FROM subscribers LIMIT 1"))
-    except Exception:
-        lending_db.rollback()
-        pytest.skip("the test database lacks the opt-out or subscriber tables")
-    blocked = []
-    monkeypatch.setattr(compliance, "_block_in_instantly", lambda emails: blocked.extend(emails))
-    compliance.propagate_opt_out(lending_db, email="Block.Me@Example.com", channel=OptOutChannel.EMAIL,
-                                 actor="test", source_ref="dev1-test:1")
-    assert blocked == ["block.me@example.com"]
-
-
 # ── the unsubscribe link on NDL's own host ──────────────────────────────────
 
 @pytest.fixture
@@ -178,15 +117,17 @@ def test_a_missing_signing_secret_is_a_clean_refusal_not_a_500(unsub_client, mon
     assert unsub_client.post(f"{UNSUBSCRIBE_PATH}?token=good").status_code == 400
 
 
-def test_the_post_is_rate_limited(unsub_client, monkeypatch):
+def test_a_valid_link_is_never_rate_limited_but_guessing_tokens_is(unsub_client, monkeypatch):
     from fastapi import HTTPException
 
     def limited(*a, **k):
         raise HTTPException(status_code=429, detail="slow down")
 
     monkeypatch.setattr(unsub_router, "enforce_or_429", limited)
-    assert unsub_client.post(f"{UNSUBSCRIBE_PATH}?token=good").status_code == 429
-    assert unsub_client.calls == []
+    assert unsub_client.post(f"{UNSUBSCRIBE_PATH}?token=good").status_code == 200  # shared provider IPs must get through
+    assert len(unsub_client.calls) == 1
+    assert unsub_client.post(f"{UNSUBSCRIBE_PATH}?token=forged").status_code == 429
+    assert len(unsub_client.calls) == 1
 
 
 def test_a_failed_opt_out_asks_the_person_to_try_again_without_leaking_the_error(unsub_client, monkeypatch):

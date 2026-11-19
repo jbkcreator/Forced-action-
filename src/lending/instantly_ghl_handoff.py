@@ -31,7 +31,7 @@ import logging
 import re
 from typing import Any, Callable, Mapping, Optional
 
-from config.lending_compliance import GHL_TAG_COLD_LEAD, GHL_TAG_INSTANTLY_INTERESTED
+from config.lending_compliance import GHL_OPT_OUT_TAG, GHL_TAG_COLD_LEAD, GHL_TAG_INSTANTLY_INTERESTED
 from config.settings import get_settings
 from src.lending.ghl_account import GhlAccount, lending_ghl_account
 from src.lending.ghl_crm import GhlContact, _contact_from
@@ -65,6 +65,9 @@ class InstantlyGhlHandoff(GhlLeadSink):
         email = str(row["lead_email"]).strip().lower()
         contact_id, duplicates = self._contact_for_email(row, email)
         contact = self._read_contact(contact_id)
+        if GHL_OPT_OUT_TAG in contact.tags or "Call" in contact.dnd_channels:  # an opt-out kept in GHL itself
+            logger.info("[instantly-handoff] reply %s not handed over: the GHL contact is opted out", row["id"])
+            return contact_id
         notes = [f"Replied with interest to NDL cold email (Instantly campaign: {row.get('campaign_name') or 'n/a'}, "
                  f"reply id {row['id']}). Handed over by Cora; the first answer goes in the Instantly thread."]
         if duplicates:

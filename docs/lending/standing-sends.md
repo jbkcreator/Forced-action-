@@ -81,3 +81,8 @@ ignores case and spacing and takes out what an agent fills in: the contact's nam
 and every run of digits. Any other change of words, or no approved card to compare with (including cards approved before this
 change, which carry no `contact_label`), gets a normal approval card, never a block. It looks at the 200 most recent person-approved cards (approved, sending, sent or failed). Digits are ignored, so a changed amount or term does not change the match: that is the point (amounts are filled in), and the reason this stays off until Josh agrees.
 This is the team's recommendation for Q19, not Josh's answer.
+
+The wording check also runs when the message is sent, not only when its draft is created: an automatically approved message that was
+queued (for example waiting for its send window) before the switch was turned on is re-checked just before it goes out, and one whose
+wording is not approved wording is sent back for a person's approval instead of sending: the relay has claimed it, the send check returns
+it to pending with no decision, and the card retry posts a fresh approval card on the next sweep.

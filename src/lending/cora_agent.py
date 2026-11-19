@@ -18,7 +18,6 @@ Usage:
 from __future__ import annotations
 
 import logging
-import re
 import signal
 import threading
 from collections.abc import Callable, Mapping
@@ -31,6 +30,7 @@ from sqlalchemy.engine import Engine
 from sqlalchemy.orm import Session
 
 from config.lending_agent_jobs import COLD_EMAIL_CHANNEL
+from config.lending_standing_sends import AUTO_GRADUATED_ACTOR
 from config.lending_compliance import CALL_WINDOW_END, CALL_WINDOW_START, DEFAULT_TZ
 from config.settings import AppSettings, get_settings
 from packages.agent_core.agent_loop import AgentLoop, MessagesClient
@@ -59,6 +59,7 @@ from src.lending.global_halt import EmergencyHalt
 from src.lending.ghl_crm import GhlCrmWriter, get_crm_writer
 from src.lending.ghl_email import GhlEmailSender, get_email_sender
 from src.lending.ghl_sms import GhlSmsSender, get_sender
+from src.lending.instantly_blocklist import BlockListSweep
 from src.lending.instantly_ghl_handoff import get_handoff
 from src.lending.instantly_client import InstantlyAccount, block_address, lending_instantly_account, send_reply
 from src.lending.instantly_email import NdlInstantlySender, get_ndl_instantly_sender
@@ -68,7 +69,9 @@ from src.lending.standing_sends import (
     auto_approval_lapsed,
     make_edit_recorder,
     make_is_graduated,
+    label_names,
     make_wording_ok,
+    return_for_approval,
 )
 from src.lending.ops_alerts import post_ops_notice, post_replies_notice
 from src.lending.cora_morning_digest import post_morning_digest
@@ -121,6 +124,7 @@ class CoraServices(NamedTuple):
     queue: Optional[PendingActionQueue] = None  # the drafts table the session, gate and relay share
     agent_jobs: Optional[Callable[[], Any]] = None  # P1.1: one pass of the Drive job queue worker
     standing_sends: Optional[Callable[[], Any]] = None  # P1.4: graduates templates that meet the rule
+    block_list: Optional[Callable[[], Any]] = None  # P1.3: sends queued opt-out addresses to Instantly's block list
 
 
 def lending_channel_ids(settings: AppSettings) -> dict[str, str]:
@@ -199,14 +203,17 @@ def email_window_open(phone: Optional[str], *, now: Optional[datetime] = None) -
 
 def make_send_check(engine: Engine, *, carrier_approved: bool = False,
                     text_window: Callable[[str], bool] = text_window_open,
-                    email_window: Callable[[Optional[str]], bool] = email_window_open) -> SendCheck:
+                    email_window: Callable[[Optional[str]], bool] = email_window_open,
+                    wording_ok: Optional[Callable[..., bool]] = None) -> SendCheck:
     """Lending rule run by the relay right before a send. Returns a reason to block, or None.
 
     A text also waits for the carrier (10DLC) approval (LENDING_SMS_CARRIER_APPROVED) and for the borrower's
     8am-8pm window, and an email (GHL or Instantly) for the recipient's 8am-8pm window: these are deferrals, so an
     approved send stays approved and goes on a later sweep once they hold, or is blocked when the draft expires. An
     action approved automatically (P1.4 graduation) whose template has since been revoked is held too, and the next
-    sweep sends it back for a person's approval."""
+    sweep sends it back for a person's approval. With ``wording_ok`` (LENDING_GRADUATED_APPROVED_WORDING_ONLY) an
+    automatically approved action is re-checked against the approved wording too, so one queued before the switch was
+    turned on cannot send wording nobody approved: it goes back for approval at once."""
 
     def check(action: PendingAction) -> Optional[str]:
         phone = normalize(action.recipient_phone) if action.recipient_phone else None
@@ -225,6 +232,11 @@ def make_send_check(engine: Engine, *, carrier_approved: bool = False,
                 # P1.4: its template was revoked after the automatic approval. Held, never sent; the next sweep
                 # sends it back for a person's approval (standing_sends.return_ungraduated_auto_approvals).
                 return SendDeferred("its message type no longer auto-sends; going back for approval")
+        if (wording_ok is not None and action.decided_by == AUTO_GRADUATED_ACTOR
+                and not wording_ok(action.payload.get("template_version") or "", action.channel, action.payload,
+                                   label_names(action.payload.get("contact_label")))):
+            return_for_approval(engine, action.action_id)
+            return SendDeferred("its wording is not approved wording; going back for approval")
         if action.channel in SMS_CHANNELS:
             if not carrier_approved:
                 return SendDeferred("texting is not approved by the carrier yet (10DLC)")
@@ -527,6 +539,11 @@ def run_sweep(services: CoraServices) -> None:
             if graduated:
                 logger.info("[cora] graduated to standing auto-send: %s",
                             ", ".join(t.template_version for t in graduated))
+    if services.block_list is not None:
+        try:
+            services.block_list()
+        except Exception as exc:  # class only; the rows stay pending and are retried next sweep
+            logger.error("[cora] Instantly block list step failed (%s); retrying next sweep", type(exc).__name__)
     if services.inbox_digest is not None:
         try:
             surfaced = services.inbox_digest()
@@ -607,7 +624,9 @@ def build_live_services(settings: AppSettings) -> Optional[CoraServices]:
     store = AgentStore(engine, config.db_schema)
     services = build_session(config, store, chat,
                              bot_user_id, messages_client=messages_client, send_check=make_send_check(
-                                 engine, carrier_approved=settings.lending_sms_carrier_approved),
+                                 engine, carrier_approved=settings.lending_sms_carrier_approved,
+                                 wording_ok=make_wording_ok(engine)
+                                 if settings.lending_graduated_approved_wording_only else None),
                              toolkit_factory=toolkit_factory, inbox_context=make_inbox_context(engine),
                              executors=build_egress_executors(), extension=RoutingSlack(web),
                              record_edits=True)
@@ -620,7 +639,8 @@ def build_live_services(settings: AppSettings) -> Optional[CoraServices]:
                              instantly_replies=make_instantly_replies(engine, store, config, messages_client,
                                                                       services.gate),
                              agent_jobs=worker.run_once if worker is not None else None,
-                             standing_sends=make_standing_sends_step(engine))
+                             standing_sends=make_standing_sends_step(engine),
+                             block_list=BlockListSweep(engine))
 
 
 def make_standing_sends_step(engine: Engine) -> Callable[[], Any]:

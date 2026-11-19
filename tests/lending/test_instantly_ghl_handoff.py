@@ -218,6 +218,16 @@ def test_a_contact_with_global_do_not_disturb_keeps_ndl_cold(pipeline):
     assert "remove cold tag" not in handoff.steps()
 
 
+@pytest.mark.parametrize("contact", [
+    {**LEAD_CONTACT, "tags": ["lending-opt-out"]},
+    {**LEAD_CONTACT, "dndSettings": {"Call": {"status": "active"}, "Email": {"status": "active"}}},
+])
+def test_a_contact_already_opted_out_in_ghl_is_not_handed_over(pipeline, contact):
+    handoff = RecordingHandoff(contacts=[contact])
+    assert handoff(row()) == "c-lead"
+    assert handoff.writes() == []  # no tag, no card, no note
+
+
 def test_nothing_is_written_while_the_emergency_halt_is_on(pipeline, monkeypatch):
     monkeypatch.setattr(ho, "is_globally_halted", lambda: True)
     handoff = RecordingHandoff(contacts=[LEAD_CONTACT])

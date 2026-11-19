@@ -495,6 +495,28 @@ def return_ungraduated_auto_approvals(conn: Any, template_version: Optional[str]
     return returned
 
 
+_RETURN_ONE_FOR_APPROVAL = text("""
+    UPDATE lending.pending_actions
+       SET status = 'pending', decided_by = NULL, decided_at = NULL, card_channel = NULL, card_ts = NULL,
+           updated_at = now()
+     WHERE action_id = :action_id AND status IN ('approved', 'sending') AND decided_by = :auto_actor
+    RETURNING action_id
+""")
+
+
+def return_for_approval(engine: Engine, action_id: int) -> bool:
+    """Send one automatically approved, still unsent action back for a person's approval (no decision, no card: the
+    card retry posts a fresh "Approval needed" card). True when it was returned. The relay has already claimed the action
+    ("sending") when its send check runs, so both states match; the relay's release of the claim then finds it pending
+    and changes nothing."""
+    with engine.begin() as conn:
+        returned = conn.execute(_RETURN_ONE_FOR_APPROVAL, {"action_id": action_id,
+                                                           "auto_actor": AUTO_GRADUATED_ACTOR}).first() is not None
+    if returned:
+        logger.warning("[standing-sends] action %s sent back for approval (its wording is not approved wording)", action_id)
+    return returned
+
+
 def auto_approval_lapsed(conn: Any, decided_by: Optional[str], template_version: Optional[str],
                          channel: Optional[str] = None) -> bool:
     """For the relay's send-time check: True when the action was approved automatically but its template no

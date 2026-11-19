@@ -9,7 +9,8 @@ stateless token as the Forced Action link, ``src.services.email_unsubscribe``).
   that address is on file with).
 * **POST** records the opt-out (the button, and RFC 8058 one-click from mailbox providers): on every channel through
   ``compliance.propagate_opt_out`` (FA's and lending's stores, the dialer, GHL do-not-disturb) and Instantly's block
-  list. Idempotent: the same address repeated returns the same event. Rate limited per IP.
+  list. Idempotent: the same address repeated returns the same event. A valid signed link is never rate limited (mailbox
+  providers post one-click requests from shared IPs); only requests with an invalid token are, per IP.
 """
 from __future__ import annotations
 
@@ -67,9 +68,9 @@ def unsubscribe_page(token: str = Query(...)):
 
 @router.post("/unsubscribe")
 def unsubscribe(request: Request, token: str = Query(...), db: Session = Depends(get_db)):
-    enforce_or_429(request, RATE_LIMIT_SCOPE, RATE_LIMIT_PER_WINDOW, RATE_LIMIT_WINDOW_SECONDS)
     email = _verified_email(token)
     if not email:
+        enforce_or_429(request, RATE_LIMIT_SCOPE, RATE_LIMIT_PER_WINDOW, RATE_LIMIT_WINDOW_SECONDS)  # only guessing is limited
         return HTMLResponse(_INVALID, status_code=400)
     try:
         propagate_opt_out(db, email=email, channel=OptOutChannel.EMAIL, actor="unsubscribe_link",

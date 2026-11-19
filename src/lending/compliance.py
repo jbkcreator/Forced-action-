@@ -15,7 +15,6 @@ from __future__ import annotations
 import hashlib
 from collections import defaultdict
 import json
-import time
 from dataclasses import dataclass, replace
 from datetime import datetime, time as dt_time, timedelta, timezone
 from typing import Callable, Optional, Sequence
@@ -1292,32 +1291,6 @@ def _with_linked_phones(db, opt_outs: list[_OptOut]) -> list[_OptOut]:
     return resolved
 
 
-BLOCKLIST_MAX_PER_BATCH = 10
-BLOCKLIST_BUDGET_SECONDS = 15.0
-
-
-def _block_in_instantly(emails: list[str]) -> None:
-    """Add each opted-out address to NDL's Instantly block list, so no campaign emails it again (the opt-out is
-    already in our stores; this is the belt for Instantly's own sending). Best effort: bounded in count and time, and
-    never raises. A no-op while the NDL Instantly account is not configured."""
-    from src.lending.instantly_client import block_address, lending_instantly_account
-
-    account = lending_instantly_account()
-    if account is None or not emails:
-        return
-    deadline = time.monotonic() + BLOCKLIST_BUDGET_SECONDS
-    done = 0
-    for email in emails[:BLOCKLIST_MAX_PER_BATCH]:
-        if time.monotonic() > deadline:
-            break
-        try:
-            done += bool(block_address(account, email))
-        except Exception as exc:  # class only: the request carries the address
-            logger.warning("[opt-out] Instantly block list call failed (%s)", type(exc).__name__)
-    if done < len(emails):
-        logger.warning("[opt-out] %d of %d opted-out addresses were added to the Instantly block list", done, len(emails))
-
-
 def _propagate(db, opt_outs: list[_OptOut], dialer_remover: Optional[DialerRemover]) -> list[int]:
     """Batch: one statement per lending table, then one dialer call per phone."""
     opt_outs = _with_linked_phones(db, opt_outs)
@@ -1375,7 +1348,9 @@ def _propagate(db, opt_outs: list[_OptOut], dialer_remover: Optional[DialerRemov
             ),
             {"phones": phones, "hashes": [phone_hash(p) for p in phones]},
         )
-    _block_in_instantly(sorted({o.email for o in opt_outs if o.email}))
+    from src.lending.instantly_blocklist import enqueue as queue_block_list_entries
+
+    queue_block_list_entries(db, sorted({o.email for o in opt_outs if o.email}))  # Cora's sweep sends them to Instantly
     stores_at = datetime.now(timezone.utc)
 
     removed_at = _remove_from_dialer(phones, dialer_remover, RemovalReason.OPT_OUT)
