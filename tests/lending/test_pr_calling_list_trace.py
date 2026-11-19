@@ -72,6 +72,26 @@ def test_live_refuses_a_trace_limit_that_leaves_too_little_for_the_scrub(monkeyp
     assert task.main(["--list", "verified_maturity", "--live"]) == 3
 
 
+def test_live_refuses_without_a_tracerfy_key_and_traces_nothing(monkeypatch, tmp_path):
+    from contextlib import contextmanager
+
+    from config.settings import get_settings
+
+    @contextmanager
+    def db_context():
+        yield None
+
+    monkeypatch.setattr(get_settings(), "tracerfy_api_key", None, raising=False)
+    monkeypatch.setattr(task, "get_db_context", db_context)
+    monkeypatch.setattr(task, "_balance", lambda: 5000)
+    replayed = []
+    monkeypatch.setattr(task, "replay_landed", lambda *a, **k: replayed.append(1) or {})
+    from src.lending import pr_list_landing as landing
+    monkeypatch.setattr(landing, "LANDING_ROOT", tmp_path)
+    assert task.main(["--list", "verified_maturity", "--live", "--trace-credits", "700"]) == 3
+    assert replayed == []
+
+
 def test_landed_results_are_replayed_from_disk_once_and_never_resent(monkeypatch, tmp_path):
     """An interrupted run's paid results are written from the landing file; replaying again writes nothing."""
     from src.services.skip_trace_ledger import trace_key

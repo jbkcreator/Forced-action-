@@ -390,7 +390,6 @@ def _run_live(args: argparse.Namespace, run_id: str, folder: Path) -> int:
     from src.lending.compliance import tracerfy_scrub
     from src.tasks.property_radar_lead_handoff import _write_traced_contacts, _write_usage_ledger
 
-    api_key = get_settings().tracerfy_api_key.get_secret_value()
     with get_db_context() as db:
         write_ledger = lambda entries: _write_usage_ledger(db, entries)  # noqa: E731
         write_contacts = lambda contacts: _write_traced_contacts(db, contacts)  # noqa: E731
@@ -409,6 +408,11 @@ def _run_live(args: argparse.Namespace, run_id: str, folder: Path) -> int:
             logger.error("[list-trace] refused: pass --trace-credits N with 2N <= the balance (%d), so the "
                          "scrub keeps a credit for every person tracing can find", start_balance)
             return 3
+        secret = get_settings().tracerfy_api_key
+        if secret is None:
+            logger.error("[list-trace] refused: TRACERFY_API_KEY is not set, so nothing can be traced")
+            return 3
+        api_key = secret.get_secret_value()
         replay = replay_landed(db, args.list_key, write_ledger=write_ledger, write_contacts=write_contacts)
         db.commit()
         logger.info("[list-trace] replayed landed results from disk: %s", json.dumps(replay))
