@@ -4,14 +4,14 @@ from __future__ import annotations
 from datetime import date
 
 from config.lending_milo import MILO_PACKET_TEMPLATE, MILO_PACKET_WATERMARK
-from src.lending.milo.mapping import MiloApplication
+from src.lending.milo.mapping import MiloApplication, has_comps
 from src.lending.milo.package import MiloPackage
 
 
 def _comp_row(raw: dict) -> dict:
     return {
         "address": raw.get("address") or "",
-        "sale_date": raw.get("sale_date") or "",
+        "sale_date": raw.get("sale_date") or raw.get("sale") or "",  # the comps service gives the month as "sale"
         "sale_price": raw.get("sale_price") or "",
     }
 
@@ -19,7 +19,7 @@ def _comp_row(raw: dict) -> dict:
 def packet_context(package: MiloPackage, application: MiloApplication, *, today: date) -> dict:
     a = package.address
     comps = None
-    if package.comps:
+    if has_comps(package.comps):
         comps = {
             "low": package.comps.get("low") or "n/a",
             "high": package.comps.get("high") or "n/a",

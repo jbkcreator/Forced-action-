@@ -84,3 +84,42 @@ def test_packet_context_carries_deal_facts_and_comps():
     ctx = packet_context(package, mapping.map_package(package), today=date(2026, 11, 17))
     assert ("Gross profit", "$100,000") in ctx["deal_rows"]
     assert ctx["comps"]["comp_count"] == 1 and ctx["comps"]["comps"][0]["address"] == "3 Oak St"
+
+
+# ── review fixes ─────────────────────────────────────────────────────────────
+
+def test_amounts_with_cents_are_rounded_once_so_the_totals_add_up():
+    application = mapping.map_package(package_from_dict(_data(purchase_price="200000.49", rehab="50000.49",
+                                                      arv="350000.50")))
+    assert application.step2_property["Purchase Price"] == "200,000"
+    assert application.step2_property["Estimated Cost of Rehab"] == "50,000"
+    assert application.step2_property["After Repair Value (ARV)"] == "350,001"
+    assert application.checks["Total Project Cost"] == "250,000"  # 200,000 + 50,000, as shown
+    assert application.checks["Gross Profit"] == "100,001"
+
+
+def test_rounding_decides_the_below_cost_warning_the_same_way_as_the_figures_shown():
+    application = mapping.map_package(package_from_dict(_data(purchase_price="200000.40", rehab="50000.40", arv="250000.20")))
+    assert application.checks["Total Project Cost"] == "250,000" and mapping.FLAG_ARV_BELOW_COST not in application.flags
+
+
+UNAVAILABLE_COMPS = {"available": False, "reason": "arv_unknown", "low": None, "point": None, "high": None,
+                     "confidence": None, "comp_count": 0, "comps": []}
+SERVICE_COMPS = {"available": True, "reason": None, "low": "330000", "point": "350000", "high": "365000",
+                 "confidence": "medium", "comp_count": 4,
+                 "comps": [{"sale_price": "352000", "sale": "2026-08", "sqft": 1500}]}
+
+
+def test_the_enrichment_services_no_comps_result_still_flags_missing_comps():
+    application = mapping.map_package(package_from_dict(_data(comps=UNAVAILABLE_COMPS)))
+    assert mapping.FLAG_NO_COMPS in application.flags
+    packet = packet_context(package_from_dict(_data(comps=UNAVAILABLE_COMPS)), application, today=date(2026, 11, 19))
+    assert packet["comps"] is None  # the PDF says no comparable sales are attached
+
+
+def test_available_comps_from_the_service_are_not_flagged_and_show_their_sale_month():
+    package = package_from_dict(_data(comps=SERVICE_COMPS))
+    application = mapping.map_package(package)
+    assert mapping.FLAG_NO_COMPS not in application.flags
+    ctx = packet_context(package, application, today=date(2026, 11, 19))
+    assert ctx["comps"]["comps"][0]["sale_date"] == "2026-08"

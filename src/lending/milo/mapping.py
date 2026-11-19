@@ -6,6 +6,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from decimal import ROUND_HALF_UP, Decimal
+from typing import Optional
 
 from config.lending_milo import (
     MILO_FICO_BANDS,
@@ -47,8 +48,22 @@ def fico_band(fico: int) -> str:
     return MILO_FICO_BANDS[-1][1]
 
 
+def _dollars(value: Decimal) -> Decimal:
+    """Whole dollars. Every amount is rounded once, and the shown figures and Milo's totals all use the rounded
+    value, so the card and the packet always add up (and match what Milo computes from what is entered)."""
+    return value.quantize(Decimal("1"), rounding=ROUND_HALF_UP)
+
+
 def _whole(value: Decimal) -> str:
-    return f"{value.quantize(Decimal('1'), rounding=ROUND_HALF_UP):,}"
+    return f"{_dollars(value):,}"
+
+
+def has_comps(comps: Optional[dict]) -> bool:
+    """True only when comparable sales are really attached: the enrichment service returns a filled-in dict with
+    ``available: false`` and no sales when it found none."""
+    if not comps or comps.get("available") is False:
+        return False
+    return bool(comps.get("comps")) or int(comps.get("comp_count") or 0) > 0
 
 
 def _ratio(arv: Decimal, cost: Decimal) -> str:
@@ -68,14 +83,15 @@ def map_package(package: MiloPackage) -> MiloApplication:
         flags.append(FLAG_FICO_BAND_UNCONFIRMED)
     if not MILO_PROPERTY_TYPES_CONFIRMED:
         flags.append(FLAG_PROPERTY_TYPE_UNCONFIRMED)
-    if not package.comps:
+    if not has_comps(package.comps):
         flags.append(FLAG_NO_COMPS)
 
     # Pricing follows the weakest credit and the strongest track record, as in the instant quote.
     pricing_fico = min(g.fico for g in package.guarantors)
     lead = max(package.guarantors, key=lambda g: g.fix_flip_exits_24m + g.ground_up_exits_24m + g.owned_rentals)
-    total_cost = package.purchase_price + package.rehab
-    if package.arv < total_cost:
+    price, rehab, arv = _dollars(package.purchase_price), _dollars(package.rehab), _dollars(package.arv)
+    total_cost = price + rehab
+    if arv < total_cost:
         flags.append(FLAG_ARV_BELOW_COST)
 
     addr = package.address
@@ -96,9 +112,9 @@ def map_package(package: MiloPackage) -> MiloApplication:
             "Refinance": "Yes" if package.refinance else "No",
             "Property Type": MILO_PROPERTY_TYPES[package.property_type],
             "GEO Restrictions": MILO_GEO_RESTRICTION_DEFAULT,
-            "Purchase Price": _whole(package.purchase_price),
-            "Estimated Cost of Rehab": _whole(package.rehab),
-            "After Repair Value (ARV)": _whole(package.arv),
+            "Purchase Price": _whole(price),
+            "Estimated Cost of Rehab": _whole(rehab),
+            "After Repair Value (ARV)": _whole(arv),
         },
         step2_borrower={
             "Est. FICO Score": fico_band(pricing_fico),
@@ -110,8 +126,8 @@ def map_package(package: MiloPackage) -> MiloApplication:
         # What Milo calculates itself; compared after filling to prove the entry.
         checks={
             "Total Project Cost": _whole(total_cost),
-            "Gross Profit": _whole(package.arv - total_cost),
-            "Viability Ratio": _ratio(package.arv, total_cost),
+            "Gross Profit": _whole(arv - total_cost),
+            "Viability Ratio": _ratio(arv, total_cost),
         },
         flags=tuple(flags),
     )
