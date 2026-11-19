@@ -1,13 +1,168 @@
 name: Deploy
 
+# P0.2: tests gate every deploy. A pull request into dev runs the tests (and shows red when one fails);
+# a push to dev deploys only after the same tests pass, so red code cannot reach production.
 on:
   push:
     branches: [dev]
+  pull_request:
+    branches: [dev]
   workflow_dispatch:
 
+concurrency:
+  group: deploy-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
+  test:
+    name: Tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: fa_ci_test
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+      redis:
+        image: redis:7
+        ports: ["6379:6379"]
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    # Throwaway CI services only. No production secret is used by this job.
+    env:
+      TEST_DATABASE_URL: postgresql://postgres:postgres@localhost:5432/fa_ci_test
+      DATABASE_URL: postgresql://postgres:postgres@localhost:5432/fa_ci_unused
+      REDIS_URL: redis://localhost:6379/0
+      # AppSettings requires these three; tests never call the real services.
+      ANTHROPIC_API_KEY: ci-placeholder-not-a-key
+      FIRECRAWL_API_KEY: ci-placeholder-not-a-key
+      COURT_LISTENER_API_KEY: ci-placeholder-not-a-key
+      PYTHONPATH: ${{ github.workspace }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt pytest -c .github/ci-constraints.txt
+          # Headless Chromium for the tests that render PDFs through Playwright (pre-qual letters).
+          python -m playwright install --with-deps chromium
+
+      - name: Prepare test database
+        env:
+          PGPASSWORD: postgres
+        run: |
+          psql -h localhost -U postgres -d fa_ci_test -c "CREATE EXTENSION IF NOT EXISTS pg_trgm;"
+          # Build every table the ORM models define (src/core/models.py is the tests' schema source of truth),
+          # including the lending schema, so database tests run against real tables instead of an empty DB.
+          python - <<'PY'
+          from sqlalchemy import create_engine, text
+          from src.core.models import Base as CoreBase
+          import src.lending.models as lending_models
+
+          metadatas = {id(CoreBase.metadata): CoreBase.metadata}
+          for obj in vars(lending_models).values():
+              md = getattr(obj, "metadata", None)
+              if md is not None and hasattr(md, "tables"):
+                  metadatas[id(md)] = md
+          engine = create_engine("postgresql://postgres:postgres@localhost:5432/fa_ci_test")
+          schemas = {t.schema for md in metadatas.values() for t in md.tables.values() if t.schema}
+          # Model server defaults call generate_uuidv7(); same definition as scripts/apply_fa087_m1_shared_backbone.py.
+          uuidv7 = """
+          CREATE OR REPLACE FUNCTION generate_uuidv7() RETURNS UUID LANGUAGE plpgsql AS $fn$
+          DECLARE
+              ts_ms  BIGINT := (EXTRACT(EPOCH FROM clock_timestamp()) * 1000)::BIGINT;
+              ts_hex TEXT   := lpad(to_hex(ts_ms), 12, '0');
+              r1     TEXT   := lpad(to_hex((random() * 4095)::INT), 3, '0');
+              r2     TEXT   := lpad(to_hex((random() * 63)::INT | 128), 2, '0');
+              r3     TEXT   := lpad(to_hex((random() * 281474976710655)::BIGINT), 14, '0');
+          BEGIN
+              RETURN (substring(ts_hex, 1, 8) || '-' || substring(ts_hex, 9, 4) || '-' || '7' || r1 || '-' ||
+                      r2 || substring(r3, 1, 2) || '-' || substring(r3, 3, 12))::UUID;
+          END;
+          $fn$;
+          """
+          with engine.begin() as conn:
+              conn.exec_driver_sql(uuidv7)
+              for schema in sorted(schemas):
+                  conn.execute(text(f'CREATE SCHEMA IF NOT EXISTS "{schema}"'))
+          for md in metadatas.values():
+              md.create_all(engine)
+          print(f"schemas: {sorted(schemas)}; tables: {sum(len(md.tables) for md in metadatas.values())}")
+          PY
+
+      # Tests already failing on dev before this gate are listed in tests/ci_known_failures.txt and excluded, so the
+      # gate blocks every NEW failure from day one. Fix a listed test, then delete its line.
+      - name: Run tests
+        run: |
+          python - <<'PY'
+          import pathlib, sys
+          import pytest
+
+          entries = [
+              line.strip() for line in pathlib.Path("tests/ci_known_failures.txt").read_text(encoding="utf-8").splitlines()
+              if line.strip() and not line.lstrip().startswith("#")
+          ]
+          args = [
+              "tests/", "-q", "-p", "no:cacheprovider",
+              "-m", "not scenario and not scenario_lifecycle and not scenario_platform and not scenario_chat and not integration",
+          ]
+          args += [f"--ignore={e}" for e in entries if "::" not in e]
+          args += [f"--deselect={e}" for e in entries if "::" in e]
+          print(f"known pre-existing failures excluded: {len(entries)}", flush=True)
+
+
+          class FailedTests:
+              """Collects the node ids of tests that fail in setup, call or teardown."""
+
+              def __init__(self):
+                  self.ids = []
+
+              def pytest_runtest_logreport(self, report):
+                  if report.failed and report.nodeid not in self.ids:
+                      self.ids.append(report.nodeid)
+
+
+          first = FailedTests()
+          code = pytest.main(args, plugins=[first])
+          if code != 1 or not first.ids or len(first.ids) > 20:
+              sys.exit(code)  # passed, a collection/usage error, or too many failures to be chance: no rerun
+
+          # A test that fails only by chance (random data, timing) passes when run again; a real break fails twice.
+          print(f"\nre-running the {len(first.ids)} failed test(s) once to tell a random failure from a real one",
+                flush=True)
+          second = FailedTests()
+          code = pytest.main(["-q", "-p", "no:cacheprovider", *first.ids], plugins=[second])
+          passed_on_rerun = [t for t in first.ids if t not in second.ids]
+          if passed_on_rerun:
+              print("::warning title=Random test failure::passed on rerun, fix or list it: " + ", ".join(passed_on_rerun))
+          sys.exit(code)
+          PY
+
   deploy:
-    runs-on: ubuntu-latest
+    name: Deploy
+    needs: test
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-24.04
 
     steps:
       - name: Deploy
@@ -16,4 +171,14 @@ jobs:
           host: ${{ secrets.VM_HOST }}
           username: ${{ secrets.VM_USER }}
           key: ${{ secrets.SSH_KEY }}
-          script: bash /root/Forced-action-/deploy.sh
+          # Deploy exactly the commit the Tests job passed, with that commit's own deploy scripts: a newer commit
+          # merged while the tests ran is not deployed by this run (it gets its own tested run).
+          script: |
+            set -euo pipefail
+            sha="${{ github.sha }}"
+            cd /root/Forced-action-
+            git fetch -q origin dev
+            tmp="$(mktemp -d)"
+            trap 'rm -rf "$tmp"' EXIT
+            git archive "$sha" deploy.sh scripts/deploy/sync_dev.sh | tar -x -C "$tmp"
+            bash "$tmp/deploy.sh" "$sha"

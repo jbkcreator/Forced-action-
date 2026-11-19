@@ -162,7 +162,9 @@ def _decide(db, row: Mapping[str, Any], *, now: datetime, text_sender: Optional[
         _record(db, rid, "skipped", "suppressed")
         return "skipped_suppressed"
 
-    if phone and has_text_consent(db, phone):
+    # Texting off (A2P pending) with email live: a consented contact (every LendingFlow lead) still gets the email.
+    textable = bool(phone) and has_text_consent(db, phone)
+    if textable and (text_enabled or not (email and email_enabled)):
         return _send_text(db, row, now=now, sender=text_sender, enabled=text_enabled, number=number, started=started,
                           reschedule_url=reschedule_url)
     if email:

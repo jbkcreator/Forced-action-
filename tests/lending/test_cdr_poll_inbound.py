@@ -62,3 +62,33 @@ def test_consent_failure_does_not_stop_ingestion(monkeypatch):
     stats = cdr_poll.ingest(db, [_cdr(10, direction="in")], only_changed=False)
     assert stats.seen == 1 and stats.failed == 0
     db.rollback.assert_called()
+
+
+# ── DNC on a call outside the lending campaigns ──────────────────────────────
+
+@pytest.fixture
+def processed(monkeypatch):
+    calls = []
+    monkeypatch.setattr(cdr_poll, "process_event", lambda db, ev: calls.append(ev.call_id) or SimpleNamespace())
+    monkeypatch.setattr(cdr_poll, "follow_up", lambda recorded, run: None)
+    return calls
+
+
+def test_inbound_dnc_from_a_known_lead_is_processed(monkeypatch, processed):
+    monkeypatch.setattr(cdr_poll, "known_lead_phones", lambda db, phones: {"+18135550142"})
+    item = _cdr(8, direction="in", disposition="DNC_REQUEST", campaign={"id": 999})
+    stats = cdr_poll.ingest(MagicMock(), [item], only_changed=False)
+    assert processed == ["8"] and stats.processed == 1
+
+
+def test_inbound_dnc_from_unknown_number_is_still_ignored(monkeypatch, processed):
+    monkeypatch.setattr(cdr_poll, "known_lead_phones", lambda db, phones: set())
+    cdr_poll.ingest(MagicMock(), [_cdr(8, direction="in", disposition="DNC_REQUEST", campaign={})], only_changed=False)
+    assert processed == []
+
+
+def test_no_lead_lookup_without_an_outside_dnc(monkeypatch, processed):
+    lookups = []
+    monkeypatch.setattr(cdr_poll, "known_lead_phones", lambda db, phones: lookups.append(phones) or set())
+    cdr_poll.ingest(MagicMock(), [_cdr(8, direction="in", campaign={"id": 999})], only_changed=False)
+    assert lookups == []

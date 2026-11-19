@@ -32,6 +32,7 @@ from config.lending_enrichment import (
 )
 from config.settings import get_settings
 from src.lending.contracts import RoutingTag
+from src.lending.slack_channels import BOT_TOKEN, report_unset
 from src.lending.enrichment.fit_card import Evaluator, FitView, evaluate_fit
 from src.lending.enrichment.ports import (
     CompsPort,
@@ -293,7 +294,7 @@ def _post_if_needed(db, lead_id, tag, address, close, facts, fit, coverage, *, f
     try:
         thread = thread or default_deal_thread()
         if isinstance(thread, UnavailableDealThread):
-            logger.warning("[enrichment] lead=%s deal thread not posted: Slack is not configured", lead_id)
+            report_unset("enrichment deal thread", ("LENDING_DIAL_TASKS_CHANNEL", BOT_TOKEN))
             return EnrichmentOutcome(lead_id, READY, tag.value)
         root = thread_ts
         if not card_done:

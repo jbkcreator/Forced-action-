@@ -16,6 +16,7 @@ from zoneinfo import ZoneInfo
 from config.lending_compliance import DEFAULT_TZ
 from config.lending_dispositions import HOURLY_POST_HOURS_ET
 from config.settings import get_settings
+from src.lending.slack_channels import BOT_TOKEN, report_unset
 from src.lending.db import lending_session
 from src.lending.dialer_port import get_http
 from src.lending.scoreboard import build_scoreboard, format_blocks, format_slack
@@ -64,7 +65,7 @@ def main(argv=None, *, now: Optional[datetime] = None) -> int:
     s = get_settings()
     channel = s.lending_daily_channel
     if not (channel and s.lending_slack_bot_token):
-        logger.error("[lending] scoreboard not posted: Slack channel or token is not configured")
+        report_unset("scoreboard", ("LENDING_DAILY_CHANNEL", BOT_TOKEN))
         return 1
     day = now_et.date()
     try:

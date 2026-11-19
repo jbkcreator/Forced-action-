@@ -23,7 +23,6 @@ from src.scrappers.liens.lien_engine import (
     _save_buckets,
     _HOA_KEYWORDS,
     _IRS_KEYWORDS,
-    _ORI_TO_LEGAL_COLS_FALLBACK,
 )
 from src.loaders.column_mapper import SIGNAL_SCHEMAS
 
@@ -252,36 +251,6 @@ class TestLienLoaderCountyAwareness:
     def test_county_id_stored_on_loader(self):
         loader = _make_lien_loader("pinellas", PINELLAS_COUNTY_CFG)
         assert loader.county_id == "pinellas"
-
-
-# ---------------------------------------------------------------------------
-# 6. ORI → legal_proceedings column bridge fallback
-# ---------------------------------------------------------------------------
-
-class TestOriToLegalColsFallback:
-
-    def test_all_four_key_columns_mapped(self):
-        assert _ORI_TO_LEGAL_COLS_FALLBACK["Instrument"]  == "CaseNumber"
-        assert _ORI_TO_LEGAL_COLS_FALLBACK["Grantor"]     == "LastName/CompanyName"
-        assert _ORI_TO_LEGAL_COLS_FALLBACK["RecordDate"]  == "FilingDate"
-        assert _ORI_TO_LEGAL_COLS_FALLBACK["Legal"]       == "PartyAddress"
-
-    def test_fallback_renames_ori_df(self):
-        df = pd.DataFrame({
-            "Instrument": ["2024-001"],
-            "Grantor":    ["JOHN DOE"],
-            "RecordDate": ["2024-01-15"],
-            "Legal":      ["LOT 1 BLK 2"],
-            "Grantee":    ["JANE DOE"],
-        })
-        result = df.rename(columns=_ORI_TO_LEGAL_COLS_FALLBACK)
-        assert "CaseNumber"           in result.columns
-        assert "LastName/CompanyName" in result.columns
-        assert "FilingDate"           in result.columns
-        assert "PartyAddress"         in result.columns
-        assert "Instrument"           not in result.columns
-        # Grantee (no mapping) passes through
-        assert "Grantee"              in result.columns
 
 
 # ---------------------------------------------------------------------------

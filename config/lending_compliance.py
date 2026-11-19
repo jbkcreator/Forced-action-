@@ -50,8 +50,15 @@ GHL_TAG_COLD_LEAD = "ndl-cold"
 # The do-not-disturb message set on a cold push. Warming up lifts only do-not-disturb carrying this message, so a
 # genuine opt-out (set with another message) is never lifted.
 COLD_LEAD_DND_MESSAGE = "Cold lead: calls only"
-# A phone called from GHL inside this window belongs to GHL calling (matches the 14-day follow-up cycle).
+# One calling rule for every lead (TL decision, Nov 4): both platforms dial until someone gets through, then the other
+# stops. "Got through" inside this window = a live-conversation result (connected, callback, DNC request, nurture,
+# booked) or, for a GHL call with no result posted, GHL's answered status with REACHED_MIN_TALK_SECONDS of talk.
+# Reached in GHL -> the number leaves BatchDialer; reached in BatchDialer -> held off Josh's GHL call lists.
 GHL_CALLING_LOOKBACK_DAYS = 14
+REACHED_CODES: tuple[str, ...] = ("CONNECTED_NOT_INTERESTED", "CALLBACK_REQUESTED", "DNC_REQUEST", "NURTURE", "BOOKED",
+                                  "DATA_NURTURE_ONLY", "GATE_FAILED_NURTURE")
+REACHED_GHL_STATUSES: tuple[str, ...] = ("ghl:completed", "ghl:answered")
+REACHED_MIN_TALK_SECONDS = 60
 GHL_DND_BATCH = 50               # GHL updates per poll cycle (GHL client throttles ~2 req/s)
 GHL_BACKSTOP_PAGE_SIZE = 100     # GHL contact search page size (DND backstop)
 GHL_BACKSTOP_MAX_PAGES = 50      # bound per backstop run (~5,000 DND contacts)
@@ -118,6 +125,46 @@ OPT_OUT_EXCLUDED_SOURCES = frozenset(NON_OPT_OUT_SOURCES | {TRACERFY_DNC_SOURCE,
 # Postgres advisory-lock key: one poller cycle at a time across all processes.
 OPT_OUT_POLL_LOCK_KEY = 7_302_020_801
 DIALER_SWEEP_LOCK_KEY = 7_302_020_802
+GHL_CALL_GATE_LOCK_KEY = 7_302_020_805
+GHL_LIST_SCRUB_LOCK_KEY = 7_302_020_806
+
+# Josh's GHL call lists (G5): one smart list per lead-type tag, each excluding GHL_DO_NOT_CALL_NOW_TAG.
+# src.lending.ghl_call_gate adds that tag to a listed contact that cannot be called now and removes it
+# when calling is allowed again. Lead-type tags are never added or removed: removing and re-adding
+# "lendingflow" re-fires the Speed to Lead and API Catch workflows (re-entry on).
+GHL_DO_NOT_CALL_NOW_TAG = "ndl-do-not-call-now"
+GHL_CALL_LIST_TAGS = (
+    "ndl-verified-maturity",
+    "ndl-builder",
+    "ndl-nurture",
+    "lendingflow",
+    "web-lead",
+    "ndl-wholesaler",
+    "ndl-partner",
+    "ndl-transaction-ready",
+)
+# BatchDialer load -> GHL sync (src/lending/ghl_load_sync.py): dialer pool -> the call-list tag its contacts get.
+# A pool missing here is never pushed (logged), so a new pool cannot reach GHL unmapped.
+GHL_LOAD_SYNC_POOL_TAGS: dict[str, str] = {
+    "verified_maturity": "ndl-verified-maturity",
+    "transaction_ready": "ndl-transaction-ready",
+    "builders": "ndl-builder",
+    "partners": "ndl-partner",
+    "wholesalers": "ndl-wholesaler",
+    "nurture": "ndl-nurture",
+    "lendingflow": "lendingflow",  # LendingFlow phones are warm, so the sync skips them; mapped for completeness
+    "website": "web-lead",  # website phones are warm too (skipped); mapped for completeness
+}
+GHL_LOAD_SYNC_BATCH_SIZE = 200       # rows per run
+GHL_LOAD_SYNC_MAX_ATTEMPTS = 5       # then status 'failed' and one ops notice
+GHL_LOAD_SYNC_HALT_CHECK_EVERY = 10  # rows between emergency-halt rechecks inside a run
+GHL_LOAD_SYNC_LOCK_KEY = 7_302_020_807
+GHL_CALL_GATE_PAGE_SIZE = 100
+GHL_CALL_GATE_MAX_PAGES = 20             # per tag per run (2,000 contacts a list)
+GHL_CALL_GATE_ALERT_AFTER_MINUTES = 10   # ops alert once no run has succeeded for this long
+# Listed numbers are rescrubbed (src.lending.ghl_list_scrub, hourly) once their newest scrub is this old,
+# so none reaches DNC_SCRUB_MAX_AGE_DAYS and drops off Josh's lists. LendingFlow numbers are never scrubbed.
+GHL_LIST_RESCRUB_AFTER_DAYS = 6
 
 # FA suppress_contact() source → opt-out channel. Anything unlisted is email-origin.
 SMS_OPT_OUT_SOURCES = frozenset({"inbound_sms", "twilio_inbound", "cascaded_from_sms"})
@@ -208,3 +255,11 @@ def validate_lending_compliance_config() -> None:
         raise ValueError("WEEKLY_SCRUB_PERIOD_DAYS must not exceed DNC_SCRUB_MAX_AGE_DAYS")
     if not 0 < SCRUB_STALE_BREAKER_PCT <= 100 or SCRUB_STALE_BREAKER_MIN_POOL < 1:
         raise ValueError("scrub-stale breaker thresholds must be positive (pct <= 100)")
+    if not 0 < GHL_LIST_RESCRUB_AFTER_DAYS < DNC_SCRUB_MAX_AGE_DAYS:
+        raise ValueError("GHL_LIST_RESCRUB_AFTER_DAYS must be positive and below DNC_SCRUB_MAX_AGE_DAYS")
+    if GHL_DO_NOT_CALL_NOW_TAG in GHL_CALL_LIST_TAGS or len(set(GHL_CALL_LIST_TAGS)) != len(GHL_CALL_LIST_TAGS):
+        raise ValueError("GHL_CALL_LIST_TAGS must be distinct and must not contain GHL_DO_NOT_CALL_NOW_TAG")
+    if not set(GHL_LOAD_SYNC_POOL_TAGS.values()) <= set(GHL_CALL_LIST_TAGS):
+        raise ValueError("GHL_LOAD_SYNC_POOL_TAGS must map pools to tags in GHL_CALL_LIST_TAGS")
+    if min(GHL_LOAD_SYNC_BATCH_SIZE, GHL_LOAD_SYNC_MAX_ATTEMPTS, GHL_LOAD_SYNC_HALT_CHECK_EVERY) < 1:
+        raise ValueError("GHL load sync batch size, max attempts and halt check interval must be positive")

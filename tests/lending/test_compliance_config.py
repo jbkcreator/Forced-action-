@@ -28,12 +28,13 @@ def test_reason_codes_are_stable_strings():
         "SUPPRESSED", "GA_NATURAL_PERSON", "HOMESTEAD_OWNER_OCCUPIED", "OUTSIDE_CALL_WINDOW",
         "ATTEMPT_CAP_REACHED", "ATTEMPT_HISTORY_EXCEEDED",
         "BACKFLIP_CONFLICT", "BACKFLIP_FEED_STALE", "BACKFLIP_FEED_UNAVAILABLE",
+        "GHL_CALLING",
     }
 
 
 def test_removal_reasons_are_stable_strings():
     assert {r.value for r in cfg.RemovalReason} == {
-        "opt_out", "call_window", "attempt_cap", "scrub_stale", "attempt_history", "handled_in_ghl",
+        "opt_out", "call_window", "attempt_cap", "scrub_stale", "attempt_history", "ghl_calling", "handled_in_ghl",
     }
 
 

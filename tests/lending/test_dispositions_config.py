@@ -81,12 +81,10 @@ def test_failed_slack_post_unclaims_the_call_so_the_next_run_retries(alert_env, 
     assert alert_env.run(slack_client=slack) == 0
 
 
-def test_approved_thirteen_codes_are_pinned_and_three_stay_separate():
+def test_the_ten_codes_shared_by_batchdialer_and_ghl_are_pinned():
     from config.lending_dispositions import DISPOSITIONS
 
     assert DISPOSITIONS == (
-        "NO_ANSWER", "LEFT_VOICEMAIL", "BAD_NUMBER", "CALL_FAILED", "WRONG_PERSON",
-        "NOT_DECISION_MAKER", "REFERRED", "DNC_REQUEST", "CONNECTED_NOT_INTERESTED",
-        "CALLBACK_REQUESTED", "DATA_NURTURE_ONLY", "GATE_FAILED_NURTURE", "BOOKED",
+        "NO_ANSWER", "LEFT_VOICEMAIL", "BAD_NUMBER", "WRONG_PERSON", "REFERRED", "DNC_REQUEST",
+        "CONNECTED_NOT_INTERESTED", "CALLBACK_REQUESTED", "NURTURE", "BOOKED",
     )
-    assert len({"WRONG_PERSON", "NOT_DECISION_MAKER", "REFERRED"} & set(DISPOSITIONS)) == 3

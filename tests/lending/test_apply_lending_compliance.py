@@ -55,7 +55,11 @@ def test_apply_creates_lending_tables_in_target_schema(env):
     engine, target, source = env
     apply(engine=engine, schema=target, source_schema=source)
 
-    assert _tables(engine, target) == TABLES
+    from src.lending.models import LendingBase
+
+    created = _tables(engine, target)
+    assert TABLES <= created  # the compliance tables are always there
+    assert created == {t.name for t in LendingBase.metadata.tables.values()}  # and every lending model table
 
 
 def _seed_sources(engine, source):

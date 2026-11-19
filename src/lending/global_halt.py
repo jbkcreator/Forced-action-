@@ -90,15 +90,36 @@ def emergency_command(message_text: str) -> Optional[str]:
     return None
 
 
+def _default_instantly_sender() -> Any:
+    from src.lending.instantly_email import get_ndl_instantly_sender
+
+    return get_ndl_instantly_sender()
+
+
 class EmergencyHalt:
-    """The Slack command, run by Cora's session before anything else sees the message."""
+    """The Slack command, run by Cora's session before anything else sees the message.
+
+    The halt also pauses NDL's Instantly cold-email campaign (an email already handed to Instantly would otherwise
+    still go out), and resume re-activates it. A failed pause never undoes the halt; the alert says so instead."""
 
     def __init__(self, *, chat: Any, cora_halt: Any, approver_ids: Collection[str],
-                 alert_channel: Optional[str]) -> None:
+                 alert_channel: Optional[str], instantly_sender: Callable[[], Any] = _default_instantly_sender) -> None:
         self._chat = chat
         self._cora_halt = cora_halt
         self._approvers = frozenset(approver_ids)
         self._alert_channel = alert_channel
+        self._instantly_sender = instantly_sender
+
+    def _instantly_campaign(self, action: str) -> Optional[bool]:
+        """Pause or resume NDL's Instantly campaign: None when Instantly is not configured, else whether it worked."""
+        try:
+            sender = self._instantly_sender()
+            if sender is None:
+                return None
+            return bool(sender.pause_campaign() if action == "pause" else sender.resume_campaign())
+        except Exception as exc:  # class only: never let Instantly stop the halt
+            logger.error("[global-halt] Instantly campaign %s failed (%s)", action, type(exc).__name__)
+            return False
 
     def __call__(self, message: Any) -> bool:
         """Handle the message if it is an emergency command; True when it was one."""
@@ -125,10 +146,14 @@ class EmergencyHalt:
                                  "Pause BatchDialer and GoHighLevel by hand now.")
             return
         self._cora_halt.set(reason=reason, user_id=message.user_id)
+        paused = self._instantly_campaign("pause")
+        instantly_stopped = ", the NDL Instantly cold-email campaign (paused)" if paused else ""
+        instantly_warning = ("\n:warning: The NDL Instantly cold-email campaign could NOT be paused: pause it by hand "
+                             "in Instantly now." if paused is False else "")
         alert = (f":rotating_light: *Lending emergency halt* by <@{message.user_id}>.\n"
                  "*Stopped automatically:* every GoHighLevel text and email this system sends, the LendingFlow intro "
-                 "text, new dialer loads and Cora's sends.\n"
-                 f"{MANUAL_CHECKLIST}\n"
+                 f"text, new dialer loads{instantly_stopped} and Cora's sends.\n"
+                 f"{MANUAL_CHECKLIST}{instantly_warning}\n"
                  "Say `@Cora emergency resume` to lift it.")
         if not self._alert_channel or message.channel == self._alert_channel:
             self._reply(message, alert)  # typed in Cora's channel: the reply is the alert, posted once
@@ -145,9 +170,12 @@ class EmergencyHalt:
             logger.error("[global-halt] could not clear the emergency halt (%s)", type(exc).__name__)
             self._reply(message, "The emergency halt could not be lifted; it is still on. Try again.")
             return
+        resumed = self._instantly_campaign("resume")
         text_ = (f":arrow_forward: Lending emergency halt lifted by <@{message.user_id}>. Texts, emails, intro texts "
                  "and dialer loads may run again. Cora stays halted until an approver says `resume`; BatchDialer and "
                  "GoHighLevel must be turned back on by hand.")
+        if resumed is False:
+            text_ += "\n:warning: The NDL Instantly cold-email campaign could not be re-activated: resume it in Instantly."
         if self._alert_channel and message.channel != self._alert_channel:
             self._chat.post(text=text_, channel=self._alert_channel)
         self._reply(message, text_)

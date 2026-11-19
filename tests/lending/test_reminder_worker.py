@@ -136,6 +136,35 @@ def test_texting_switched_off_sends_nothing_and_says_why(db):
     assert sender.calls == []
 
 
+def test_texting_switched_off_falls_back_to_email_when_email_is_live(db):
+    book(db)
+    record_consent(db, PHONE, "on_call_yes")
+    texts, mails = TextSender(), EmailSender()
+    assert cycle(db, text_sender=texts, email_sender=mails, text_enabled=False, email_enabled=True) == {"sent": 1}
+    assert texts.calls == [] and row(db)["channel"] == "email"
+
+
+def _lendingflow_lead(db, phone=PHONE):
+    db.execute(text("INSERT INTO lending.lendingflow_leads (vendor_lead_id, dedupe_hash, raw_payload, phone) "
+                    "VALUES ('v-remind', 'h-remind', '{}'::jsonb, :p)"), {"p": phone})
+
+
+def test_a_lendingflow_lead_gets_the_email_while_texting_is_off(db):
+    book(db)
+    _lendingflow_lead(db)
+    texts, mails = TextSender(), EmailSender()
+    assert cycle(db, text_sender=texts, email_sender=mails, text_enabled=False, email_enabled=True) == {"sent": 1}
+    assert texts.calls == [] and mails.calls[0][0] == "jane@example.com"
+
+
+def test_a_lendingflow_lead_gets_the_text_once_texting_is_on(db):
+    book(db)
+    _lendingflow_lead(db)
+    texts, mails = TextSender(), EmailSender()
+    assert cycle(db, text_sender=texts, email_sender=mails, text_enabled=True, email_enabled=True) == {"sent": 1}
+    assert len(texts.calls) == 1 and mails.calls == []
+
+
 def test_no_text_back_number_means_the_text_is_not_sent(db):
     book(db)
     record_consent(db, PHONE, "on_call_yes")
@@ -221,7 +250,8 @@ def test_a_deferral_that_would_pass_the_call_is_skipped(db):
 def test_a_call_that_already_started_is_not_texted_about(db):
     book(db)
     record_consent(db, PHONE, "on_call_yes")
-    assert cycle(db, text_sender=TextSender(), now=SLOT + timedelta(minutes=1)) == {"skipped_call_started": 3}
+    # All four texts (confirmation, night-before, 90-minute and, since Oct 26, 10-minute) are skipped.
+    assert cycle(db, text_sender=TextSender(), now=SLOT + timedelta(minutes=1)) == {"skipped_call_started": 4}
 
 
 def test_an_ambiguous_ghl_error_is_never_resent(db):

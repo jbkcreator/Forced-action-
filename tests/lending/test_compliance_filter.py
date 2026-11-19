@@ -282,14 +282,21 @@ def test_fresh_lending_scrub_is_reused_without_tracerfy(db):
     assert out[P_CLEAN].allowed
 
 
-def _ghl_call(db, phone, ended_at):
+def _ghl_call(db, phone, ended_at, disposition="CONNECTED_NOT_INTERESTED"):
     db.execute(text("INSERT INTO lending.call_dispositions "
-                    "(dialer_call_id, call_source, phone, direction, call_ended_at, raw_event) "
-                    "VALUES (:cid, 'ghl', :p, 'outbound', :t, '{}')"),
-               {"cid": f"ghl-test-{phone}-{ended_at.isoformat()}", "p": phone, "t": ended_at})
+                    "(dialer_call_id, call_source, phone, direction, call_ended_at, disposition, raw_event) "
+                    "VALUES (:cid, 'ghl', :p, 'outbound', :t, :d, '{}')"),
+               {"cid": f"ghl-test-{phone}-{ended_at.isoformat()}", "p": phone, "t": ended_at, "d": disposition})
 
 
-def test_a_phone_called_from_ghl_in_the_last_14_days_is_blocked_without_scrub(db):
+def test_an_unanswered_ghl_call_does_not_block_the_load(db):
+    """One calling rule: a missed GHL call leaves the number to BatchDialer (it only counts as an attempt)."""
+    _dnc(db, P_CLEAN, age_days=1)
+    _ghl_call(db, P_CLEAN, NOW - timedelta(days=3), disposition="NO_ANSWER")
+    assert _run(db, [{"phone": P_CLEAN}])[P_CLEAN].allowed
+
+
+def test_a_phone_reached_in_ghl_in_the_last_14_days_is_blocked_without_scrub(db):
     _ghl_call(db, P_CLEAN, NOW - timedelta(days=3))
     out = _run(db, [{"phone": P_CLEAN}])
     assert not out[P_CLEAN].allowed and out[P_CLEAN].reason is ReasonCode.GHL_CALLING

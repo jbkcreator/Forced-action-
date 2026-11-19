@@ -9,7 +9,9 @@ gets the lead into GHL. Each run also tags delivered leads whose intro text was 
 
 Each run first does the LendingFlow -> BatchDialer step (src/lending/lendingflow_dialer.py: removals of leads handled
 in GHL always, loading only with LENDING_LENDINGFLOW_DIALER_ENABLED) and retries the BatchDialer results not yet
-written to GHL (src/lending/bd_result_to_ghl.py, LENDING_BD_RESULT_TO_GHL_ENABLED); both run whatever the intake switch.
+written to GHL (src/lending/bd_result_to_ghl.py, LENDING_BD_RESULT_TO_GHL_ENABLED) and writes GHL call results onto the
+BatchDialer contact card (src/lending/ghl_result_to_bd.py, LENDING_GHL_RESULT_TO_BD_ENABLED); all run whatever the intake
+switch.
 
     python -m src.tasks.lending_lendingflow_sweep
 """
@@ -22,7 +24,8 @@ from sqlalchemy import text
 
 from config.lending_lendingflow import GHL_ALERT_AFTER_MINUTES, GHL_GIVE_UP_AFTER_HOURS, SWEEP_BATCH_SIZE
 from config.settings import get_settings
-from src.lending import bd_result_to_ghl, lendingflow_dialer, lendingflow_events
+from src.lending.slack_channels import BOT_TOKEN, report_unset
+from src.lending import bd_result_to_ghl, ghl_result_to_bd, lendingflow_dialer, lendingflow_events
 from src.lending.db import lending_session
 from src.lending.lead_arrival_alert import alert_josh
 from src.lending.disposition_delivery import _configured_slack, _slack_client
@@ -42,7 +45,7 @@ def alert_undelivered(slack_client: Any = None, minutes: Optional[int] = None) -
     Never raises: an alert problem must not stop the sweep."""
     minutes = GHL_ALERT_AFTER_MINUTES if minutes is None else minutes
     if not (slack_client or _configured_slack()):
-        logger.error("[lendingflow] undelivered-lead alert skipped: Slack is not configured")
+        report_unset("LendingFlow undelivered-lead alert", ("LENDING_DIAL_TASKS_CHANNEL", BOT_TOKEN))
         return 0
     try:
         with lending_session() as db:
@@ -89,6 +92,9 @@ def run() -> int:
     notes = bd_result_to_ghl.write_notes()
     if notes:
         logger.info("[lendingflow] sweep wrote %d BatchDialer result(s) to GHL", notes)
+    cards = ghl_result_to_bd.write_card_notes()
+    if cards:
+        logger.info("[lendingflow] sweep wrote %d GHL call result(s) to BatchDialer cards", cards)
     if not get_settings().lending_lendingflow_enabled:
         return 0
     sink = get_live_sink()

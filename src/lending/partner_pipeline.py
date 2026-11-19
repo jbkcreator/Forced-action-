@@ -113,6 +113,7 @@ def letters_enabled() -> bool:
 
 def live_services() -> PipelineServices:
     from config.settings import get_settings
+    from src.lending.slack_channels import BOT_TOKEN, report_unset
     from src.lending.ghl_email import get_email_sender
     from src.lending.ghl_sms import get_sender
     from src.lending.lender_fit import evaluate_lender_fit
@@ -129,7 +130,7 @@ def live_services() -> PipelineServices:
     def slack(note: SlackNote) -> None:
         channel, token = settings.lending_partner_channel, settings.lending_slack_bot_token  # #deals
         if not (channel and token):
-            logger.info("[partner-door] Slack note skipped: LENDING_PARTNER_CHANNEL or bot token not set")
+            report_unset("partner file card", ("LENDING_PARTNER_CHANNEL", BOT_TOKEN))
             return
         from slack_sdk import WebClient
 

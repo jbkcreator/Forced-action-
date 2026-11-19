@@ -27,6 +27,7 @@ from packages.agent_core.config import parse_user_ids
 from src.lending.contracts import LendingFlowLeadCreated
 from src.lending.cora_inbox import add_to_inbox_in_own_session
 from src.lending.db import lending_session
+from src.lending.slack_channels import BOT_TOKEN, report_unset
 from src.lending.slack_names import name_and_ref
 from src.lending.slack_test_filter import is_hidden_lendingflow_uuid, log_skipped
 
@@ -106,8 +107,10 @@ def alert_josh(event: LendingFlowLeadCreated) -> Optional[bool]:
     settings = get_settings()
     channel = settings.lending_ops_channel
     mention_ids = parse_user_ids(settings.lending_cora_approver_user_ids)
-    if not (settings.lending_lead_arrival_alert_enabled and settings.lending_slack_bot_token and channel
-            and mention_ids):
+    if not settings.lending_lead_arrival_alert_enabled:
+        return None
+    if not (settings.lending_slack_bot_token and channel and mention_ids):
+        report_unset("lead arrival alert", ("LENDING_OPS_CHANNEL", BOT_TOKEN, "LENDING_CORA_APPROVER_USER_IDS"))
         return None
     if _is_test_lead(event):
         log_skipped("lead arrival alert", event.lead_id)

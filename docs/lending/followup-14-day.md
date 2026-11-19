@@ -51,7 +51,7 @@ it anyway). This is the only place a Goto belongs; the opted-out branches of the
 | 5 | Wait 2 days → task "Call" → SMS 5 |
 | 7 | Wait 2 days → task **"Call – leave Josh's personal voicemail"** (a task, not a ringless voicemail action) |
 | 10 | Wait 3 days → task "Call" → Email 10 |
-| 14 | Wait 4 days → task "Final call" → SMS 14 ("Should I close your file?") → add tag **`ndl-nurture`** (starts the nurture track, Runbook § 4.2) |
+| 14 | Wait 4 days → task "Final call" → SMS 14 ("Should we close your file?") → add tag **`ndl-nurture`** (starts the nurture track, Runbook § 4.2) |
 
 Each day starts with the DND check, and every SMS sits behind the `ndl-sms-enabled` check. The time-of-day waits
 use the contact's time zone with a window ending at **8:00 PM**: 09:00–20:00, 17:00–20:00, 12:00–20:00.

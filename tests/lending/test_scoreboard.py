@@ -126,7 +126,7 @@ def test_answer_rate_per_caller_id_number(lending_db):
     assert (by["+18135550001"].dials, by["+18135550001"].answered) == (2, 1)
     assert (by["+18135550002"].dials, by["+18135550002"].answered) == (3, 1)
     number_section = format_slack(data, DAY).split("By caller-ID number")[1]
-    assert "Answer rate" in number_section and "50%" in number_section
+    assert "answer rate" in number_section.lower() and "50%" in number_section
 
 
 def test_two_plus_minute_conversations_count_calls_of_at_least_two_minutes(lending_db):
@@ -159,3 +159,11 @@ def test_show_rate_uses_held_over_booked_per_row(lending_db):
 def test_transfers_are_not_counted_until_a_transfer_code_is_configured(lending_db):
     _call(lending_db, "1", disp="BOOKED")
     assert build_scoreboard(lending_db, DAY, NAMES).total.transfers == 0
+
+
+def test_caller_key_labels_agentless_batchdialer_dials():
+    from src.lending.scoreboard import _caller_key
+
+    sql = _caller_key()
+    assert "'Auto-dialer (' || COALESCE(NULLIF(raw_event->'campaign'->>'name', '')" in sql
+    assert "CASE WHEN call_source = 'batchdialer'" in sql and "ELSE '(unknown)' END" in sql

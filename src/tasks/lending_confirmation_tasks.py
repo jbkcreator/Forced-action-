@@ -20,6 +20,7 @@ from sqlalchemy import text
 
 from config.lending_reminders import TIMEZONE
 from config.settings import get_settings
+from src.lending.slack_channels import BOT_TOKEN, report_unset
 from src.lending.db import lending_session
 from src.lending.slack_names import name_and_ref, names_by_phone
 from src.lending.slack_test_filter import hidden_phones
@@ -82,7 +83,7 @@ def main(argv=None, *, now: Optional[datetime] = None) -> int:
     settings = get_settings()
     channel = settings.lending_dial_tasks_channel
     if not (channel and settings.lending_slack_bot_token):
-        logger.error("[confirmation-tasks] not posted: LENDING_DIAL_TASKS_CHANNEL or the Slack token is not configured")
+        report_unset("confirmation tasks", ("LENDING_DIAL_TASKS_CHANNEL", BOT_TOKEN))
         return 1
     try:
         with lending_session() as db:

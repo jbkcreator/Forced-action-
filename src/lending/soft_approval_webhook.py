@@ -27,6 +27,7 @@ from src.lending.db import lending_session
 from src.lending.slack_names import names_by_phone
 from src.lending.soft_approval.enrichment_link import share_facts_with_enrichment
 from src.lending.soft_approval.facts import SoftApprovalFacts
+from src.lending.soft_approval.prequal_link import send_prequal_after_call
 from src.lending.soft_approval.service import generate_soft_approval
 from src.lending.soft_approval.slack_card import (
     OUTCOME_MESSAGES,
@@ -165,6 +166,8 @@ def _process_submission(call_id: str, facts: SoftApprovalFacts, user_id: str, ch
     status_text = "The soft approval could not be processed. Please tell the engineering team."
     phone = None
     card: Optional[tuple[str, Optional[str], str]] = None  # (phone, caller, outcome key)
+    lender_fits = False
+    assessed_lead_ref: Optional[str] = None
     client = slack_client()
     try:
         with lending_session() as db:
@@ -180,7 +183,9 @@ def _process_submission(call_id: str, facts: SoftApprovalFacts, user_id: str, ch
                     db, phone=phone, dialer_call_id=call_id, facts=facts, submitted_by=user_id or None)
                 status_text = _status_text(outcome) or status_text
                 card = (phone, call[1], _outcome_key(outcome))
-                if outcome.status == "generated" and outcome.approval_id and channel and message_ts:
+                lender_fits = outcome.status == "generated"
+                assessed_lead_ref = outcome.lead_ref
+                if lender_fits and outcome.approval_id and channel and message_ts:
                     _upload_pdf(client, db, approval_id=outcome.approval_id, phone=phone,
                                 channel=channel, message_ts=message_ts)
     except Exception as exc:  # class only: SQL errors embed bound params (phones)
@@ -195,6 +200,8 @@ def _process_submission(call_id: str, facts: SoftApprovalFacts, user_id: str, ch
                           phone=card[0], caller=card[1], key=card[2])
     if phone:
         share_facts_with_enrichment(call_id, phone, facts)
+    if phone and lender_fits:
+        send_prequal_after_call(call_id, phone, assessed_lead_ref)  # Q2: the letter waits for the call figures
 
 
 def _handle_submission(payload: dict, background: BackgroundTasks) -> dict[str, Any]:

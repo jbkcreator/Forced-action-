@@ -43,10 +43,32 @@ def test_lookup_returns_the_phones_ghl_owns_and_looks_back_fourteen_days():
     db = RecordingDb(ghl_rows=[GHL_PHONE])
     assert ghl_calling.ghl_calling_phones(db, [GHL_PHONE, DIALER_PHONE], now=NOW) == {GHL_PHONE}
     sql, params = db.statements[0]
-    assert params == {"phones": [GHL_PHONE, DIALER_PHONE], "since": NOW - timedelta(days=GHL_CALLING_LOOKBACK_DAYS)}
+    assert params["phones"] == [GHL_PHONE, DIALER_PHONE] and params["source"] == "ghl"
+    assert params["since"] == NOW - timedelta(days=GHL_CALLING_LOOKBACK_DAYS)
     assert GHL_CALLING_LOOKBACK_DAYS == 14
-    for source in ("lending.lendingflow_leads", "lending.web_leads", "call_source = 'ghl'"):
+    for source in ("lending.lendingflow_leads", "lending.web_leads", "d.call_source = :source"):
         assert source in sql
+
+
+def test_only_a_call_that_got_through_makes_a_number_ghls():
+    """One calling rule for every lead: an unanswered GHL call leaves the number in BatchDialer; a live-conversation
+    result, or GHL's answered status with a minute of talk when no result was posted, hands it to GHL."""
+    from config.lending_compliance import REACHED_CODES, REACHED_GHL_STATUSES, REACHED_MIN_TALK_SECONDS
+    db = RecordingDb()
+    ghl_calling.ghl_calling_phones(db, [GHL_PHONE], now=NOW)
+    sql, params = db.statements[0]
+    assert "d.disposition = ANY(:codes)" in sql and "d.disposition_raw = ANY(:statuses)" in sql
+    assert params["codes"] == list(REACHED_CODES) and "NO_ANSWER" not in REACHED_CODES
+    assert "BOOKED" in REACHED_CODES and "CONNECTED_NOT_INTERESTED" in REACHED_CODES
+    assert params["statuses"] == list(REACHED_GHL_STATUSES) and params["min_talk"] == REACHED_MIN_TALK_SECONDS == 60
+
+
+def test_the_reverse_lookup_reads_batchdialer_calls_with_the_same_rule():
+    db = RecordingDb(ghl_rows=[DIALER_PHONE])
+    assert ghl_calling.reached_in_batchdialer_phones(db, [DIALER_PHONE], now=NOW) == {DIALER_PHONE}
+    sql, params = db.statements[0]
+    assert params["source"] == "batchdialer" and "d.disposition = ANY(:codes)" in sql
+    assert ghl_calling.reached_in_batchdialer_phones(db, []) == set()
 
 
 def test_a_lendingflow_lead_is_left_to_the_lendingflow_dialer_flow():

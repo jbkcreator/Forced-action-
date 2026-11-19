@@ -11,16 +11,39 @@ from sqlalchemy import text
 
 from config.lending_compliance import DEFAULT_TZ
 from config.lending_dispositions import (
-    ANSWERED_CODES, BOOKED_CODE, GATED_CODES, LIVE_CONVERSATION_CODES, LONG_CONVERSATION_SECONDS, NURTURE_SENT_CODES,
-    SHOWED_STAGE_KEYS, TRANSFER_CODES,
+    ANSWERED_CODES, AUTO_DIALER_LABEL, AUTO_DIALER_UNKNOWN_CAMPAIGN, BOOKED_CODE, BOOKED_STAGE_KEYS, GATED_CODES, LIVE_CONVERSATION_CODES, LONG_CONVERSATION_SECONDS, NURTURE_CODE,
+    NURTURE_SENT_CODES, SHARED_SEAT_LABELS, SHOWED_STAGE_KEYS, TRANSFER_CODES,
 )
 from config.lending_followup import GHL_CALLER_SEAT
 
 logger = logging.getLogger(__name__)
 
 UNATTRIBUTED = "(unattributed)"
+
+
+def _sql_literal(value: str) -> str:
+    return "'" + value.replace("'", "''") + "'"
+
+
+def _caller_key() -> str:
+    """Caller name, except a shared BatchDialer seat (SHARED_SEAT_LABELS) shows its label: the seat's login owner
+    did not make every call on it. Config literals only, never user input."""
+    prefix, suffix = AUTO_DIALER_LABEL.split("{campaign}")
+    auto = (f"{_sql_literal(prefix)} || COALESCE(NULLIF(raw_event->'campaign'->>'name', ''), "
+            f"NULLIF(dialer_campaign_id, ''), {_sql_literal(AUTO_DIALER_UNKNOWN_CAMPAIGN)}) || {_sql_literal(suffix)}")
+    name = (f"COALESCE(NULLIF(caller_name, ''), NULLIF(caller_seat, ''), "
+            f"CASE WHEN call_source = 'batchdialer' THEN {auto} ELSE '(unknown)' END)")
+    if not SHARED_SEAT_LABELS:
+        return name
+    whens = " ".join(f"WHEN caller_seat = {_sql_literal(seat)} THEN {_sql_literal(label)}"
+                     for seat, label in sorted(SHARED_SEAT_LABELS.items()))
+    return f"CASE {whens} ELSE {name} END"
+
+
+# NURTURE counts as Gated / Nurture sent only when the gate failed; legacy GATE_FAILED_NURTURE rows count as before.
+_GATE_FAILED_NURTURE = "(disposition = :nurture_code AND gate_failed IS TRUE)"
 _KEYS = {  # SQL literals, never user input
-    "caller": "COALESCE(NULLIF(caller_name, ''), NULLIF(caller_seat, ''), '(unknown)')",
+    "caller": _caller_key(),
     "campaign": "COALESCE(NULLIF(dialer_campaign_id, ''), '')",
     "hook": "COALESCE(NULLIF(campaign_tag, ''), '')",
     "seat": "COALESCE(NULLIF(caller_seat, ''), '(unknown)')",
@@ -75,6 +98,9 @@ class ScoreboardData:
     by_number: list[NumberRow] = field(default_factory=list)
     by_seat: list[Row] = field(default_factory=list)
     by_source: list[Row] = field(default_factory=list)
+    # B1: GHL Booked stage entries today (all callers); None when the count could not be read. The rows' ``booked``
+    # stays the caller-reported BOOKED disposition.
+    booked_stage: Optional[int] = None
 
 
 def _bounds(day: date) -> tuple[datetime, datetime]:
@@ -85,7 +111,7 @@ def _bounds(day: date) -> tuple[datetime, datetime]:
 def _query(db, key: str, day: date) -> list[tuple[str, int, int, int, int, int, int, int]]:
     start, end = _bounds(day)
     params = {"live": sorted(LIVE_CONVERSATION_CODES), "gated": sorted(GATED_CODES), "nurture": sorted(NURTURE_SENT_CODES),
-              "booked": BOOKED_CODE, "long": LONG_CONVERSATION_SECONDS, "start": start, "end": end}
+              "nurture_code": NURTURE_CODE, "booked": BOOKED_CODE, "long": LONG_CONVERSATION_SECONDS, "start": start, "end": end}
     if TRANSFER_CODES:
         transfers = "count(*) FILTER (WHERE disposition = ANY(:transfer))"
         params["transfer"] = sorted(TRANSFER_CODES)
@@ -94,9 +120,9 @@ def _query(db, key: str, day: date) -> list[tuple[str, int, int, int, int, int, 
     rows = db.execute(
         text(f"SELECT {_KEYS[key]} AS k, count(*) AS dials, "
              "count(*) FILTER (WHERE disposition = ANY(:live)) AS live, "
-             "count(*) FILTER (WHERE disposition = ANY(:gated)) AS gated, "
+             f"count(*) FILTER (WHERE disposition = ANY(:gated) OR {_GATE_FAILED_NURTURE}) AS gated, "
              "count(*) FILTER (WHERE disposition = :booked AND NOT booking_blocked) AS booked, "
-             "count(*) FILTER (WHERE disposition = ANY(:nurture)) AS nurture, "
+             f"count(*) FILTER (WHERE disposition = ANY(:nurture) OR {_GATE_FAILED_NURTURE}) AS nurture, "
              "count(*) FILTER (WHERE talk_duration_sec >= :long) AS long_calls, "
              f"{transfers} AS transfers "
              "FROM lending.call_dispositions "
@@ -136,8 +162,10 @@ def _showed(db, key: str, day: date) -> dict[str, int]:
                      "SELECT COALESCE(NULLIF(b.caller_name, ''), "
                      "CASE WHEN lower(e.booked_by) IN ('null', 'none', 'undefined', 'nan') THEN NULL ELSE e.booked_by END) "
                      "AS caller_name, b.caller_seat, "
-                     "b.dialer_campaign_id, b.campaign_tag, b.source_tag FROM lending.ghl_stage_events e "
-                     "LEFT JOIN LATERAL (SELECT caller_name, caller_seat, dialer_campaign_id, campaign_tag, source_tag "
+                     "b.dialer_campaign_id, b.campaign_tag, b.source_tag, b.call_source, b.raw_event "
+                     "FROM lending.ghl_stage_events e "
+                     "LEFT JOIN LATERAL (SELECT caller_name, caller_seat, dialer_campaign_id, campaign_tag, source_tag, "
+                     "call_source, raw_event "
                      "FROM lending.call_dispositions d WHERE d.phone = e.phone AND d.disposition = :booked "
                      "ORDER BY d.call_ended_at DESC NULLS LAST LIMIT 1) b ON true "
                      "WHERE e.stage_key = ANY(:showed) AND e.event_at >= :start AND e.event_at < :end) s GROUP BY 1"),
@@ -147,6 +175,22 @@ def _showed(db, key: str, day: date) -> dict[str, int]:
         logger.warning("[lending-scoreboard] showed query failed, reporting Showed 0: %s", type(exc).__name__)
         return {}
     return {k: n for k, n in rows}
+
+
+def booked_stage_count(db, day: date) -> Optional[int]:
+    """GHL opportunities that entered a Booked stage (BOOKED_STAGE_KEYS) on ``day``; None when the query fails, so the
+    board still posts. The savepoint keeps the outer transaction usable."""
+    start, end = _bounds(day)
+    try:
+        with db.begin_nested():
+            return int(db.execute(
+                text("SELECT count(*) FROM lending.ghl_stage_events WHERE stage_key = ANY(:booked) "
+                     "AND event_at >= :start AND event_at < :end"),
+                {"booked": sorted(BOOKED_STAGE_KEYS), "start": start, "end": end},
+            ).scalar() or 0)
+    except Exception as exc:
+        logger.warning("[lending-scoreboard] booked stage query failed: %s", type(exc).__name__)
+        return None
 
 
 def _rows(raw, showed: dict[str, int], name_of) -> list[Row]:
@@ -167,7 +211,8 @@ def build_scoreboard(db, day: date, campaign_names: Optional[Mapping[str, str]] 
     sources = _rows(_query(db, "source", day), _showed(db, "source", day), lambda k: k or UNATTRIBUTED)
     total = Row("TOTAL", *(sum(getattr(r, f) for r in callers)
                            for f in ("dials", "live", "gated", "booked", "nurture", "showed", "long_calls", "transfers")))
-    return ScoreboardData(callers, campaigns, hooks, total, _by_number(db, day), seats, sources)
+    return ScoreboardData(callers, campaigns, hooks, total, _by_number(db, day), seats, sources,
+                          booked_stage_count(db, day))
 
 
 MAX_TABLE_ROWS = 12  # a Slack section holds 3000 chars
@@ -247,11 +292,22 @@ def _title(day: date) -> str:
     return f"Lending scoreboard · {day:%a %b} {day.day}, {day.year}"
 
 
-def _totals(t: Row) -> list[tuple[str, str]]:
+def _stage_show_rate(data: ScoreboardData) -> str:
+    """Held today ÷ Booked stage entries today; the caller-reported rate when the stage count could not be read."""
+    if data.booked_stage is None:
+        return _show_rate(data.total)
+    return f"{data.total.showed / data.booked_stage:.0%}" if data.booked_stage else "–"
+
+
+def _totals(data: ScoreboardData) -> list[tuple[str, str]]:
+    t = data.total
+    stage = str(data.booked_stage) if data.booked_stage is not None else "n/a"
+    show_label = "Held ÷ Booked (stage)" if data.booked_stage is not None else "Held ÷ Booked"
     return [("Dials", str(t.dials)), ("Contacts", str(t.live)), ("Calls 2+ min", str(t.long_calls)),
-            ("Gated", str(t.gated)), ("Booked", str(t.booked)), ("Transfers", _transfers(t.transfers)),
-            ("Showed", str(t.showed)), ("Held ÷ Booked", _show_rate(t)), ("Nurture", str(t.nurture)), ("Connect", f"{t.connect_rate:.0%}"),
-            ("Book rate", f"{t.book_rate:.0%}")]
+            ("Gated", str(t.gated)), ("Booked (caller)", str(t.booked)), ("Booked (stage)", stage),
+            ("Transfers", _transfers(t.transfers)), ("Showed", str(t.showed)),
+            (show_label, _stage_show_rate(data)), ("Nurture", str(t.nurture)),
+            ("Connect", f"{t.connect_rate:.0%}"), ("Book rate", f"{t.book_rate:.0%}")]
 
 
 def _headline(t: Row) -> str:
@@ -259,9 +315,12 @@ def _headline(t: Row) -> str:
             f":spiral_calendar_pad: *{t.booked}* booked ({t.book_rate:.0%})")
 
 
-def _secondary(t: Row) -> str:
-    parts = [f"{t.long_calls} over 2 min", f"{t.gated} gated", f"{t.showed} showed (held ÷ booked {_show_rate(t)})",
+def _secondary(data: ScoreboardData) -> str:
+    t = data.total
+    parts = [f"{t.long_calls} over 2 min", f"{t.gated} gated", f"{t.showed} showed (held ÷ booked {_stage_show_rate(data)})",
              f"{t.nurture} nurture"]
+    if data.booked_stage is not None:
+        parts.append(f"{data.booked_stage} booked (stage)")
     if TRANSFER_CODES:
         parts.append(f"{t.transfers} transferred")
     return " · ".join(parts)
@@ -274,7 +333,7 @@ def _clock(moment: datetime) -> str:
 def format_slack(data: ScoreboardData, day: date, as_of: Optional[datetime] = None) -> str:
     """Plain mrkdwn version: the notification preview and the fallback when blocks are unavailable.
     ``as_of`` (Eastern) marks an hourly day-so-far board; without it this is the closing 7:20pm board."""
-    totals = " | ".join(f"{k} {v}" for k, v in _totals(data.total))
+    totals = " | ".join(f"{k} {v}" for k, v in _totals(data))
     span = f"as of {_clock(as_of)}" if as_of else "through 7:15pm ET"
     out = [f"*{_title(day)}* ({span})", f"TOTAL: {totals}", "", "*By caller*", _table(data.by_caller)]
     if as_of is None:
@@ -296,7 +355,7 @@ def format_blocks(data: ScoreboardData, day: date, as_of: Optional[datetime] = N
         {"type": "header", "text": {"type": "plain_text", "text": _title(day), "emoji": True}},
         {"type": "context", "elements": [{"type": "mrkdwn", "text": span}]},
         _section(_headline(data.total)),
-        {"type": "context", "elements": [{"type": "mrkdwn", "text": _secondary(data.total)}]},
+        {"type": "context", "elements": [{"type": "mrkdwn", "text": _secondary(data)}]},
         {"type": "divider"},
         _section(f"*By caller*\n{_table(data.by_caller)}"),
     ]

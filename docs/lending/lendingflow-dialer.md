@@ -7,7 +7,7 @@ Code: `src/lending/lendingflow_dialer.py` (load + removal) and `src/lending/bd_r
 ## How a lead moves
 
 1. The lead is delivered to GHL, as before.
-2. After `LENDING_LENDINGFLOW_DIALER_DELAY_MINUTES` (Josh's first-call window), the sweep re-reads the lead's GHL calls live. If that read fails, the lead is not loaded and is retried later.
+2. After `LENDING_LENDINGFLOW_DIALER_DELAY_MINUTES` (default **0**: the next 5-minute sweep; set minutes to give Josh a head start in GHL), the sweep re-reads the lead's GHL calls live. If that read fails, the lead is not loaded and is retried later.
 3. If Josh already had a connected call with the lead, it is never loaded (`blocked` / `HANDLED_IN_GHL`).
 4. Otherwise it goes through `run_dialer_load` alone with `dnc_scrub=False`. **Client decision: LendingFlow leads need no consent certificate and get no Tracerfy DNC scrub.** Still applied: opt-out / suppression, Georgia, Backflip, the attempt caps and the calling window. Loaded LendingFlow numbers are also skipped by the dialer sweep's stale-scrub hold and by the weekly rescrub (`compliance.scrub_exempt_phones`). Its card shows name, loan amount, loan type, state, request date and prior contact.
 5. A lead stays `pending` for temporary reasons and is retried after 15 minutes: outside calling hours, attempt cap, halt, a failed GHL read, or a refused load. A lead that arrives at 8:30pm loads the next morning.
@@ -43,7 +43,8 @@ Code: `src/lending/lendingflow_dialer.py` (load + removal) and `src/lending/bd_r
 4. Set `LENDING_GHL_CALL_IMPORT_ENABLED=true`. The import keeps Josh's GHL calls in `call_dispositions`; the loader also reads them live.
 5. Have Josh approve the hook line (`CAMPAIGN_HOOKS["LendingFlow"]`, a placeholder), the delay, and the "connected" talk time.
 6. Set `LENDING_LENDINGFLOW_DIALER_ENABLED=true`.
-7. For the results in GHL: create a text custom field "Last BatchDialer call" and put its id in `LENDING_GHL_CF_LAST_BD_CALL`. Then set `LENDING_BD_RESULT_TO_GHL_ENABLED=true`. Tags used: `called-in-batchdialer`, `bd-connected`, `bd-callback`, `bd-booked`. A GHL workflow started by one of these tags runs on every BatchDialer call.
+7. For the results in GHL: create a text custom field "Last BatchDialer call" and put its id in `LENDING_GHL_CF_LAST_BD_CALL`. Then set `LENDING_BD_RESULT_TO_GHL_ENABLED=true`. Tags used: `called-in-batchdialer`, `bd-connected`, `bd-callback`, `bd-booked`. A GHL workflow started by one of these tags runs on every BatchDialer call. For the exact latest result, create a GHL **dropdown** custom field "Last BatchDialer result" with the 10 result codes as options (NO_ANSWER, LEFT_VOICEMAIL, BAD_NUMBER, WRONG_PERSON, REFERRED, DNC_REQUEST, CONNECTED_NOT_INTERESTED, CALLBACK_REQUESTED, NURTURE, BOOKED) and put its id in `LENDING_GHL_CF_LAST_BD_RESULT`: it always holds one value, the latest, so smart lists can filter on it.
+8. For GHL results on the BatchDialer card (the other direction): BatchDialer contacts have no tags, so each GHL call to a phone that is live in BatchDialer is written to the card custom field **`card_ghl_call`** (e.g. "2026-11-04 10:15 ET, no answer, 2 GHL calls"; rewritten when its result code arrives). Add `card_ghl_call` to the BatchDialer contact card, run the migration again (it adds `bd_note_*` to `call_dispositions`), then set `LENDING_GHL_RESULT_TO_BD_ENABLED=true`. Only that field changes: `set_custom_fields` reads the contact and sends every other field back as it was. Test it on one test contact first.
 
 ## Things Josh must agree to
 
@@ -57,3 +58,14 @@ Code: `src/lending/lendingflow_dialer.py` (load + removal) and `src/lending/bd_r
 SELECT id, dialer_status, dialer_block_reason, handled_in_ghl_reason, dialer_last_error
   FROM lending.lendingflow_leads WHERE phone = '+1XXXXXXXXXX';
 ```
+
+## Website leads (same code, campaign "Website")
+
+Website leads go through the same dialer step (`LeadSource` `WEBSITE` in `src/lending/lendingflow_dialer.py`), run by the website-lead sweep (`lending_web_lead_sweep`, every 5 minutes). Differences from LendingFlow:
+
+- **Call consent:** only leads who ticked the call-consent box (`web_leads.call_consent`) are loaded; the rest are `blocked` / `NO_CALL_CONSENT`.
+- **DNC:** the Tracerfy DNC / litigator scrub runs (`dnc_scrub=True`), like every list except LendingFlow.
+- **Campaign:** "Website", with its own hook line (placeholder until Josh approves).
+- **Ownership:** website phones are no longer always "GHL's"; like LendingFlow, they leave BatchDialer once booked or connected in GHL.
+
+Setup: create the BatchDialer campaign **Website** (copy LendingFlow's settings) and add its ID to `LENDING_DIALER_CAMPAIGN_IDS`; re-run `migrations/apply_lending_lendingflow_dialer.py` (adds the dialer columns to `web_leads`; existing website leads become `preexisting`); set `LENDING_WEB_LEAD_DIALER_ENABLED=true`.

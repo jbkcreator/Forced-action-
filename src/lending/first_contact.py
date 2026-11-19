@@ -12,6 +12,7 @@ commit: the caller owns the transaction.
 from __future__ import annotations
 
 import json
+import logging
 from dataclasses import fields
 from datetime import date, datetime
 from decimal import Decimal
@@ -20,9 +21,12 @@ from zoneinfo import ZoneInfo
 
 from sqlalchemy import text as sa_text
 
+from config.lending_queues import WARM_POOLS
 from src.lending.lead_facts import load_lead_facts
 from src.lending.lead_scoring import LeadScore, LeadSignals, score_lead
 from src.services.phone_utils import normalize as normalize_phone
+
+logger = logging.getLogger(__name__)
 
 # Scoring dates (the 90-day maturity window) follow the callers' Eastern calendar day.
 LENDING_TIMEZONE = ZoneInfo("America/New_York")
@@ -143,3 +147,24 @@ def snapshot_first_contact(
         signals=signals,
         score=score_lead(signals, today=today),
     )
+
+
+def snapshot_reached_call(session, *, phone: Optional[str], contacted_at: Optional[datetime],
+                          caller_seat: Optional[str], queue: Optional[str], source_tag: Optional[str],
+                          call_ref: str) -> bool:
+    """Snapshot the lead on a call that reached someone, once per phone; never raises.
+
+    Called by the BatchDialer intake and the GHL call import. The load records carry a PropertyRadar reference, not
+    a property id, so the snapshot is taken with every scoring input missing (``property_id=None``). Runs in its own
+    savepoint; a failure is logged by class and leaves the caller's transaction usable. Does not commit."""
+    if not phone or contacted_at is None:
+        return False
+    try:
+        with session.begin_nested():
+            return snapshot_first_contact(
+                session, phone=phone, property_id=None, contacted_at=contacted_at, caller_seat=caller_seat,
+                script_version=None, source_tag=source_tag, queue=queue, warm=queue in WARM_POOLS,
+            )
+    except Exception as exc:  # class only: SQL errors embed bound params (phones)
+        logger.error("[first-contact] snapshot for call %s failed: %s", call_ref, type(exc).__name__)
+        return False

@@ -1,11 +1,11 @@
 """Application configuration powered by Pydantic settings."""
 
 from functools import lru_cache
-from datetime import date
+from datetime import date, datetime
 
 from typing import Literal, Optional
 
-from pydantic import AliasChoices, AnyUrl, Field, SecretStr, PostgresDsn, field_validator
+from pydantic import AliasChoices, AnyUrl, Field, SecretStr, PostgresDsn, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -27,6 +27,10 @@ class AppSettings(BaseSettings):
 	fred_api_key: Optional[SecretStr] = Field(default=None, env="FRED_API_KEY")
 	# Census Bureau ACS API — free key at https://api.census.gov/data/key_signup.html
 	census_api_key: Optional[SecretStr] = Field(default=None, env="CENSUS_API_KEY")
+	# Sentry error tracking (src/utils/sentry.py). Unset = nothing is sent; the error is still logged. Only the
+	# errors code sends explicitly go to Sentry (e.g. an unset lending Slack channel), never every error log line.
+	sentry_dsn: Optional[SecretStr] = Field(default=None, env="SENTRY_DSN")
+	sentry_environment: str = Field(default="production", env="SENTRY_ENVIRONMENT")
 
 	# Property-matching LLM tiebreak. When False, borderline name matches
 	# (rapidfuzz 80-94) are NOT sent to Claude; matching falls back to pure
@@ -635,9 +639,10 @@ class AppSettings(BaseSettings):
 	synthflow_webhook_secret: Optional[SecretStr] = Field(default=None, env="SYNTHFLOW_WEBHOOK_SECRET")
 	synthflow_inbound_did: Optional[str] = Field(default=None, env="SYNTHFLOW_INBOUND_DID")
 
-	# QA-only: comma-separated E.164 numbers (incl. non-US) that phone_utils.normalize
-	# lets through for staging voice-drop tests. Unset in production → strict US-only
-	# guard is unchanged. Never enable in prod for real traffic.
+	# QA-only: comma-separated E.164 team test numbers (incl. non-US). phone_utils.normalize lets them through
+	# (US-only check), and lending texts to them skip the 8am-8pm borrower window (compliance.text_window_open,
+	# logged as a WARNING; calls are never affected). Unset in production. Never a borrower's number; clear it and
+	# restart the services right after a test.
 	qa_test_phone_allowlist: Optional[str] = Field(default=None, env="QA_TEST_PHONE_ALLOWLIST")
 
 	# Admin upload layer
@@ -951,18 +956,22 @@ class AppSettings(BaseSettings):
 	# T-11 LendingFlow intake. Off by default; the receiver is closed (503) until the flag is on AND the secret is set.
 	lending_lendingflow_enabled: bool = Field(default=False, env="LENDING_LENDINGFLOW_ENABLED")
 	lending_lendingflow_webhook_secret: Optional[SecretStr] = Field(default=None, env="LENDING_LENDINGFLOW_WEBHOOK_SECRET")
-	# Off: no lead gets the lendingflow-intro-ready tag, so the GHL intro-SMS workflow cannot start (client: keep the
-	# intro text off until LendingFlow confirms its consent covers it and whether it runs a DNC/litigator check).
-	lending_lendingflow_intro_sms_enabled: bool = Field(default=False, env="LENDING_LENDINGFLOW_INTRO_SMS_ENABLED")
 	# Pipeline stage (in LENDING_GHL_PIPELINE_ID) for new LendingFlow leads; unset = contact only.
 	lending_ghl_stage_lendingflow_new: Optional[str] = Field(default=None, env="LENDING_GHL_STAGE_LENDINGFLOW_NEW")
 	# LendingFlow -> BatchDialer campaign "LendingFlow" (src/lending/lendingflow_dialer.py). Off: nothing is loaded; leads
-	# already loaded are still removed once they are handled in GHL. The delay is Josh's first-call window (placeholder).
+	# already loaded are still removed once they are handled in GHL. Delay before a new lead is loaded: 0 = on the next sweep
+	# (no head start for GHL; a GHL booking or connected call still removes the lead). Set minutes to give GHL a head start.
 	lending_lendingflow_dialer_enabled: bool = Field(default=False, env="LENDING_LENDINGFLOW_DIALER_ENABLED")
-	lending_lendingflow_dialer_delay_minutes: int = Field(default=15, env="LENDING_LENDINGFLOW_DIALER_DELAY_MINUTES")
+	# Website leads into the BatchDialer campaign "Website" (same dialer step; call-consent tick + DNC scrub required).
+	lending_web_lead_dialer_enabled: bool = Field(default=False, env="LENDING_WEB_LEAD_DIALER_ENABLED")
+	lending_lendingflow_dialer_delay_minutes: int = Field(default=0, env="LENDING_LENDINGFLOW_DIALER_DELAY_MINUTES")
 	# BatchDialer call results as tags + a "last BatchDialer call" field on the GHL contact (src/lending/bd_result_to_ghl.py).
 	lending_bd_result_to_ghl_enabled: bool = Field(default=False, env="LENDING_BD_RESULT_TO_GHL_ENABLED")
 	lending_ghl_cf_last_bd_call: Optional[str] = Field(default=None, env="LENDING_GHL_CF_LAST_BD_CALL")  # GHL custom field id; unset = tags only
+	# GHL dropdown custom field "Last BatchDialer result" (options = the 10 result codes); unset = not written
+	lending_ghl_cf_last_bd_result: Optional[str] = Field(default=None, env="LENDING_GHL_CF_LAST_BD_RESULT")
+	# GHL call results on the BatchDialer contact card (custom field card_ghl_call; src/lending/ghl_result_to_bd.py).
+	lending_ghl_result_to_bd_enabled: bool = Field(default=False, env="LENDING_GHL_RESULT_TO_BD_ENABLED")
 	# T-09 intro SMS. Off: the tag that starts the GHL intro workflow is never added, so nobody is texted. Turn on only after
 	# Josh confirms LendingFlow's consent and DNC check. Needs the id of the GHL contact custom field "intro_name".
 	lending_intro_sms_enabled: bool = Field(default=False, env="LENDING_INTRO_SMS_ENABLED")
@@ -996,18 +1005,54 @@ class AppSettings(BaseSettings):
 	lending_ghl_app_url: str = Field(default="https://app.gohighlevel.com", env="LENDING_GHL_APP_URL")  # GHL web app base for contact links (white-label domain if any)
 	lending_lead_arrival_alert_enabled: bool = Field(default=False, env="LENDING_LEAD_ARRIVAL_ALERT_ENABLED")  # T-05: @-mention Josh in LENDING_OPS_CHANNEL when a LendingFlow lead arrives
 	lending_alarm_sms_to: Optional[str] = Field(default=None, env="LENDING_ALARM_SMS_TO")  # Josh's mobile; normalized before use
+	# Uncalled-lead alarm working hours, Eastern, HH:MM 24h, Mon-Fri. No alarm or retry outside them; those leads go
+	# on the 08:55 "call these first" list. Start inclusive, end exclusive.
+	lending_alarm_hours_start: str = Field(default="09:00", env="LENDING_ALARM_HOURS_START")
+	lending_alarm_hours_end: str = Field(default="19:15", env="LENDING_ALARM_HOURS_END")
+	# Dialer calling window, HH:MM 24h, start inclusive, end exclusive. A dial needs BOTH windows open.
+	# LOCAL = the borrower's own timezone (legal floor 08:00-20:00, config.lending_compliance.CALL_WINDOW_START/_END).
+	# ET = Josh's hours, Eastern. Values can only NARROW calling: compliance.dial_window() clamps both windows to
+	# the legal 08:00-20:00 floor (P0.1) and logs an ERROR when a configured value is wider.
+	# Texts keep the fixed 08:00-20:00 local window and are not affected by these.
+	lending_call_window_local_start: str = Field(default="08:00", env="LENDING_CALL_WINDOW_LOCAL_START")
+	lending_call_window_local_end: str = Field(default="20:00", env="LENDING_CALL_WINDOW_LOCAL_END")
+	lending_call_window_et_start: str = Field(default="09:00", env="LENDING_CALL_WINDOW_ET_START")
+	lending_call_window_et_end: str = Field(default="19:15", env="LENDING_CALL_WINDOW_ET_END")
 	lending_ops_channel: str = Field(default="", env="LENDING_OPS_CHANNEL")  # #lead-alerts channel ID: call-now alert, 5-minute flags, returning-borrower alert
 	lending_ops_notice_channel: str = Field(default="", env="LENDING_OPS_NOTICE_CHANNEL")  # opt-out mailbox and webhook-failure alerts; channel ID, unset = not posted
+	# P1.3 Instantly replies (src/lending/instantly_replies.py): NDL's own Instantly workspace, separate from FA's
+	# INSTANTLY_* settings. POST /webhooks/lending/instantly is closed (503) while the secret is unset; approved answers
+	# go back in the Instantly thread only when the API key is set.
+	lending_instantly_webhook_secret: Optional[SecretStr] = Field(default=None, env="LENDING_INSTANTLY_WEBHOOK_SECRET")
+	lending_instantly_api_key: Optional[SecretStr] = Field(default=None, env="LENDING_INSTANTLY_API_KEY")
+	lending_instantly_base_url: str = Field(default="https://api.instantly.ai", env="LENDING_INSTANTLY_BASE_URL")
 	# 14-day follow-up (src/lending/ghl_call_import.py): record calls made in GoHighLevel in lending.call_dispositions
 	lending_ghl_call_import_enabled: bool = Field(default=False, env="LENDING_GHL_CALL_IMPORT_ENABLED")
+	# G3: GHL calls ended at/after this (ISO time) are flagged by the missing-disposition alert; unset = GHL calls are not
+	# flagged (set it once the GHL disposition workflow is live, so calls from before it are not reported)
+	lending_ghl_outcomes_live_since: Optional[datetime] = Field(default=None, env="LENDING_GHL_OUTCOMES_LIVE_SINCE")
+	# G5 (src/lending/ghl_call_gate.py): tag ndl-do-not-call-now on listed GHL contacts that cannot be called now; off until Dev A's smart lists exclude the tag
+	lending_ghl_call_gate_enabled: bool = Field(default=False, env="LENDING_GHL_CALL_GATE_ENABLED")
+	# BatchDialer load -> GHL contact sync (src/lending/ghl_load_sync.py): every active dialer load pushed to GHL as a cold contact
+	lending_ghl_load_sync_enabled: bool = Field(default=False, env="LENDING_GHL_LOAD_SYNC_ENABLED")
+	# DNC scrub of numbers on Josh's GHL call lists (src/lending/ghl_list_scrub.py): website and cold leads, never LendingFlow
+	lending_ghl_list_scrub_enabled: bool = Field(default=False, env="LENDING_GHL_LIST_SCRUB_ENABLED")
+	lending_ghl_list_scrub_max_credits: int = Field(default=100, env="LENDING_GHL_LIST_SCRUB_MAX_CREDITS")  # hard Tracerfy credit cap per hourly run (1 credit per number)
 	# David's end-of-day activity post (src/tasks/lending_david_summary.py) to LENDING_DAVID_CHANNEL; off until enabled and the user id is set
 	lending_david_summary_enabled: bool = Field(default=False, env="LENDING_DAVID_SUMMARY_ENABLED")
 	lending_david_channel: str = Field(default="", env="LENDING_DAVID_CHANNEL")  # #isa-daily channel ID; unset = not posted
 	lending_david_ghl_user_id: str = Field(default="", env="LENDING_DAVID_GHL_USER_ID")  # David's GHL user id: his calls, texts and emails
+	lending_david_bd_agent_id: str = Field(default="", env="LENDING_DAVID_BD_AGENT_ID")  # David's BatchDialer agent id (CDR agent.id): his BatchDialer calls; unset = no BatchDialer section
 	lending_flagged_tag: str = Field(default="flag-for-josh", env="LENDING_FLAGGED_TAG")  # GHL tag David adds to a lead for Josh (name TBC by client)
 	# Retargeting audience export (src/tasks/lending_audience_export.py): nightly hashed files, written only when both are set
 	lending_audience_export_enabled: bool = Field(default=False, env="LENDING_AUDIENCE_EXPORT_ENABLED")
 	lending_audience_export_dir: Optional[str] = Field(default=None, env="LENDING_AUDIENCE_EXPORT_DIR")
+	# Nightly ledger export to Drive (src/tasks/lending_ledger_export.py, Cora brief P1.2): off until both are set; uses
+	# LENDING_DRIVE_SERVICE_ACCOUNT_KEY_PATH (else the Sheets key) with the drive scope; the folder is "NDL Ledger Exports", shared with that account
+	lending_ledger_export_enabled: bool = Field(default=False, env="LENDING_LEDGER_EXPORT_ENABLED")
+	lending_ledger_export_folder_id: str = Field(default="", env="LENDING_LEDGER_EXPORT_FOLDER_ID")
+	# Drive service account (shared with the P1.1 job queue); blank = LENDING_SHEETS_SERVICE_ACCOUNT_KEY_PATH
+	lending_drive_service_account_key_path: str = Field(default="", env="LENDING_DRIVE_SERVICE_ACCOUNT_KEY_PATH")
 	# Opt-out mailbox listener (src/lending/email_opt_out.py): reads mail sent to LENDING_OPTOUT_ADDRESS over IMAP.
 	# The mailbox is either a dedicated optout@ mailbox or the one optout@ forwards into; off while user or password is unset.
 	lending_optout_imap_host: str = Field(default="imap.porkbun.com", env="LENDING_OPTOUT_IMAP_HOST")
@@ -1040,6 +1085,22 @@ class AppSettings(BaseSettings):
 	lending_cora_pending_action_ttl_hours: int = Field(default=72, env="LENDING_CORA_PENDING_ACTION_TTL_HOURS")  # unapproved drafts expire after this
 	lending_cora_calendar_id: str = Field(default="", env="LENDING_CORA_CALENDAR_ID")
 	lending_cora_calendar_service_account_key_path: str = Field(default="", env="LENDING_CORA_CALENDAR_SERVICE_ACCOUNT_KEY_PATH")
+	# P1.1 agent job queue (src/lending/agent_jobs): agents drop job files in Drive "NDL Jobs/inbox", Cora cards them
+	# and writes receipts to "NDL Jobs/done". Off until enabled; the folders must sit in a Shared Drive (a service
+	# account cannot create files in a personal My Drive). The key may be the same file as the Sheets one.
+	lending_agent_jobs_enabled: bool = Field(default=False, env="LENDING_AGENT_JOBS_ENABLED")
+	lending_drive_service_account_key_path: str = Field(default="", env="LENDING_DRIVE_SERVICE_ACCOUNT_KEY_PATH")
+	lending_jobs_inbox_folder_id: str = Field(default="", env="LENDING_JOBS_INBOX_FOLDER_ID")
+	lending_jobs_processed_folder_id: str = Field(default="", env="LENDING_JOBS_PROCESSED_FOLDER_ID")
+	lending_jobs_done_folder_id: str = Field(default="", env="LENDING_JOBS_DONE_FOLDER_ID")
+	# P1.1 cold email through NDL's Instantly workspace, with the same LENDING_INSTANTLY_API_KEY / _BASE_URL as P1.3
+	# (defined above). Cold email stays off until the key, the passthrough campaign id and the footer postal address
+	# (CAN-SPAM) are all set.
+	lending_instantly_campaign_id: str = Field(default="", env="LENDING_INSTANTLY_CAMPAIGN_ID")
+	lending_instantly_sender_email: str = Field(default="", env="LENDING_INSTANTLY_SENDER_EMAIL")
+	lending_email_footer_brand: str = Field(default="Next Deal Lending", env="LENDING_EMAIL_FOOTER_BRAND")
+	lending_email_footer_postal_address: str = Field(default="", env="LENDING_EMAIL_FOOTER_POSTAL_ADDRESS")
+	lending_email_footer_phone: str = Field(default="(656) 221-1100", env="LENDING_EMAIL_FOOTER_PHONE")
 	# ── Meta Conversions API (CAPI) — S2 ────────────────────────────────────
 	# Server-side Purchase reporting for closed-loop Meta ad attribution.
 	# Feature-gated and OFF by default — when disabled, or when pixel_id /
@@ -1200,8 +1261,50 @@ class AppSettings(BaseSettings):
 		if not url.startswith("https://") or any(c.isspace() for c in url):
 			raise ValueError("LENDING_RESCHEDULE_URL must be a single https:// URL")
 		return url
+
+	@field_validator("lending_alarm_hours_start", "lending_alarm_hours_end", mode="before")
+	@classmethod
+	def _alarm_hours_hhmm(cls, value):
+		raw = str(value).strip()
+		try:
+			parsed = datetime.strptime(raw, "%H:%M")
+		except ValueError as exc:
+			raise ValueError("LENDING_ALARM_HOURS_START / _END must be HH:MM (24h), e.g. 09:00 or 19:15") from exc
+		return parsed.strftime("%H:%M")
+
+	@model_validator(mode="after")
+	def _alarm_hours_order(self):
+		if self.lending_alarm_hours_start >= self.lending_alarm_hours_end:
+			raise ValueError("LENDING_ALARM_HOURS_START must be before LENDING_ALARM_HOURS_END")
+		return self
+
+	@field_validator(
+		"lending_call_window_local_start", "lending_call_window_local_end",
+		"lending_call_window_et_start", "lending_call_window_et_end", mode="before",
+	)
+	@classmethod
+	def _call_window_hhmm(cls, value):
+		raw = str(value).strip()
+		try:
+			parsed = datetime.strptime(raw, "%H:%M")
+		except ValueError as exc:
+			raise ValueError("LENDING_CALL_WINDOW_* must be HH:MM (24h), e.g. 09:00 or 19:15") from exc
+		return parsed.strftime("%H:%M")
+
+	@model_validator(mode="after")
+	def _call_window_order(self):
+		if not self.lending_call_window_local_start < self.lending_call_window_local_end:
+			raise ValueError("LENDING_CALL_WINDOW_LOCAL_START must be before LENDING_CALL_WINDOW_LOCAL_END")
+		if not self.lending_call_window_et_start < self.lending_call_window_et_end:
+			raise ValueError("LENDING_CALL_WINDOW_ET_START must be before LENDING_CALL_WINDOW_ET_END")
+		return self
 	# Verified GHL sending address for those emails (hello@nextdeallending.com). Unset = no email sender.
 	lending_ghl_email_from: Optional[str] = Field(default=None, env="LENDING_GHL_EMAIL_FROM")
+	# Emails to a LendingFlow lead (every one, first touch included) are From LENDING_LENDINGFLOW_EMAIL_FROM (David) with
+	# a blind copy to LENDING_LENDINGFLOW_EMAIL_BCC (Josh; comma-separated, never CC). Either unset or invalid = no
+	# email to a LendingFlow lead is sent (src/lending/email_identity.py). Other recipients keep LENDING_GHL_EMAIL_FROM.
+	lending_lendingflow_email_from: str | None = Field(default=None, env="LENDING_LENDINGFLOW_EMAIL_FROM")
+	lending_lendingflow_email_bcc: str = Field(default="", env="LENDING_LENDINGFLOW_EMAIL_BCC")
 	# Logs the key paths (never values) of each incoming lending GHL webhook, to confirm the real field names.
 	lending_ghl_log_payload_shape: bool = Field(default=False, env="LENDING_GHL_LOG_PAYLOAD_SHAPE")
 	# A failed caller check cancels the AI-booked GHL appointment (frees Josh's slot). Off until the end-to-end test.

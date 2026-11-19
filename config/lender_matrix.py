@@ -14,17 +14,25 @@ for takes ``PLACEHOLDER_BOX`` (Josh, A1, Oct 8).  The evaluator still evaluates
 such a lender; a pass is flagged ``subject_to_confirmation`` and the fit score
 stays hidden until every lender is confirmed.
 
-Current status (2026-10-08):
-  generic_backflip_* — CLIENT-STATED, NOT YET CONFIRMED (verified=False):
-      values copied by hand from Josh's Oct 1 email ("context on the Backflip
-      box") and Consolidated §1.1.  Josh must confirm before they count.  Open
-      items: (Q2) confirm 7.75–8% is a rate spread and 12-month hold is the
-      correct cost basis; (Q3) confirm whether the 36-month window on the
-      ground-up build rule must be tracked separately in the profile.
+Current status (2026-11-03, L1: Backflip and Central Lending are the two real
+lenders): all seven lenders run on the same safe placeholder set
+(``PLACEHOLDER_BOX``) until Josh sends the real rules.
+  generic_backflip_* — NOT VERIFIED: loan types only; Josh's Oct 1 values are
+      kept in a comment above the entries and are not applied.  Open items:
+      (Q2) confirm 7.75–8% is a rate spread and 12-month hold is the correct
+      cost basis; (Q3) confirm whether the 36-month window on the ground-up
+      build rule must be tracked separately in the profile.
   rcn_capital       — NOT VERIFIED: shell only, awaiting values from Josh.
   easy_street       — NOT VERIFIED: shell only.
   kiavi_affiliate   — NOT VERIFIED: shell only.
   abl               — NOT VERIFIED: shell only.
+  central_lending   — NOT VERIFIED: shell only; the client sends its credit box the week of Nov 3.
+
+UNVERIFIED LENDERS NEVER ROUTE (L1)
+-----------------------------------
+A lender with any ``placeholder`` field is never routed to by R-1 (``has_placeholder_rules``), even when
+signed; it still appears on the fit card as "subject to confirmation". ``RULES_EFFECTIVE_FROM`` dates each
+lender's rules; ``lending.lender_rule_values.effective_from`` dates each stored edit.
 
 OPEN QUESTIONS (block Test 2 sign-off, not the Oct 10 shell)
 --------------------------------------------------------------
@@ -51,6 +59,7 @@ a specific rate or term being offered to a borrower.  See Consolidated §5.2
 from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
+from datetime import date
 from decimal import Decimal
 from typing import Mapping, Optional
 
@@ -153,6 +162,12 @@ def fully_confirmed(rules: LenderRules) -> bool:
     return all(field_status_of(rules, name) is FieldStatus.CONFIRMED for name in PARAMETER_FIELDS)
 
 
+def has_placeholder_rules(rules: LenderRules) -> bool:
+    """True when any parameter is still a placeholder: such a lender is unverified and never routed to (L1).
+    ``confirm_at_submission`` is a decision Josh made, not a placeholder, so it does not block."""
+    return any(field_status_of(rules, name) is FieldStatus.PLACEHOLDER for name in PARAMETER_FIELDS)
+
+
 def effective_rules(rules: LenderRules) -> LenderRules:
     """The rules to evaluate: unset, unconfirmed parameters take the placeholder value (A1: an
     unknown cap is never skipped). A confirmed parameter that is unset means "no limit"."""
@@ -166,7 +181,7 @@ def effective_rules(rules: LenderRules) -> LenderRules:
 
 
 # ---------------------------------------------------------------------------
-# Matrix — 5 lenders
+# Matrix — 6 lenders
 # ---------------------------------------------------------------------------
 
 # Generic Backflip
@@ -182,37 +197,25 @@ def effective_rules(rules: LenderRules) -> LenderRules:
 # NOTE: "Generic Backflip" means these values come from Josh's description
 # of Backflip's box, not from any direct Backflip API or sync (SPEC §2).
 # Josh places the actual product himself; the evaluator is a decision aid.
+#
+# Client list Nov 2 (Q1): until Josh sends the real rules, all five lenders run on the same safe set
+# (PLACEHOLDER_BOX: credit 680, LTC 85%, ARV 70%, FL/GA/TX, $75K-$2M), Backflip included. The Oct 1
+# Backflip values above (flip: floor 640, ARV 75%, $100K min loan, ~$85K min purchase; ground-up: floor
+# 680, $500K min, 3+ projects incl. 1 ground-up, 7.75% spread) are NOT applied: set them here, with their
+# field status confirmed, once Josh confirms them. The $500K ground-up routing minimum is R-1 routing
+# (config/lending_routing.py), not a fit rule, and is unchanged.
 _BACKFLIP_FLIP = LenderRules(
     key="generic_backflip_flip",
     name="Backflip (Fix & Flip)",
-    verified=False,                     # client-stated (Josh Oct 1); awaiting his confirmation
+    verified=False,
     loan_types=frozenset({LoanType.FIX_AND_FLIP, LoanType.BRIDGE}),
-    min_loan_amount=Decimal("100_000"),  # Consolidated intake diagram: "$100K for flip"
-    max_loan_amount=None,               # not stated; no cap modelled
-    max_ltv=Decimal("0.75"),            # ARV cap 75% == max LTV of 75% of ARV
-    # "100% of rehab funded" (Josh Oct 1) is not modelled: LoanRequest has no
-    # input for how much of the rehab the loan covers, so it cannot be checked.
-    min_purchase_price=Decimal("85_000"),   # ~$85K per Josh Oct 1
-    credit_floor=640,
-    min_completed_projects=0,
-    origination_points=None,            # Q2: not confirmed
-    rate_spread=None,                   # Q2: Josh to confirm spread for flip product
-    hold_months=12,
 )
 
 _BACKFLIP_CONSTRUCTION = LenderRules(
     key="generic_backflip_construction",
     name="Backflip (Ground-Up Construction)",
-    verified=False,                     # client-stated (Josh Oct 1, Consolidated §1.1); awaiting confirmation
+    verified=False,
     loan_types=frozenset({LoanType.GROUND_UP_CONSTRUCTION}),
-    min_loan_amount=Decimal("500_000"),  # $500K min per Josh Oct 1 / Consolidated §1.1
-    max_loan_amount=None,
-    credit_floor=680,                   # Josh Oct 1 — "credit floor 680"
-    min_completed_projects=3,           # "3+ completed projects"
-    requires_ground_up_build=True,      # "including ≥1 ground-up build" per Josh Oct 1
-    origination_points=None,
-    rate_spread=Decimal("0.0775"),      # 7.75% (lower bound of 7.75–8.00% stated by Consolidated §1.1; Q2)
-    hold_months=12,
 )
 
 # RCN Capital — NOT VERIFIED, shell only (awaiting values from Josh: Q5)
@@ -249,6 +252,16 @@ _ABL = LenderRules(
                           LoanType.BRIDGE}),
 )
 
+# Central Lending — NOT VERIFIED, shell only. A real lender (L1, Nov 3); the client sends its credit box this
+# week. Products from Josh's Nov 2 term-sheet intake checklist; every number takes PLACEHOLDER_BOX until then.
+_CENTRAL_LENDING = LenderRules(
+    key="central_lending",
+    name="Central Lending",
+    verified=False,
+    loan_types=frozenset({LoanType.FIX_AND_FLIP, LoanType.GROUND_UP_CONSTRUCTION,
+                          LoanType.BRIDGE, LoanType.DSCR_RENTAL}),
+)
+
 # Canonical order: used by evaluate_lender_fit when no matrix is passed.
 # Backflip entries are split by product but share "generic_backflip" in
 # display grouping; the evaluator picks the first qualifying entry.
@@ -259,7 +272,19 @@ LENDER_MATRIX: tuple[LenderRules, ...] = (
     _EASY_STREET,
     _KIAVI_AFFILIATE,
     _ABL,
+    _CENTRAL_LENDING,
 )
+
+# The date each lender's config values took effect; seeded into lender_rule_values.effective_from.
+RULES_EFFECTIVE_FROM: dict[str, date] = {
+    "generic_backflip_flip": date(2026, 10, 1),          # Josh's Oct 1 email
+    "generic_backflip_construction": date(2026, 10, 1),
+    "rcn_capital": date(2026, 11, 3),                    # flagged unverified placeholders (L1)
+    "easy_street": date(2026, 11, 3),
+    "kiavi_affiliate": date(2026, 11, 3),
+    "abl": date(2026, 11, 3),
+    "central_lending": date(2026, 11, 3),
+}
 
 
 def validate_lender_matrix(matrix: tuple[LenderRules, ...] = LENDER_MATRIX) -> None:
@@ -302,4 +327,11 @@ def validate_lender_matrix(matrix: tuple[LenderRules, ...] = LENDER_MATRIX) -> N
             raise ValueError(f"{rules.key}: verified=True but a field is not confirmed")
 
 
+def validate_effective_dates(matrix: tuple[LenderRules, ...] = LENDER_MATRIX) -> None:
+    missing = {rules.key for rules in matrix} - set(RULES_EFFECTIVE_FROM)
+    if missing:
+        raise ValueError(f"RULES_EFFECTIVE_FROM has no date for {sorted(missing)}")
+
+
 validate_lender_matrix()
+validate_effective_dates()

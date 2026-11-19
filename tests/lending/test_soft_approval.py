@@ -7,6 +7,7 @@ import json
 import re
 import time
 from contextlib import contextmanager
+from dataclasses import replace
 from decimal import Decimal as D
 from types import SimpleNamespace
 from urllib.parse import urlencode
@@ -65,7 +66,7 @@ def soft_db(lending_db):
     return lending_db
 
 
-def _flow_lead(db, *, vendor="v1", phone=PHONE, fico=640, amount=290000, loan_type="FIX_AND_FLIP", state="FL",
+def _flow_lead(db, *, vendor="v1", phone=PHONE, fico=700, amount=290000, loan_type="FIX_AND_FLIP", state="FL",
                suppressed=False, received="2026-10-01 10:00:00+00"):
     db.execute(
         text("INSERT INTO lending.lendingflow_leads (vendor_lead_id, dedupe_hash, phone, credit_band_min_fico, loan_amount, "
@@ -363,6 +364,18 @@ class TestService:
         assert row["figures"]["net_loan"] == "300000" and row["dialer_call_id"] == "call-2"
         assert len(row["history"]) == 1 and row["history"][0]["figures"]["net_loan"] == "290000"
 
+    def test_the_assessed_lead_is_stored_and_a_new_lead_with_identical_facts_replaces_it(self, soft_db):
+        first = _generate(soft_db)
+        assert first.lead_ref == "lf-1" and _row(soft_db)["lead_ref"] == "lf-1"
+        newer = replace(LEAD, lead_ref="lf-2")
+        second = _generate(soft_db, lead=newer, call_id="call-2")
+        row = _row(soft_db)
+        assert second.lead_ref == "lf-2" and row["lead_ref"] == "lf-2" and row["history"][0]["lead_ref"] == "lf-1"
+
+    def test_no_lead_stores_no_lead_ref(self, soft_db):
+        out = _generate(soft_db, lead=None)
+        assert out.status == "no_lead" and out.lead_ref is None and _row(soft_db)["lead_ref"] is None
+
     def test_production_defaults_produce_a_flagged_pdf_on_the_placeholder_inputs(self, soft_db):
         """Real lead source + real evaluator (T-05) + real matrix: every lender is unconfirmed, so the PDF is made
         on Josh's placeholder box and flagged subject to lender confirmation (A1). The feature itself stays closed
@@ -383,6 +396,17 @@ class TestService:
         apply_soft_approvals(soft_db.get_bind())
         apply_soft_approvals(soft_db.get_bind())
 
+    def test_lead_ref_migration_adds_the_column_to_an_existing_table_and_is_idempotent(self, soft_db):
+        from migrations.apply_lending_soft_approvals_lead_ref import apply_to as apply_lead_ref
+
+        conn = soft_db.get_bind()
+        conn.execute(text("ALTER TABLE lending.soft_approvals DROP COLUMN lead_ref"))
+        apply_lead_ref(conn)
+        apply_lead_ref(conn)
+        assert conn.execute(text(
+            "SELECT count(*) FROM information_schema.columns WHERE table_schema = 'lending' "
+            "AND table_name = 'soft_approvals' AND column_name = 'lead_ref'")).scalar() == 1
+
 
 # ---- template ----------------------------------------------------------------------------------
 
@@ -401,7 +425,7 @@ class TestLendingFlowLeadSource:
         _flow_lead(soft_db)
         lead = self.SOURCE.for_phone(soft_db, PHONE)
         assert lead.loan_type is LoanType.FIX_AND_FLIP and lead.loan_amount == D(290000) and lead.state == "FL"
-        assert lead.borrower.credit_band_min_fico == 640 and lead.has_core_fields()
+        assert lead.borrower.credit_band_min_fico == 700 and lead.has_core_fields()
 
     def test_a_closed_band_carries_its_upper_bound_so_a_higher_floor_is_a_decline(self, soft_db):
         """Review on #363: "680-719" must reach the evaluator as 680 to 719, never as an open-ended 680+."""

@@ -41,6 +41,7 @@ from config.lending_reply_agent import (
 from config.settings import get_settings
 from src.lending.compliance import phone_hash
 from src.lending.cora_inbox import add_to_inbox_safely
+from src.lending.slack_channels import BOT_TOKEN, report_unset
 from src.lending.slack_names import name_and_ref, names_by_ghl_contact
 from src.lending.slack_test_filter import log_skipped, hidden_ghl_contacts
 from src.services.phone_utils import normalize
@@ -264,6 +265,7 @@ def slack_poster() -> Optional[SlackPoster]:
     settings = get_settings()
     channel = settings.lending_replies_channel
     if not (channel and settings.lending_slack_bot_token):
+        report_unset("reply handoff", ("LENDING_REPLIES_CHANNEL", BOT_TOKEN))
         return None
 
     def post(message: str) -> None:

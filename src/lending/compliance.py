@@ -15,8 +15,8 @@ from __future__ import annotations
 import hashlib
 from collections import defaultdict
 import json
-from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from dataclasses import dataclass, replace
+from datetime import datetime, time as dt_time, timedelta, timezone
 from typing import Callable, Optional, Sequence
 from zoneinfo import ZoneInfo
 
@@ -96,6 +96,33 @@ def phone_hash(phone: str) -> str:
     return hashlib.sha256(phone.encode()).hexdigest()
 
 
+# Log de-duplication for the hours checks (P0.1). Sweeps re-check the same window and the same deferred lead
+# many times; each distinct event is logged once, so the log stays readable without hiding a new one.
+_BLOCKED_HOURS_LOG_MAX = 10_000
+_blocked_hours_logged: set[tuple[str, str, str]] = set()
+_clamp_logged_for: Optional["DialWindow"] = None
+
+
+def _log_blocked_hours(kind: str, phone: str, moment: datetime, detail: str = "") -> None:
+    """Logs ``BLOCKED_HOURS <kind> refused`` once per phone per Eastern day."""
+    digest = phone_hash(phone)[:12]
+    key = (kind, digest, moment.astimezone(ZoneInfo(DEFAULT_TZ)).date().isoformat())
+    if key in _blocked_hours_logged:
+        return
+    if len(_blocked_hours_logged) >= _BLOCKED_HOURS_LOG_MAX:
+        _blocked_hours_logged.clear()
+    _blocked_hours_logged.add(key)
+    logger.info("[lending-compliance] BLOCKED_HOURS %s refused phone_hash=%s at=%s%s",
+                kind, digest, moment.isoformat(), detail)
+
+
+def reset_hours_log_state() -> None:
+    """Forget which hours events were already logged (tests)."""
+    global _clamp_logged_for
+    _blocked_hours_logged.clear()
+    _clamp_logged_for = None
+
+
 # ── List-build filter (WP-W0-2 + Georgia stop) ───────────────────────────────
 
 
@@ -140,6 +167,12 @@ def _suppressed_phones(db, phones: list[str]) -> set[str]:
 def is_phone_suppressed(db, phone: str) -> bool:
     """Whether this number is on the lending suppression list or opted out of texts (STOP)."""
     return bool(_suppressed_phones(db, [phone]))
+
+
+def suppressed_phones(db, phones: Sequence[str]) -> set[str]:
+    """``is_phone_suppressed`` for many phones in one query: the subset that is suppressed."""
+    phones = list(phones)
+    return _suppressed_phones(db, phones) if phones else set()
 
 
 def suppress_warm_network_phones(db, phones: list[str], *, source_ref: Optional[str] = None) -> int:
@@ -515,6 +548,7 @@ def can_dial_now(
         return _blocked(phone, ReasonCode.INVALID_PHONE)
 
     if _outside_call_window(normalized, now, zip_code, seat_group):
+        _log_blocked_hours("call", normalized, now)
         return _blocked(normalized, ReasonCode.OUTSIDE_CALL_WINDOW)
 
     cap_result = _attempt_cap(db, normalized, now)
@@ -525,6 +559,48 @@ def can_dial_now(
     return cap_result
 
 
+@dataclass(frozen=True)
+class DialWindow:
+    local_start: dt_time
+    local_end: dt_time
+    et_start: dt_time
+    et_end: dt_time
+
+
+def dial_window() -> DialWindow:
+    """The dialer calling window from settings (LENDING_CALL_WINDOW_*), defaulting to the shipped values.
+
+    Hard clamp (P0.1): both windows are held inside the legal 08:00-20:00 floor (CALL_WINDOW_START/_END), so
+    an env value can only narrow calling, never widen it. A wider value is clamped and logged as an ERROR. An
+    unreadable setting falls back to the shipped window."""
+    shipped = DialWindow(CALL_WINDOW_START, CALL_WINDOW_END, ET_WINDOW_START, ET_WINDOW_END)
+    try:
+        from config.settings import get_settings
+
+        s = get_settings()
+        configured = DialWindow(
+            dt_time.fromisoformat(s.lending_call_window_local_start), dt_time.fromisoformat(s.lending_call_window_local_end),
+            dt_time.fromisoformat(s.lending_call_window_et_start), dt_time.fromisoformat(s.lending_call_window_et_end),
+        )
+    except Exception as exc:  # class only
+        logger.warning("[lending-compliance] call window settings unreadable (%s); shipped window used",
+                       type(exc).__name__)
+        return shipped
+    clamped = DialWindow(
+        max(configured.local_start, CALL_WINDOW_START), min(configured.local_end, CALL_WINDOW_END),
+        max(configured.et_start, CALL_WINDOW_START), min(configured.et_end, CALL_WINDOW_END),
+    )
+    global _clamp_logged_for
+    if clamped != configured and configured != _clamp_logged_for:
+        _clamp_logged_for = configured
+        logger.error("[lending-compliance] LENDING_CALL_WINDOW_* wider than the legal %s-%s window "
+                     "(local %s-%s, ET %s-%s); clamped to local %s-%s, ET %s-%s",
+                     CALL_WINDOW_START, CALL_WINDOW_END,
+                     configured.local_start, configured.local_end, configured.et_start, configured.et_end,
+                     clamped.local_start, clamped.local_end, clamped.et_start, clamped.et_end)
+    return clamped
+
+
 def _outside_call_window(
     phone: str, now: datetime, zip_code: Optional[str] = None, seat_group: Optional[str] = None
 ) -> bool:
@@ -533,11 +609,14 @@ def _outside_call_window(
         logger.warning("[lending-compliance] no timezone for phone_hash=%s; call window fails closed",
                        phone_hash(phone)[:12])
         return True
+    window = dial_window()
     local = now.astimezone(tz).time()
-    if not (CALL_WINDOW_START <= local < CALL_WINDOW_END):
+    if not (window.local_start <= local < window.local_end):
         return True
-    start, end = SHIFT_GROUPS.get(seat_group, (ET_WINDOW_START, ET_WINDOW_END)) if seat_group else (
-        ET_WINDOW_START, ET_WINDOW_END)
+    start, end = window.et_start, window.et_end
+    if seat_group in SHIFT_GROUPS:
+        group_start, group_end = SHIFT_GROUPS[seat_group]
+        start, end = max(start, group_start), min(end, group_end)
     eastern = now.astimezone(ZoneInfo(DEFAULT_TZ)).time()
     return not (start <= eastern < end)
 
@@ -559,11 +638,34 @@ def text_window_open(
         if tz is not None:
             zones.add(tz.key)
     zones.update(STATE_TZ.get((property_state or "").strip().upper(), ()))
+    moment = now or datetime.now(timezone.utc)
+    if zones and _zones_inside_window(zones, moment):
+        return True
+    if normalize_phone(phone) in text_window_test_phones():
+        logger.warning("[lending-compliance] TEXT WINDOW TEST BYPASS phone_hash=%s at=%s: number is on "
+                       "QA_TEST_PHONE_ALLOWLIST (team test numbers only; clear it after the test)",
+                       phone_hash(phone)[:12], moment.isoformat())
+        return True
     if not zones:
         logger.warning("[lending-compliance] no timezone for phone_hash=%s; text window fails closed",
                        phone_hash(phone)[:12])
         return False
-    return _zones_inside_window(zones, now or datetime.now(timezone.utc))
+    _log_blocked_hours("text", phone, moment, f" zones={','.join(sorted(zones))}")
+    return False
+
+
+def text_window_test_phones() -> frozenset[str]:
+    """Team-owned test numbers (QA_TEST_PHONE_ALLOWLIST, comma-separated) that may be texted outside 8:00-20:00 for
+    an end-to-end test; the same list also lets a non-US test number pass ``phone_utils.normalize``. Empty by
+    default; never put a borrower's number here. Invalid entries are ignored, and an unreadable setting means no
+    exceptions (fails closed)."""
+    try:
+        from config.settings import get_settings
+
+        raw = get_settings().qa_test_phone_allowlist or ""
+    except Exception:  # class only
+        return frozenset()
+    return frozenset(p for p in (normalize_phone(part.strip()) for part in raw.split(",") if part.strip()) if p)
 
 
 def _zones_inside_window(zones: set[str], now: datetime) -> bool:
@@ -728,6 +830,18 @@ def scrub_exempt_phones(db, phones: Sequence[str]) -> set[str]:
     ).scalars().all())
 
 
+def lendingflow_lead_phones(db, phones: Sequence[str]) -> set[str]:
+    """Phones of a LendingFlow lead, wherever it is worked. Every LendingFlow lead counts as having agreed
+    to calls and texts (client decision), so it needs no DNC scrub; an opt-out still wins."""
+    phones = list(phones)
+    if not phones:
+        return set()
+    return set(db.execute(
+        text("SELECT DISTINCT phone FROM lending.lendingflow_leads WHERE phone = ANY(:phones)"),
+        {"phones": phones},
+    ).scalars().all())
+
+
 def _stale_scrub_phones(db, phones: list[str], now: datetime) -> set[str]:
     """Phones with no scrub, or one older than the freshness window — the weekly job's
     README says these are "blocked from dialing until rescrubbed"; this is what
@@ -769,6 +883,19 @@ def dial_blocks(db, phones: list[str], *, now: Optional[datetime] = None,
             blocks[phone] = ReasonCode.OUTSIDE_CALL_WINDOW
         elif phone in stale:
             blocks[phone] = ReasonCode.NO_FRESH_SCRUB
+    return blocks
+
+
+def scrub_verdict_blocks(db, phones: list[str]) -> dict[str, ReasonCode]:
+    """phone -> reason for each phone whose newest stored scrub found it on a DNC or litigator list.
+    ``dial_blocks`` checks only a scrub's age; this checks what it found (the load gate's ``_verdict``)."""
+    if not phones:
+        return {}
+    blocks: dict[str, ReasonCode] = {}
+    for phone, scrub in _stored_scrubs(db, phones).items():
+        verdict = _verdict(phone, scrub)
+        if not verdict.allowed:
+            blocks[phone] = verdict.reason
     return blocks
 
 
@@ -1069,7 +1196,7 @@ def poll_fa_opt_outs(db, *, dialer_remover: Optional[DialerRemover] = None,
     return PollResult(new_opt_outs=len(opt_outs), dialer_retried=retried)
 
 
-def sync_ghl_dnd(db, ghl_dnd: Optional[Callable[[str], bool]]) -> int:
+def sync_ghl_dnd(db, ghl_dnd: Optional[Callable[[str], bool]] = None) -> int:
     """Write every opt-out not yet in GHL as do-not-disturb (new ones and retries alike),
     a bounded batch per poll. Returns how many GHL accepted."""
     if ghl_dnd is None:
@@ -1099,8 +1226,47 @@ def sync_ghl_dnd(db, ghl_dnd: Optional[Callable[[str], bool]]) -> int:
     return len(done)
 
 
+_LINKED_PHONES = text(
+    "SELECT lower(email), phone FROM lending.contacts WHERE lower(email) = ANY(:emails) AND phone IS NOT NULL "
+    "UNION SELECT lower(email), phone FROM lending.web_leads WHERE lower(email) = ANY(:emails) AND phone IS NOT NULL "
+    "UNION SELECT lower(email), phone FROM lending.lendingflow_leads "
+    "WHERE lower(email) = ANY(:emails) AND phone IS NOT NULL "
+    "UNION SELECT lower(email), phone FROM lending.partners WHERE lower(email) = ANY(:emails) AND phone IS NOT NULL"
+)
+
+
+def _with_linked_phones(db, opt_outs: list[_OptOut]) -> list[_OptOut]:
+    """An email-only opt-out also blocks every phone that email is on file with in lending (ADR 0028: an opt-out
+    blocks every channel; the web form tells leads to email optout@ to stop calls). Every linked phone gets its own
+    event, so the dialer-removal retry and the GHL DND sync (both keyed on the event's phone) cover each one. Only
+    the first keeps the FA row id (one event per FA row: the poller's dedup key). FA's stores get the phones too
+    (source DIALER_OPT_OUT_SOURCE, which the poller skips, so nothing loops)."""
+    from src.services.email_suppression import suppress_contact
+
+    emails = sorted({o.email for o in opt_outs if o.email and not o.phone})
+    if not emails:
+        return opt_outs
+    by_email: dict[str, set[str]] = defaultdict(set)
+    for email, raw in db.execute(_LINKED_PHONES, {"emails": emails}).fetchall():
+        phone = normalize_phone(raw)
+        if phone:
+            by_email[email].add(phone)
+    resolved: list[_OptOut] = []
+    for o in opt_outs:
+        linked = sorted(by_email.get(o.email, ())) if o.email and not o.phone else []
+        if not linked:
+            resolved.append(o)
+            continue
+        for i, phone in enumerate(linked):
+            suppress_contact(db, email=o.email, phone=phone, source=DIALER_OPT_OUT_SOURCE)
+            resolved.append(replace(o, phone=phone) if i == 0
+                            else replace(o, phone=phone, fa_table=None, fa_row_id=None))
+    return resolved
+
+
 def _propagate(db, opt_outs: list[_OptOut], dialer_remover: Optional[DialerRemover]) -> list[int]:
     """Batch: one statement per lending table, then one dialer call per phone."""
+    opt_outs = _with_linked_phones(db, opt_outs)
     event_ids = [
         r[0]
         for r in db.execute(

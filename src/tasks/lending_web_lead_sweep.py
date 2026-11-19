@@ -17,6 +17,8 @@ from sqlalchemy import text
 
 from config.lending_web import GHL_ALERT_AFTER_MINUTES, GHL_GIVE_UP_AFTER_HOURS
 from config.settings import get_settings
+from src.lending.slack_channels import BOT_TOKEN, report_unset
+from src.lending import lendingflow_dialer
 from src.lending.db import lending_session
 from src.lending.disposition_delivery import _configured_slack, _slack_client
 from src.lending.slack_names import name_and_ref
@@ -32,7 +34,7 @@ def alert_undelivered(slack_client: Any = None, minutes: Optional[int] = None) -
     Returns how many leads were flagged. Never raises: an alert problem must not stop the sweep."""
     minutes = GHL_ALERT_AFTER_MINUTES if minutes is None else minutes
     if not (slack_client or _configured_slack()):
-        logger.error("[lending-web] undelivered-lead alert skipped: Slack is not configured")
+        report_unset("website undelivered-lead alert", ("LENDING_DIAL_TASKS_CHANNEL", BOT_TOKEN))
         return 0
     try:
         with lending_session() as db:
@@ -78,6 +80,8 @@ def run() -> int:
     with lending_session() as db:
         delivered = deliver_pending(db, get_live_sink())
     logger.info("[lending-web] sweep delivered=%d", delivered)
+    # Website leads into the BatchDialer "Website" campaign (call-consent tick + DNC scrub; removals always run).
+    lendingflow_dialer.run_from_settings(lendingflow_dialer.WEBSITE)
     alert_undelivered()
     return delivered
 

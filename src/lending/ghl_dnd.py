@@ -7,6 +7,7 @@ gets a DND-only contact, so a later form or import with that phone stays blocked
 from __future__ import annotations
 
 import logging
+import re
 from typing import Callable, Optional
 
 from config.lending_compliance import GHL_DND_CHANNELS, GHL_OPT_OUT_TAG
@@ -16,32 +17,104 @@ logger = logging.getLogger(__name__)
 
 GhlDnd = Callable[[str], bool]
 
+_PERMANENT_DND_REFUSAL = re.compile(r"permanent dnd setting for (\w+)", re.IGNORECASE)
+
 
 def set_ghl_dnd(phone: str) -> bool:
-    """True when GHL accepted the DND update. Never raises; logs the status only."""
+    """True when GHL accepted the DND update. Never raises; logs the status only.
+
+    The upsert carries no ``tags``: GHL's upsert REPLACES the tag list, so sending the opt-out tag there wiped every
+    other tag on the contact (lead source, consent, list tags). The tag is added afterwards with the add-tags call,
+    which keeps existing tags. A failed tag call does not undo the DND, which is what the opt-out needs.
+
+    A channel GHL has blocked permanently (a STOP reply) refuses any API change, which fails the whole upsert: it
+    is left out and the rest are sent again. If GHL still refuses it because the global ``dnd`` flag covers it,
+    the channels are sent once more without the flag. Any other refusal fails."""
     from src.services import ghl_webhook
 
     account = lending_ghl_account()
     if account is None:
         return False
-    body = {
-        "locationId": account.location_id,
-        "phone": phone,
-        "dnd": True,
-        "dndSettings": {channel: {"status": "active", "message": "Lending opt-out"} for channel in GHL_DND_CHANNELS},
-        "tags": [GHL_OPT_OUT_TAG],
-    }
-    try:
-        response = ghl_webhook._ghl_request(
-            "POST", f"{ghl_webhook._GHL_BASE}/contacts/upsert", headers=ghl_headers(account.api_key), json=body,
-        )
-    except Exception as exc:
-        logger.warning("[lending-ghl] DND upsert failed: %s", type(exc).__name__)
-        return False
-    if response.status_code >= 400:
+    headers = ghl_headers(account.api_key)
+    channels = list(GHL_DND_CHANNELS)
+    left_out: set[str] = set()  # lower-case names of channels GHL has blocked permanently
+    global_flag = True
+    while True:
+        body: dict = {
+            "locationId": account.location_id,
+            "phone": phone,
+            "dndSettings": {channel: {"status": "active", "message": "Lending opt-out"} for channel in channels},
+        }
+        if global_flag:
+            body["dnd"] = True
+        try:
+            response = ghl_webhook._ghl_request("POST", f"{ghl_webhook._GHL_BASE}/contacts/upsert",
+                                                headers=headers, json=body)
+        except Exception as exc:
+            logger.warning("[lending-ghl] DND upsert failed: %s", type(exc).__name__)
+            return False
+        if response.status_code < 400:
+            break
+        refused = (_permanently_blocked_channel(response) or "").lower()
+        locked = next((channel for channel in channels if channel.lower() == refused), None)
+        if locked:
+            # A STOP reply makes GHL block the channel permanently and refuse any API change to it, so the
+            # whole upsert fails while the opt-out is already in force there: send the other channels only.
+            logger.info("[lending-ghl] DND already permanent in GHL for %s; setting the other channels", locked)
+            channels.remove(locked)
+            left_out.add(refused)
+            continue
+        if refused and refused in left_out and global_flag:
+            # Refused again for a channel already left out: the global dnd flag also covers it. The per-channel
+            # settings carry the opt-out on every other channel, so send those without the flag.
+            logger.info("[lending-ghl] DND refused again for %s through the global flag; setting each channel instead",
+                        refused)
+            global_flag = False
+            continue
+        if refused and refused in left_out:
+            logger.warning("[lending-ghl] DND upsert failed: GHL refused %s again with it and the global flag "
+                           "left out (HTTP %s)", refused, response.status_code)
+            return False
         logger.warning("[lending-ghl] DND upsert failed: HTTP %s", response.status_code)
         return False
+    _add_opt_out_tag(ghl_webhook, headers, _contact_id(response))
     return True
+
+
+def _permanently_blocked_channel(response) -> Optional[str]:
+    """The channel named in GHL's refusal to change a permanent DND, e.g. "Not authorized to update
+    permanent dnd setting for SMS"; None for any other failure."""
+    if response.status_code not in (401, 403):
+        return None
+    try:
+        message = str((response.json() or {}).get("message") or "")
+    except Exception:
+        return None
+    match = _PERMANENT_DND_REFUSAL.search(message)
+    return match.group(1) if match else None
+
+
+def _contact_id(response) -> Optional[str]:
+    try:
+        contact_id = ((response.json() or {}).get("contact") or {}).get("id")
+    except Exception:  # an unreadable body only costs the tag
+        return None
+    return str(contact_id) if contact_id else None
+
+
+def _add_opt_out_tag(ghl_webhook, headers: dict[str, str], contact_id: Optional[str]) -> None:
+    """Add the opt-out tag, keeping the contact's other tags. Best effort: logged, never raised."""
+    if not contact_id:
+        logger.warning("[lending-ghl] DND set but no contact id returned; opt-out tag not added")
+        return
+    try:
+        response = ghl_webhook._ghl_request("POST", f"{ghl_webhook._GHL_BASE}/contacts/{contact_id}/tags",
+                                            headers=headers, json={"tags": [GHL_OPT_OUT_TAG]})
+    except Exception as exc:
+        logger.warning("[lending-ghl] opt-out tag not added: %s", type(exc).__name__)
+        return
+    if response.status_code >= 400:
+        logger.warning("[lending-ghl] opt-out tag not added: HTTP %s", response.status_code)
 
 
 def get_ghl_dnd() -> Optional[GhlDnd]:

@@ -26,6 +26,7 @@ from config.lending_routing import AGREEMENT_STATUS_CHOICES
 from config.settings import get_settings
 from src.lending.contracts import LoanType
 from src.lending.db import lending_session
+from src.lending.slack_channels import CORA_BOT_TOKEN, report_unset
 from src.lending.routing import lender_service, notify
 from src.lending.routing.lender_service import RoutingError
 
@@ -525,7 +526,7 @@ def _apply(values: dict, db: Session) -> str:
 def _post_audit(user_id: str, summary: str) -> None:
     client, channel = notify._client(), notify.audit_channel()
     if client is None or not channel:
-        logger.warning("[routing-slack] change applied but LENDING_CORA_CHANNEL or LENDING_CORA_SLACK_BOT_TOKEN is not set")
+        report_unset("lender change audit", ("LENDING_CORA_CHANNEL", CORA_BOT_TOKEN))
         return
     try:
         client.chat_postMessage(channel=channel, text=f":gear: Lender rules changed by <@{user_id}>: {summary}")

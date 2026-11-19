@@ -218,10 +218,19 @@ def test_missing_settings_are_named() -> None:
     assert cora_agent.build_live_services(_settings(lending_cora_approver_user_ids="")) is None
 
 
-def test_only_email_is_registered_when_the_ghl_sender_is_configured(monkeypatch) -> None:
+@pytest.fixture(autouse=True)
+def _no_live_crm_writer(monkeypatch) -> None:
+    """No test registers the real GHL CRM writer; the CRM tests pass their own."""
+    monkeypatch.setattr(cora_agent, "get_crm_writer", lambda: None)
+    monkeypatch.setattr(cora_agent, "get_ndl_instantly_sender", lambda: None)
+    monkeypatch.setattr(cora_agent, "lending_instantly_account", lambda: None)  # a developer's .env may hold the key
+
+
+def test_email_is_registered_when_the_ghl_email_sender_is_configured(monkeypatch) -> None:
     calls = []
     monkeypatch.setattr(cora_agent, "get_email_sender",
                         lambda: lambda *args, **kwargs: calls.append((args, kwargs)) or "m1")
+    monkeypatch.setattr(cora_agent, "get_sender", lambda: None)
     executors = cora_agent.build_egress_executors()
     assert set(executors) == {"ghl_email"}
     assert executors["ghl_email"]({"lead_ref": "web_lead:7", "to_email": "sam@example.com",
@@ -229,8 +238,67 @@ def test_only_email_is_registered_when_the_ghl_sender_is_configured(monkeypatch)
     assert calls == [(("sam@example.com", "Hello", "Hi Sam"), {"phone": None})]
 
 
+def test_sms_is_registered_and_sends_exactly_the_approved_text(monkeypatch) -> None:
+    calls = []
+    monkeypatch.setattr(cora_agent, "get_email_sender", lambda: None)
+    monkeypatch.setattr(cora_agent, "get_sender", lambda: lambda *args, **kwargs: calls.append((args, kwargs)) or "s1")
+    executors = cora_agent.build_egress_executors()
+    assert set(executors) == {"ghl_sms"}
+    assert executors["ghl_sms"]({"lead_ref": "web_lead:7", "to_phone": "+17275550100",
+                                 "body": "Hi Sam, Josh here. Reply STOP to opt out."}) == "s1"
+    assert calls == [(("+17275550100", "Hi Sam, Josh here. Reply STOP to opt out."), {})]
+
+
+def test_both_channels_are_registered_when_both_senders_are_configured(monkeypatch) -> None:
+    monkeypatch.setattr(cora_agent, "get_email_sender", lambda: lambda *a, **k: "m1")
+    monkeypatch.setattr(cora_agent, "get_sender", lambda: lambda *a, **k: "s1")
+    assert set(cora_agent.build_egress_executors()) == {"ghl_email", "ghl_sms"}
+
+
+class _RecordingCrm:
+    def __init__(self) -> None:
+        self.calls: list[tuple] = []
+
+    def move_stage(self, contact_id, stage):
+        self.calls.append(("move_stage", contact_id, stage))
+        return "opp-1"
+
+    def add_tag(self, contact_id, tag):
+        self.calls.append(("add_tag", contact_id, tag))
+        return "tag-ref"
+
+    def add_note(self, contact_id, body):
+        self.calls.append(("add_note", contact_id, body))
+        return "note-9"
+
+    def create_task(self, contact_id, title, due_at, assignee):
+        self.calls.append(("create_task", contact_id, title, due_at, assignee))
+        return "task-1"
+
+
+def test_crm_writes_are_registered_and_apply_exactly_the_approved_payload(monkeypatch) -> None:
+    crm = _RecordingCrm()
+    monkeypatch.setattr(cora_agent, "get_email_sender", lambda: None)
+    monkeypatch.setattr(cora_agent, "get_sender", lambda: None)
+    monkeypatch.setattr(cora_agent, "get_crm_writer", lambda: crm)
+    executors = cora_agent.build_egress_executors()
+    assert set(executors) == {"ghl_stage", "ghl_tag", "ghl_note", "ghl_task"}
+    assert executors["ghl_stage"]({"lead_ref": "web_lead:7", "ghl_contact_id": "ghl-123", "stage": "Application"}) == "opp-1"
+    assert executors["ghl_tag"]({"lead_ref": "web_lead:7", "ghl_contact_id": "ghl-123", "tag": "hot lead"}) == "tag-ref"
+    assert executors["ghl_note"]({"lead_ref": "web_lead:7", "ghl_contact_id": "ghl-123", "body": "Call Friday"}) == "note-9"
+    assert crm.calls == [("move_stage", "ghl-123", "Application"), ("add_tag", "ghl-123", "hot lead"),
+                         ("add_note", "ghl-123", "Call Friday")]
+
+
+def test_crm_writes_stay_unregistered_without_a_ghl_account(monkeypatch) -> None:
+    monkeypatch.setattr(cora_agent, "get_email_sender", lambda: lambda *a, **k: "m1")
+    monkeypatch.setattr(cora_agent, "get_sender", lambda: None)
+    assert set(cora_agent.build_egress_executors()) == {"ghl_email"}
+
+
 def test_nothing_is_registered_without_a_configured_ghl_sender(monkeypatch) -> None:
     monkeypatch.setattr(cora_agent, "get_email_sender", lambda: None)
+    monkeypatch.setattr(cora_agent, "get_sender", lambda: None)
     assert cora_agent.build_egress_executors() == {}
 
 
@@ -291,7 +359,8 @@ def test_text_without_consent_is_blocked() -> None:
 
 def test_email_needs_no_text_consent_but_is_checked_for_suppression() -> None:
     engine = ScriptedEngine(False)
-    assert cora_agent.make_send_check(engine)(_action("ghl_email", phone=None, email=" Sam@Example.com")) is None
+    check = cora_agent.make_send_check(engine, email_window=lambda phone: True)
+    assert check(_action("ghl_email", phone=None, email=" Sam@Example.com")) is None
     assert engine.queries == [{"p": None, "e": "sam@example.com"}]
 
 
@@ -353,3 +422,108 @@ def test_inbox_channel_ids_skip_unset_channels() -> None:
                                lending_dial_tasks_channel="C_DIAL", lending_daily_channel="", lending_deals_channel="C_DEALS")
     assert cora_agent.lending_channel_ids(settings) == {"replies": "C_REPLIES", "ops_notice": "C_NOTICE",
                                                         "dial_tasks": "C_DIAL", "deals": "C_DEALS"}
+
+
+# ── P1.1 agent jobs: tasks, Instantly cold email, email hours, the job worker in the sweep ──────────────────
+
+def test_ghl_task_executor_registered(monkeypatch) -> None:
+    from datetime import datetime, timezone
+
+    crm = _RecordingCrm()
+    monkeypatch.setattr(cora_agent, "get_email_sender", lambda: None)
+    monkeypatch.setattr(cora_agent, "get_sender", lambda: None)
+    monkeypatch.setattr(cora_agent, "get_crm_writer", lambda: crm)
+    executors = cora_agent.build_egress_executors()
+    assert executors["ghl_task"]({"ghl_contact_id": "ghl-123", "title": "Call Mark",
+                                  "due_at": "2026-11-12T17:00:00-05:00", "assignee": None}) == "task-1"
+    assert crm.calls == [("create_task", "ghl-123", "Call Mark",
+                          datetime(2026, 11, 12, 22, 0, tzinfo=timezone.utc), None)]
+
+
+class _RecordingInstantly:
+    def __init__(self) -> None:
+        self.sent: list[tuple] = []
+
+    def send(self, to_email, subject, body):
+        self.sent.append((to_email, subject, body))
+        return "lead-1"
+
+
+def test_instantly_executor_registered_only_when_configured(monkeypatch) -> None:
+    monkeypatch.setattr(cora_agent, "get_email_sender", lambda: None)
+    monkeypatch.setattr(cora_agent, "get_sender", lambda: None)
+    assert "instantly_cold_email" not in cora_agent.build_egress_executors()
+    sender = _RecordingInstantly()
+    monkeypatch.setattr(cora_agent, "get_ndl_instantly_sender", lambda: sender)
+    executors = cora_agent.build_egress_executors()
+    assert executors["instantly_cold_email"]({"to_email": "m@example.com", "subject": "S", "body": "B"}) == "lead-1"
+    assert sender.sent == [("m@example.com", "S", "B")]
+
+
+@pytest.mark.parametrize("channel", ["ghl_email", "instantly_email", "instantly_cold_email"])
+def test_email_deferred_outside_window(channel: str) -> None:
+    answers = (False, False) if channel.startswith("instantly") else (False,)  # Instantly also checks email_opt_outs
+    check = cora_agent.make_send_check(ScriptedEngine(*answers), email_window=lambda phone: False)
+    reason = check(_action(channel, phone="(727) 555-0100", email="sam@example.com"))
+    assert reason == "outside the recipient's 8am-8pm window" and isinstance(reason, SendDeferred)
+
+
+def test_email_window_uses_the_phone_when_known(monkeypatch) -> None:
+    from datetime import datetime, timezone
+
+    seen = []
+    monkeypatch.setattr(cora_agent, "text_window_open", lambda phone, **kw: seen.append(phone) or True)
+    assert cora_agent.email_window_open("+17275550100") is True and seen == ["+17275550100"]
+    night = datetime(2026, 11, 13, 2, 0, tzinfo=timezone.utc)  # 9:00 PM Eastern
+    assert cora_agent.email_window_open(None, now=night) is False
+    assert cora_agent.email_window_open(None, now=datetime(2026, 11, 12, 15, 0, tzinfo=timezone.utc)) is True
+
+
+def test_instantly_send_check_blocks_opted_out_email() -> None:
+    reason = cora_agent.make_send_check(ScriptedEngine(True), email_window=lambda phone: True)(
+        _action("instantly_cold_email", phone=None, email="sam@example.com"))
+    assert reason == "recipient is suppressed or marked do-not-contact"
+
+
+def test_sweep_runs_agent_jobs_before_relay() -> None:
+    order: list[str] = []
+    parts = _SweepParts()
+    original_run = parts.run
+    parts.run = lambda: order.append("relay") or original_run()
+    services = _sweep_services(parts, None)._replace(agent_jobs=lambda: order.append("jobs"))
+    cora_agent.run_sweep(services)
+    assert order == ["jobs", "relay"]
+
+
+def test_agent_jobs_failure_does_not_skip_relay() -> None:
+    def broken():
+        raise RuntimeError("drive down")
+
+    parts = _SweepParts()
+    cora_agent.run_sweep(_sweep_services(parts, None)._replace(agent_jobs=broken))
+    assert parts.relay_runs == 1
+
+
+def test_agent_jobs_off_when_flag_false(monkeypatch) -> None:
+    built = []
+    monkeypatch.setattr(cora_agent, "google_job_folders", lambda: built.append("folders") or object())
+    worker = cora_agent.build_agent_jobs(SimpleNamespace(lending_agent_jobs_enabled=False), engine=None, gate=None,
+                                         queue=None, approval_channel="C_APPROVALS")
+    assert worker is None and built == []
+
+
+def test_agent_jobs_off_without_drive_folders(monkeypatch) -> None:
+    monkeypatch.setattr(cora_agent, "google_job_folders", lambda: None)
+    monkeypatch.setattr(cora_agent, "get_crm_writer", lambda: object())
+    worker = cora_agent.build_agent_jobs(SimpleNamespace(lending_agent_jobs_enabled=True), engine=None, gate=None,
+                                         queue=None, approval_channel="C_APPROVALS")
+    assert worker is None
+
+
+def test_cold_email_checks_fa_email_opt_outs_too() -> None:
+    """Like P1.3's thread answers, a cold email honours an unsubscribe recorded in email_opt_outs before the
+    opt-out poller copies it to the lending list."""
+    engine = ScriptedEngine(False, True)
+    reason = cora_agent.make_send_check(engine, email_window=lambda phone: True)(
+        _action("instantly_cold_email", phone=None, email="sam@example.com"))
+    assert reason == "recipient is suppressed or marked do-not-contact"

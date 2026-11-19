@@ -1225,8 +1225,8 @@ COUNTY_ID=hillsborough
 # Lending: warn once per call when a connected call has no disposition after N minutes.
 */5 * * * * $PROJECT/scripts/cron/run.sh src.tasks.lending_missing_disposition_alert
 
-# Lending: is each call recording readable with our key? forbidden (permission off) ones are rechecked every 30 min.
-*/10 * * * * $PROJECT/scripts/cron/run.sh src.tasks.lending_recording_check
+# Lending: recording status is set when a call is stored (recorded / none); the old recording check
+# (src.tasks.lending_recording_check) was removed 2026-11: BatchDialer's recording link answers 404 for every call.
 
 # Lending 14-day follow-up (Runbook §4.1) — record calls made in GoHighLevel in lending.call_dispositions so every
 # attempt counts toward the LendingFlow replacement rule. No-op while LENDING_GHL_CALL_IMPORT_ENABLED=false.
@@ -1235,6 +1235,16 @@ COUNTY_ID=hillsborough
 # Lending retargeting audiences (Runbook § 4.7) — nightly hashed Google Customer Match / Meta Custom Audience files,
 # staged in LENDING_AUDIENCE_EXPORT_DIR, never uploaded. No-op until LENDING_AUDIENCE_EXPORT_ENABLED=true and the dir is set.
 15 8 * * * $PROJECT/scripts/cron/run.sh src.tasks.lending_audience_export
+
+# Lending nightly ledger export to Drive (Cora brief P1.2) — one CSV per table (contacts, consents, touches,
+# dispositions, outcomes, scores; no full phone/email) + manifest.json into NDL Ledger Exports/{yesterday ET}/, due by
+# 2:00 AM ET. 05:00 UTC = midnight EST / 1:00 AM EDT (run.sh retries ~05:15 / ~05:45). The 05:55 --retry run is the
+# last try: it shares the flock, so it waits for the main run and its retries to finish (no two runs at once), then
+# skips a finished day, else exports once more and alerts #cora if that fails (exit 0, so run.sh adds no repeats).
+# If the lock wait (50 min) runs out, --alert-stalled posts to #cora unless the day's manifest is in Drive.
+# No-op until LENDING_LEDGER_EXPORT_ENABLED=true and LENDING_LEDGER_EXPORT_FOLDER_ID is set.
+0 5 * * * flock /tmp/lending_ledger_export.lock $PROJECT/scripts/cron/run.sh src.tasks.lending_ledger_export
+55 5 * * * flock -w 3000 /tmp/lending_ledger_export.lock $PROJECT/scripts/cron/run.sh src.tasks.lending_ledger_export --retry || $PROJECT/scripts/cron/run.sh src.tasks.lending_ledger_export --alert-stalled
 
 # Lending 7:20pm ET scoreboard to Slack (Part 5.6; dialer stops 7:15pm). Two lines because ET is UTC-4 until Nov 1 and UTC-5 after; the task posts only when it is 19:xx ET.
 20 23 * * * $PROJECT/scripts/cron/run.sh src.tasks.lending_daily_scoreboard
@@ -1263,6 +1273,22 @@ COUNTY_ID=hillsborough
 # Cap 1000 credits/week, approved 2026-09-30. Scrubs only numbers loaded in the dialer.
 # Dry check first: PYTHONPATH=. python -m src.lending.weekly_scrub --dry-run
 0 6 * * 1 $PROJECT/scripts/cron/run.sh src.lending.weekly_scrub --max-credits 1000
+
+# Lending GHL call-list gate (G5): tags ndl-do-not-call-now on contacts on Josh's 8 GHL smart lists that cannot be
+# called now (attempt limit, calling hours, DNC result, emergency stop) and removes it when they can. Idle until
+# LENDING_GHL_CALL_GATE_ENABLED=true. Dry check first: PYTHONPATH=. python -m src.lending.ghl_call_gate --dry-run
+* * * * * $PROJECT/scripts/cron/run.sh src.lending.ghl_call_gate
+
+# Lending BatchDialer load -> GHL sync: every active dialer load (any pool, any loader) is upserted into the NDL GHL
+# account as a cold contact tagged with its call-list tag; warm/suppressed/unmapped skipped. Idle until
+# LENDING_GHL_LOAD_SYNC_ENABLED=true. Dry check first: PYTHONPATH=. python -m src.lending.ghl_load_sync --dry-run
+*/5 * * * * $PROJECT/scripts/cron/run.sh src.lending.ghl_load_sync
+
+# Lending DNC scrub of numbers on Josh's GHL lists (website and cold leads, never LendingFlow): scrubbed within the
+# hour, rescrubbed before the 7-day window ends. 1 Tracerfy credit per number, capped per run by
+# LENDING_GHL_LIST_SCRUB_MAX_CREDITS; exit 4 = cap reached. Idle until LENDING_GHL_LIST_SCRUB_ENABLED=true.
+# Dry check first: PYTHONPATH=. python -m src.lending.ghl_list_scrub --dry-run
+20 * * * * $PROJECT/scripts/cron/run.sh src.lending.ghl_list_scrub
 
 # Lending GHL opt-out backstop: every GHL contact with do-not-disturb on is suppressed in
 # lending, in case the GHL "DND changed" workflow webhook is missing or down. Idempotent.

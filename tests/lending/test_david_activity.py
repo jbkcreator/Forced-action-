@@ -160,3 +160,63 @@ def test_slack_text_lists_numbers_and_flagged_leads():
 def test_slack_text_without_flags_or_bookings():
     out = da.format_slack(da.DavidActivity(DAY, ghl_read_failed=True))
     assert "No leads flagged." in out and "Show rate –" in out and ":warning:" in out and "Talk time 0s" in out
+
+
+# ── Voicemails received and BatchDialer calls ───────────────────────────────
+
+def test_inbound_voicemail_is_not_talk_time():
+    a = da.DavidActivity(DAY)
+    da.count_messages(a, [_msg(da.CALL, direction="inbound", status="voicemail", duration=38)], DAVID, START, END)
+    assert (a.talk_seconds, a.voicemails_received, a.inbound_answered) == (0, 1, 0)
+
+
+class _BdDb(_Db):
+    def __init__(self, bd_row=(298, 22, 3600, 5, 9, 1), fail_bd=False):
+        super().__init__()
+        self.bd_row, self.fail_bd, self.sql = bd_row, fail_bd, []
+
+    def execute(self, sql, params=None):
+        text_sql = " ".join(str(sql).split())
+        self.sql.append((text_sql, params))
+        if "call_source = 'batchdialer'" in text_sql:
+            if self.fail_bd:
+                raise RuntimeError("down")
+            return type("R", (), {"one": lambda s: self.bd_row})()
+        return super().execute(sql, params)
+
+
+def _build(db, bd_agent_id):
+    post = lambda url, **kw: _Resp({"contacts": []})
+    get = lambda url, **kw: _Resp({"conversations": []})
+    return da.build_activity(db, DAY, user_id=DAVID, flagged_tag="", get=get, post=post, base="B", headers={},
+                             location_id="loc", bd_agent_id=bd_agent_id)
+
+
+def test_batchdialer_counts_credit_only_davids_connected_calls():
+    db = _BdDb()
+    a = _build(db, "118924")
+    assert (a.bd_dials, a.bd_connected, a.bd_talk_seconds, a.bd_voicemails_left, a.bd_callbacks,
+            a.bd_booked_reported) == (298, 22, 3600, 5, 9, 1)
+    sql, params = next((s, p) for s, p in db.sql if "call_source = 'batchdialer'" in s)
+    assert "caller_seat = :agent_id" in sql and params["agent_id"] == "118924"
+
+
+def test_no_bd_agent_id_skips_the_batchdialer_section():
+    db = _BdDb()
+    a = _build(db, "")
+    assert not any("call_source = 'batchdialer'" in s for s, _ in db.sql)
+    assert "BatchDialer" not in da.format_slack(a)
+
+
+def test_failed_batchdialer_read_is_flagged_and_keeps_the_rest():
+    a = _build(_BdDb(fail_bd=True), "118924")
+    assert a.bd_read_failed and a.bd_dials == 0 and (a.booked, a.held) == (4, 3)
+    assert "BatchDialer calls could not be read" in da.format_slack(a)
+
+
+def test_slack_text_shows_batchdialer_and_voicemails_received():
+    a = da.DavidActivity(DAY, bd_included=True, bd_dials=298, bd_connected=22, bd_talk_seconds=3600,
+                         voicemails_received=1)
+    out = da.format_slack(a)
+    assert "BatchDialer · Dials in his campaigns 298 · Connected 22 · Talk time 1h 0m" in out
+    assert "Voicemails received 1" in out

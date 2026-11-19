@@ -65,6 +65,7 @@ class SoftApprovalOutcome:
     approval_id: Optional[int]
     lender_key: Optional[str] = None
     subject_to_confirmation: bool = False
+    lead_ref: Optional[str] = None  # the LendingFlow lead the submission assessed
 
 
 def _money(value: Decimal) -> str:
@@ -149,16 +150,18 @@ def generate_soft_approval(
     lead_source = lead_source or default_lead_source()
     evaluator = evaluator or MatrixLenderFitEvaluator()
 
+    lead = lead_source.for_phone(db, phone)
+    lead_ref = lead.lead_ref if lead is not None else None
+
     def finish(status, reason, *, figures=None, lender_key=None, pdf=None, subject_to_confirmation=False):
         approval_id = save_soft_approval(
-            db, phone=phone, dialer_call_id=dialer_call_id, status=status, reason=reason, facts=facts,
-            figures=figures, lender_key=lender_key, pdf=pdf,
+            db, phone=phone, dialer_call_id=dialer_call_id, lead_ref=lead_ref, status=status, reason=reason,
+            facts=facts, figures=figures, lender_key=lender_key, pdf=pdf,
             template_version=TEMPLATE_VERSION if pdf else None, submitted_by=submitted_by,
         )
         logger.info("[soft-approval] call=%s status=%s reason=%s", dialer_call_id, status, reason)
-        return SoftApprovalOutcome(status, reason, approval_id, lender_key, subject_to_confirmation)
+        return SoftApprovalOutcome(status, reason, approval_id, lender_key, subject_to_confirmation, lead_ref)
 
-    lead = lead_source.for_phone(db, phone)
     if lead is None:
         return finish("no_lead", "no_lendingflow_lead")
     if not lead.has_core_fields():

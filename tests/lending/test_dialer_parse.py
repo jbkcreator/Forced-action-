@@ -37,7 +37,7 @@ def test_answer_status_is_not_an_unknown_code():
 def test_telephony_no_answer_maps_to_our_code():
     assert d.normalize_code("NO ANSWER") == ("NO_ANSWER", True)
     assert d.normalize_code("Busy") == ("NO_ANSWER", True)
-    assert d.normalize_code("FAILED") == ("CALL_FAILED", True)
+    assert d.normalize_code("FAILED") == ("NO_ANSWER", True)  # carrier failure, not a bad number (2026-11-03)
 
 
 def test_a_cdr_with_no_id_is_rejected():
@@ -66,22 +66,26 @@ def test_absolute_recording_url_is_unchanged():
     assert d.parse_event({**DOC_CDR, "callRecordUrl": "https://x/rec"}).recording_ref == "https://x/rec"
 
 
-# The 13 results created in BatchDialer (group "Lending"): 3 built-ins keep their own names.
+# The 10 results in BatchDialer (group "Lending") after the 2026-11-03 cut: 3 built-ins keep their own names.
 BATCHDIALER_RESULT_NAMES = {
     "No Answer": "NO_ANSWER",
     "LEFT_VOICEMAIL": "LEFT_VOICEMAIL",
     "BAD_NUMBER": "BAD_NUMBER",
-    "CALL_FAILED": "CALL_FAILED",
     "WRONG_PERSON": "WRONG_PERSON",
-    "NOT_DECISION_MAKER": "NOT_DECISION_MAKER",
     "REFERRED": "REFERRED",
     "Do Not Call": "DNC_REQUEST",
     "CONNECTED_NOT_INTERESTED": "CONNECTED_NOT_INTERESTED",
     "Call Back": "CALLBACK_REQUESTED",
-    "DATA_NURTURE_ONLY": "DATA_NURTURE_ONLY",
-    "GATE_FAILED_NURTURE": "GATE_FAILED_NURTURE",
+    "NURTURE": "NURTURE",
     "BOOKED": "BOOKED",
 }
+# Results of the old list, still sent until BatchDialer's Call Results are switched: kept as sent, never unknown.
+OLD_LIST_RESULT_NAMES = ("CALL_FAILED", "NOT_DECISION_MAKER", "DATA_NURTURE_ONLY", "GATE_FAILED_NURTURE")
+
+
+def test_old_list_results_stay_known():
+    for name in OLD_LIST_RESULT_NAMES:
+        assert d.normalize_code(name) == (name, True), name
 
 
 def test_every_result_created_in_batchdialer_maps_to_its_code():

@@ -19,6 +19,7 @@ from zoneinfo import ZoneInfo
 from config.lending_compliance import DEFAULT_TZ
 from config.lending_dispositions import DAVID_SUMMARY_HOUR_ET
 from config.settings import get_settings
+from src.lending.slack_channels import BOT_TOKEN, report_unset
 from src.lending.david_activity import build_activity, format_slack, ghl_transport
 from src.lending.db import lending_session
 from src.lending.ghl_account import lending_ghl_account
@@ -47,7 +48,7 @@ def main(argv=None, *, now: Optional[datetime] = None) -> int:
         return 1
     channel = s.lending_david_channel.strip()
     if not args.dry_run and not (channel and s.lending_slack_bot_token):
-        logger.error("[lending-david] summary not posted: LENDING_DAVID_CHANNEL or the Slack token is not configured")
+        report_unset("David's end-of-day recap", ("LENDING_DAVID_CHANNEL", BOT_TOKEN))
         return 1
     from src.services.ghl_webhook import _GHL_BASE
 
@@ -56,7 +57,8 @@ def main(argv=None, *, now: Optional[datetime] = None) -> int:
     try:
         with lending_session() as db:
             activity = build_activity(db, day, user_id=user_id, flagged_tag=s.lending_flagged_tag.strip(), get=get,
-                                      post=post, base=_GHL_BASE, headers=headers, location_id=account.location_id)
+                                      post=post, base=_GHL_BASE, headers=headers, location_id=account.location_id,
+                                      bd_agent_id=s.lending_david_bd_agent_id.strip())
         message = format_slack(activity, lambda cid: ghl_contact_url(s.lending_ghl_app_url, account.location_id, cid))
         if args.dry_run:
             logger.info("[lending-david] dry run for %s:\n%s", day, message)

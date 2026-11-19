@@ -241,11 +241,13 @@ def test_second_sweep_skips_while_the_first_holds_the_lock(db):
         other.close()
 
 
-def _ghl_call(db, phone, ended_at):
+def _ghl_call(db, phone, ended_at, disposition="CONNECTED_NOT_INTERESTED", raw=None, talk=None):
     db.execute(text("INSERT INTO lending.call_dispositions "
-                    "(dialer_call_id, call_source, phone, direction, call_ended_at, raw_event) "
-                    "VALUES (:cid, 'ghl', :p, 'outbound', :t, '{}')"),
-               {"cid": f"ghl-test-{uuid.uuid4().hex}", "p": phone, "t": ended_at})
+                    "(dialer_call_id, call_source, phone, direction, call_ended_at, disposition, disposition_raw, "
+                    " talk_duration_sec, raw_event) "
+                    "VALUES (:cid, 'ghl', :p, 'outbound', :t, :d, :raw, :talk, '{}')"),
+               {"cid": f"ghl-test-{uuid.uuid4().hex}", "p": phone, "t": ended_at, "d": disposition, "raw": raw,
+                "talk": talk})
 
 
 def test_a_loaded_phone_called_from_ghl_is_deleted_from_the_dialer_and_not_held(db):
@@ -256,6 +258,23 @@ def test_a_loaded_phone_called_from_ghl_is_deleted_from_the_dialer_and_not_held(
     assert result.moved_to_ghl == 1 and result.pulled == 0
     assert aircall.removed == [(PHONE, "ghl_calling")]
     assert _hold(db) is None  # a permanent handover, never a hold the sweep would restore
+
+
+def test_an_unanswered_ghl_call_leaves_the_phone_in_the_dialer(db):
+    """One calling rule: only a call that got through hands the number to GHL; a miss just counts as an attempt."""
+    _fresh_scrub(db, PHONE, NOON_LOCAL)
+    _ghl_call(db, PHONE, NOON_LOCAL - timedelta(hours=2), disposition="NO_ANSWER")  # 2 calls: under the 3/24 h cap
+    _ghl_call(db, PHONE, NOON_LOCAL - timedelta(minutes=30), disposition=None, raw="ghl:completed", talk=20)
+    aircall = FakeAircall()
+    assert _sweep(db, NOON_LOCAL, aircall).moved_to_ghl == 0
+    assert aircall.removed == []
+
+
+def test_a_ghl_call_answered_for_a_minute_with_no_result_posted_still_hands_the_number_over(db):
+    _fresh_scrub(db, PHONE, NOON_LOCAL)
+    _ghl_call(db, PHONE, NOON_LOCAL - timedelta(hours=1), disposition=None, raw="ghl:completed", talk=75)
+    aircall = FakeAircall()
+    assert _sweep(db, NOON_LOCAL, aircall).moved_to_ghl == 1
 
 
 def test_a_ghl_call_older_than_14_days_leaves_the_phone_in_the_dialer(db):

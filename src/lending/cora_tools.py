@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+from config.lending_standing_sends import CORA_EMAIL_TEMPLATE, CORA_SMS_TEMPLATE
 from collections.abc import Callable, Iterator, Mapping
 from contextlib import AbstractContextManager, contextmanager
 from dataclasses import dataclass
@@ -58,7 +59,13 @@ logger = logging.getLogger(__name__)
 STATEMENT_TIMEOUT = "5s"
 MAX_ROWS = 50
 _TZ = ZoneInfo(DEFAULT_TZ)
-_LEAD_REF = re.compile(r"^(web_lead|contact):(\d+)$")
+_LEAD_REF = re.compile(r"^(web_lead|lendingflow_lead|contact):(\d+)$")
+_LEAD_SQL = {
+    "web_lead": "SELECT name, phone, email, ghl_contact_id FROM lending.web_leads WHERE id = :id",
+    "lendingflow_lead": ("SELECT NULLIF(concat_ws(' ', first_name, last_name), '') AS name, phone, email, "
+                         "ghl_contact_id FROM lending.lendingflow_leads WHERE id = :id"),
+    "contact": "SELECT NULL AS name, phone, email, NULL AS ghl_contact_id FROM lending.contacts WHERE id = :id",
+}
 
 # Free-form SQL guard. The READ ONLY transaction is the hard stop for writes; these checks keep the
 # query inside the lending schema and away from server functions.
@@ -90,7 +97,7 @@ CONSENT_TEXT_HIDDEN = "[consent text not shown]"
 # (G4; docs/lending/ghl-conversation-ai.md hard rule 1). Enforced on the draft text itself, not just
 # asked of the model: the GL-10 reply-agent patterns (money, %, points, "rate ... N") plus ratios,
 # fees/payments, "400k" amounts and loan terms in months or years.
-BORROWER_MESSAGE_CHANNELS = frozenset({"ghl_sms", "ghl_email"})
+BORROWER_MESSAGE_CHANNELS = frozenset({"ghl_sms", "ghl_email", "instantly_email", "instantly_cold_email"})
 _DRAFT_NUMBER_PATTERNS = (
     *QUOTED_NUMBER_PATTERNS,
     r"\b\d+(?:\.\d+)?\s?k\b",                                                    # 400k
@@ -110,9 +117,23 @@ def borrower_draft_problem(fields: Mapping[str, str]) -> Optional[str]:
             "messages never quote numbers, even when a standing rule asks for it. Redraft without them")
 
 
+# The longest value each revisable GHL CRM field may hold, the same limits the draft tools' inputs enforce.
+CRM_FIELD_LIMITS: dict[str, tuple[str, int, str]] = {
+    "ghl_stage": ("stage", 100, "a stage name"),
+    "ghl_tag": ("tag", 60, "a tag"),
+    "ghl_note": ("body", 2000, "a note"),
+}
+
+
 def draft_content_check(channel: str, fields: Mapping[str, str]) -> Optional[str]:
-    """The same rule for a revised draft (``DraftReviser.content_check``)."""
-    return borrower_draft_problem(fields) if channel in BORROWER_MESSAGE_CHANNELS else None
+    """The same rules for a revised draft (``DraftReviser.content_check``)."""
+    if channel in BORROWER_MESSAGE_CHANNELS:
+        return borrower_draft_problem(fields)
+    if limit := CRM_FIELD_LIMITS.get(channel):
+        field, max_length, label = limit
+        if len((fields.get(field) or "").strip()) > max_length:
+            return f"{label} is at most {max_length} characters"
+    return None
 
 
 LENDING_TABLES_HELP = (
@@ -192,7 +213,7 @@ class DeactivateRuleInput(_Input):
 
 
 class DraftSmsInput(_Input):
-    lead_ref: str = Field(..., pattern=_LEAD_REF.pattern, description="From find_lead, e.g. web_lead:12.")
+    lead_ref: str = Field(..., pattern=_LEAD_REF.pattern, description="From find_lead, e.g. web_lead:12 or lendingflow_lead:56.")
     body: str = Field(..., min_length=1, max_length=600)
 
 
@@ -204,7 +225,20 @@ class DraftEmailInput(_Input):
 
 class DraftPipelineMoveInput(_Input):
     lead_ref: str = Field(..., pattern=r"^web_lead:\d+$", description="Only website leads are in GHL today.")
-    stage: str = Field(..., min_length=2, max_length=100, description="Target stage name in the Booked Calls pipeline.")
+    stage: str = Field(..., min_length=2, max_length=CRM_FIELD_LIMITS["ghl_stage"][1],
+                       description="Target stage name in the Booked Calls pipeline.")
+
+
+class DraftAddTagInput(_Input):
+    lead_ref: str = Field(..., pattern=r"^web_lead:\d+$", description="Only website leads are in GHL today.")
+    tag: str = Field(..., min_length=1, max_length=CRM_FIELD_LIMITS["ghl_tag"][1], pattern=r"\S",
+                     description="One GoHighLevel tag.")
+
+
+class DraftAddNoteInput(_Input):
+    lead_ref: str = Field(..., pattern=r"^web_lead:\d+$", description="Only website leads are in GHL today.")
+    body: str = Field(..., min_length=1, max_length=CRM_FIELD_LIMITS["ghl_note"][1], pattern=r"\S",
+                      description="Internal note text.")
 
 
 class InboxListInput(_Input):
@@ -355,13 +389,20 @@ def relations_outside_schema(plan: Any, schema: str = "lending") -> set[str]:
     return found
 
 
+def _crm_draft(lead: _Lead, channel: str, fields: dict[str, str], summary: str) -> EgressDraft:
+    """A GHL CRM write held for approval, aimed at the lead's GHL contact."""
+    return EgressDraft(channel=channel, payload={"lead_ref": lead.ref, "ghl_contact_id": lead.ghl_contact_id, **fields},
+                       summary=summary, recipient_phone=lead.phone, recipient_email=lead.email, contact_ref=lead.ref)
+
+
 class CoraToolkit:
     def __init__(self, engine: Engine, memory: AgentMemory,
                  campaign_names: Optional[Mapping[str, str]] = None, *,
                  channels: Optional[ChannelDirectory] = None,
                  inbox_session: Optional[Callable[[], AbstractContextManager[Session]]] = None,
                  attempt_messages: Optional[MessageReader] = None,
-                 attempt_recordings: Optional[RecordingCheck] = None) -> None:
+                 attempt_recordings: Optional[RecordingCheck] = None,
+                 ledger_manifest: Optional[Callable[[], Optional[dict]]] = None) -> None:
         """``channels`` is the channels Cora's bot is in: listed, read and routed to. ``inbox_session``
         overrides where the inbox tools read and write; tests pass their rolled-back session.
         ``attempt_messages`` reads a lead's GHL messages for the attempt log (None: calls only);
@@ -373,6 +414,7 @@ class CoraToolkit:
         self._inbox_session = inbox_session
         self._attempt_messages = attempt_messages
         self._attempt_recordings = attempt_recordings
+        self._ledger_manifest = ledger_manifest
 
     @contextmanager
     def _inbox(self) -> Iterator[Session]:
@@ -446,6 +488,13 @@ class CoraToolkit:
                     OR (CAST(:email AS text) IS NOT NULL AND w.email = :email)
                     OR (CAST(:name AS text) IS NOT NULL AND w.name ILIKE :name)
                 UNION ALL
+                SELECT 'lendingflow_lead:' || l.id, NULLIF(concat_ws(' ', l.first_name, l.last_name), ''), l.phone,
+                       l.email, l.received_at, l.loan_type, l.property_city, NULL, l.ghl_contact_id IS NOT NULL
+                  FROM lending.lendingflow_leads l
+                 WHERE (CAST(:phone AS text) IS NOT NULL AND l.phone = :phone)
+                    OR (CAST(:email AS text) IS NOT NULL AND lower(l.email) = :email)
+                    OR (CAST(:name AS text) IS NOT NULL AND concat_ws(' ', l.first_name, l.last_name) ILIKE :name)
+                UNION ALL
                 SELECT 'contact:' || c.id, NULL, c.phone, c.email, c.created_at, NULL, NULL, NULL, false
                   FROM lending.contacts c
                  WHERE (CAST(:phone AS text) IS NOT NULL AND c.phone = :phone)
@@ -455,7 +504,15 @@ class CoraToolkit:
             phones = sorted({lead["phone"] for lead in leads if lead["phone"]})
             status = {row["phone"]: row for row in session.execute(text("""
                 SELECT p.phone,
-                       EXISTS (SELECT 1 FROM lending.text_consents t WHERE t.phone = p.phone AND t.revoked_at IS NULL) AS text_consent,
+                       -- the send check's rule (consent.has_text_consent): recorded consent, or a LendingFlow lead
+                       -- with no revoked consent (client decision Nov 3); never while suppressed or do-not-contact
+                       ((EXISTS (SELECT 1 FROM lending.text_consents t WHERE t.phone = p.phone AND t.revoked_at IS NULL)
+                         OR (EXISTS (SELECT 1 FROM lending.lendingflow_leads l WHERE l.phone = p.phone)
+                             AND NOT EXISTS (SELECT 1 FROM lending.text_consents t
+                                              WHERE t.phone = p.phone AND t.revoked_at IS NOT NULL)))
+                        AND NOT EXISTS (SELECT 1 FROM lending.suppression_list s WHERE s.phone = p.phone)
+                        AND NOT EXISTS (SELECT 1 FROM lending.contacts c WHERE c.phone = p.phone AND c.do_not_contact))
+                         AS text_consent,
                        EXISTS (SELECT 1 FROM lending.suppression_list s WHERE s.phone = p.phone) AS suppressed,
                        EXISTS (SELECT 1 FROM lending.contacts c WHERE c.phone = p.phone AND c.do_not_contact) AS do_not_contact,
                        (SELECT json_build_object('ended_at', d.call_ended_at, 'caller', d.caller_name,
@@ -661,10 +718,9 @@ class CoraToolkit:
     def _lead(self, lead_ref: str) -> _Lead:
         match = _LEAD_REF.match(lead_ref)
         if not match:
-            raise ToolInputError("lead_ref must look like web_lead:12 or contact:34")
+            raise ToolInputError("lead_ref must look like web_lead:12, lendingflow_lead:56 or contact:34")
         kind, lead_id = match.group(1), int(match.group(2))
-        sql = ("SELECT name, phone, email, ghl_contact_id FROM lending.web_leads WHERE id = :id" if kind == "web_lead"
-               else "SELECT NULL AS name, phone, email, NULL AS ghl_contact_id FROM lending.contacts WHERE id = :id")
+        sql = _LEAD_SQL[kind]
         with self._read_only() as session:
             row = session.execute(text(sql), {"id": lead_id}).mappings().first()
             # A contact row has no name: take it from the lead record that holds the same phone.
@@ -682,7 +738,8 @@ class CoraToolkit:
         lead = self._lead(args.lead_ref)
         if not lead.phone:
             raise ToolInputError(f"{lead.ref} has no phone number on record")
-        return EgressDraft(channel="ghl_sms", payload={"lead_ref": lead.ref, "to_phone": lead.phone, "body": args.body},
+        return EgressDraft(channel="ghl_sms", payload={"lead_ref": lead.ref, "to_phone": lead.phone, "body": args.body,
+                                                       "template_version": CORA_SMS_TEMPLATE},
                            summary=f"Text to {_who(lead)} ({_last4(lead.phone)})",
                            recipient_phone=lead.phone, recipient_email=lead.email, contact_ref=lead.ref)
 
@@ -694,18 +751,39 @@ class CoraToolkit:
             raise ToolInputError(f"{lead.ref} has no email address on record")
         return EgressDraft(channel="ghl_email",
                            payload={"lead_ref": lead.ref, "to_email": lead.email, "to_phone": lead.phone,
-                                    "subject": args.subject, "body": args.body},
+                                    "subject": args.subject, "body": args.body,
+                                    "template_version": CORA_EMAIL_TEMPLATE},
                            summary=f"Email to {_who(lead)} <{lead.email}>: {args.subject}",
                            recipient_phone=lead.phone, recipient_email=lead.email, contact_ref=lead.ref)
 
     def draft_pipeline_move(self, args: DraftPipelineMoveInput, _: ToolContext) -> EgressDraft:
-        lead = self._lead(args.lead_ref)
+        lead = self._lead_in_ghl(args.lead_ref)
+        return _crm_draft(lead, "ghl_stage", {"stage": args.stage}, f"Move {_who(lead)} to '{args.stage}' in GoHighLevel")
+
+    def _lead_in_ghl(self, lead_ref: str) -> _Lead:
+        lead = self._lead(lead_ref)
         if not lead.ghl_contact_id:
-            raise ToolInputError(f"{lead.ref} has not reached GoHighLevel yet, so it has no pipeline card to move")
-        return EgressDraft(channel="ghl_stage",
-                           payload={"lead_ref": lead.ref, "ghl_contact_id": lead.ghl_contact_id, "stage": args.stage},
-                           summary=f"Move {_who(lead)} to '{args.stage}' in GoHighLevel",
-                           recipient_phone=lead.phone, recipient_email=lead.email, contact_ref=lead.ref)
+            raise ToolInputError(f"{lead.ref} has not reached GoHighLevel yet, so there is no contact to update")
+        return lead
+
+    def draft_add_tag(self, args: DraftAddTagInput, _: ToolContext) -> EgressDraft:
+        lead, tag = self._lead_in_ghl(args.lead_ref), args.tag.strip()
+        return _crm_draft(lead, "ghl_tag", {"tag": tag}, f"Tag {_who(lead)} with '{tag}' in GoHighLevel")
+
+    def draft_add_note(self, args: DraftAddNoteInput, _: ToolContext) -> EgressDraft:
+        lead = self._lead_in_ghl(args.lead_ref)
+        return _crm_draft(lead, "ghl_note", {"body": args.body.strip()}, f"Add a note to {_who(lead)} in GoHighLevel")
+
+    def ledger_export_status(self, _: NoInput, __: ToolContext) -> dict[str, Any]:
+        """The newest nightly ledger export in Drive (P1.2): its day and the row count of each file."""
+        if self._ledger_manifest is None:
+            return {"status": "not configured"}
+        try:
+            found = self._ledger_manifest()
+        except Exception as exc:  # Drive errors can embed ids; the class is enough to diagnose
+            logger.warning("[cora] ledger manifest read failed (%s)", type(exc).__name__)
+            return {"status": "unreadable", "error": type(exc).__name__}
+        return {"status": "found", **found} if found else {"status": "no export yet"}
 
     def tools(self) -> list[Tool]:
         read, write, egress = SafetyLevel.READ_ONLY, SafetyLevel.INTERNAL_WRITE, SafetyLevel.EXTERNAL_EGRESS
@@ -732,6 +810,9 @@ class CoraToolkit:
                  "SELECT over lending.* tables.", QueryInput, read, self.query_lending_data),
             Tool("save_standing_rule", "Save a standing rule an approver stated, so it applies to every future "
                  "conversation.", SaveRuleInput, write, self.save_rule, approver_only=True),
+            Tool("get_ledger_export_status", "The newest nightly ledger export the agents read from Drive (NDL "
+                 "Ledger Exports): which day it covers and how many rows each CSV holds.", NoInput, read,
+                 self.ledger_export_status),
             Tool("list_standing_rules", "List the standing rules currently in force.", NoInput, read, self.list_rules),
             Tool("deactivate_standing_rule", "Stop applying a standing rule (by memory_id from list_standing_rules).",
                  DeactivateRuleInput, write, self.deactivate_rule, approver_only=True),
@@ -754,4 +835,9 @@ class CoraToolkit:
                  DraftEmailInput, egress, self.draft_email),
             Tool("draft_pipeline_move", "Draft moving a website lead to another GoHighLevel pipeline stage. Held for "
                  "approval; nothing changes until approved.", DraftPipelineMoveInput, egress, self.draft_pipeline_move),
+            Tool("draft_add_tag", "Draft adding one tag to a website lead's GoHighLevel contact (existing tags are "
+                 "kept). Held for approval; nothing changes until approved.", DraftAddTagInput, egress,
+                 self.draft_add_tag),
+            Tool("draft_add_note", "Draft adding an internal note to a website lead's GoHighLevel contact. Held "
+                 "for approval; nothing changes until approved.", DraftAddNoteInput, egress, self.draft_add_note),
         ]

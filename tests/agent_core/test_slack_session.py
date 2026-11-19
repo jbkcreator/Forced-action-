@@ -205,6 +205,20 @@ def test_approval_blocked_at_send_says_why(config, queue, halt, executor: Record
     assert "no text consent" in harness.chat.updates[-1]["text"]
 
 
+def test_approval_deferred_at_send_says_it_will_send_later(config, queue, halt, executor: RecordingExecutor) -> None:
+    from packages.agent_core.relay import SendDeferred
+
+    relay = Relay(queue, halt, {"ghl_sms": executor},
+                  send_check=lambda action: SendDeferred("outside the recipient's 8am-8pm window"))
+    harness = Harness(config, queue, halt, relay)
+    action_id = enqueue_sms(queue)
+    harness.click(APPROVER, str(action_id))
+    assert executor.sent == [] and queue.get(action_id).status is ActionStatus.APPROVED
+    text = harness.chat.updates[-1]["text"]
+    assert "Approved, waiting to send" in text and "8am-8pm" in text
+    assert "Already handled elsewhere" not in text
+
+
 def test_expired_drafts_lose_their_buttons(harness: Harness, queue: PendingActionQueue, clock: Clock) -> None:
     with_card = enqueue_sms(queue, ttl=timedelta(hours=1))
     queue.attach_card(with_card, "C_CORA", "777.7")

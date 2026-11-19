@@ -1,4 +1,7 @@
-"""Text-consent evidence (client Q27). A number is textable only with a live, unrevoked row and no opt-out."""
+"""Text-consent evidence (client Q27). A number is textable only with a live, unrevoked row and no opt-out.
+
+Every LendingFlow lead counts as having agreed to texts (client decision) without a row, unless a consent row for
+that number was revoked (STOP or a soft decline) or the number is opted out."""
 from __future__ import annotations
 
 import logging
@@ -42,7 +45,9 @@ def has_text_consent(db, phone: str) -> bool:
     if not norm:
         return False
     return bool(db.execute(
-        text("SELECT EXISTS (SELECT 1 FROM lending.text_consents WHERE phone = :p AND revoked_at IS NULL) "
+        text("SELECT (EXISTS (SELECT 1 FROM lending.text_consents WHERE phone = :p AND revoked_at IS NULL) "
+             "      OR (EXISTS (SELECT 1 FROM lending.lendingflow_leads WHERE phone = :p) "
+             "          AND NOT EXISTS (SELECT 1 FROM lending.text_consents WHERE phone = :p AND revoked_at IS NOT NULL))) "
              "AND NOT EXISTS (SELECT 1 FROM lending.suppression_list WHERE phone = :p) "
              "AND NOT EXISTS (SELECT 1 FROM lending.contacts WHERE phone = :p AND do_not_contact)"),
         {"p": norm},
