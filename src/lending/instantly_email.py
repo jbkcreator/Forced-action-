@@ -41,7 +41,7 @@ import requests
 
 from config.lending_compliance import UNSUBSCRIBE_PATH
 from config.settings import get_settings
-from packages.agent_core.lane_guard import lane_violation
+from packages.agent_core.lane_guard import LaneViolation, lane_violation
 from src.lending.global_halt import is_globally_halted
 from src.lending.instantly_client import lending_instantly_account
 from src.services.email_unsubscribe import unsubscribe_url
@@ -58,6 +58,12 @@ Request = Callable[..., Any]
 
 class InstantlySendError(RuntimeError):
     """The email was not handed to Instantly (or the outcome is unknown). Never holds an address."""
+
+
+class InstantlyLaneBlock(InstantlySendError, LaneViolation):
+    """The Backflip check refused the email after the footer was added. A kind of send error (existing callers keep
+    catching it) that the relay recognises as a lane block: the action is stored as blocked with the standard
+    ``BACKFLIP_LANE`` reason, so the Backflip digest finds it."""
 
 
 @dataclass(frozen=True)
@@ -167,7 +173,7 @@ class NdlInstantlySender:
         if lane_violation({"subject": subject, "body": html}) is not None:  # the footer added here is scanned too
             logger.error("%s SECURITY: email blocked by the Backflip check (footer included); nothing sent",
                          self._log_prefix)
-            raise InstantlySendError("the email, with its footer, names Backflip; nothing sent")
+            raise InstantlyLaneBlock("the email, with its footer, names Backflip; nothing sent")
         self._remove_previous_lead(email)
         self._refuse_if_halted("send")  # again: a halt can be set while the lookup runs
         result = self._call("send", "POST", "/api/v2/leads/add", json={

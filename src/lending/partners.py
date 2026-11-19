@@ -302,6 +302,21 @@ class ConsentEvidence:
     user_agent: Optional[str]
 
 
+_STATUS_EVENT = text("INSERT INTO lending.loan_file_status_events (loan_file_id, status, reason, at) "
+                     "VALUES (:file_id, :status, :reason, :at)")
+
+
+def _record_status_event(db, file_id: int, status: str, reason: Optional[str], at: datetime) -> None:
+    """One history row per status change, in the same transaction (a savepoint, so a missing table or a failed write
+    never undoes the status change itself: it is logged). The nightly ledger export reads these rows."""
+    try:
+        with db.begin_nested():
+            db.execute(_STATUS_EVENT, {"file_id": file_id, "status": status, "reason": (reason or None) and reason[:200],
+                                       "at": at})
+    except Exception as exc:  # class only
+        logger.error("[partners] status event for file %s not recorded (%s)", file_id, type(exc).__name__)
+
+
 def save_submission(db, partner: Partner, data: SubmissionInput, uploads: Sequence[Upload], *,
                     consent: ConsentEvidence, upload_dir: str, now: Optional[datetime] = None) -> int:
     """Store the file, the partner's consent evidence and the uploads. Returns the loan file id.
@@ -328,6 +343,7 @@ def save_submission(db, partner: Partner, data: SubmissionInput, uploads: Sequen
          "projects": data.completed_projects, "band": data.credit_band, "timeline": data.timeline,
          "notes": data.notes, "occupancy": data.occupancy, "now": now},
     ).scalar_one())
+    _record_status_event(db, file_id, "received", None, now)
     db.execute(
         text("INSERT INTO lending.partner_submissions (file_id, partner_id, consent_checked, consent_text, "
              "consented_at, ip_address, page_url, user_agent, created_at) VALUES (:file_id, :partner_id, :checked, "
@@ -394,6 +410,8 @@ def record_status_change(db, file_id: int, status: str, reason: Optional[str] = 
         {"status": status, "reason": (reason or None) and reason[:200], "now": now, "id": file_id,
          "notify": status in PARTNER_NOTIFY_STATUSES},
     )
+    if result.rowcount == 1:
+        _record_status_event(db, file_id, status, reason, now)
     if result.rowcount != 1 or status not in PARTNER_NOTIFY_STATUSES:
         return None
     row = db.execute(

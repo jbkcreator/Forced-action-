@@ -248,3 +248,50 @@ def test_morning_post_escapes_caller_supplied_slack_markup():
     pin = PinnedCall(12, parse_intake({**BODY, "first_name": "<!channel>"}, now=NOW))
     message = format_slack([MorningReply(pin, 7)])
     assert "<!channel>" not in message and "&lt;!channel&gt;" in message
+
+
+# ── a blocked voicemail reply is described as blocked, not as missing consent or waiting for approval ──
+
+def _pin():
+    return PinnedCall(12, parse_intake(BODY, now=NOW))
+
+
+def test_a_blocked_reply_is_flagged_blocked_in_the_digest_line():
+    from src.tasks.lending_pinned_callbacks import _line
+
+    pin = _pin()
+    blocked = MorningReply(pin, None, blocked=True)
+    assert "blocked by the Backflip check" in _line(blocked, {}) and "no card" in _line(blocked, {})
+    assert "no text consent" not in _line(blocked, {}) and "waiting for Approve" not in _line(blocked, {})
+    assert "no text consent" in _line(MorningReply(pin, None), {})
+    assert "waiting for Approve" in _line(MorningReply(pin, 7), {})
+
+
+def test_a_blocked_draft_found_on_a_repost_is_still_blocked_not_waiting_for_approval():
+    from types import SimpleNamespace
+
+    pin = _pin()
+    key = pin.event.call_key
+
+    class Db:
+        def execute(self, statement, params=None):
+            sql = str(statement)
+            if "idempotency_key" in sql:
+                return SimpleNamespace(all=lambda: [(key, 41, "blocked")])
+            raise AssertionError("no other query is needed for an already drafted call")
+
+    replies = draft_morning_replies(Db(), [pin], queue=None, drafter=lambda *a: "x")
+    assert [(r.action_id, r.blocked) for r in replies] == [(None, True)]
+
+
+def test_an_existing_pending_draft_is_still_waiting_for_approval():
+    from types import SimpleNamespace
+
+    pin = _pin()
+
+    class Db:
+        def execute(self, statement, params=None):
+            return SimpleNamespace(all=lambda: [(pin.event.call_key, 41, "pending")])
+
+    replies = draft_morning_replies(Db(), [pin], queue=None, drafter=lambda *a: "x")
+    assert [(r.action_id, r.blocked) for r in replies] == [(41, False)]

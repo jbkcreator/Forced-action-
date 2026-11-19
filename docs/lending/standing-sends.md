@@ -70,8 +70,7 @@ recommendation for open question P1.4 #1, not Josh's answer.
 
 Turning the switch on does not revoke a type that already graduated: only the send-time check becomes stricter. A type that graduated
 under the old rule but is over the limit once rejections count goes back to approval cards for new jobs (the tracker still shows it as
-graduated until it is revoked with `--revoke`), and an action already approved automatically but not yet sent is held until its draft
-expires. The rate stored with a graduation (`edit_rate`) is the rate the decision used.
+graduated until it is revoked with `--revoke`), and an action already approved automatically but not yet sent goes back for a person's approval on the next sweep. The rate stored with a graduation (`edit_rate`) is the rate the decision used.
 
 ## A graduated message sends only approved wording (off until Josh confirms)
 
@@ -86,3 +85,8 @@ The wording check also runs when the message is sent, not only when its draft is
 queued (for example waiting for its send window) before the switch was turned on is re-checked just before it goes out, and one whose
 wording is not approved wording is sent back for a person's approval instead of sending: the relay has claimed it, the send check returns
 it to pending with no decision, and the card retry posts a fresh approval card on the next sweep.
+
+The recovery sweep and the send-time check use the same rule: an automatically approved, still unsent action goes back for a person's
+approval (no decision, no card; the card retry posts a fresh approval card) when its template has no active graduation **or its
+channel no longer meets the rule** (25 person approvals on that channel, under 10% edited). So a draft whose channel lapsed while it
+was queued is not deferred until it expires.

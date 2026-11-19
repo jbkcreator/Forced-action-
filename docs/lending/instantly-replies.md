@@ -146,3 +146,11 @@ retried with a growing wait (1 minute doubling to 1 hour); an address Instantly 
 tries the row is marked `failed` and an `instantly_block_failed` item (no address) goes to Cora's inbox so a person adds it by hand.
 A `failed` row, or one `done` more than a day ago, is queued again by a new opt-out for the same address. Rows stay pending while `LENDING_INSTANTLY_API_KEY` is unset. **Run `migrations/apply_lending_instantly_block_queue.py` before
 deploying**: without the table an opt-out is still recorded, but its address is not queued.
+
+
+**A callback request or a number correction is not a STOP.** Wording that only *could* mean stop ("remove my number", "delete my info", "take my
+email off") is not suppressed on the spot when the same reply asks us to call, text or reach the lead ("call me at my new number", "give me a
+call", "my new number is ..."): it goes to triage, where the model decides (a real stop in wording the phrases miss is still suppressed by
+Cora's sweep). The guard never applies to a clear stop: a strict phrase ("remove me", "remove my email address from your list", "take my number
+off your list", "unsubscribe", "this is spam"), or a negated contact verb in the same reply ("delete my info, don't call me", "never call me
+again"), is still suppressed within seconds, whatever else the reply says.

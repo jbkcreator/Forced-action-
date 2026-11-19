@@ -14,7 +14,7 @@ from enum import Enum
 from typing import Any
 
 from .halt import HaltSwitch
-from .lane_guard import lane_block_reason, lane_violation
+from .lane_guard import LANE_BLOCK_PREFIX, LaneViolation, lane_block_reason, lane_violation
 from .pending_actions import ActionStatus, PendingAction, PendingActionQueue, payload_deadline
 
 logger = logging.getLogger(__name__)
@@ -120,6 +120,13 @@ class Relay:
 
         try:
             provider_ref = executor(action.payload)
+        except LaneViolation as exc:
+            # An executor that finds a Backflip name only in what it adds (a footer): blocked, not failed, with the
+            # standard reason so the Backflip block alerts find it. Nothing was sent.
+            reason = f"{LANE_BLOCK_PREFIX}: {exc}"
+            logger.error("relay SECURITY: action %s blocked by its executor's lane check; nothing sent", action_id)
+            self._queue.mark_blocked(action_id, reason)
+            return DispatchResult(DispatchOutcome.BLOCKED, reason)
         except Exception as exc:
             # Payload values can carry contact details; log the id and the error type only.
             logger.error("relay: executor for %s failed on action %s (%s)", action.channel, action_id,

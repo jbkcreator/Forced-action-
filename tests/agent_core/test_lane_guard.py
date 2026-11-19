@@ -170,3 +170,27 @@ def test_relay_block_always_writes_the_security_log(queue: PendingActionQueue, r
         result = relay.dispatch(action_id)
     assert result.outcome is DispatchOutcome.BLOCKED and result.reason == lane_block_reason("blocked_domain")
     assert "SECURITY" in caplog.text and executor.sent == []
+
+
+def test_an_executor_that_finds_a_backflip_name_in_what_it_adds_is_a_block_not_a_failure(queue: PendingActionQueue,
+                                                                                         halt, caplog) -> None:
+    from packages.agent_core.lane_guard import LANE_BLOCK_PREFIX, LaneViolation
+
+    executor = RecordingExecutor(error=LaneViolation("the email, with its footer, names Backflip; nothing sent"))
+    relay = Relay(queue, halt, {"ghl_sms": executor})
+    action_id = enqueue_sms(queue, "Hi Sam, Josh here.")  # the draft itself is clean
+    queue.approve(action_id, APPROVER)
+    with caplog.at_level(logging.ERROR):
+        result = relay.dispatch(action_id)
+    assert result.outcome is DispatchOutcome.BLOCKED and result.reason.startswith(LANE_BLOCK_PREFIX)
+    action = queue.get(action_id)
+    assert action.status is ActionStatus.BLOCKED and action.error.startswith(LANE_BLOCK_PREFIX)
+    assert "SECURITY" in caplog.text and executor.sent == []
+
+
+def test_an_ordinary_executor_error_is_still_a_failed_send(queue: PendingActionQueue, halt) -> None:
+    relay = Relay(queue, halt, {"ghl_sms": RecordingExecutor(error=RuntimeError("provider down"))})
+    action_id = enqueue_sms(queue, "Hi Sam, Josh here.")
+    queue.approve(action_id, APPROVER)
+    assert relay.dispatch(action_id).outcome is DispatchOutcome.FAILED
+    assert queue.get(action_id).status is ActionStatus.FAILED
