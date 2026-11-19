@@ -39,6 +39,7 @@ from packages.agent_core.redaction import mask_emails
 from src.lending.compliance import propagate_opt_out
 from src.lending.cora_inbox import add_to_inbox_safely, slack_safe
 from src.lending.cora_tools import borrower_draft_problem
+from src.lending.web_leads import DeliveryError
 
 logger = logging.getLogger(__name__)
 
@@ -226,6 +227,12 @@ _SUPPRESSED = text("""
 """)
 
 
+_EMAIL_SUPPRESSED = text("""
+    SELECT EXISTS (SELECT 1 FROM lending.suppression_list WHERE email = :e)
+        OR EXISTS (SELECT 1 FROM email_opt_outs WHERE email = :e)
+""")
+
+
 def suppress_reply(db, reply_id: int) -> Optional[int]:
     """Record the opt-out for a STOP reply or an unsubscribe; returns the opt-out event id (None when it was already
     recorded). Idempotent per Instantly event. Does not commit."""
@@ -387,7 +394,8 @@ class ReplyProcessor:
     def __init__(self, *, session_factory: Callable[[], Any], client: Any, model: str, enqueue: Enqueue,
                  post_card: PostCard, post_triage: Poster, post_notice: Poster,
                  rules: Callable[[], list[str]] = lambda: [],
-                 block_address: Blocker = lambda email: False) -> None:
+                 block_address: Blocker = lambda email: False,
+                 hand_off: Optional[Callable[[Mapping[str, Any]], Any]] = None) -> None:
         self._session_factory = session_factory
         self._client = client
         self._model = model
@@ -397,6 +405,7 @@ class ReplyProcessor:
         self._post_notice = post_notice
         self._rules = rules
         self._block_address = block_address
+        self._hand_off = hand_off
 
     def run(self, limit: int = BATCH_SIZE) -> SweepResult:
         result = SweepResult()
@@ -469,7 +478,30 @@ class ReplyProcessor:
                     error = "the drafted answer names Backflip, so the send gate blocked it"
             else:
                 error = "reply has no Instantly inbox or email id, so it cannot be answered in the thread"
+        if triage.intent == "deal" and self._hand_off is not None:
+            self._hand_off_deal(db, row)
         self._finish(db, row, triage, action_id, error, result)
+
+    def _hand_off_deal(self, db, row: Mapping[str, Any]) -> None:
+        """A Deal reply becomes a GHL contact and pipeline card. Best effort: a failure never stops the reply being
+        triaged and answered; it is raised to Cora's inbox so the team adds the contact by hand."""
+        try:
+            with db.begin_nested():  # a failed read must not abort the sweep's transaction
+                opted_out = bool(db.execute(_EMAIL_SUPPRESSED, {"e": row["lead_email"].strip().lower()}).scalar())
+            if opted_out:
+                logger.info("[instantly-replies] reply %s not handed to GHL: the address has opted out", row["id"])
+                return
+            if self._hand_off is not None:
+                self._hand_off(row)
+        except Exception as exc:  # the step name and status carry no address; the class alone for anything else
+            detail = str(exc)[:120] if isinstance(exc, DeliveryError) else type(exc).__name__
+            logger.error("[instantly-replies] reply %s not handed to GHL (%s)", row["id"], detail)
+            add_to_inbox_safely(
+                db, event_type="instantly_ghl_handoff_failed", dedup_key=str(row["id"]), target_channel="ops",
+                summary=f"A Deal reply from {mask_emails(row['lead_email'])} may be only partly in GHL ({detail}): "
+                        "check the contact, its tag and the pipeline card, and finish by hand",
+                payload={"instantly_reply_id": row["id"], "email_masked": mask_emails(row["lead_email"]),
+                         "error": detail})
 
     def _suppress_model_stop(self, db, row: Mapping[str, Any], triage: Triage, result: SweepResult) -> None:
         """A stop request in wording the phrase check missed: marked as a STOP first, so a failed opt-out is retried

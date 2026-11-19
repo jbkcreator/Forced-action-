@@ -58,6 +58,7 @@ from src.lending.global_halt import EmergencyHalt
 from src.lending.ghl_crm import GhlCrmWriter, get_crm_writer
 from src.lending.ghl_email import GhlEmailSender, get_email_sender
 from src.lending.ghl_sms import GhlSmsSender, get_sender
+from src.lending.instantly_ghl_handoff import get_handoff
 from src.lending.instantly_client import InstantlyAccount, block_address, lending_instantly_account, send_reply
 from src.lending.instantly_email import NdlInstantlySender, get_ndl_instantly_sender
 from src.lending.instantly_replies import CHANNEL as INSTANTLY_CHANNEL, ReplyProcessor
@@ -636,7 +637,8 @@ def make_instantly_replies(engine: Engine, store: AgentStore, config: AgentCoreC
         session_factory=lambda: Session(engine), client=messages_client, model=config.model, enqueue=lane_checked_enqueue(queue),
         post_card=gate.post_card, post_triage=post_replies_notice, post_notice=post_ops_notice,
         rules=lambda: [rule.rule_text for rule in memory.active_rules()],
-        block_address=(lambda email: block_address(instantly, email)) if instantly else (lambda email: False))
+        block_address=(lambda email: block_address(instantly, email)) if instantly else (lambda email: False),
+        hand_off=get_handoff())
     return processor.run
 
 
