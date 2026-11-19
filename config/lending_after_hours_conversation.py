@@ -12,6 +12,10 @@ CHANNEL_SMS = "sms"
 CHANNEL_EMAIL = "email"
 CHANNELS = (CHANNEL_SMS, CHANNEL_EMAIL)
 
+# What opened a conversation (``source``). A voicemail keeps the source its webhook names (default ghl_voicemail).
+SOURCE_INBOUND_TEXT = "inbound_text"  # a text from the lead outside Josh's hours, with no conversation open
+SOURCE_WEB_FORM = "web_form"  # a website lead who ticked the text box, submitted outside Josh's hours
+
 # One state per question, in the order asked; the wording below is indexed the same way.
 QUESTION_STATES = ("question_1", "question_2", "question_3")
 SLOT_CHOICE = "slot_choice"  # the slots have been offered; waiting for the lead to pick one
@@ -87,6 +91,11 @@ OFFERED_SLOT_COUNT = 3
 MAX_SLOT_REPROMPTS = 2
 # A reply after this long is no longer part of the conversation: the morning shift has taken over by then.
 CONVERSATION_TTL_HOURS = 12
+# On a contact's GHL record while its conversation is open; the GHL Conversation AI workflow skips contacts with it,
+# so the lead never gets two answers. Removed once the conversation is booked, closed or expired.
+GHL_TAG_NIGHT_CONVERSATION = "ndl-night-conversation"
+TAG_SYNC_BATCH_SIZE = 50  # tag adds (and removals) per pass
+
 # Message ids already applied, kept so a redelivered webhook changes nothing. A conversation has only a handful
 # of inbound messages, so the list is capped well above that.
 HANDLED_MESSAGE_IDS_KEPT = 50

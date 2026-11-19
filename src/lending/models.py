@@ -1567,6 +1567,8 @@ class LendingAfterHoursConversation(LendingBase):
     sending_claimed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
     send_attempts: Mapped[int] = mapped_column(SmallInteger, nullable=False, default=0, server_default=text("0"))
     sent_messages: Mapped[list] = mapped_column(JSONB, nullable=False, default=list, server_default=text("'[]'::jsonb"))
+    ghl_tagged_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))  # night tag added in GHL
+    ghl_untagged_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))  # and removed
     opened_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_now, server_default=text("now()"))
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_now, server_default=text("now()"))
     expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)

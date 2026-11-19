@@ -28,7 +28,7 @@ from config.lending_web import (
 )
 from config.lending_occupancy import OWNER_OCCUPIED, UNKNOWN, occupancy_from_answer
 from config.settings import get_settings
-from src.lending.consent import record_consent
+from src.lending.consent import has_text_consent, record_consent
 from src.lending.cora_inbox import add_to_inbox_in_own_session
 from src.lending.lead_arrival_alert import ghl_contact_url
 from src.lending.ops_alerts import post_ops_alert
@@ -237,6 +237,29 @@ def save_web_lead(db, data: WebLeadInput) -> tuple[int, bool]:
     logger.info("[lending-web] lead saved id=%s sms_consent=%s call_consent=%s deal_drop=%s suppressed=%s occupancy=%s",
                 lead_id, data.sms_consent, data.call_consent, data.deal_drop_optin, suppressed, data.occupancy)
     return int(lead_id), True
+
+
+def open_night_conversation(db, lead_id: int, data: WebLeadInput, now: datetime) -> bool:
+    """A lead who ticked the text box outside Josh's hours gets the night responder's questions by text (team
+    decision Q8). Not for an owner-occupied lead (never contacted) or a suppressed number. Does not commit and never
+    raises; True when a conversation was opened, so the caller can send its first question at once."""
+    from config.lending_after_hours_conversation import CHANNEL_SMS, SOURCE_WEB_FORM
+    from src.lending.after_hours_conversation import conversations_enabled, open_conversation
+    from src.lending.reply_guard import in_reply_hours
+
+    if not (data.sms_consent and conversations_enabled()) or data.occupancy == OWNER_OCCUPIED or in_reply_hours(now):
+        return False
+    first_name = (data.name or "").split(" ")[0] or None
+    try:
+        with db.begin_nested():  # a failure here must never lose the lead itself
+            if not has_text_consent(db, data.phone):
+                return False
+            return open_conversation(db, inquiry_key=f"after_hours:{SOURCE_WEB_FORM}:{lead_id}",
+                                     source=SOURCE_WEB_FORM, channel=CHANNEL_SMS, phone=data.phone,
+                                     first_name=first_name, now=now) is not None
+    except Exception as exc:  # class only: SQL errors embed bound parameters
+        logger.error("[lending-web] night conversation for lead %s not opened (%s)", lead_id, type(exc).__name__)
+        return False
 
 
 def will_be_contacted(db, lead_id: int) -> bool:

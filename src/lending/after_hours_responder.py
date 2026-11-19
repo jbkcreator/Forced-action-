@@ -455,6 +455,24 @@ def _release_unsent(db, item: DueStep) -> Optional[str]:
         return None
 
 
+def _sync_night_tags(db, now: datetime) -> None:
+    """The GHL night-conversation tag, before any message goes out. Never raises: a GHL or database problem here must
+    not stop the sends, and the next pass tries again."""
+    from src.lending.after_hours_ghl_tag import night_tag_client, sync_night_tags
+
+    client = night_tag_client()
+    if client is None:
+        return
+    try:
+        counts = sync_night_tags(db, client, now)
+    except Exception as exc:  # class only: errors can embed phones
+        db.rollback()
+        logger.error("[after-hours-responder] night tag sync failed (%s); retrying next pass", type(exc).__name__)
+        return
+    if counts:
+        logger.info("[after-hours-responder] night tags %s", counts)
+
+
 def run_send_cycle(*, now: Optional[datetime] = None) -> dict[str, int]:
     """One pass with the real settings, senders and its own session. Nothing while the feature is off or the
     lending emergency halt is on."""
@@ -473,6 +491,7 @@ def run_send_cycle(*, now: Optional[datetime] = None) -> dict[str, int]:
     # With no morning calendar configured both hooks are None: a lead who answers all three questions is closed
     # as no_slots and stays on the morning call list.
     with lending_session() as db:
+        _sync_night_tags(db, now or _utcnow())
         slot_finder, booker = calendar_hooks(db)
         return process_due(db, text_sender=get_sender(), email_sender=get_email_sender(),
                            carrier_approved=bool(get_settings().lending_sms_carrier_approved),

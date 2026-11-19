@@ -1,5 +1,6 @@
 """``lending.after_hours_conversations``: one row per after-hours inquiry the night responder is answering (the
-three qualifying questions, then a call slot). Rows are added by ``src.lending.after_hours_conversation``.
+three qualifying questions, then a call slot). Rows are added by ``src.lending.after_hours_conversation``. Also adds
+the ``ghl_tagged_at`` / ``ghl_untagged_at`` columns to a table created before them.
 
 Idempotent; run after apply_lending_compliance.py (creates the ``lending`` schema). Run it BEFORE setting
 LENDING_AFTER_HOURS_CONVERSATION_ENABLED=true: the voicemail intake and the reply webhook write this table.
@@ -11,7 +12,7 @@ from __future__ import annotations
 
 import logging
 
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, text
 from sqlalchemy.engine import Connection, Engine
 
 from config.settings import get_settings
@@ -24,6 +25,10 @@ logger = logging.getLogger(__name__)
 def apply_to(conn: Connection, schema: str = LENDING_SCHEMA) -> None:
     translated = conn.execution_options(schema_translate_map={LENDING_SCHEMA: schema})
     LendingAfterHoursConversation.__table__.create(translated, checkfirst=True)
+    # Added after the table: the GHL night-conversation tag (src.lending.after_hours_ghl_tag).
+    for column in ("ghl_tagged_at", "ghl_untagged_at"):
+        conn.execute(text(f'ALTER TABLE "{schema}".after_hours_conversations '
+                          f"ADD COLUMN IF NOT EXISTS {column} TIMESTAMPTZ"))
 
 
 def apply(engine: Engine | None = None, schema: str = LENDING_SCHEMA) -> None:

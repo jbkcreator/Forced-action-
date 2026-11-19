@@ -8,6 +8,7 @@ by design, so it is rate limited per IP and has a honeypot field.
 from __future__ import annotations
 
 import logging
+from datetime import datetime, timezone
 from typing import Optional
 
 from fastapi import APIRouter, BackgroundTasks, Depends, Form, HTTPException, Request
@@ -15,9 +16,11 @@ from sqlalchemy.orm import Session
 
 from config.lending_web import RATE_LIMIT_PER_WINDOW, RATE_LIMIT_SCOPE, RATE_LIMIT_WINDOW_SECONDS
 from src.api.deps import get_db
+from src.lending.after_hours_responder import run_send_cycle_now
 from src.lending.db import lending_session
 from src.lending.web_lead_ghl import get_live_sink
-from src.lending.web_leads import InvalidWebLead, build_input, deliver_pending, merge_into_existing, save_web_lead, will_be_contacted
+from src.lending.web_leads import (InvalidWebLead, build_input, deliver_pending, merge_into_existing,
+                                  open_night_conversation, save_web_lead, will_be_contacted)
 from src.services.rate_limit import client_ip, enforce_or_429
 
 logger = logging.getLogger(__name__)
@@ -81,6 +84,7 @@ def create_web_lead(
         lead_id, created = save_web_lead(db, data)
         enriched = False if created else merge_into_existing(db, lead_id, data)
         contact = created and will_be_contacted(db, lead_id)
+        night = created and open_night_conversation(db, lead_id, data, datetime.now(timezone.utc))
         db.commit()
     except Exception as exc:
         db.rollback()
@@ -88,4 +92,6 @@ def create_web_lead(
         raise HTTPException(status_code=500, detail="We could not save your request. Please call us.") from exc
     if created or enriched:
         background_tasks.add_task(deliver_in_background, lead_id)
+    if night:
+        background_tasks.add_task(run_send_cycle_now)  # the night responder's first question, right away
     return {"received": True, "will_contact": contact} if created else {"received": True, "duplicate": True}
