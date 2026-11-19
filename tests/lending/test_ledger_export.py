@@ -47,7 +47,7 @@ def test_every_table_is_written_even_when_empty():
         assert parse(data) == []
     for name, data in files.items():
         header = data.decode().splitlines()[0]
-        assert header.startswith("ghl_contact_id,contact_id,phone_last4") == (name != "cohorts.csv")
+        assert header.startswith("ghl_contact_id,contact_id,phone_last4") == (name[:-len(".csv")] not in le.NO_KEY_TABLES)
 
 
 def test_no_full_phone_or_email_appears_in_any_file():
@@ -367,3 +367,21 @@ def test_a_test_contacts_row_with_no_phone_is_left_out_by_its_ghl_id():
 
     rows = le._rows(Db(), None, frozenset(), frozenset({"g-test"}))
     assert [r["ghl_contact_id"] for r in rows] == ["g-real"]
+
+
+def test_audiences_are_exported_as_counts_only(monkeypatch):
+    """Team decision Q33: the agents get the audience sizes, never the hashed files."""
+    from collections import Counter
+    from datetime import date
+
+    from src.tasks import lending_audience_export as audience
+
+    result = audience.ExportResult(contacts_by_source=Counter({"lendingflow": 7, "web": 2}), google_rows=9, meta_rows=8)
+    monkeypatch.setattr(audience, "export", lambda db, directory, day=None, dry_run=False: result)
+    rows = le._audience_rows(None, date(2026, 11, 18))
+    assert rows == [
+        {"day": "2026-11-18", "platform": "google", "rows": 9, "lendingflow_contacts": 7, "web_contacts": 2},
+        {"day": "2026-11-18", "platform": "meta", "rows": 8, "lendingflow_contacts": 7, "web_contacts": 2},
+    ]
+    csv_text = le.build_files(le.LedgerData(audiences=rows))["audiences.csv"].decode()
+    assert csv_text.splitlines()[0] == "day,platform,rows,lendingflow_contacts,web_contacts"
