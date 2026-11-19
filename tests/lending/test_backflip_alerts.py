@@ -128,3 +128,23 @@ def test_blocks_are_found_and_raised_once_on_postgres(lending_db):
     assert f"draft:{lane}" in keys and "job:BF-TEST-JOB-1" in keys
     assert not {f"draft:{consent}", f"draft:{old}", "job:BF-TEST-JOB-2", "job:BF-TEST-JOB-3"} & keys
     assert raise_backflip_blocks(lending_db) == 0
+
+
+def test_a_job_blocked_by_the_send_gate_is_raised_once_as_its_draft_not_twice(lending_db):
+    """What production writes: the gate stored the draft as blocked, and the worker's receipt has no action id."""
+    from migrations.apply_lending_agent_jobs import apply_to as apply_jobs
+    from migrations.apply_lending_cora_agent_core import apply_to as apply_core
+    from migrations.apply_lending_cora_inbox import apply_to as apply_inbox
+    from src.lending.agent_jobs.worker import JobQueueWorker  # noqa: F401  (the reason text below is the worker's)
+
+    conn = lending_db.connection()
+    apply_core(conn)
+    apply_inbox(conn)
+    apply_jobs(conn)
+    lending_db.execute(text("DELETE FROM lending.cora_inbox WHERE event_type = :t"), {"t": EVENT_TYPE})
+    draft = _draft(lending_db, "blocked", "BACKFLIP_LANE: blocked_name")
+    _job(lending_db, "BF-GATE-JOB-1", "the send gate blocked the draft (lane deny list)")  # the worker's real reason
+    raise_backflip_blocks(lending_db)
+    keys = set(lending_db.execute(text("SELECT dedup_key FROM lending.cora_inbox WHERE event_type = :t"),
+                                  {"t": EVENT_TYPE}).scalars())
+    assert f"draft:{draft}" in keys and "job:BF-GATE-JOB-1" not in keys

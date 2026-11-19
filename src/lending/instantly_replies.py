@@ -76,7 +76,8 @@ _STOP_PHRASES = re.compile(
 # The webhook treats any of them as a STOP on the spot (the safe default: missing an opt-out is the bigger risk), so a
 # STOP never waits for Cora's sweep or the AI model; the model still sorts every other reply.
 _POSSIBLE_STOP = re.compile(
-    r"\b(?:cease\w*|unsubscrib\w*|harass\w*|leave (?:me|us) alone|(?:please |pls )?stop (?:it|this|that|now)|"
+    r"\b(?:cease(?: and desist| (?:all |any |further |more )?(?:contact|communication\w*|emailing|e-?mails?|"
+    r"sending|messaging|calling|texting))|unsubscrib\w*|harass\w*|leave (?:me|us) alone|(?:please |pls )?stop (?:it|this|that|now)|"
     r"(?:remove|delete|take) (?:me|us|my|our) (?:\w+ )?(?:name|email|e-?mail|address|number|info|details|from|off)|"
     r"(?:this (?:is|was)|it'?s|reported? (?:as|you as)|mark(?:ed|ing)? (?:as|you as)) spam|spammer|"
     r"no longer (?:want|wish) to (?:receive|hear|get)|"

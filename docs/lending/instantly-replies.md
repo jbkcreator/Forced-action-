@@ -89,3 +89,9 @@ call", "my new number is ..."): it goes to triage, where the model decides (a re
 Cora's sweep). The guard never applies to a clear stop: a strict phrase ("remove me", "remove my email address from your list", "take my number
 off your list", "unsubscribe", "this is spam"), or a negated contact verb in the same reply ("delete my info, don't call me", "never call me
 again"), is still suppressed within seconds, whatever else the reply says.
+
+**Prerequisites of the email-only STOP lookup.** It reads the traced emails in `lending.calling_pool_staging`
+(`migrations/apply_lending_calling_pool_staging.py`) and the GHL contact id on `lending.dialer_load_records`
+(`migrations/apply_lending_dialer_load_ghl_contact_id.py`). If either migration has not been run the opt-out still completes: each lookup
+runs in its own savepoint and a failure is logged by class and that source is skipped (a failed dialer-load lookup also raises the
+`stop_phone_link_failed` inbox item, no address in it, so a person checks the dialer and GHL by hand). Run both migrations anyway.

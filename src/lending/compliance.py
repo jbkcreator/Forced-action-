@@ -1226,13 +1226,18 @@ def sync_ghl_dnd(db, ghl_dnd: Optional[Callable[[str], bool]] = None) -> int:
     return len(done)
 
 
-_LINKED_PHONES = text(
+_LINKED_PHONES_BASE = (
     "SELECT lower(email), phone FROM lending.contacts WHERE lower(email) = ANY(:emails) AND phone IS NOT NULL "
     "UNION SELECT lower(email), phone FROM lending.web_leads WHERE lower(email) = ANY(:emails) AND phone IS NOT NULL "
     "UNION SELECT lower(email), phone FROM lending.lendingflow_leads "
     "WHERE lower(email) = ANY(:emails) AND phone IS NOT NULL "
-    "UNION SELECT lower(email), phone FROM lending.partners WHERE lower(email) = ANY(:emails) AND phone IS NOT NULL "
-    "UNION SELECT lower(email), normalized_phone FROM lending.calling_pool_staging "
+    "UNION SELECT lower(email), phone FROM lending.partners WHERE lower(email) = ANY(:emails) AND phone IS NOT NULL"
+)
+# The traced emails in the cold calling lists (apply_lending_calling_pool_staging.py): a second query, so a database
+# without that table still links the phones from the tables every deployment has.
+_LINKED_PHONES_TABLES = text(_LINKED_PHONES_BASE)
+_LINKED_PHONES_COLD_LISTS = text(
+    "SELECT lower(email), normalized_phone FROM lending.calling_pool_staging "
     "WHERE lower(email) = ANY(:emails) AND normalized_phone IS NOT NULL"
 )
 
@@ -1264,10 +1269,18 @@ def _with_linked_phones(db, opt_outs: list[_OptOut]) -> list[_OptOut]:
     if not emails:
         return opt_outs
     by_email: dict[str, set[str]] = defaultdict(set)
-    for email, raw in db.execute(_LINKED_PHONES, {"emails": emails}).fetchall():
-        phone = normalize_phone(raw)
-        if phone:
-            by_email[email].add(phone)
+    for query in (_LINKED_PHONES_TABLES, _LINKED_PHONES_COLD_LISTS):
+        try:
+            with db.begin_nested():  # a missing table or a failed read must never abort the opt-out itself
+                rows = db.execute(query, {"emails": emails}).fetchall()
+        except Exception as exc:  # class only: SQL errors embed the addresses
+            logger.error("[opt-out] a linked-phone lookup failed (%s); the opt-out continues without it",
+                         type(exc).__name__)
+            continue
+        for email, raw in rows:
+            phone = normalize_phone(raw)
+            if phone:
+                by_email[email].add(phone)
     from src.lending.ghl_email_lookup import phones_for_emails
 
     # A cold contact held only in GHL and the dialer is on none of those tables: ask GHL (and the dialer loads of the
