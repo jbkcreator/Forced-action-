@@ -40,3 +40,14 @@ MILO_FICO_BANDS_CONFIRMED = False
 
 MILO_PACKET_TEMPLATE = "milo_packet.html"
 MILO_PACKET_WATERMARK = "PREPARED FOR LENDER SUBMISSION — FIGURES AS PROVIDED BY THE BORROWER AND FORCED ACTION ESTIMATES"
+
+# The Slack Confirm / Cancel card (src/lending/milo/slack_card.py), posted in #approvals by Cora's bot. Only Cora's
+# approvers (LENDING_CORA_APPROVER_USER_IDS) may press either button.
+ACTION_CONFIRM = "milo_confirm"
+ACTION_CANCEL = "milo_cancel"
+CARD_FLAG_TEXT = {
+    "fico_band_unconfirmed": "FICO band list not yet checked against Milo's dropdown",
+    "property_type_unconfirmed": "Property type list not yet checked against Milo's dropdown",
+    "no_comps": "No comps attached",
+    "arv_below_total_cost": "ARV is below purchase price plus rehab",
+}

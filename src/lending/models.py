@@ -1552,3 +1552,26 @@ class LendingMiloSubmission(LendingBase):
     __table_args__ = (
         CheckConstraint("status IN ('pending', 'submitted', 'failed')", name="ck_lending_milo_submissions_status"),
     )
+
+
+class LendingMiloCard(LendingBase):
+    """One Slack Confirm / Cancel card for a Milo application (P3.3). ``application`` is exactly what the card showed,
+    so Confirm sends that and nothing else. ``status``: open -> confirmed | cancelled; a confirm that sent nothing
+    (no filler connected, or the duplicate guard refused) leaves it open."""
+
+    __tablename__ = "milo_cards"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    package_ref: Mapped[str] = mapped_column(String(80), nullable=False)
+    application: Mapped[dict] = mapped_column(JSONB, nullable=False)
+    is_test: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default=text("false"))
+    channel: Mapped[Optional[str]] = mapped_column(String(32))
+    message_ts: Mapped[Optional[str]] = mapped_column(String(64))
+    status: Mapped[str] = mapped_column(String(16), nullable=False, default="open", server_default=text("'open'"))
+    decided_by: Mapped[Optional[str]] = mapped_column(String(64))
+    decided_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_now, server_default=text("now()"))
+
+    __table_args__ = (
+        CheckConstraint("status IN ('open', 'confirmed', 'cancelled')", name="ck_lending_milo_cards_status"),
+    )

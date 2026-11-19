@@ -1,4 +1,5 @@
-"""P3.3: ``lending.milo_submissions`` (one Central Lending Milo application per loan package; duplicate guard).
+"""P3.3: ``lending.milo_submissions`` (one Central Lending Milo application per loan package; duplicate guard) and
+``lending.milo_cards`` (the Slack Confirm / Cancel card for each application, with what it showed).
 
 Idempotent; run after apply_lending_compliance.py (creates the ``lending`` schema).
 
@@ -13,7 +14,7 @@ from sqlalchemy import create_engine
 from sqlalchemy.engine import Connection, Engine
 
 from config.settings import get_settings
-from src.lending.models import LENDING_SCHEMA, LendingMiloSubmission
+from src.lending.models import LENDING_SCHEMA, LendingMiloCard, LendingMiloSubmission
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
@@ -22,6 +23,7 @@ logger = logging.getLogger(__name__)
 def apply_to(conn: Connection, schema: str = LENDING_SCHEMA) -> None:
     translated = conn.execution_options(schema_translate_map={LENDING_SCHEMA: schema})
     LendingMiloSubmission.__table__.create(translated, checkfirst=True)
+    LendingMiloCard.__table__.create(translated, checkfirst=True)
 
 
 def apply(engine: Engine | None = None, schema: str = LENDING_SCHEMA) -> None:
