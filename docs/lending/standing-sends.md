@@ -67,3 +67,8 @@ The brief's rule ignores rejections, so a type with 25 approvals and 20 rejectio
 only when **(edited + rejected) / (approved + rejected) is under 10%**, still after 25 approvals. The per-channel send-time check
 uses the same rule on that channel's own cards, and the morning card shows "edited or rejected". This is the team's
 recommendation for open question P1.4 #1, not Josh's answer.
+
+Turning the switch on does not revoke a type that already graduated: only the send-time check becomes stricter. A type that graduated
+under the old rule but is over the limit once rejections count goes back to approval cards for new jobs (the tracker still shows it as
+graduated until it is revoked with `--revoke`), and an action already approved automatically but not yet sent is held until its draft
+expires. The rate stored with a graduation (`edit_rate`) is the rate the decision used.

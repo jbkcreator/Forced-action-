@@ -313,7 +313,7 @@ def evaluate_graduations(engine: Engine, since: Optional[Any] = None) -> list[Te
                 continue
             new = conn.execute(_GRADUATE, {"template_version": stats.template_version, "approvals": stats.approved,
                                            "edited": stats.edited, "rejected": stats.rejected,
-                                           "edit_rate": round(stats.edit_rate, 4)}).scalar()
+                                           "edit_rate": round(stats.graduation_rate, 4)}).scalar()
             if new is None:
                 continue
             graduated.append(stats)
@@ -323,7 +323,7 @@ def evaluate_graduations(engine: Engine, since: Optional[Any] = None) -> list[Te
                          f"{stats.edit_rate:.0%} edited. Agent jobs of this type that don't require approval now send "
                          "without a card (every send check still runs)."),
                 payload={"template_version": stats.template_version, "approvals": stats.approved,
-                         "edited": stats.edited, "rejected": stats.rejected, "edit_rate": round(stats.edit_rate, 4)},
+                         "edited": stats.edited, "rejected": stats.rejected, "edit_rate": round(stats.graduation_rate, 4)},
             )
             logger.info("[standing-sends] %s graduated approvals=%s edited=%s", stats.template_version,
                         stats.approved, stats.edited)
