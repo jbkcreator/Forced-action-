@@ -1054,6 +1054,9 @@ class AppSettings(BaseSettings):
 	# P1.3: a "Deal" reply to an NDL cold email creates the GHL contact + pipeline card and swaps ndl-cold for
 	# ndl-instantly-interested (src/lending/instantly_ghl_handoff.py). Off until Josh confirms (open question P1.3 #1).
 	lending_instantly_ghl_handoff_enabled: bool = Field(default=False, env="LENDING_INSTANTLY_GHL_HANDOFF_ENABLED")
+	# P1.4: when true, a rejection counts against graduation: (edited + rejected) / (approved + rejected) must be under 10%
+	# (src/lending/standing_sends.py). Off until Josh confirms (open question P1.4 #1); off = the brief's rule.
+	lending_graduation_count_rejections: bool = Field(default=False, env="LENDING_GRADUATION_COUNT_REJECTIONS")
 	# Drive service account (shared with the P1.1 job queue); blank = LENDING_SHEETS_SERVICE_ACCOUNT_KEY_PATH
 	lending_drive_service_account_key_path: str = Field(default="", env="LENDING_DRIVE_SERVICE_ACCOUNT_KEY_PATH")
 	# Opt-out mailbox listener (src/lending/email_opt_out.py): reads mail sent to LENDING_OPTOUT_ADDRESS over IMAP.

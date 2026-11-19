@@ -11,7 +11,7 @@ its wording. The tracker counts **each template version separately**:
 |---|---|
 | Approved | Cards of this type Josh approved (sent, or approved and then stopped by a send check) |
 | Edited | Of those, the ones he revised before approving |
-| Rejected | Cards he rejected (shown only: they neither help nor block graduation) |
+| Rejected | Cards he rejected (shown only: they neither help nor block graduation, unless `LENDING_GRADUATION_COUNT_REJECTIONS=true`, below) |
 | Sent automatically | Sent after graduation, without a card (not counted as approvals) |
 
 A new wording means a new version (`...-v2`), which starts again from 0.
@@ -59,3 +59,11 @@ re-approve them; they stay on their cards.
 ## Setup
 
 Run `PYTHONPATH=. python migrations/apply_lending_standing_sends.py` before deploying.
+
+## Rejections count against graduation (off until Josh confirms)
+
+The brief's rule ignores rejections, so a type with 25 approvals and 20 rejections could still graduate. With
+`LENDING_GRADUATION_COUNT_REJECTIONS=true` (default false; restart `fa-lending-cora` and the sweep to change it) a type graduates
+only when **(edited + rejected) / (approved + rejected) is under 10%**, still after 25 approvals. The per-channel send-time check
+uses the same rule on that channel's own cards, and the morning card shows "edited or rejected". This is the team's
+recommendation for open question P1.4 #1, not Josh's answer.

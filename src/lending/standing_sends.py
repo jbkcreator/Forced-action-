@@ -48,6 +48,7 @@ from config.lending_standing_sends import (
     GRADUATION_MIN_APPROVALS,
     MORNING_CARD_LIMIT,
 )
+from config.settings import get_settings
 from src.lending.cora_inbox import add_to_inbox_safely, slack_safe
 
 logger = logging.getLogger(__name__)
@@ -180,10 +181,20 @@ class TemplateStats:
     auto_sent: int
     graduated: bool = False
     revoked: bool = False
+    count_rejections: bool = False
 
     @property
     def edit_rate(self) -> float:
         return self.edited / self.approved if self.approved else 0.0
+
+    @property
+    def graduation_rate(self) -> float:
+        """The rate that must stay under the limit: edited over approved (the brief), or, with rejections counted,
+        (edited + rejected) over (approved + rejected)."""
+        if not self.count_rejections:
+            return self.edit_rate
+        decided = self.approved + self.rejected
+        return (self.edited + self.rejected) / decided if decided else 0.0
 
     @property
     def approval_only(self) -> bool:
@@ -193,7 +204,7 @@ class TemplateStats:
     @property
     def meets_rule(self) -> bool:
         return (not self.approval_only and self.approved >= GRADUATION_MIN_APPROVALS
-                and self.edit_rate < GRADUATION_MAX_EDIT_RATE)
+                and self.graduation_rate < GRADUATION_MAX_EDIT_RATE)
 
     @property
     def state(self) -> str:
@@ -235,14 +246,18 @@ def template_stats(conn: Any, versions: Optional[list[str]] = None) -> list[Temp
     """Counts per template version: every one, or only ``versions``."""
     rows = conn.execute(_STATS, {"auto_actor": AUTO_GRADUATED_ACTOR, "auto_prefix": f"{AUTO_APPROVER_PREFIX}%",
                                  "versions": versions}).mappings()
+    count_rejections = get_settings().lending_graduation_count_rejections
     return [TemplateStats(template_version=row["template_version"], approved=int(row["approved"]),
                           edited=int(row["edited"]), rejected=int(row["rejected"]), auto_sent=int(row["auto_sent"]),
-                          graduated=bool(row["graduated"]), revoked=bool(row["revoked"])) for row in rows]
+                          graduated=bool(row["graduated"]), revoked=bool(row["revoked"]),
+                          count_rejections=count_rejections) for row in rows]
 
 
 def tracker_line(stats: TemplateStats) -> str:
     label = slack_safe(stats.template_version)
-    counts = (f"{stats.approved}/{GRADUATION_MIN_APPROVALS} approvals · {stats.edit_rate:.0%} edited"
+    rate = (f"{stats.graduation_rate:.0%} edited or rejected" if stats.count_rejections
+            else f"{stats.edit_rate:.0%} edited")
+    counts = (f"{stats.approved}/{GRADUATION_MIN_APPROVALS} approvals · {rate}"
               + (f" · {stats.rejected} rejected" if stats.rejected else ""))
     if stats.state == "approval_only":
         return f"• {label}: drafted by Cora, always needs approval · {stats.approved} approved · {stats.edit_rate:.0%} edited" + (
@@ -347,19 +362,24 @@ _IS_GRADUATED = text("""
     SELECT EXISTS (SELECT 1 FROM lending.template_graduations
                     WHERE template_version = :template_version AND revoked_at IS NULL)
        AND (CAST(:channel AS text) IS NULL OR COALESCE((
-            SELECT c.approved >= :min_approvals AND c.edited < :max_edit_rate * c.approved
-              FROM (SELECT count(*) AS approved,
-                           count(*) FILTER (WHERE jsonb_array_length(COALESCE(revisions, '[]'::jsonb)) > 0) AS edited
+            SELECT c.approved >= :min_approvals
+                   AND CASE WHEN :count_rejections THEN c.edited + c.rejected < :max_edit_rate * (c.approved + c.rejected)
+                            ELSE c.edited < :max_edit_rate * c.approved END
+              FROM (SELECT count(*) FILTER (WHERE decided_by IS NOT NULL AND decided_by NOT LIKE :auto_prefix
+                                              AND status <> 'rejected') AS approved,
+                           count(*) FILTER (WHERE decided_by IS NOT NULL AND decided_by NOT LIKE :auto_prefix
+                                              AND status <> 'rejected'
+                                              AND jsonb_array_length(COALESCE(revisions, '[]'::jsonb)) > 0) AS edited,
+                           count(*) FILTER (WHERE status = 'rejected') AS rejected
                       FROM lending.pending_actions
-                     WHERE payload->>'template_version' = :template_version AND channel = :channel
-                       AND decided_by IS NOT NULL AND decided_by NOT LIKE :auto_prefix
-                       AND status <> 'rejected') c), FALSE))
+                     WHERE payload->>'template_version' = :template_version AND channel = :channel) c), FALSE))
 """)
 
 
 def _graduated_params(template_version: str, channel: Optional[str]) -> dict[str, Any]:
     return {"template_version": template_version, "channel": channel, "min_approvals": GRADUATION_MIN_APPROVALS,
-            "max_edit_rate": GRADUATION_MAX_EDIT_RATE, "auto_prefix": f"{AUTO_APPROVER_PREFIX}%"}
+            "max_edit_rate": GRADUATION_MAX_EDIT_RATE, "auto_prefix": f"{AUTO_APPROVER_PREFIX}%",
+            "count_rejections": get_settings().lending_graduation_count_rejections}
 
 
 def make_is_graduated(engine: Engine) -> Callable[..., bool]:
