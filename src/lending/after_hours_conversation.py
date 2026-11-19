@@ -23,7 +23,7 @@ from zoneinfo import ZoneInfo
 
 from sqlalchemy import text
 
-from config.lending_compliance import OptOutChannel
+from config.lending_compliance import CALL_WINDOW_END, CALL_WINDOW_START, OptOutChannel
 from config.lending_after_hours_conversation import (ANSWER_MAX_CHARS, BOOKED, BOOKED_CONFIRMATION, CHANNEL_EMAIL,
                                                      CHANNEL_SMS, CLOSED, CLOSED_OPTED_OUT, CLOSED_UNCLEAR_SLOT,
                                                      CONVERSATION_TTL_HOURS, GREETING, HANDLED_MESSAGE_IDS_KEPT,
@@ -103,6 +103,18 @@ def question_message(state: str, first_name: Optional[str]) -> str:
     return f"{GREETING.format(name=first_name or 'there')} {question}" if position == 0 else question
 
 
+def first_send_at(now: datetime) -> datetime:
+    """When the conversation's first message may go: now inside 8am-8pm Eastern, else the next 8am Eastern. Nothing
+    is sent at night (team decision Q7), so a conversation opened at night is given its full time from the morning
+    and never expires before its first message could go out (the expiry restarts again at that first message)."""
+    zone = ZoneInfo(SLOT_TIMEZONE)
+    local = now.astimezone(zone)
+    if CALL_WINDOW_START <= local.time() < CALL_WINDOW_END:
+        return now
+    day = local.date() if local.time() < CALL_WINDOW_START else local.date() + timedelta(days=1)
+    return datetime.combine(day, CALL_WINDOW_START, tzinfo=zone)
+
+
 def next_morning_window(now: datetime) -> tuple[datetime, datetime]:
     """The next business morning still ahead of ``now``: (start, end), never starting in the past. A lead who
     finishes at 9pm Friday gets Monday morning; one who finishes at 10am on a weekday gets the rest of that
@@ -157,7 +169,7 @@ def open_conversation(db, *, inquiry_key: str, source: str, channel: str, now: d
         "inquiry_key": inquiry_key[:200], "source": source[:40], "channel": channel, "contact_key": contact_key,
         "phone": norm_phone, "email": norm_email, "ghl_contact_id": ghl_contact_id,
         "first_name": (first_name or "")[:100] or None, "state": QUESTION_STATES[0], "now": now,
-        "expires_at": now + timedelta(hours=CONVERSATION_TTL_HOURS),
+        "expires_at": first_send_at(now) + timedelta(hours=CONVERSATION_TTL_HOURS),
     }).scalar_one_or_none()
     if conversation_id is not None:
         logger.info("[after-hours-conversation] opened id=%s source=%s channel=%s", conversation_id, source, channel)

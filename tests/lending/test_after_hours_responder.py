@@ -104,7 +104,8 @@ def test_a_nine_pm_text_is_refused_and_goes_when_the_window_opens(db, caplog):
 
 def test_the_time_to_reply_runs_from_the_first_message_not_from_the_inquiry(db):
     conversation_id, sender = _open(db, opened_at=NIGHT), FakeSender()
-    assert _row(db, conversation_id)["expires_at"] == NIGHT + timedelta(hours=CONVERSATION_TTL_HOURS)
+    # Opened at night, nothing can go before 8 AM (team decision Q7): the time is counted from then.
+    assert _row(db, conversation_id)["expires_at"] == MORNING + timedelta(hours=CONVERSATION_TTL_HOURS)
     assert _pass(db, sender, now=MORNING) == {"sent": 1}
     assert _row(db, conversation_id)["expires_at"] == MORNING + timedelta(hours=CONVERSATION_TTL_HOURS)
     record_reply(db, message_id="m-0", body="Fix and flip", phone=PHONE, now=MORNING)

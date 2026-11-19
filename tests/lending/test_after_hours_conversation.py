@@ -22,6 +22,7 @@ HEADERS = {"X-Webhook-Secret": SECRET}
 PHONE = "+18135550199"
 CONTACT_ID = "ghl-contact-1"
 NOW = datetime(2026, 10, 21, 1, 0, tzinfo=timezone.utc)  # 9:00 pm ET
+MORNING_8_ET = datetime(2026, 10, 21, 12, 0, tzinfo=timezone.utc)  # the next 8:00 am ET, when a message may go
 SLOTS = [datetime(2026, 10, 21, 13, 0, tzinfo=timezone.utc) + timedelta(minutes=30 * n) for n in range(3)]
 ANSWERS = ("Fix and flip", "412 Oak St, Tampa FL", "About 250k, closing on the 30th")
 
@@ -118,7 +119,7 @@ def _answer_all(db, conversation_id):
 def test_open_stores_the_normalized_phone_and_starts_at_the_first_question(db):
     row = _row(db, _open(db))
     assert (row["state"], row["prompted_state"], row["contact_key"], row["phone"]) == (QUESTION_STATES[0], None, PHONE, PHONE)
-    assert row["answers"] == [] and row["expires_at"] == NOW + timedelta(hours=CONVERSATION_TTL_HOURS)
+    assert row["answers"] == [] and row["expires_at"] == MORNING_8_ET + timedelta(hours=CONVERSATION_TTL_HOURS)
 
 
 def test_the_same_inquiry_or_a_second_inquiry_from_the_same_contact_opens_nothing(db):
@@ -205,7 +206,8 @@ def test_a_stop_reply_closes_the_conversation(db):
 def test_a_reply_after_the_conversation_expired_or_from_an_unknown_sender_finds_nothing(db):
     conversation_id = _open(db)
     mark_prompted(db, conversation_id, QUESTION_STATES[0], now=NOW)
-    assert _reply(db, "m-late", "Fix and flip", minutes=CONVERSATION_TTL_HOURS * 60 + 1) == "no_conversation"
+    to_expiry = (MORNING_8_ET - NOW) + timedelta(hours=CONVERSATION_TTL_HOURS)
+    assert _reply(db, "m-late", "Fix and flip", minutes=int(to_expiry.total_seconds() // 60) + 1) == "no_conversation"
     assert _reply(db, "m-other", "Fix and flip", phone="+18135550111") == "no_conversation"
     assert record_reply(db, message_id="m-nobody", body="hi", now=NOW) == "no_conversation"
 
@@ -336,3 +338,18 @@ def test_an_answer_that_could_not_be_saved_is_refused_so_ghl_redelivers_it(db, c
     assert response.status_code == 200 and night_responder_send_passes == ["reply"]
     row = _row(db, conversation_id)
     assert (row["state"], row["answers"]) == (QUESTION_STATES[1], ["Fix and flip"])
+
+
+
+# --- team decision Q7: nothing is sent at night ---
+
+def test_a_conversation_opened_at_night_counts_its_time_from_the_next_8am():
+    from src.lending.after_hours_conversation import first_send_at
+
+    assert first_send_at(NOW) == MORNING_8_ET                                   # 9 pm: tomorrow 8 am
+    early = datetime(2026, 10, 21, 10, 30, tzinfo=timezone.utc)                  # 6:30 am ET: today 8 am
+    assert first_send_at(early) == MORNING_8_ET
+    midday = datetime(2026, 10, 21, 16, 0, tzinfo=timezone.utc)                  # noon ET: now
+    assert first_send_at(midday) == midday
+    just_after = datetime(2026, 10, 22, 0, 0, 30, tzinfo=timezone.utc)           # 8:00:30 pm ET
+    assert first_send_at(just_after) == datetime(2026, 10, 22, 12, 0, tzinfo=timezone.utc)
