@@ -14,6 +14,10 @@ skipped, never overwritten.
 Change detection: an owner change marks the row `sold`, a loan change marks
 it `refinanced`. Flags, prior values and changed_at persist until the next
 real change, so a later unchanged re-stage never erases the signal.
+
+A record staged under a maturity campaign keeps that campaign when another
+campaign (cash purchase, investor portfolio) re-stages it, so the loan keeps
+its maturing-loan signal.
 """
 from __future__ import annotations
 
@@ -28,6 +32,7 @@ from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from config.property_radar import OWNER_ABBREVIATIONS
+from config.property_radar_campaigns import MATURITY_CAMPAIGNS
 
 logger = logging.getLogger(__name__)
 
@@ -140,7 +145,9 @@ _INSERT_SQL = f"""
 
 _UPDATE_SQL = f"""
     UPDATE property_radar_records r SET
-        {", ".join(f"{c} = x.{c}" for c in _COLUMNS if c not in _KEY_COLUMNS)},
+        {", ".join(f"{c} = x.{c}" for c in _COLUMNS if c not in _KEY_COLUMNS + ("campaign",))},
+        campaign     = CASE WHEN r.campaign = ANY(:maturity) AND (x.campaign IS NULL OR NOT (x.campaign = ANY(:maturity)))
+                            THEN r.campaign ELSE x.campaign END,
         status       = x.status,
         change_flags = CASE WHEN x.has_change THEN x.change_flags ELSE r.change_flags END,
         prior        = CASE WHEN x.has_change THEN x.prior ELSE r.prior END,
@@ -239,7 +246,7 @@ def _upsert_batch(session: Session, batch: list[dict[str, Any]], skipped: int) -
     if inserts:
         session.execute(text(_INSERT_SQL), _rows_param(inserts))
     if updates:
-        session.execute(text(_UPDATE_SQL), _rows_param(updates))
+        session.execute(text(_UPDATE_SQL), {**_rows_param(updates), "maturity": sorted(MATURITY_CAMPAIGNS)})
     session.flush()
 
     logger.info(

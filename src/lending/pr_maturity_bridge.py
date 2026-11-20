@@ -54,6 +54,11 @@ CAMPAIGN_SOURCE_TAG = {
 }
 
 
+# Campaigns that have a dialer source list; other staged campaigns (cash_purchase, investor_portfolio) are
+# never dialed, so the bridge leaves them out and they never take a phone a dialed record needs.
+DIALED_CAMPAIGNS = ("maturity_target_lender", *CAMPAIGN_SOURCE_TAG)
+
+
 def _source_tag(campaign: Optional[str], state: Optional[str]) -> Optional[str]:
     if campaign == "maturity_target_lender":
         return "list_5" if (state or "").strip().upper() == "GA" else "list_1"
@@ -173,7 +178,7 @@ _RECORDS_SQL = """
            owner_name, ownership_type, principal_name, loan_amount, campaign,
            est_maturity_date, property_id
     FROM property_radar_records
-    WHERE status = 'active' AND id > :after_id
+    WHERE status = 'active' AND id > :after_id AND campaign = ANY(:dialed)
     {state_filter}
     ORDER BY id
     LIMIT :limit
@@ -188,7 +193,7 @@ def _iter_record_pages(
     sql = text(_RECORDS_SQL.format(state_filter=clause))
     after_id = 0
     while True:
-        params: dict[str, Any] = {"after_id": after_id, "limit": page_size}
+        params: dict[str, Any] = {"after_id": after_id, "limit": page_size, "dialed": list(DIALED_CAMPAIGNS)}
         if state:
             params["state"] = state.upper()
         rows = session.execute(sql, params).mappings().all()
@@ -198,7 +203,7 @@ def _iter_record_pages(
         yield [dict(r) for r in rows]
 
 
-def _load_trace_contacts(session: Session, radar_ids: list[str]) -> dict[str, dict[str, list]]:
+def load_trace_contacts(session: Session, radar_ids: list[str]) -> dict[str, dict[str, list]]:
     """Map radar_id -> {'phones': [...], 'emails': [...]} for the given records."""
     if not radar_ids:
         return {}
@@ -212,7 +217,7 @@ def _load_trace_contacts(session: Session, radar_ids: list[str]) -> dict[str, di
     return {r["radar_id"]: {"phones": r["phones"] or [], "emails": r["emails"] or []} for r in rows}
 
 
-def _first_phone(phones: list) -> Optional[str]:
+def first_phone(phones: list) -> Optional[str]:
     for raw in phones:
         norm = normalize_phone(str(raw))
         if norm:
@@ -296,7 +301,7 @@ def extract_pr_maturity_pool(
     total = with_phone = ga = ga_dialable = written = 0
 
     for records in _iter_record_pages(session, state=state):
-        contacts = _load_trace_contacts(session, [r["radar_id"] for r in records])
+        contacts = load_trace_contacts(session, [r["radar_id"] for r in records])
         rows: list[dict[str, Any]] = []
         for r in records:
             c = contacts.get(r["radar_id"], {"phones": [], "emails": []})

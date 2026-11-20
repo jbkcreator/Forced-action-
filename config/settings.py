@@ -360,6 +360,13 @@ class AppSettings(BaseSettings):
 	# in a single invocation regardless of remaining monthly allowance. Prevents
 	# a runaway backlog from draining the monthly budget in one shot.
 	property_radar_per_run_cap: int = Field(default=5000, env="PROPERTY_RADAR_PER_RUN_CAP")
+	# Cora P3.1 statewide activation, off by default so a deploy changes nothing: the runner cron lines
+	# (Florida + Georgia, every campaign, live Tracerfy trace), the calling-pool bridge cron line and the
+	# 5.5-month maturity window. While false, only the daily Florida maturity pull runs, as before.
+	property_radar_statewide_enabled: bool = Field(default=False, env="PROPERTY_RADAR_STATEWIDE_ENABLED")
+	# Hard cap per calendar month (UTC) across every state and campaign: a pull that would take
+	# the month's exports_consumed past it is refused. Default = the Solo plan's 10,000 credits.
+	property_radar_monthly_cap: int = Field(default=10000, env="PROPERTY_RADAR_MONTHLY_CAP")
 
 
 	# ── Mode-aware helpers ────────────────────────────────────────────────────
@@ -1087,6 +1094,11 @@ class AppSettings(BaseSettings):
 	# P1.4: when true, a rejection counts against graduation: (edited + rejected) / (approved + rejected) must be under 10%
 	# (src/lending/standing_sends.py). Off until Josh confirms (open question P1.4 #1); off = the brief's rule.
 	lending_graduation_count_rejections: bool = Field(default=False, env="LENDING_GRADUATION_COUNT_REJECTIONS")
+	# Cora P3.1 daily FA export (src/tasks/lending_fa_export.py): one CSV a day into Drive "FA Exports";
+	# the GHL push (contacts tagged NDL) has its own switch.
+	lending_fa_export_enabled: bool = Field(default=False, env="LENDING_FA_EXPORT_ENABLED")
+	lending_fa_export_folder_id: str = Field(default="", env="LENDING_FA_EXPORT_FOLDER_ID")
+	lending_fa_export_ghl_enabled: bool = Field(default=False, env="LENDING_FA_EXPORT_GHL_ENABLED")
 	# Drive service account (shared with the P1.1 job queue); blank = LENDING_SHEETS_SERVICE_ACCOUNT_KEY_PATH
 	lending_drive_service_account_key_path: str = Field(default="", env="LENDING_DRIVE_SERVICE_ACCOUNT_KEY_PATH")
 	# Opt-out mailbox listener (src/lending/email_opt_out.py): reads mail sent to LENDING_OPTOUT_ADDRESS over IMAP.

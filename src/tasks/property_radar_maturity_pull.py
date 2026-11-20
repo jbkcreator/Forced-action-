@@ -88,10 +88,23 @@ logger = logging.getLogger(__name__)
 # Budget guard
 # ---------------------------------------------------------------------------
 
+def _month_exports(session) -> int:
+    """Exports bought so far this calendar month (UTC), every state and campaign."""
+    return int(session.execute(text(
+        "SELECT COALESCE(SUM(exports_consumed), 0) FROM property_radar_pull_runs "
+        "WHERE started_at >= date_trunc('month', now() AT TIME ZONE 'UTC') AT TIME ZONE 'UTC'"
+    )).scalar() or 0)
+
+
+class BudgetRefused(RuntimeError):
+    """A pull the budget guard refused before anything was bought."""
+
+
 def _check_budget(
-    port, criteria: list[dict], state: str, campaign: str, max_records: Optional[int] = None
+    port, criteria: list[dict], state: str, campaign: str, max_records: Optional[int] = None,
+    month_used: int = 0,
 ) -> int:
-    """Return the safe export count, or raise RuntimeError if over budget.
+    """Return the safe export count, or raise BudgetRefused if over budget.
 
     Calls count() (free) first, then checks remaining allowance and per-run cap
     against the records this run will actually buy (``max_records`` caps it).
@@ -105,10 +118,18 @@ def _check_budget(
     if total == 0:
         return 0
 
+    monthly_cap = settings.property_radar_monthly_cap
+    if month_used + total > monthly_cap:
+        raise BudgetRefused(
+            f"PropertyRadar budget guard: {total} records on top of {month_used} already bought "
+            f"this month exceeds the monthly cap of {monthly_cap} — aborting "
+            f"(raise PROPERTY_RADAR_MONTHLY_CAP only with budget approval)"
+        )
+
     allowance = port.allowance()
     per_run_cap = settings.property_radar_per_run_cap
     if allowance.verified and total > allowance.total_remaining:
-        raise RuntimeError(
+        raise BudgetRefused(
             f"PropertyRadar budget guard: {total} matching records but only "
             f"{allowance.total_remaining} export credits remaining — aborting"
         )
@@ -121,7 +142,7 @@ def _check_budget(
             per_run_cap,
         )
     if total > per_run_cap:
-        raise RuntimeError(
+        raise BudgetRefused(
             f"PropertyRadar budget guard: {total} matching records exceeds "
             f"per-run cap of {per_run_cap} — aborting (raise PROPERTY_RADAR_PER_RUN_CAP or "
             f"split the pull into county-scoped runs)"
@@ -279,7 +300,7 @@ def _run_pull(
 
     # Budget guard — free count first
     if not dry_run:
-        _check_budget(port, criteria, state, campaign, max_records)
+        _check_budget(port, criteria, state, campaign, max_records, month_used=_month_exports(session))
     else:
         count = port.count(criteria)
         logger.info("[dry-run] Would fetch %d records from PropertyRadar", count)
@@ -563,6 +584,12 @@ def main() -> None:
         logger.info(
             "PropertyRadar pull is disabled (PROPERTY_RADAR_ENABLED=false) — "
             "no-op. Set PROPERTY_RADAR_ENABLED=true to enable real runs."
+        )
+        return
+    if settings.property_radar_statewide_enabled is True:
+        logger.info(
+            "PropertyRadar pull skipped: PROPERTY_RADAR_STATEWIDE_ENABLED is on, "
+            "so the runner cron lines pull every state and campaign."
         )
         return
 

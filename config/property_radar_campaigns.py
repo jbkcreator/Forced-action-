@@ -15,6 +15,9 @@ CAMPAIGN_CRITERIA — keyed by (state, campaign_key). Each value is a list of
     private_maturity        List 8 — first loan coded Private by PropertyRadar
     stalled_flip            List 9 — financed (private) purchase, not resold
     auction_winner          List 6 — trustee-sale buyers
+  Cora P3.1 export signals (no source list, so the calling-pool bridge never dials them):
+    cash_purchase           100% down purchase in the last 90 days, not owner-occupied
+    investor_portfolio      company-owned, not owner-occupied, bought in the last 12 months
   PropertyRadar does not code the named hard-money lenders as Private, so
   maturity_target_lender and private_maturity never overlap. stalled_flip
   and private_maturity overlap as a loan ages, so they share seen_ids
@@ -66,22 +69,55 @@ _ALL_LENDER_NAMES: list[str] = [
 ]
 
 
-# Date windows as (older_days, newer_days) before today.
-_MATURITY_WINDOW_DAYS: tuple[int, int] = (15 * 30, 8 * 30)  # recorded ~8–15 months ago
+# Cora P3.1: a loan becomes a "coming due" lead this many days before it matures (5.5 months).
+MATURITY_TRIGGER_DAYS: int = 167
+# Term assumed when PropertyRadar gives none (hard-money bridge loans run 12 months).
+ASSUMED_TERM_DAYS: int = 365
 
-# List 8 window per state. FL dials only loans 30–90 days from maturity on a
-# 12-month term (recorded 275–335 days ago); GA takes the full 8–15 month
-# window because GA starts at zero records.
-PRIVATE_MATURITY_WINDOW_DAYS: dict[str, tuple[int, int]] = {
-    "FL": (365 - 30, 365 - 90),
-    "GA": _MATURITY_WINDOW_DAYS,
-}
+
+
+def _maturity_near_edge_days() -> int:
+    """Recorded 8 months ago, or, with PROPERTY_RADAR_STATEWIDE_ENABLED, the day a 12-month loan
+    crosses the 5.5-month trigger (recorded 198 days ago). Read at call time so the flag
+    takes effect without a restart."""
+    from config.settings import get_settings
+
+    if get_settings().property_radar_statewide_enabled:
+        return ASSUMED_TERM_DAYS - MATURITY_TRIGGER_DAYS
+    return 8 * 30
+
+
+def _maturity_window_days() -> tuple[int, int]:
+    """(older_days, newer_days) before today; the far edge is 15 months."""
+    return (15 * 30, _maturity_near_edge_days())
+
+
+# List 8 window for FL: dials only loans 30–90 days from maturity on a 12-month term
+# (recorded 275–335 days ago). GA takes the full maturity window (starts at zero records).
+_FL_PRIVATE_MATURITY_WINDOW_DAYS: tuple[int, int] = (365 - 30, 365 - 90)
+
+
+def _private_maturity_window_days(state: str) -> tuple[int, int]:
+    return _FL_PRIVATE_MATURITY_WINDOW_DAYS if state == "FL" else _maturity_window_days()
 
 # List 9: last purchase 90–365 days ago and not resold since.
 STALLED_FLIP_PURCHASE_WINDOW_DAYS: tuple[int, int] = (365, 90)
 
 # List 6: trustee-sale purchase in the last 12 months.
 AUCTION_WINNER_PURCHASE_WINDOW_DAYS: tuple[int, int] = (365, 0)
+
+# Cora P3.1 cash purchases: bought with 100% down in the last 90 days by a non-occupant.
+CASH_PURCHASE_WINDOW_DAYS: tuple[int, int] = (90, 0)
+CASH_PURCHASE_MIN_DOWN_PERCENT: int = 100
+
+# Cora P3.1 investor-owned portfolios: company-owned, not owner-occupied, bought in the last
+# 12 months. PropertyRadar has no "properties owned" criterion, so the portfolio size is
+# counted over the staged records by the export (INVESTOR_PORTFOLIO_MIN_PROPERTIES).
+INVESTOR_PORTFOLIO_WINDOW_DAYS: tuple[int, int] = (365, 0)
+INVESTOR_PORTFOLIO_MIN_PROPERTIES: int = 3
+
+# Campaigns whose records are maturing-loan leads.
+MATURITY_CAMPAIGNS: frozenset[str] = frozenset({"maturity_target_lender", "private_maturity"})
 
 # Far-past lower bound for an open-ended "before" date range.
 _EARLIEST_DATE = date(1990, 1, 1)
@@ -99,7 +135,7 @@ def _window_dates(
 def _maturity_window_dates(as_of: Optional[date] = None) -> tuple[date, date]:
     """Return (start, end) dates for loans recorded 8–15 months ago, as of ``as_of``
     (default today). Returns real ``date`` objects — callers format for the API."""
-    return _window_dates(*_MATURITY_WINDOW_DAYS, as_of=as_of)
+    return _window_dates(*_maturity_window_days(), as_of=as_of)
 
 
 def _fmt(d: date) -> str:
@@ -111,6 +147,7 @@ def build_campaign_criteria(
     campaign: str,
     *,
     daily_since: Optional[date] = None,
+    gap_from_days: Optional[int] = None,
 ) -> list[dict]:
     """Return the Criteria list for a given (state, campaign) pair.
 
@@ -123,11 +160,26 @@ def build_campaign_criteria(
     (§2.3): pass the last successful daily/backlog run's date here, and only
     ~16/week new-to-the-window Florida loans get queried, not the whole ~700+
     record backlog every time. Pass None (the default) for a full backlog pull.
+
+    ``gap_from_days``: a maturity campaign's FirstDate window becomes loans recorded
+    ``gap_from_days`` back to the day before today's near edge. Used once, by hand, after
+    PROPERTY_RADAR_STATEWIDE_ENABLED moves the near edge in (240 -> 198 days): the daily
+    watermark was set under the old edge, so those loans are otherwise never pulled.
     """
     key = (state.upper(), campaign)
     if key not in _CAMPAIGN_BUILDERS:
         raise ValueError(f"Unknown campaign: state={state!r} campaign={campaign!r}")
-    return _CAMPAIGN_BUILDERS[key](daily_since)
+    criteria = _CAMPAIGN_BUILDERS[key](daily_since)
+    if gap_from_days is None:
+        return criteria
+    if campaign not in MATURITY_CAMPAIGNS:
+        raise ValueError(f"gap_from_days applies to maturity campaigns only, not {campaign!r}")
+    window = _private_maturity_window_days(state.upper()) if campaign == "private_maturity" else _maturity_window_days()
+    near = window[1]
+    if gap_from_days <= near:
+        raise ValueError(f"gap_from_days must be beyond the near edge ({near} days)")
+    gap = _date_window_criterion("FirstDate", (gap_from_days, near + 1), None)
+    return [gap if c.get("name") == "FirstDate" else c for c in criteria]
 
 
 def _date_window_criterion(
@@ -163,7 +215,7 @@ def _outside_window_criterion(name: str, window_days: tuple[int, int]) -> dict:
 
 
 def _maturity_date_criterion(daily_since: Optional[date]) -> dict:
-    return _date_window_criterion("FirstDate", _MATURITY_WINDOW_DAYS, daily_since)
+    return _date_window_criterion("FirstDate", _maturity_window_days(), daily_since)
 
 
 def _fl_maturity_target_lender(daily_since: Optional[date] = None) -> list[dict]:
@@ -209,7 +261,7 @@ def _private_maturity(state: str, daily_since: Optional[date] = None) -> list[di
         _CORPORATE,
         _NOT_LISTED,
         _PRIVATE_FIRST_LOAN,
-        _date_window_criterion("FirstDate", PRIVATE_MATURITY_WINDOW_DAYS[state], daily_since),
+        _date_window_criterion("FirstDate", _private_maturity_window_days(state), daily_since),
         _state(state),
     ]
 
@@ -222,7 +274,7 @@ def _stalled_flip(state: str, daily_since: Optional[date] = None) -> list[dict]:
         # The last transfer is the flipper's own purchase: not resold since.
         _date_window_criterion("LastTransferRecDate", STALLED_FLIP_PURCHASE_WINDOW_DAYS, daily_since),
         # Records already covered by private_maturity are not bought again.
-        _outside_window_criterion("FirstDate", PRIVATE_MATURITY_WINDOW_DAYS[state]),
+        _outside_window_criterion("FirstDate", _private_maturity_window_days(state)),
         _state(state),
     ]
 
@@ -231,6 +283,32 @@ def _auction_winner(state: str, daily_since: Optional[date] = None) -> list[dict
     return [
         {"name": "ForeclosureStage", "value": ["3rd Owned"]},
         _date_window_criterion("LastTransferRecDate", AUCTION_WINNER_PURCHASE_WINDOW_DAYS, daily_since),
+        _state(state),
+    ]
+
+
+_NOT_OWNER_OCCUPIED = {"name": "isSameMailingOrExempt", "value": ["0"]}
+
+
+def _cash_purchase(state: str, daily_since: Optional[date] = None) -> list[dict]:
+    return [
+        _NOT_OWNER_OCCUPIED,
+        _NOT_LISTED,
+        {"name": "LastTransferDownPaymentPercent", "value": [[CASH_PURCHASE_MIN_DOWN_PERCENT, None]]},
+        _date_window_criterion("LastTransferRecDate", CASH_PURCHASE_WINDOW_DAYS, daily_since),
+        _state(state),
+    ]
+
+
+def _investor_portfolio(state: str, daily_since: Optional[date] = None) -> list[dict]:
+    return [
+        _CORPORATE,
+        _NOT_OWNER_OCCUPIED,
+        _NOT_LISTED,
+        _date_window_criterion("LastTransferRecDate", INVESTOR_PORTFOLIO_WINDOW_DAYS, daily_since),
+        # Loans the maturity campaigns buy are not bought again here (records with no first loan
+        # are left out too: PropertyRadar has no NOT, and a range never matches a blank date).
+        _outside_window_criterion("FirstDate", _maturity_window_days()),
         _state(state),
     ]
 
@@ -250,6 +328,8 @@ _CAMPAIGN_BUILDERS: dict[tuple[str, str], object] = {
             ("private_maturity", _private_maturity),
             ("stalled_flip", _stalled_flip),
             ("auction_winner", _auction_winner),
+            ("cash_purchase", _cash_purchase),
+            ("investor_portfolio", _investor_portfolio),
         )
     },
 }
@@ -262,4 +342,6 @@ DEFAULT_CAMPAIGN: str = "maturity_target_lender"
 SHARED_SEEN_CAMPAIGNS: dict[str, tuple[str, ...]] = {
     "stalled_flip": ("private_maturity",),
     "private_maturity": ("stalled_flip",),
+    "cash_purchase": ("investor_portfolio",),
+    "investor_portfolio": ("cash_purchase",),
 }
