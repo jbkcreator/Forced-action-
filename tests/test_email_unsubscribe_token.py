@@ -21,7 +21,10 @@ def test_verify_returns_email_for_valid_token():
 def test_verify_returns_none_for_tampered_token():
     with patch("src.services.email_unsubscribe.get_settings", return_value=_settings()):
         token = mint_unsubscribe_token("contact@example.com")
-    tampered = token[:-1] + ("a" if token[-1] != "a" else "b")
+    # change a middle signature character: the last base64url character carries only 4 bits, so
+    # swapping it can decode to the same signature and the token still verifies (~5% of runs)
+    i = len(token) - 10
+    tampered = token[:i] + ("a" if token[i] != "a" else "b") + token[i + 1:]
     with patch("src.services.email_unsubscribe.get_settings", return_value=_settings()):
         assert verify_unsubscribe_token(tampered) is None
 

@@ -266,4 +266,7 @@ def test_bridge_reads_only_campaigns_with_a_dialer_list():
             return MagicMock(**{"mappings.return_value.all.return_value": []})
 
     assert list(bridge._iter_record_pages(_Session(), state=None)) == []
-    assert set(seen[0]["dialed"]) == {"maturity_target_lender", "private_maturity", "stalled_flip", "auction_winner"}
+    assert set(seen[0]["dialed"]) == {
+        "maturity_target_lender", "private_maturity", "stalled_flip", "auction_winner",
+        "cash_purchase", "investor_portfolio",
+    }
