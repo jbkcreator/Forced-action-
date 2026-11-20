@@ -79,3 +79,92 @@ def test_a_merge_field_that_did_not_resolve_is_refused_not_saved(client, lending
     r = client.post("/webhooks/lending/ghl-stage", headers=HEADERS, json=body)
     assert r.status_code == 422 and "did not resolve" in r.json()["detail"]
     assert _rows(lending_db) == []
+
+
+# ---- P2.4 current stage (lending.ghl_opportunity_stage) -------------------------------------------------------------
+
+def _current(db, opp="opp-9"):
+    return db.execute(text("SELECT stage_key FROM lending.ghl_opportunity_stage WHERE ghl_opportunity_id = :o"),
+                      {"o": opp}).scalar()
+
+
+def _stage(client, stage, opp="opp-9"):
+    response = client.post("/webhooks/lending/ghl-stage", headers=HEADERS,
+                           json={"opportunity_id": opp, "stage_name": stage, "phone": "(813) 555-0199"})
+    assert response.status_code == 200
+    return response.json()["recorded"]
+
+
+def test_a_late_redelivery_never_reopens_a_funded_deal(client, lending_db):
+    assert _stage(client, "Application") and _stage(client, "Funded")
+    assert _stage(client, "Application") is False      # GHL redelivers the earlier event after Funded
+    assert _current(lending_db) == "funded"
+
+
+def test_a_repeated_event_never_reopens_a_lost_deal(client, lending_db):
+    _stage(client, "Submitted to lender"), _stage(client, "Lost")
+    _stage(client, "Submitted to lender")
+    assert _current(lending_db) == "lost"
+
+
+def test_a_first_time_stage_after_funded_still_applies(client, lending_db):
+    _stage(client, "Funded")
+    assert _stage(client, "Application") is True        # never seen before for this deal: a real move
+    assert _current(lending_db) == "application"
+
+
+def _age_events(db, hours=2, opp="opp-9"):
+    """The deal's earlier deliveries, and its entry into its current stage, happened ``hours`` ago."""
+    db.execute(text("UPDATE lending.ghl_stage_events SET event_at = now() - make_interval(hours => :h) "
+                    "WHERE ghl_opportunity_id = :o"), {"h": hours, "o": opp})
+    db.execute(text("UPDATE lending.ghl_opportunity_stage SET entered_at = now() - make_interval(hours => :h) "
+                    "WHERE ghl_opportunity_id = :o"), {"h": hours, "o": opp})
+
+
+def _held_items(db):
+    return db.execute(text("SELECT summary FROM lending.cora_inbox WHERE event_type = 'ghl_stage_repeat_held'")
+                      ).scalars().all()
+
+
+def test_a_redelivery_after_a_revival_never_reopens_a_funded_deal(client, lending_db):
+    """Application (day 1), Lost, revived to Application days later, Funded, then the revival redelivered."""
+    _stage(client, "Application"), _stage(client, "Lost")
+    _age_events(lending_db, hours=72)
+    _stage(client, "Application")                     # the revival: applied
+    assert _current(lending_db) == "application"
+    _stage(client, "Funded")
+    _stage(client, "Application")                     # GHL redelivers the revival minutes after Funded
+    assert _current(lending_db) == "funded"
+
+
+def test_a_held_repeat_raises_one_inbox_item_naming_both_stages(client, lending_db):
+    _stage(client, "Application"), _stage(client, "Lost")
+    _stage(client, "Application"), _stage(client, "Application")
+    assert _current(lending_db) == "lost"
+    items = _held_items(lending_db)
+    assert len(items) == 1 and '"Application"' in items[0] and '"Lost"' in items[0] and "opp-9" in items[0]
+
+
+def test_a_redelivery_within_the_hour_never_moves_an_active_deal_back(client, lending_db):
+    _stage(client, "Application"), _stage(client, "Submitted to lender")
+    _stage(client, "Application")                     # GHL redelivers the earlier event minutes later
+    assert _current(lending_db) == "submitted to lender"
+
+
+def test_a_repeated_stage_later_than_the_hour_is_a_real_move(client, lending_db):
+    _stage(client, "Application"), _stage(client, "Submitted to lender")
+    _age_events(lending_db)
+    _stage(client, "Application")                     # the deal really went back
+    assert _current(lending_db) == "application"
+
+
+def test_a_lost_deal_revived_to_a_stage_it_was_in_before_is_reopened(client, lending_db):
+    _stage(client, "Application"), _stage(client, "Lost")
+    _age_events(lending_db, hours=48)
+    assert _stage(client, "Application") is False     # a repeat in ghl_stage_events...
+    assert _current(lending_db) == "application"      # ...but days later: Josh revived it
+
+
+def test_a_redelivered_funded_keeps_funded(client, lending_db):
+    _stage(client, "Funded"), _stage(client, "Funded")
+    assert _current(lending_db) == "funded"

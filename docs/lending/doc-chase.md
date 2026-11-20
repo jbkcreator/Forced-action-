@@ -1,0 +1,88 @@
+# P2.4: closing blocker card and document chase
+
+Code: `src/lending/closing/` (rules, drafts, blockers, doc_chase), upload page `src/api/lending_doc_upload_router.py`
+on `lending-api`, settings and copy in `config/lending_closing.py`. Both parts run on Cora's minute sweep
+(`fa-lending-cora`) and are **off** until their flag is set.
+
+## Setup
+
+1. `PYTHONPATH=. python migrations/apply_lending_doc_chase.py` (idempotent; **before** deploying: the stage webhook
+   writes `lending.ghl_opportunity_stage`). It backfills each deal's current stage from `lending.ghl_stage_events`.
+2. GHL: the "Pipeline Stage Changed" workflow that posts to `POST /webhooks/lending/ghl-stage` must fire for
+   **every** stage of the lending pipeline, including moves made through the API (P2.3 relies on the same).
+3. Env: `LENDING_CLOSING_BLOCKERS_ENABLED=true`, `LENDING_DOC_CHASE_ENABLED=true`, `LENDING_DOC_UPLOAD_DIR` (an
+   **absolute** path on persistent, backed-up storage; unset or relative = no chase starts and no upload is stored),
+   `LENDING_DOC_CHASE_SMS_LINKS_ENABLED` (see Messages), and `LENDING_PARTNER_LINK_BASE_URL` (https host of
+   the upload links; already set for the partner door). Cora needs `LENDING_CORA_CHANNEL` and
+   `LENDING_CORA_APPROVALS_CHANNEL` (already required).
+4. The upload folder holds borrowers' financial documents: folder `0700`, files `0600`, never served by nginx,
+   never sent to Slack. Include it in the server backup. There is no automatic deletion yet: it is built once Josh
+   sets the retention period.
+5. So Josh can open them: `LENDING_DOC_UPLOAD_DRIVE_FOLDER_ID` = the id of a **new Shared Drive** "NDL Borrower
+   Documents" whose only members are Josh (Manager), whoever he names, and the lending service account
+   (`fa-lending-engine@forcedaction.iam.gserviceaccount.com`, Content manager). Not a folder inside NDL Cora (every
+   member of that drive sees it) and not Josh's My Drive (a service account has no storage of its own, so uploads
+   there fail). Cora's sweep copies each upload to `chase-<id>/<item>-<upload id>.<ext>` (no borrower name in Drive)
+   once. A failure waits and retries (1, 2, 4 ... minutes, at most 6 hours) and pauses the copy step (5 minutes,
+   up to an hour) so Cora's sweep is never held; it never gives up. While uploads have failed 5 times or more, one
+   ops notice per outage (repeated at most every 6 hours), not one per document. Files over 5 MB go as a resumable
+   upload. Empty = documents stay on the server only.
+
+Current stage: each GHL stage webhook updates `lending.ghl_opportunity_stage` (time = when it arrived; GHL sends
+no event time). A stage event this deal already sent before (a repeat) is held when the deal entered its current
+stage less than an hour ago: that is a redelivery (e.g. "Application" again just after "Funded"). Otherwise it is a
+real move (e.g. a Lost deal revived to Application days later). A real move back within the hour looks the same, so
+a held repeat raises a Cora inbox item: if the deal really went back, move it in GHL again after the hour.
+
+## 7 AM closing blocker card (#cora)
+
+Once a day between 7:00 and noon ET (`lending.closing_blocker_cards` stops a second post). Cora claims the day in
+its own transaction before posting and records the post as soon as Slack has it; a claim left unposted (Cora stopped
+in between) is taken again after 10 minutes. Lists every deal in
+Application, Ready to fund or Submitted to lender (`ACTIVE_STAGE_KEYS`) for more than 3 days, oldest first, red.
+A long card continues in its thread, so every deal is shown in full. Who holds it up: missing documents mean the borrower (the partner when the deal came from a partner's file);
+otherwise Application = borrower, Submitted to lender = lender, Ready to fund = closing (title).
+
+- Borrower deal with a document chase running: the chase does the reminding, the card shows the last step.
+- Borrower deal without a chase: a check-in draft goes to #approvals (at most one per deal every 3 days in a stage),
+  by text with consent, else by the email on the lead record (website lead, LendingFlow lead or loan file).
+- No text consent and no email: the card says to call.
+- Lender or title: the card shows a ready-to-copy line for Josh. Cora never contacts lenders or title companies.
+
+`stuck_deals(db, now)` in `src/lending/closing/blockers.py` is the shared query (P2.5 "daily blockers").
+
+## Document chase
+
+Start: an approver tells Cora the borrower accepted the term sheet, e.g. "Mark accepted the term sheet, start the
+document chase" (tool `start_document_chase`; optional P2.2 `quote_id`, whose `INTEREST_RESERVE_FULL_TERM`
+condition adds a document). One open chase per phone; asking again keeps the open one. While texts with links are
+off, a borrower with no email is refused with the reason (no link could ever reach them); asking again with
+their email adds it to an open chase, and the step that could not be sent goes out by email.
+
+Where the documents are: on the lending-api server under `LENDING_DOC_UPLOAD_DIR`, one folder per chase, and
+copied to Josh's Drive folder `chase-<id>/` when `LENDING_DOC_UPLOAD_DRIVE_FOLDER_ID` is set (setup step 5). Cora's
+inbox says what arrived and the chase number, e.g. "Mark (…0101) uploaded Photo ID: 1 of 6 documents received
+(chase 12).".
+
+Checklist: Central Lending's list from Josh's Term Sheet Intake Checklist (Nov 2). Backflip has none (blocked).
+
+Messages (approval cards in #approvals; text with consent, else email; the relay still checks consent, the 8 AM to 8
+PM window, suppression, the lane deny list and the halt). Chase texts carry the upload link, so they go only once
+`LENDING_DOC_CHASE_SMS_LINKS_ENABLED=true` (off until the 10DLC campaign declares embedded links); while it is off the
+request and reminders go by email, or to Cora's inbox as "call them" when there is no email. Steps: the request on
+acceptance day, reminders on ET days 2, 5 and 8 while anything is missing. After an outage only the latest due step
+goes out. Each message carries its own upload link; every link works for 30 days or until the chase closes.
+`doc_chase_links` keeps only the token's SHA-256; the full link is in the drafted message (so in
+`pending_actions.payload` until sent), and the approval card shows it masked (`…/api/lending/docs/[…]`). Template
+versions `DOCS-*` and `BLOCKER-*` are counted by the P1.4 tracker like any other.
+
+Closes: `complete` when every document is in, `cancelled` when the deal enters Funded, Lost or Nurture. Links are
+revoked, drafts still awaiting approval are withdrawn, Cora's send check refuses any approved reminder of a closed
+chase, and Cora's inbox gets one item. A chase started before its deal reached GHL is matched to the deal on a later
+sweep, but only when the borrower's phone has exactly one GHL opportunity (never guessed). Each upload also raises an inbox item ("3 of 6 received").
+`get_document_chases` answers "who still owes documents?".
+
+## Open with Josh
+
+Active stages, the owner per stage, the message wording (`TEMPLATES`), the document retention period, and Josh's
+restricted Drive folder for uploaded documents (`LENDING_DOC_UPLOAD_DRIVE_FOLDER_ID`).

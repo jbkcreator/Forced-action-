@@ -938,6 +938,19 @@ class AppSettings(BaseSettings):
 	lending_partner_consent_text: str = Field(default="", env="LENDING_PARTNER_CONSENT_TEXT")
 	lending_partner_upload_dir: str = Field(default="data/partner_uploads", env="LENDING_PARTNER_UPLOAD_DIR")  # uploads + generated pre-qual PDFs
 	lending_partner_link_base_url: str = Field(default="", env="LENDING_PARTNER_LINK_BASE_URL")  # public host of partner links, e.g. https://api.nextdeallending.com; unset = /partners creates no links
+	# P2.4 closing blocker card (7 AM, LENDING_CORA_CHANNEL) and document chase (src/lending/closing/); both off by default.
+	lending_closing_blockers_enabled: bool = Field(default=False, env="LENDING_CLOSING_BLOCKERS_ENABLED")
+	lending_doc_chase_enabled: bool = Field(default=False, env="LENDING_DOC_CHASE_ENABLED")
+	# Chase texts carry the upload link. Off until the 10DLC campaign declares embedded links (the same condition as
+	# LENDING_TEXT_BACK_BOOKING_LINK_ENABLED); off = the request and reminders go by email, or to Cora's inbox as
+	# "call them" when there is no email.
+	lending_doc_chase_sms_links_enabled: bool = Field(default=False, env="LENDING_DOC_CHASE_SMS_LINKS_ENABLED")
+	# Borrower documents (link host = LENDING_PARTNER_LINK_BASE_URL). An absolute path on persistent, backed-up
+	# storage; unset or relative = no chase starts and no upload is stored (a rebuild could lose them).
+	lending_doc_upload_dir: str = Field(default="", env="LENDING_DOC_UPLOAD_DIR")
+	# Josh's restricted Drive folder for borrower documents (only Josh, plus the lending service account as Content
+	# manager; never a team-wide folder). Empty = documents stay on the server only.
+	lending_doc_upload_drive_folder_id: str = Field(default="", env="LENDING_DOC_UPLOAD_DRIVE_FOLDER_ID")
 	# Shared secret the GHL "DND changed" workflow sends in X-Webhook-Secret. Unset = endpoint closed.
 	lending_ghl_webhook_secret: Optional[SecretStr] = Field(default=None, env="LENDING_GHL_WEBHOOK_SECRET")
 	lending_ghl_sms_from_number: Optional[str] = Field(default=None, env="LENDING_GHL_SMS_FROM_NUMBER")  # E.164; the GHL SMS number (texting only). Calls run through BatchDialer on a different number
