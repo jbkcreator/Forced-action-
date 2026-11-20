@@ -10,7 +10,8 @@ own halt still needs ``resume``.
 While the flag is set, every GoHighLevel SMS and email this code sends is refused (``ghl_sms`` send path), the
 LendingFlow intro-SMS tag that starts the GHL workflow is not added, and no new contacts are loaded into the
 dialer. Two things cannot be stopped from here and the alert says so: calls already queued in BatchDialer (its
-API has no campaign-pause call) and automations that run inside GHL itself. If the flag cannot be read, sends are
+API has no campaign-pause call) and automations that run inside GHL itself, except P2.1 speed-to-lead call cascades,
+whose tags the halt removes (``speed_to_lead.stop_active_cascades``). If the flag cannot be read, sends are
 treated as halted.
 """
 from __future__ import annotations
@@ -90,6 +91,12 @@ def emergency_command(message_text: str) -> Optional[str]:
     return None
 
 
+def _default_cascade_stopper() -> Optional[int]:
+    from src.lending.speed_to_lead import stop_active_cascades_live
+
+    return stop_active_cascades_live()
+
+
 def _default_instantly_sender() -> Any:
     from src.lending.instantly_email import get_ndl_instantly_sender
 
@@ -103,12 +110,14 @@ class EmergencyHalt:
     still go out), and resume re-activates it. A failed pause never undoes the halt; the alert says so instead."""
 
     def __init__(self, *, chat: Any, cora_halt: Any, approver_ids: Collection[str],
-                 alert_channel: Optional[str], instantly_sender: Callable[[], Any] = _default_instantly_sender) -> None:
+                 alert_channel: Optional[str], instantly_sender: Callable[[], Any] = _default_instantly_sender,
+                 cascade_stopper: Callable[[], Optional[int]] = _default_cascade_stopper) -> None:
         self._chat = chat
         self._cora_halt = cora_halt
         self._approvers = frozenset(approver_ids)
         self._alert_channel = alert_channel
         self._instantly_sender = instantly_sender
+        self._cascade_stopper = cascade_stopper
 
     def _instantly_campaign(self, action: str) -> Optional[bool]:
         """Pause or resume NDL's Instantly campaign: None when Instantly is not configured, else whether it worked."""
@@ -120,6 +129,14 @@ class EmergencyHalt:
         except Exception as exc:  # class only: never let Instantly stop the halt
             logger.error("[global-halt] Instantly campaign %s failed (%s)", action, type(exc).__name__)
             return False
+
+    def _stop_cascades(self) -> Optional[int]:
+        """P2.1: stop speed-to-lead call cascades already running in GHL. None when there is nothing to stop."""
+        try:
+            return self._cascade_stopper()
+        except Exception as exc:  # class only: never let this stop the halt
+            logger.error("[global-halt] speed-to-lead stop failed (%s)", type(exc).__name__)
+            return None
 
     def __call__(self, message: Any) -> bool:
         """Handle the message if it is an emergency command; True when it was one."""
@@ -147,7 +164,10 @@ class EmergencyHalt:
             return
         self._cora_halt.set(reason=reason, user_id=message.user_id)
         paused = self._instantly_campaign("pause")
+        cascades = self._stop_cascades()
         instantly_stopped = ", the NDL Instantly cold-email campaign (paused)" if paused else ""
+        if cascades is not None:
+            instantly_stopped += f", speed-to-lead calls in progress ({cascades} stopped)"
         instantly_warning = ("\n:warning: The NDL Instantly cold-email campaign could NOT be paused: pause it by hand "
                              "in Instantly now." if paused is False else "")
         alert = (f":rotating_light: *Lending emergency halt* by <@{message.user_id}>.\n"

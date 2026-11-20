@@ -922,6 +922,12 @@ class AppSettings(BaseSettings):
 	# Backflip borrower conflict check on the lending load. Off for launch: there is no
 	# Backflip export, and a missing or stale feed blocks every record when it is on.
 	lending_backflip_check_enabled: bool = Field(default=False, env="LENDING_BACKFLIP_CHECK_ENABLED")
+	# Instant quote endpoint (POST /api/lending/instant-quote on lending-api). Off until the client's go;
+	# callers send the key in X-Api-Key. Unset key = every caller refused.
+	lending_instant_quote_enabled: bool = Field(default=False, env="LENDING_INSTANT_QUOTE_ENABLED")
+	lending_instant_quote_api_key: Optional[SecretStr] = Field(default=None, env="LENDING_INSTANT_QUOTE_API_KEY")
+	# Second program's 1-exit new-construction rule. Off until the client approves that program in writing.
+	lending_instant_quote_exit_rule_enabled: bool = Field(default=False, env="LENDING_INSTANT_QUOTE_EXIT_RULE_ENABLED")
 	# T-07 Minute-5 pre-qualification PDF. Off until Josh + compliance review the template.
 	lending_prequal_pdf_enabled: bool = Field(default=False, env="LENDING_PREQUAL_PDF_ENABLED")
 	# Placeholder range: +/- this percent around the requested amount, clamped to fitting lenders' limits.
@@ -975,6 +981,9 @@ class AppSettings(BaseSettings):
 	# T-09 intro SMS. Off: the tag that starts the GHL intro workflow is never added, so nobody is texted. Turn on only after
 	# Josh confirms LendingFlow's consent and DNC check. Needs the id of the GHL contact custom field "intro_name".
 	lending_intro_sms_enabled: bool = Field(default=False, env="LENDING_INTRO_SMS_ENABLED")
+	# P2.1 Speed-to-Lead call cascade (src/lending/speed_to_lead.py). Off: the tag that starts the GHL "NDL - Speed to
+	# Lead" workflow (Josh -> David -> Voice AI at 2 min) is never added, so nobody is called by it.
+	lending_speed_to_lead_enabled: bool = Field(default=False, env="LENDING_SPEED_TO_LEAD_ENABLED")
 	# After-hours voicemail / answering-service intake (POST /webhooks/lending/after-hours-intake); closed (503) while off
 	lending_after_hours_intake_enabled: bool = Field(default=False, env="LENDING_AFTER_HOURS_INTAKE_ENABLED")
 	# Night responder: an after-hours inquiry opens a three-question conversation and inbound replies advance it. Off: no conversation is opened or advanced
@@ -984,6 +993,8 @@ class AppSettings(BaseSettings):
 	# Carrier (10DLC) approval for lending texts Cora sends after Approve; until true an approved text waits (then blocks at expiry)
 	lending_sms_carrier_approved: bool = Field(default=False, env="LENDING_SMS_CARRIER_APPROVED")
 	lending_ghl_cf_intro_name: Optional[str] = Field(default=None, env="LENDING_GHL_CF_INTRO_NAME")
+	# GHL contact custom field "lead_id": every LendingFlow push writes our lendingflow_leads.lead_uuid; unset = not written
+	lending_ghl_cf_lead_id: Optional[str] = Field(default=None, env="LENDING_GHL_CF_LEAD_ID")
 	# T-12 background enrichment card + routing. Off: no card is built, the deal-facts webhook returns 503.
 	lending_enrichment_enabled: bool = Field(default=False, env="LENDING_ENRICHMENT_ENABLED")
 	# Street View Static API (metadata lookup only; the key is never put in a posted link). Unset = no Street View.

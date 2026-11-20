@@ -47,7 +47,7 @@ def test_every_table_is_written_even_when_empty():
         assert parse(data) == []
     for name, data in files.items():
         header = data.decode().splitlines()[0]
-        assert header.startswith("ghl_contact_id,contact_id,phone_last4") == (name != "cohorts.csv")
+        assert header.startswith("ghl_contact_id,contact_id,phone_last4") == (name[:-len(".csv")] not in le.NO_KEY_TABLES)
 
 
 def test_no_full_phone_or_email_appears_in_any_file():
@@ -367,3 +367,86 @@ def test_a_test_contacts_row_with_no_phone_is_left_out_by_its_ghl_id():
 
     rows = le._rows(Db(), None, frozenset(), frozenset({"g-test"}))
     assert [r["ghl_contact_id"] for r in rows] == ["g-real"]
+
+
+def _audience_dir(monkeypatch, directory) -> None:
+    from config.settings import get_settings
+
+    monkeypatch.setattr(get_settings(), "lending_audience_export_dir", str(directory) if directory else None,
+                        raising=False)
+
+
+def _staged_audience(monkeypatch, directory, day, contacts):
+    """Runs the real audience export for ``day`` into ``directory`` with fixed contacts."""
+    from src.tasks import lending_audience_export as audience
+
+    monkeypatch.setattr(audience, "eligible_contacts", lambda db: iter(contacts))
+    return audience.export(None, directory, day=day)
+
+
+def test_audiences_are_exported_as_counts_only(monkeypatch, tmp_path):
+    """Team decision Q33: the agents get the audience sizes, never the hashed files."""
+    from datetime import date
+
+    from src.tasks.lending_audience_export import Contact
+
+    contacts = [Contact("lendingflow", f"+1813555010{i}", f"lf{i}@example.com") for i in range(7)]
+    contacts += [Contact("web", None, "w1@example.com"), Contact("web", "+18135550190", None)]
+    _staged_audience(monkeypatch, tmp_path, date(2026, 11, 18), contacts)
+    _audience_dir(monkeypatch, tmp_path)
+    rows = le._audience_rows(date(2026, 11, 18))
+    assert rows == [
+        {"day": "2026-11-18", "platform": "google", "rows": 9, "lendingflow_contacts": 7, "web_contacts": 2},
+        {"day": "2026-11-18", "platform": "meta", "rows": 9, "lendingflow_contacts": 7, "web_contacts": 2},
+    ]
+    csv_text = le.build_files(le.LedgerData(audiences=rows))["audiences.csv"].decode()
+    assert csv_text.splitlines()[0] == "day,platform,rows,lendingflow_contacts,web_contacts"
+
+
+def test_audience_counts_are_the_staged_files_counts_even_if_contacts_change_before_the_ledger(monkeypatch, tmp_path):
+    """A signup or an opt-out after the audience export never changes the counts the ledger reports for that day."""
+    from datetime import date
+
+    from src.tasks import lending_audience_export as audience
+    from src.tasks.lending_audience_export import Contact
+
+    day = date(2026, 11, 18)
+    _staged_audience(monkeypatch, tmp_path, day, [Contact("lendingflow", "+18135550100", None),
+                                                   Contact("web", "+18135550101", None)])
+    # after the export: one contact opts out and two new ones sign up
+    monkeypatch.setattr(audience, "eligible_contacts", lambda db: iter([
+        Contact("web", "+18135550101", None), Contact("web", "+18135550102", None), Contact("web", "+18135550103", None)]))
+    _audience_dir(monkeypatch, tmp_path)
+    assert [(r["rows"], r["lendingflow_contacts"], r["web_contacts"]) for r in le._audience_rows(day)] == [
+        (2, 1, 1), (2, 1, 1)]
+
+
+def test_a_backfill_reports_that_days_staged_counts_not_todays(monkeypatch, tmp_path):
+    from datetime import date
+
+    from src.tasks.lending_audience_export import Contact
+
+    _staged_audience(monkeypatch, tmp_path, date(2026, 11, 10), [Contact("web", "+18135550100", None)])
+    _staged_audience(monkeypatch, tmp_path, date(2026, 11, 18),
+                     [Contact("web", f"+1813555011{i}", None) for i in range(5)])
+    _audience_dir(monkeypatch, tmp_path)
+    rows = le._audience_rows(date(2026, 11, 10))
+    assert [(r["day"], r["rows"], r["web_contacts"]) for r in rows] == [("2026-11-10", 1, 1), ("2026-11-10", 1, 1)]
+
+
+def test_a_day_without_a_finished_audience_export_has_no_audience_rows(monkeypatch, tmp_path):
+    from datetime import date
+
+    _audience_dir(monkeypatch, tmp_path)
+    assert le._audience_rows(date(2026, 11, 18)) == []
+    _audience_dir(monkeypatch, None)
+    assert le._audience_rows(date(2026, 11, 18)) == []
+
+
+def test_an_unreadable_audience_summary_leaves_the_rest_of_the_ledger_alone(monkeypatch, tmp_path, caplog):
+    from datetime import date
+
+    (tmp_path / "audience_counts_2026-11-18.json").write_text("{not json")
+    _audience_dir(monkeypatch, tmp_path)
+    assert le._audience_rows(date(2026, 11, 18)) == []
+    assert "unreadable" in caplog.text

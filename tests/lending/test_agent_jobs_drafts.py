@@ -32,6 +32,13 @@ def test_sms_payload_matches_existing_executor_keys() -> None:
         "+18135550142", "mark@example.com", "ghl:ghl-123")
 
 
+def test_a_message_to_a_partner_is_marked_so_the_send_check_can_tell() -> None:
+    partner = GhlContact(contact_id="ghl-123", phone="+18135550142", email="mark@example.com",
+                         dnd_channels=frozenset(), tags=frozenset({"ndl-partner"}))
+    assert build_draft(_job(), partner, "ghl").payload["partner_contact"] is True
+    assert "partner_contact" not in build_draft(_job(), CONTACT, "ghl").payload
+
+
 def test_warm_email_payload_has_subject() -> None:
     draft = build_draft(_job(type="send_email", subject="Your loan"), CONTACT, "ghl")
     assert draft.channel == "ghl_email"

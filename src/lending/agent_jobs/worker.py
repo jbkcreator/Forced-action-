@@ -89,6 +89,21 @@ def make_check(engine: Engine, *, instantly_ready: bool) -> Check:
     return check
 
 
+def may_send_without_card(channel: str, payload: Mapping[str, Any]) -> bool:
+    """Team decision Q18: cold emails (the Instantly rail) and messages to partners (``partner_contact`` on the draft,
+    set from the ndl-partner tag) graduate on the same rule as every other type, but only once rejections count (Q14,
+    LENDING_GRADUATION_COUNT_REJECTIONS) and only approved wording may send without a card (Q19,
+    LENDING_GRADUATED_APPROVED_WORDING_ONLY). Until both are on, they always get a card. The worker asks when it makes
+    the draft and the relay's send check asks again right before the send, so an action approved automatically while
+    both were on goes back for a person's approval if either is turned off before it sends."""
+    from config.settings import get_settings
+
+    settings = get_settings()
+    if settings.lending_graduation_count_rejections and settings.lending_graduated_approved_wording_only:
+        return True
+    return channel != COLD_EMAIL_CHANNEL and not payload.get("partner_contact")
+
+
 class JobQueueWorker:
     def __init__(self, engine: Engine, folders: JobFolders, gate: SendGate, queue: PendingActionQueue,
                  read_contact: ReadContact, *, approval_channel: str, check: Check,
@@ -250,7 +265,8 @@ class JobQueueWorker:
         draft = build_draft(job, contact, verdict.rail or "ghl")
         context = ToolContext(user_id=REQUESTED_BY, is_approver=False, channel=self._approval_channel, thread_ts="",
                               tool_use_id=_draft_key(job))
-        automatic = not job.requires_approval and self._is_graduated(job.template_version, draft.channel)
+        automatic = (not job.requires_approval and may_send_without_card(draft.channel, draft.payload)
+                     and self._is_graduated(job.template_version, draft.channel))
         if automatic and self._wording_ok is not None and not self._wording_ok(
                 job.template_version, draft.channel, draft.payload, label_names(job.contact_label)):
             automatic = False  # graduated, but this wording is not one Josh approved: it gets a card
