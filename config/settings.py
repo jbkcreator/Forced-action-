@@ -975,6 +975,9 @@ class AppSettings(BaseSettings):
 	# T-09 intro SMS. Off: the tag that starts the GHL intro workflow is never added, so nobody is texted. Turn on only after
 	# Josh confirms LendingFlow's consent and DNC check. Needs the id of the GHL contact custom field "intro_name".
 	lending_intro_sms_enabled: bool = Field(default=False, env="LENDING_INTRO_SMS_ENABLED")
+	# P2.1 Speed-to-Lead call cascade (src/lending/speed_to_lead.py). Off: the tag that starts the GHL "NDL - Speed to
+	# Lead" workflow (Josh -> David -> Voice AI at 2 min) is never added, so nobody is called by it.
+	lending_speed_to_lead_enabled: bool = Field(default=False, env="LENDING_SPEED_TO_LEAD_ENABLED")
 	# After-hours voicemail / answering-service intake (POST /webhooks/lending/after-hours-intake); closed (503) while off
 	lending_after_hours_intake_enabled: bool = Field(default=False, env="LENDING_AFTER_HOURS_INTAKE_ENABLED")
 	# Carrier (10DLC) approval for lending texts Cora sends after Approve; until true an approved text waits (then blocks at expiry)

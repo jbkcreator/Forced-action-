@@ -1198,6 +1198,10 @@ COUNTY_ID=hillsborough
 # Lending LendingFlow intake (T-11) — retry GHL delivery of leads not yet in GoHighLevel, then emit the
 # LendingFlowLeadCreated event + pre-qual hand-off. No-op while LENDING_LENDINGFLOW_ENABLED=false.
 */5 * * * * $PROJECT/scripts/cron/run.sh src.tasks.lending_lendingflow_sweep
+# Lending P2.1 speed-to-lead call queue — every minute: release one queued lead (fresh first, then oldest) inside
+# the callers' hours after re-checking every rule, expire leads queued 72 h, post the morning summary / backlog
+# alert. No-op while LENDING_SPEED_TO_LEAD_ENABLED=false.
+* * * * * $PROJECT/scripts/cron/run.sh src.tasks.lending_speed_to_lead_queue
 */5 * * * * $PROJECT/scripts/cron/run.sh src.tasks.lending_partner_sweep
 # Lending test traffic (Q35, Q42) — tag new rows from test email domains and test partners is_test and log each
 # one in lending.test_data_cleanup_log, so reports, the audience export and seat caps leave them out.

@@ -398,8 +398,9 @@ def _record_exclusions(db, run_id: str, results: list[GateResult]) -> None:
     )
 
 
-def tracerfy_scrub(phones: list[str]) -> list[dict]:
-    """Live Tracerfy DNC batch via FA's existing submit/poll helpers (ADR 0002)."""
+def tracerfy_scrub(phones: list[str], max_polls: int = 120) -> list[dict]:
+    """Live Tracerfy DNC batch via FA's existing submit/poll helpers (ADR 0002). ``max_polls`` bounds the wait for
+    the result (5 s apart); past it the call raises and the numbers stay unscrubbed."""
     from config.settings import get_settings
     from src.tasks.dnc_refresh import _poll_queue, _submit_scrub_batch
 
@@ -407,7 +408,7 @@ def tracerfy_scrub(phones: list[str]) -> list[dict]:
     if not key:
         raise RuntimeError("TRACERFY_API_KEY not configured")
     api_key = key.get_secret_value()
-    return _poll_queue(_submit_scrub_batch(phones, api_key), api_key)
+    return _poll_queue(_submit_scrub_batch(phones, api_key), api_key, max_attempts=max_polls)
 
 
 # ── A2 coverage check (spec §12) ──────────────────────────────────────────────

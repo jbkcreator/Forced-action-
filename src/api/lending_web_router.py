@@ -17,6 +17,8 @@ from config.lending_web import RATE_LIMIT_PER_WINDOW, RATE_LIMIT_SCOPE, RATE_LIM
 from src.api.deps import get_db
 from src.lending.db import lending_session
 from src.lending.web_lead_ghl import get_live_sink
+from config.lending_speed_to_lead import SOURCE_WEB
+from src.lending import speed_to_lead
 from src.lending.web_leads import InvalidWebLead, build_input, deliver_pending, merge_into_existing, save_web_lead, will_be_contacted
 from src.services.rate_limit import client_ip, enforce_or_429
 
@@ -29,7 +31,7 @@ def deliver_in_background(lead_id: int) -> None:
     """Runs after the response. Never raises: the saved row and the sweep cover any failure."""
     try:
         with lending_session() as db:
-            deliver_pending(db, get_live_sink(), lead_id=lead_id)
+            deliver_pending(db, get_live_sink(), lead_id=lead_id, after_delivery=speed_to_lead.live_step(SOURCE_WEB))
     except Exception as exc:
         logger.error("[lending-web] background delivery crashed lead=%s: %s", lead_id, type(exc).__name__)
 
@@ -54,6 +56,8 @@ def create_web_lead(
     deal_drop_optin: Optional[str] = Form(default=None),  # box 3: the weekly Deal Drop by email
     consent_text: Optional[str] = Form(default=None),
     call_consent_text: Optional[str] = Form(default=None),
+    ai_call_consent: Optional[str] = Form(default=None),  # box 4 (P2.1): calls from the AI voice assistant only
+    ai_call_consent_text: Optional[str] = Form(default=None),
     page_url: Optional[str] = Form(default=None),
     company_website: Optional[str] = Form(default=None),  # honeypot: hidden on the page, bots fill it
     db: Session = Depends(get_db),
@@ -71,6 +75,7 @@ def create_web_lead(
                 "property_state": property_state, "credit_band": credit_band, "occupancy": occupancy,
                 "sms_consent": sms_consent, "call_consent": call_consent, "deal_drop_optin": deal_drop_optin,
                 "consent_text": consent_text, "call_consent_text": call_consent_text, "page_url": page_url,
+                "ai_call_consent": ai_call_consent, "ai_call_consent_text": ai_call_consent_text,
             },
             ip_address=client_ip(request),
             user_agent=request.headers.get("user-agent"),
