@@ -10,6 +10,7 @@ from sqlalchemy import text
 
 from migrations.apply_lending_uncalled_alarms import apply_to
 from migrations.apply_lending_uncalled_alarms_after_hours import apply_to as apply_after_hours
+from migrations.apply_lending_speed_to_lead import apply_to as apply_speed_to_lead
 
 ARRIVED = datetime(2026, 10, 9, 15, 0, tzinfo=timezone.utc)
 LEAD_PHONE = "+17275550100"
@@ -75,6 +76,7 @@ def db(lending_db):
     conn.execute(text(_WEB_LEADS))
     apply_to(conn)  # existing shared-DB leads become 'preexisting' and never alarm in tests
     apply_after_hours(conn)  # a table created before 'after_hours' keeps the old reason CHECK otherwise
+    apply_speed_to_lead(conn)  # the due-alarm query reads the P2.1 call queue
     return lending_db
 
 
@@ -1026,3 +1028,58 @@ def test_a_single_digit_hour_is_normalized(monkeypatch):
 
     monkeypatch.setenv("LENDING_ALARM_HOURS_START", "9:00")
     assert AppSettings().lending_alarm_hours_start == "09:00"
+
+
+# ── P2.1: a lead waiting in the speed-to-lead call queue ──────────────────────
+
+def test_a_lead_in_the_speed_to_lead_queue_is_not_due_and_its_clock_starts_at_release(db):
+    from src.lending.uncalled_alarm_worker import _DUE
+
+    lead_id = lead(db, arrived=ARRIVED)
+    pick_up_new_leads(db)
+    row_id = alarm(db, lead_id)["id"]
+    db.execute(text("INSERT INTO lending.speed_to_lead (source, lead_id, received_at, call_status, queued_at, "
+                    "queue_reason) VALUES ('lendingflow', :i, :r, 'queued', :r, 'outside_hours')"),
+               {"i": lead_id, "r": ARRIVED})
+
+    def due(at):
+        rows = db.execute(_DUE, {"first_due": at - timedelta(seconds=120), "escalation_due": at - timedelta(seconds=300),
+                                 "limit": 1000}).mappings().all()
+        return {r["id"]: r for r in rows}
+
+    assert row_id not in due(ARRIVED + timedelta(hours=14))  # queued overnight: no alarm, not on the 08:55 list
+    released = ARRIVED + timedelta(hours=14)
+    db.execute(text("UPDATE lending.speed_to_lead SET call_status = 'tagged', call_tagged_at = :t, released_at = :t "
+                    "WHERE source = 'lendingflow' AND lead_id = :i"), {"t": released, "i": lead_id})
+    assert row_id not in due(released + timedelta(seconds=119))
+    assert due(released + timedelta(seconds=120))[row_id]["arrived_at"] == released
+
+
+def test_a_lead_the_queue_never_held_keeps_its_arrival_clock(db):
+    from src.lending.uncalled_alarm_worker import _DUE
+
+    lead_id = lead(db, arrived=ARRIVED)
+    pick_up_new_leads(db)
+    row_id = alarm(db, lead_id)["id"]
+    rows = db.execute(_DUE, {"first_due": ARRIVED, "escalation_due": ARRIVED - timedelta(seconds=180),
+                             "limit": 1000}).mappings().all()
+    assert {r["id"]: r["arrived_at"] for r in rows}[row_id] == ARRIVED
+
+
+def test_the_morning_list_leaves_out_a_lead_in_the_call_queue_and_lists_one_that_expired_overnight(db):
+    queued_alarm = _close_after_hours(db, SATURDAY_NOON)  # closed after hours first, then queued (GHL was slow)
+    queued_lead = db.execute(text("SELECT lendingflow_lead_id FROM lending.uncalled_alarms WHERE id = :i"),
+                             {"i": queued_alarm}).scalar()
+    db.execute(text("INSERT INTO lending.speed_to_lead (source, lead_id, received_at, call_status, queued_at, "
+                    "queue_reason) VALUES ('lendingflow', :i, :r, 'queued', :r, 'delayed')"),
+               {"i": queued_lead, "r": SATURDAY_NOON})
+    expired_alarm = _close_after_hours(db, datetime(2026, 10, 6, 23, 30, tzinfo=timezone.utc))  # Tue: before Friday
+    expired_lead = db.execute(text("SELECT lendingflow_lead_id FROM lending.uncalled_alarms WHERE id = :i"),
+                              {"i": expired_alarm}).scalar()
+    db.execute(text("INSERT INTO lending.speed_to_lead (source, lead_id, received_at, call_status, released_at) "
+                    "VALUES ('lendingflow', :i, :r, 'expired', :e)"),
+               {"i": expired_lead, "r": datetime(2026, 10, 6, 23, 30, tzinfo=timezone.utc),
+                "e": SATURDAY_NOON + timedelta(hours=5)})  # left the queue on Saturday
+    ids = [row["id"] for row in after_hours_leads(db, MONDAY_LIST)]
+    assert queued_alarm not in ids  # the queue rings it: never both
+    assert expired_alarm in ids  # counted from the moment it left the queue

@@ -1,6 +1,8 @@
 """An email-only opt-out also blocks the phones that email is on file with in lending (ADR 0028)."""
 from __future__ import annotations
 
+from contextlib import contextmanager
+
 from datetime import datetime, timezone
 
 import pytest
@@ -25,6 +27,10 @@ class _Rows:
 class FakeDb:
     def __init__(self, linked: list[tuple[str, str]]):
         self.linked, self.calls = linked, []
+
+    @contextmanager
+    def begin_nested(self):  # the opt-out's lookups each run in a savepoint
+        yield
 
     def execute(self, stmt, params=None):
         sql = str(stmt)

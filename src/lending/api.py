@@ -16,6 +16,7 @@ from src.api.lending_ghl_router import router as lending_ghl_router
 from src.lending.booking_webhook import router as lending_booking_webhook_router
 from src.lending.reply_webhook import router as lending_reply_webhook_router
 from src.lending.instantly_webhook import router as lending_instantly_webhook_router
+from src.api.lending_email_unsubscribe_router import router as lending_email_unsubscribe_router
 from src.lending.soft_approval_webhook import router as lending_soft_approval_router
 from src.api.lending_web_router import router as lending_web_router
 from src.lending.lendingflow_webhook import router as lending_lendingflow_router
@@ -25,6 +26,7 @@ from src.lending.enrichment.service import on_lead_created as enrich_on_lead_cre
 from src.lending.enrichment.webhook import router as lending_enrichment_router
 from src.api.lending_partner_router import router as lending_partner_router
 from src.api.lending_doc_upload_router import UploadTokenLogFilter, router as lending_doc_upload_router
+from src.api.lending_instant_quote_router import router as lending_instant_quote_router
 
 app = FastAPI(title="Lending API", docs_url=None, redoc_url=None)
 # Borrower upload links carry their token in the path: the access logs record it redacted.
@@ -42,6 +44,7 @@ app.include_router(lending_ghl_router)
 app.include_router(lending_booking_webhook_router)
 app.include_router(lending_reply_webhook_router)
 app.include_router(lending_instantly_webhook_router)
+app.include_router(lending_email_unsubscribe_router)
 app.include_router(lending_soft_approval_router)
 app.include_router(lending_web_router)
 app.include_router(lending_lendingflow_router)
@@ -52,6 +55,7 @@ lendingflow_events.subscribe(enrich_on_lead_created)
 lendingflow_events.subscribe(alert_josh)
 app.include_router(lending_partner_router)
 app.include_router(lending_doc_upload_router)
+app.include_router(lending_instant_quote_router)
 
 
 @app.get("/health")

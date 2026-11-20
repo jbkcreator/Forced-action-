@@ -80,7 +80,7 @@ _LOAN_FILE = text("SELECT id FROM lending.loan_files WHERE borrower_phone = :pho
 # P2.2 stores each quote's request and result in lending.instant_quotes; conditions[] carries {"code": ...}.
 _QUOTE_CONDITIONS = text("SELECT c ->> 'code' FROM lending.instant_quotes q, "
                          "jsonb_array_elements(COALESCE(q.result -> 'conditions', '[]'::jsonb)) c "
-                         "WHERE q.quote_id = CAST(:q AS uuid)")
+                         "WHERE q.id = CAST(:q AS uuid)")
 _INSERT_CHASE = text("""
     INSERT INTO lending.doc_chases (lead_ref, ghl_contact_id, ghl_opportunity_id, loan_file_id, first_name, phone, email,
                                     lender_key, quote_id, accepted_at, accepted_by, created_at, updated_at)

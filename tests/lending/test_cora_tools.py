@@ -148,13 +148,13 @@ SAM = _Lead("web_lead:7", "Sam Smith", "+17275550100", "sam@example.com", "ghl-1
 
 def test_tool_set_and_safety_levels() -> None:
     tools = {tool.name: tool for tool in CoraToolkit(engine=None, memory=None).tools()}  # type: ignore[arg-type]
-    assert len(tools) == 24
+    assert len(tools) == 25
     assert tools["get_ledger_export_status"].safety is SafetyLevel.READ_ONLY
     egress = {name for name, tool in tools.items() if tool.safety is SafetyLevel.EXTERNAL_EGRESS}
     assert egress == {"draft_sms", "draft_email", "draft_pipeline_move", "draft_add_tag", "draft_add_note"}
     assert {name for name, tool in tools.items() if tool.approver_only} == {
         "save_standing_rule", "deactivate_standing_rule", "dismiss_inbox_item", "route_inbox_item",
-        "start_document_chase"}
+        "start_document_chase", "get_instant_quote"}
     assert tools["query_lending_data"].safety is SafetyLevel.READ_ONLY
     assert tools["list_inbox_items"].safety is SafetyLevel.READ_ONLY
     assert tools["list_channels"].safety is SafetyLevel.READ_ONLY and tools["read_channel"].safety is SafetyLevel.READ_ONLY
@@ -294,3 +294,54 @@ def test_revised_crm_drafts_keep_the_draft_length_limits() -> None:
 def test_note_body_is_stripped(monkeypatch) -> None:
     note = _toolkit(monkeypatch, SAM).draft_add_note(DraftAddNoteInput(lead_ref="web_lead:7", body="  Call Friday \n"), CONTEXT)
     assert note.payload["body"] == "Call Friday"
+
+
+# ── instant quote (team decision Q36) ────────────────────────────────────────
+
+class _QuoteStore:
+    def __init__(self, fail=False):
+        self.records, self.fail = [], fail
+
+    def save(self, record):
+        if self.fail:
+            raise RuntimeError("database down")
+        self.records.append(record)
+        return "q-1"
+
+
+_DEAL = dict(state="fl", zip_code="33602", borrower_type="entity",
+             guarantors=[{"fico": 720, "completed_deals": 3}], purpose="purchase",
+             purchase_price="300000", rehab="50000", arv="450000")
+
+
+def _quote_on(monkeypatch, enabled=True):
+    from config.settings import get_settings
+
+    monkeypatch.setattr(get_settings(), "lending_instant_quote_enabled", enabled, raising=False)
+
+
+def test_cora_runs_the_quote_saves_it_as_cora_and_marks_it_internal(monkeypatch) -> None:
+    _quote_on(monkeypatch)
+    store = _QuoteStore()
+    toolkit = CoraToolkit(engine=None, memory=None, quote_store=store)  # type: ignore[arg-type]
+    result = toolkit.instant_quote(cora_tools.InstantQuoteInput(**_DEAL), CONTEXT)
+    assert result["quote_id"] == "q-1" and "never send it to a borrower" in result["internal_only"]
+    assert result["disclaimer"] and result["status"]
+    (record,) = store.records
+    assert record.api_key_label == "cora" and record.request["state"] == "FL"
+
+
+def test_no_quote_while_instant_quotes_are_off(monkeypatch) -> None:
+    _quote_on(monkeypatch, enabled=False)
+    store = _QuoteStore()
+    with pytest.raises(ToolInputError, match="switched off"):
+        CoraToolkit(engine=None, memory=None, quote_store=store).instant_quote(  # type: ignore[arg-type]
+            cora_tools.InstantQuoteInput(**_DEAL), CONTEXT)
+    assert store.records == []
+
+
+def test_a_quote_that_could_not_be_saved_is_not_shown(monkeypatch) -> None:
+    _quote_on(monkeypatch)
+    with pytest.raises(ToolInputError, match="not shown"):
+        CoraToolkit(engine=None, memory=None, quote_store=_QuoteStore(fail=True)).instant_quote(  # type: ignore[arg-type]
+            cora_tools.InstantQuoteInput(**_DEAL), CONTEXT)

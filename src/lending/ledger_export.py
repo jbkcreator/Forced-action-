@@ -1,10 +1,20 @@
 """Nightly ledger export to Google Drive (Cora brief P1.2): the agents' outcome feed for their nightly learning loop.
 
 One CSV per table goes to Drive ``NDL Ledger Exports/{ET date}/``: contacts, consents, touches, dispositions, outcomes,
-scores. No full phone number or email and no phone hash is ever written: a row is keyed by ``ghl_contact_id`` (when a
+scores, cohorts. No full phone number or email and no phone hash is ever written: a row is keyed by ``ghl_contact_id`` (when a
 lead carries one), the internal ``contact_id`` and the last 4 digits of the phone.
 
-* contacts, consents, scores: full snapshot each night.
+* contacts, consents, scores, cohorts: full snapshot each night. ``cohorts.csv`` is one row per LendingFlow batch
+  (``cohort_report.cohorts``), with no contact columns.
+* audiences: the retargeting audiences as daily counts only (rows per platform, contacts per source), never the
+  hashed files, which stay on our server (team decision Q33). Read from the audience export's summary for the same
+  Eastern date, so the counts match the staged files; no rows for a day whose audience export did not finish.
+* contacts carry the first-contact rank and time (``lending.first_contact_snapshots``).
+* consents include email-only opt-outs (matched to a website lead's contact by email, else keyless) and the boxes
+  ticked on the website form.
+* touches include booking reminders and the LendingFlow intro text; outcomes include every partner-file status change
+  (``lending.loan_file_status_events``, one row per change, so two changes in a day are both exported) and their routing
+  events.
 * touches, dispositions, outcomes: the ET calendar day being exported (yesterday, run after midnight ET).
 * scores: the borrower score (``borrower_score.py``) worked out at export time per LendingFlow / website lead, with
   the inputs it was missing. ``lead_scoring.score_lead`` is not wired to stored inputs, so it is not exported.
@@ -20,6 +30,7 @@ from __future__ import annotations
 
 import csv
 import io
+import logging
 import re
 from dataclasses import dataclass, field
 from datetime import date, datetime, time, timedelta, timezone
@@ -31,22 +42,30 @@ from sqlalchemy import text
 from src.lending.borrower_score import facts_from_lendingflow_lead, facts_from_web_lead, score_borrower
 from src.services.phone_utils import normalize
 
+logger = logging.getLogger(__name__)
+
 ET = ZoneInfo("America/New_York")
 KEY_COLUMNS = ("ghl_contact_id", "contact_id", "phone_last4")
 
 TABLES: dict[str, tuple[str, ...]] = {
-    "contacts": ("do_not_contact", "nurture", "line_type", "last_dnc_scrub", "created_at"),
+    "contacts": ("do_not_contact", "nurture", "line_type", "last_dnc_scrub", "created_at", "first_contact_rank",
+                 "first_contact_at"),
     "consents": ("kind", "detail", "at", "revoked_at"),
     "touches": ("at", "kind", "direction", "outcome"),
     "dispositions": ("dialer_call_id", "direction", "disposition", "disposition_raw", "talk_duration_sec",
                      "call_source", "queue", "call_started_at"),
     "outcomes": ("at", "kind", "outcome", "ref"),
     "scores": ("lead_source", "lead_id", "borrower_score", "missing", "received_at"),
+    "cohorts": ("batch_id", "name", "purchased_at", "leads_bought", "leads_delivered", "funded_30d", "funded_60d",
+                "funded_90d", "funded_to_date", "fees_recorded", "fees_total", "revenue_per_lead",
+                "replacements_requested", "replacements_credited", "replacements_denied"),
+    "audiences": ("day", "platform", "rows", "lendingflow_contacts", "web_contacts"),
 }
+NO_KEY_TABLES = frozenset({"cohorts", "audiences"})  # batch- or day-level rows: no contact columns
 
 # Columns that hold text a dialer, GHL or a person typed (not our own codes or ids): phone-like digit runs and email
 # addresses in them are redacted, since nothing upstream whitelists these values.
-FREE_TEXT_COLUMNS = frozenset({"disposition_raw", "outcome", "detail"})
+FREE_TEXT_COLUMNS = frozenset({"disposition_raw", "outcome", "detail", "name"})
 _EMAIL = re.compile(r"[\w.+-]+@[\w-]+(?:\.[\w-]+)+")
 _PHONE_LIKE = re.compile(r"\+?\d[\d\s().-]{5,}\d")
 REDACTED = "[redacted]"
@@ -69,6 +88,8 @@ class LedgerData:
     dispositions: list[dict] = field(default_factory=list)
     outcomes: list[dict] = field(default_factory=list)
     scores: list[dict] = field(default_factory=list)
+    cohorts: list[dict] = field(default_factory=list)
+    audiences: list[dict] = field(default_factory=list)
 
 
 def export_day(now: datetime) -> date:
@@ -112,9 +133,15 @@ def redact(value: Any) -> Any:
     return _PHONE_LIKE.sub(lambda m: REDACTED if sum(c.isdigit() for c in m.group()) >= 7 else m.group(), text_)
 
 
-def _csv(columns: Sequence[str], rows: Iterable[Mapping[str, Any]], keys: Mapping[str, ContactKey]) -> bytes:
+def _csv(columns: Sequence[str], rows: Iterable[Mapping[str, Any]], keys: Mapping[str, ContactKey], *,
+         keyed: bool = True) -> bytes:
     out = io.StringIO()
     writer = csv.writer(out, lineterminator="\n")
+    if not keyed:
+        writer.writerow(columns)
+        writer.writerows([_cell(redact(row.get(c)) if c in FREE_TEXT_COLUMNS else row.get(c)) for c in columns]
+                         for row in rows)
+        return out.getvalue().encode("utf-8")
     writer.writerow((*KEY_COLUMNS, *columns))
     for row in rows:
         ids = key_columns(row.get("phone"), keys, row.get("ghl_contact_id"))
@@ -125,7 +152,8 @@ def _csv(columns: Sequence[str], rows: Iterable[Mapping[str, Any]], keys: Mappin
 
 def build_files(data: LedgerData) -> dict[str, bytes]:
     """File name -> CSV bytes, one per table, header always present."""
-    return {f"{name}.csv": _csv(columns, getattr(data, name), data.keys) for name, columns in TABLES.items()}
+    return {f"{name}.csv": _csv(columns, getattr(data, name), data.keys, keyed=name not in NO_KEY_TABLES)
+            for name, columns in TABLES.items()}
 
 
 def publish(files: Mapping[str, bytes], *, day: date, folder_id: str, upload: Uploader) -> list[str]:
@@ -155,16 +183,36 @@ _TEST_PHONES = text("""
     UNION SELECT phone FROM lending.web_leads WHERE is_test
     UNION SELECT phone FROM lending.lendingflow_leads WHERE is_test
 """)
+_TEST_GHL_IDS = text("""
+    SELECT ghl_contact_id FROM lending.web_leads WHERE is_test AND ghl_contact_id IS NOT NULL
+    UNION SELECT ghl_contact_id FROM lending.lendingflow_leads WHERE is_test AND ghl_contact_id IS NOT NULL
+""")
 _CONTACTS = text("""
-    SELECT phone, do_not_contact, nurture, line_type, last_dnc_scrub, created_at
-      FROM lending.contacts WHERE NOT is_test ORDER BY id
+    SELECT c.phone, c.do_not_contact, c.nurture, c.line_type, c.last_dnc_scrub, c.created_at,
+           f.rank AS first_contact_rank, f.first_contact_at
+      FROM lending.contacts c LEFT JOIN lending.first_contact_snapshots f ON f.phone = c.phone
+     WHERE NOT c.is_test ORDER BY c.id
 """)
 _CONSENTS = text("""
-    SELECT phone, 'text_consent' AS kind, source AS detail, captured_at AS at, revoked_at
+    SELECT phone, 'text_consent' AS kind, source AS detail, captured_at AS at, revoked_at,
+           NULL::text AS ghl_contact_id
       FROM lending.text_consents
     UNION ALL
-    SELECT phone, 'suppression', reason || ':' || source_channel, created_at, NULL
+    SELECT phone, 'suppression', reason || ':' || source_channel, created_at, NULL, NULL
       FROM lending.suppression_list WHERE NOT is_test AND phone IS NOT NULL
+    UNION ALL
+    SELECT w.phone, 'web_form_consent',
+           concat_ws(',', CASE WHEN w.sms_consent THEN 'sms' END, CASE WHEN w.call_consent THEN 'call' END,
+                     CASE WHEN w.deal_drop_optin THEN 'deal_drop' END),
+           w.received_at, NULL, w.ghl_contact_id
+      FROM lending.web_leads w WHERE NOT w.is_test AND (w.sms_consent OR w.call_consent OR w.deal_drop_optin)
+    UNION ALL
+    SELECT w.phone, 'email_opt_out', o.source, o.opted_out_at AT TIME ZONE 'UTC', NULL, w.ghl_contact_id
+      FROM public.email_opt_outs o
+      LEFT JOIN LATERAL (SELECT phone, ghl_contact_id FROM lending.web_leads
+                          WHERE lower(email) = lower(o.email) AND NOT is_test
+                          ORDER BY received_at DESC LIMIT 1) w ON TRUE
+     WHERE NOT o.is_test
     ORDER BY 4
 """)
 _TOUCHES = text("""
@@ -180,6 +228,13 @@ _TOUCHES = text("""
                COALESCE(payload->>'ghl_contact_id',
                         CASE WHEN contact_ref LIKE 'ghl:%' THEN substr(contact_ref, 5) END)
           FROM lending.pending_actions WHERE status IN ('sent', 'failed')
+        UNION ALL
+        SELECT contact_phone, sent_at, 'booking_' || COALESCE(channel, 'text'), 'outbound', kind || ':' || status,
+               NULL
+          FROM lending.booking_messages WHERE sent_at IS NOT NULL
+        UNION ALL
+        SELECT phone, intro_sms_tagged_at, 'intro_text', 'outbound', 'tagged', ghl_contact_id
+          FROM lending.lendingflow_leads WHERE intro_sms_tagged_at IS NOT NULL AND NOT is_test
     ) t WHERE at >= :start AND at < :end ORDER BY at
 """)
 _DISPOSITIONS = text("""
@@ -197,6 +252,14 @@ _OUTCOMES = text("""
         SELECT l.phone, e.created_at, 'routing', e.action, e.lead_id::text
           FROM lending.file_routing_events e JOIN lending.lendingflow_leads l ON l.id = e.lead_id
          WHERE NOT l.is_test
+        UNION ALL
+        SELECT f.borrower_phone, e.at, 'partner_file', e.status, e.loan_file_id::text
+          FROM lending.loan_file_status_events e JOIN lending.loan_files f ON f.id = e.loan_file_id
+         WHERE f.partner_id IS NOT NULL AND NOT f.is_test
+        UNION ALL
+        SELECT f.borrower_phone, e.created_at, 'partner_routing', e.action, e.loan_file_id::text
+          FROM lending.file_routing_events e JOIN lending.loan_files f ON f.id = e.loan_file_id
+         WHERE e.loan_file_id IS NOT NULL AND NOT f.is_test
     ) t WHERE at >= :start AND at < :end ORDER BY at
 """)
 _SCORE_LEADS = text("""
@@ -210,13 +273,37 @@ _SCORE_LEADS = text("""
 """)
 
 
-def _rows(db, query, test_phones: frozenset[str] = frozenset(), **params) -> list[dict]:
+def _rows(db, query, test_phones: frozenset[str] = frozenset(), test_ghl: frozenset[str] = frozenset(),
+          **params) -> list[dict]:
+    """Rows with the phone normalised. A test contact's row is left out by its phone, or, for a row with no phone
+    (an email-only send or opt-out), by its GHL id."""
     rows = []
     for row in db.execute(query, params).mappings():
         item = dict(row)
         item["phone"] = normalize(item["phone"]) if item.get("phone") else None
-        if item["phone"] not in test_phones:
-            rows.append(item)
+        if item["phone"] in test_phones or (item.get("ghl_contact_id") or None) in test_ghl:
+            continue
+        rows.append(item)
+    return rows
+
+
+def _test_ghl_ids(db) -> frozenset[str]:
+    return frozenset(raw for (raw,) in db.execute(_TEST_GHL_IDS) if raw)
+
+
+def _cohort_rows(db) -> list[dict]:
+    from config.lending_cohorts import FUNDED_WINDOWS_DAYS
+    from src.lending.cohort_report import cohorts
+
+    rows = []
+    for c in cohorts(db)[0]:
+        row = {"batch_id": c.batch_id, "name": c.name, "purchased_at": c.purchased_at, "leads_bought": c.leads_bought,
+               "leads_delivered": c.leads_delivered, "funded_to_date": c.funded_to_date,
+               "fees_recorded": c.fees_recorded, "fees_total": c.fees_total, "revenue_per_lead": c.revenue_per_lead,
+               "replacements_requested": c.replacements_requested,
+               "replacements_credited": c.replacements_credited, "replacements_denied": c.replacements_denied}
+        row.update({f"funded_{days}d": c.funded.get(days) for days in FUNDED_WINDOWS_DAYS})  # blank while open
+        rows.append(row)
     return rows
 
 
@@ -243,13 +330,40 @@ def _score(lead: dict) -> dict:
 
 def collect(db, day: date) -> LedgerData:
     start, end = day_window(day)
-    test = _test_phones(db)
+    test, test_ghl = _test_phones(db), _test_ghl_ids(db)
     return LedgerData(
         keys=_keys(db),
-        contacts=_rows(db, _CONTACTS, test),
-        consents=_rows(db, _CONSENTS, test),
-        touches=_rows(db, _TOUCHES, test, start=start, end=end),
-        dispositions=_rows(db, _DISPOSITIONS, test, start=start, end=end),
-        outcomes=_rows(db, _OUTCOMES, test, start=start, end=end),
-        scores=[_score(lead) for lead in _rows(db, _SCORE_LEADS, test)],
+        contacts=_rows(db, _CONTACTS, test, test_ghl),
+        consents=_rows(db, _CONSENTS, test, test_ghl),
+        touches=_rows(db, _TOUCHES, test, test_ghl, start=start, end=end),
+        dispositions=_rows(db, _DISPOSITIONS, test, test_ghl, start=start, end=end),
+        outcomes=_rows(db, _OUTCOMES, test, test_ghl, start=start, end=end),
+        scores=[_score(lead) for lead in _rows(db, _SCORE_LEADS, test, test_ghl)],
+        cohorts=_cohort_rows(db),
+        audiences=_audience_rows(day),
     )
+
+
+def _audience_rows(day: date) -> list[dict]:
+    """The retargeting audiences as counts only (team decision Q33): rows per platform and contacts per source of the
+    audience files dated ``day``, read from the summary the audience export writes after both files (same Eastern date
+    convention). No rows when that day's export never finished or the export folder is not set, never a live count.
+    The hashed files themselves stay on our server."""
+    from pathlib import Path
+
+    from config.settings import get_settings
+    from src.tasks.lending_audience_export import read_summary
+
+    directory = get_settings().lending_audience_export_dir
+    try:
+        counts = read_summary(Path(directory), day) if directory else None
+    except (OSError, ValueError, KeyError, TypeError) as exc:  # an unreadable summary must not stop the whole ledger
+        logger.error("[ledger-export] audience summary for %s unreadable (%s); no audience rows", day,
+                     type(exc).__name__)
+        return []
+    if counts is None:
+        return []
+    by_source = counts.contacts_by_source
+    return [{"day": day.isoformat(), "platform": platform, "rows": rows,
+             "lendingflow_contacts": by_source.get("lendingflow", 0), "web_contacts": by_source.get("web", 0)}
+            for platform, rows in (("google", counts.google_rows), ("meta", counts.meta_rows))]

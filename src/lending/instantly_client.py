@@ -83,6 +83,8 @@ def block_address(account: InstantlyAccount, email: str) -> bool:
     try:
         _post(account, "/api/v2/block-lists-entries", {"entries": [email]})
     except InstantlyError as exc:
+        if "HTTP 409" in str(exc):  # already on the list
+            return True
         logger.warning("[instantly] block list entry not added (%s)", exc)
         return False
     return True

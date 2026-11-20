@@ -12,6 +12,7 @@ import logging
 import re
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from collections.abc import Callable
 from typing import Any, Mapping, Optional, Protocol
 
 from sqlalchemy import text
@@ -21,6 +22,7 @@ from config.lending_web import (
     FIELD_MAX_LENGTHS,
     GHL_GIVE_UP_AFTER_HOURS,
     GHL_RETRY_BACKOFF_MINUTES,
+    AI_CALL_CONSENT_TEXT,
     CALL_CONSENT_TEXT,
     MAX_LOAN_AMOUNT,
     SMS_CONSENT_TEXT,
@@ -71,6 +73,8 @@ class WebLeadInput:
     ip_address: Optional[str]
     user_agent: Optional[str]
     occupancy: str = UNKNOWN  # 1.1.2: config.lending_occupancy
+    ai_call_consent: bool = False  # box 4 (P2.1): calls from the AI voice assistant only
+    ai_call_consent_text: Optional[str] = None  # the AI box's label
 
 
 @dataclass(frozen=True)
@@ -169,6 +173,8 @@ def build_input(form: Mapping[str, Optional[str]], *, ip_address: Optional[str],
         ip_address=(str(ip_address).strip()[:45] or None) if ip_address else None,
         user_agent=_clean(user_agent, "user_agent"),
         occupancy=occupancy_from_answer(form.get("occupancy")),
+        ai_call_consent=_ticked(form.get("ai_call_consent")),
+        ai_call_consent_text=_clean(form.get("ai_call_consent_text"), "ai_call_consent_text"),
     )
 
 
@@ -190,9 +196,10 @@ def _suppression_reason(db, phone: str, email: Optional[str]) -> Optional[str]:
 def _recent_duplicate(db, data: WebLeadInput) -> Optional[int]:
     return db.execute(
         text("SELECT id FROM lending.web_leads WHERE phone = :p AND sms_consent = :c AND call_consent = :k "
-             "AND deal_drop_optin = :d AND received_at > now() - make_interval(mins => :m) ORDER BY id DESC LIMIT 1"),
+             "AND deal_drop_optin = :d AND ai_call_consent = :a "
+             "AND received_at > now() - make_interval(mins => :m) ORDER BY id DESC LIMIT 1"),
         {"p": data.phone, "c": data.sms_consent, "k": data.call_consent, "d": data.deal_drop_optin,
-         "m": DEDUP_WINDOW_MINUTES},
+         "a": data.ai_call_consent, "m": DEDUP_WINDOW_MINUTES},
     ).scalar()
 
 
@@ -211,11 +218,12 @@ def save_web_lead(db, data: WebLeadInput) -> tuple[int, bool]:
         text("INSERT INTO lending.web_leads (name, phone, email, property_city, deal_type, completed_projects_3y, "
              "loan_amount, property_address, property_state, credit_band, "
              "sms_consent, call_consent, deal_drop_optin, consent_text, consent_text_matches, "
-             "call_consent_text, call_consent_text_matches, page_url, ip_address, user_agent, "
+             "call_consent_text, call_consent_text_matches, ai_call_consent, ai_call_consent_text, "
+             "ai_call_consent_text_matches, page_url, ip_address, user_agent, "
              "suppressed, suppression_reason, occupancy, ghl_status) "
              "VALUES (:name, :phone, :email, :city, :deal, :projects, :amount, :address, :state, :band, "
-             ":sms, :call, :drop, :ctext, :cmatch, :ktext, :kmatch, :url, :ip, :ua, :sup, :reason, :occupancy, "
-             ":ghl_status) "
+             ":sms, :call, :drop, :ctext, :cmatch, :ktext, :kmatch, :ai, :atext, :amatch, :url, :ip, :ua, :sup, "
+             ":reason, :occupancy, :ghl_status) "
              "RETURNING id"),
         {
             "name": data.name, "phone": data.phone, "email": data.email, "city": data.property_city,
@@ -227,6 +235,8 @@ def save_web_lead(db, data: WebLeadInput) -> tuple[int, bool]:
             "cmatch": None if data.consent_text is None else data.consent_text == SMS_CONSENT_TEXT,
             "ktext": data.call_consent_text,
             "kmatch": None if data.call_consent_text is None else data.call_consent_text == CALL_CONSENT_TEXT,
+            "ai": data.ai_call_consent, "atext": data.ai_call_consent_text,
+            "amatch": None if data.ai_call_consent_text is None else data.ai_call_consent_text == AI_CALL_CONSENT_TEXT,
             "url": data.page_url, "ip": data.ip_address, "ua": data.user_agent, "sup": suppressed,
             "reason": reason, "occupancy": data.occupancy,
             "ghl_status": "excluded" if data.occupancy == OWNER_OCCUPIED else "pending",
@@ -234,8 +244,9 @@ def save_web_lead(db, data: WebLeadInput) -> tuple[int, bool]:
     ).scalar_one()
     if data.sms_consent and not suppressed:
         record_consent(db, data.phone, "web_form")
-    logger.info("[lending-web] lead saved id=%s sms_consent=%s call_consent=%s deal_drop=%s suppressed=%s occupancy=%s",
-                lead_id, data.sms_consent, data.call_consent, data.deal_drop_optin, suppressed, data.occupancy)
+    logger.info("[lending-web] lead saved id=%s sms_consent=%s call_consent=%s ai_call_consent=%s deal_drop=%s "
+                "suppressed=%s occupancy=%s", lead_id, data.sms_consent, data.call_consent, data.ai_call_consent,
+                data.deal_drop_optin, suppressed, data.occupancy)
     return int(lead_id), True
 
 
@@ -315,19 +326,21 @@ def _backoff_minutes_sql() -> str:
 
 _DELIVERABLE = (
     "SELECT id, name, phone, email, property_city, deal_type, completed_projects_3y, loan_amount, "
-    "property_address, property_state, credit_band, sms_consent, call_consent, "
+    "property_address, property_state, credit_band, sms_consent, call_consent, ai_call_consent, "
     "deal_drop_optin, suppressed, received_at, ghl_attempts FROM lending.web_leads "
     "WHERE ghl_status IN ('pending', 'failed') AND received_at > :oldest {extra} "
     "ORDER BY received_at LIMIT :limit FOR UPDATE SKIP LOCKED"
 )
 
 
-def deliver_pending(db, sink: Optional[LeadSink], *, lead_id: Optional[int] = None, now: Optional[datetime] = None) -> int:
+def deliver_pending(db, sink: Optional[LeadSink], *, lead_id: Optional[int] = None, now: Optional[datetime] = None,
+                    after_delivery: Optional[Callable[[Any, int], None]] = None) -> int:
     """Deliver stored leads to the sink; returns how many reached it. One lead (``lead_id``, used
     right after submit) or the retry backlog. The backlog is every lead not yet in GHL that is younger
     than GHL_GIVE_UP_AFTER_HOURS and past its backoff wait, so a long outage is retried for days, not
     minutes. With no sink (GHL not configured) leads stay pending and no attempt is counted, so
-    configuring GHL later drains them. Never raises per lead."""
+    configuring GHL later drains them. ``after_delivery`` (P2.1 speed-to-lead; live callers only) runs for each lead
+    that reached GHL and never raises. Never raises per lead."""
     now = now or datetime.now(timezone.utc)
     if sink is None:
         logger.warning("[lending-web] GHL is not configured: web leads stay pending")
@@ -343,7 +356,11 @@ def deliver_pending(db, sink: Optional[LeadSink], *, lead_id: Optional[int] = No
     rows = db.execute(text(_DELIVERABLE.format(extra=extra)), params).mappings().all()
     delivered = 0
     for row in rows:
-        delivered += _deliver_one(db, sink, dict(row), now)
+        lead = dict(row)
+        reached = _deliver_one(db, sink, lead, now)
+        delivered += reached
+        if reached and after_delivery is not None:
+            after_delivery(db, lead["id"])
     return delivered
 
 

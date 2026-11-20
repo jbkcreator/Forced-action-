@@ -10,7 +10,7 @@ GHL_TAG_LENDINGFLOW = "lendingflow"
 GHL_TAG_INTRO_READY = "lendingflow-intro-ready"
 GHL_SOURCE = "LendingFlow"
 # A lead that arrives without a LendingFlow lead id is stored, not rejected (client, Oct 2026): its vendor id is this
-# prefix + the phone/email dedupe hash, and GHL gets this tag so the missing id is visible.
+# prefix + the phone/email dedupe hash. GHL gets no extra tag for it: LendingFlow must send the id itself.
 MISSING_LEAD_ID_PREFIX = "missing:"
 # The GHL intake workflow fills its fixed body template with this text for every field LendingFlow did not send;
 # any field holding it (any case, surrounding spaces ignored) is read as missing.
@@ -20,8 +20,6 @@ NULL_TEXT_VALUES = frozenset({"null", "undefined"})
 def is_missing_lead_id(vendor_lead_id: str) -> bool:
     """True for a lead stored without a LendingFlow lead id (its vendor id was made up from phone + email)."""
     return vendor_lead_id.startswith(MISSING_LEAD_ID_PREFIX)
-
-GHL_TAG_NO_LEAD_ID = "lendingflow-no-lead-id"
 
 # The intro text greets the borrower with this contact custom field (LENDING_GHL_CF_INTRO_NAME), never with GHL's own
 # first-name merge field, which has no fallback: the field holds the lead's first name, or this word when it has none.
