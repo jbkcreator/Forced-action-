@@ -32,6 +32,9 @@ from sqlalchemy import (
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
+from config.lending_after_hours_conversation import (CHANNELS as CONVERSATION_CHANNELS,
+                                                     OPEN_STATES as CONVERSATION_OPEN_STATES, QUESTION_STATES,
+                                                     STATES as CONVERSATION_STATES)
 from config.lending_cohorts import REPLACEMENT_REQUESTED, REPLACEMENT_STATUSES
 from config.lending_text_back import SLOT_HOLDING_SQL
 
@@ -460,6 +463,10 @@ class LendingWebLead(LendingBase):
     consent_text_matches: Mapped[Optional[bool]] = mapped_column(Boolean)  # equals config.lending_web.SMS_CONSENT_TEXT
     call_consent_text: Mapped[Optional[str]] = mapped_column(Text)  # the call box's label the visitor saw, verbatim
     call_consent_text_matches: Mapped[Optional[bool]] = mapped_column(Boolean)  # equals config.lending_web.CALL_CONSENT_TEXT
+    # P2.1 box 4: calls from the AI voice assistant only (the Voice AI gate)
+    ai_call_consent: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default=text("false"))
+    ai_call_consent_text: Mapped[Optional[str]] = mapped_column(Text)  # the AI box's label the visitor saw, verbatim
+    ai_call_consent_text_matches: Mapped[Optional[bool]] = mapped_column(Boolean)  # equals AI_CALL_CONSENT_TEXT
     page_url: Mapped[Optional[str]] = mapped_column(String(300))
     ip_address: Mapped[Optional[str]] = mapped_column(String(45))
     user_agent: Mapped[Optional[str]] = mapped_column(String(300))
@@ -1357,6 +1364,24 @@ class LendingLoanFile(LendingBase):
     )
 
 
+class LendingLoanFileStatusEvent(LendingBase):
+    """One row per status change of a loan file (``partners.record_status_change``); the nightly ledger export reads
+    these, because ``loan_files.status`` and ``status_at`` hold only the latest change."""
+
+    __tablename__ = "loan_file_status_events"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    loan_file_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("lending.loan_files.id", ondelete="CASCADE"), nullable=False)
+    status: Mapped[str] = mapped_column(String(20), nullable=False)
+    reason: Mapped[Optional[str]] = mapped_column(String(200))
+    at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_now, server_default=text("now()"))
+
+    __table_args__ = (
+        Index("ix_lending_loan_file_status_events_at", "at"),
+        Index("ix_lending_loan_file_status_events_file", "loan_file_id", "at"),
+    )
+
+
 class LendingPartner(LendingBase):
     """A wholesaler, broker or referral partner who may submit files through their own link (P-1).
 
@@ -1525,3 +1550,265 @@ class LendingTemplateGraduation(LendingBase):
     edit_rate: Mapped[float] = mapped_column(Numeric(5, 4), nullable=False)
     revoked_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
     revoked_by: Mapped[Optional[str]] = mapped_column(String(64))
+
+
+class LendingGhlOpportunityStage(LendingBase):
+    """P2.4: the stage each GHL opportunity is in now and since when, kept by ``POST /webhooks/lending/ghl-stage``.
+    A redelivered stage keeps ``entered_at``; a move to a different stage resets it (``ghl_stage_events`` keeps
+    the first entry per stage only, so it cannot say how long a deal has sat where it is)."""
+
+    __tablename__ = "ghl_opportunity_stage"
+
+    ghl_opportunity_id: Mapped[str] = mapped_column(String(100), primary_key=True)
+    stage_name: Mapped[str] = mapped_column(String(100), nullable=False)
+    stage_key: Mapped[str] = mapped_column(String(100), nullable=False)
+    entered_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    phone: Mapped[Optional[str]] = mapped_column(String(20))  # phone_utils.normalize
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_now, server_default=text("now()"))
+
+    __table_args__ = (Index("idx_lending_ghl_opportunity_stage_key", "stage_key", "entered_at"),
+                      Index("idx_lending_ghl_opportunity_stage_phone", "phone"))
+
+
+class LendingDocChase(LendingBase):
+    """P2.4: one document chase, started when an approver says the borrower accepted the term sheet. One open chase
+    per phone. Its upload links are in ``doc_chase_links``."""
+
+    __tablename__ = "doc_chases"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    lead_ref: Mapped[str] = mapped_column(String(40), nullable=False)
+    ghl_contact_id: Mapped[Optional[str]] = mapped_column(String(100))
+    ghl_opportunity_id: Mapped[Optional[str]] = mapped_column(String(100))
+    loan_file_id: Mapped[Optional[int]] = mapped_column(BigInteger)  # lending.loan_files.id when the phone has one
+    first_name: Mapped[Optional[str]] = mapped_column(String(80))
+    phone: Mapped[Optional[str]] = mapped_column(String(20))  # phone_utils.normalize
+    email: Mapped[Optional[str]] = mapped_column(String(255))
+    lender_key: Mapped[str] = mapped_column(String(40), nullable=False)
+    quote_id: Mapped[Optional[uuid.UUID]] = mapped_column(UUID(as_uuid=True))
+    accepted_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    accepted_by: Mapped[str] = mapped_column(String(64), nullable=False)
+    status: Mapped[str] = mapped_column(String(12), nullable=False, default="open", server_default=text("'open'"))
+    status_reason: Mapped[Optional[str]] = mapped_column(String(120))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_now, server_default=text("now()"))
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_now, server_default=text("now()"))
+
+    __table_args__ = (
+        CheckConstraint("status IN ('open', 'complete', 'cancelled')", name="ck_lending_doc_chases_status"),
+        Index("uq_lending_doc_chases_open_phone", "phone", unique=True, postgresql_where=text("status = 'open'")),
+        Index("uq_lending_doc_chases_open_email", text("lower(email)"), unique=True,
+              postgresql_where=text("status = 'open' AND phone IS NULL")),
+        Index("idx_lending_doc_chases_opportunity", "ghl_opportunity_id"),
+    )
+
+
+class LendingDocChaseLink(LendingBase):
+    """P2.4: one upload link sent in a chase message. Only the SHA-256 of the token is stored. Every link of a chase
+    works until it expires or the chase closes, so an older message's link still opens the page."""
+
+    __tablename__ = "doc_chase_links"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    chase_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("lending.doc_chases.id"), nullable=False)
+    token_hash: Mapped[str] = mapped_column(String(64), nullable=False, unique=True)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    revoked_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_now, server_default=text("now()"))
+
+    __table_args__ = (Index("idx_lending_doc_chase_links_chase", "chase_id"),)
+
+
+class LendingDocChaseItem(LendingBase):
+    """P2.4: one required document on a chase (lender checklist plus quote conditions)."""
+
+    __tablename__ = "doc_chase_items"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    chase_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("lending.doc_chases.id"), nullable=False)
+    item_code: Mapped[str] = mapped_column(String(40), nullable=False)
+    label: Mapped[str] = mapped_column(String(200), nullable=False)
+    received_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+
+    __table_args__ = (Index("uq_lending_doc_chase_items_code", "chase_id", "item_code", unique=True),)
+
+
+class LendingDocChaseUpload(LendingBase):
+    """P2.4: one file a borrower uploaded through the chase link; stored on disk under a generated name."""
+
+    __tablename__ = "doc_chase_uploads"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    chase_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("lending.doc_chases.id"), nullable=False)
+    item_code: Mapped[str] = mapped_column(String(40), nullable=False)
+    original_name: Mapped[str] = mapped_column(String(255), nullable=False)
+    stored_path: Mapped[str] = mapped_column(String(300), nullable=False)
+    content_type: Mapped[str] = mapped_column(String(100), nullable=False)
+    size_bytes: Mapped[int] = mapped_column(Integer, nullable=False)
+    uploaded_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_now, server_default=text("now()"))
+    drive_file_id: Mapped[Optional[str]] = mapped_column(String(100))  # set once copied to Josh's folder (doc_copies)
+    drive_attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default=text("0"))
+    drive_retry_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))  # next try after a failure
+
+    __table_args__ = (Index("idx_lending_doc_chase_uploads_chase", "chase_id"),)
+
+
+class LendingDocChaseTouch(LendingBase):
+    """P2.4: one chase step (day 0 / 2 / 5 / 8) taken for a chase; ``action_id`` is NULL when no channel was usable."""
+
+    __tablename__ = "doc_chase_touches"
+
+    chase_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("lending.doc_chases.id"), primary_key=True)
+    chase_day: Mapped[int] = mapped_column(SmallInteger, primary_key=True)
+    action_id: Mapped[Optional[int]] = mapped_column(BigInteger)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_now, server_default=text("now()"))
+
+
+class LendingClosingBlockerCard(LendingBase):
+    """P2.4: one row per ET day the 7 AM closing blocker card was posted (same claim pattern as the morning digest)."""
+
+    __tablename__ = "closing_blocker_cards"
+
+    card_day: Mapped[date] = mapped_column(Date, primary_key=True)
+    slack_channel: Mapped[Optional[str]] = mapped_column(String(32))
+    slack_ts: Mapped[Optional[str]] = mapped_column(String(64))
+    posted_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    claimed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), server_default=text("now()"))
+
+
+class LendingSpeedToLead(LendingBase):
+    """P2.1: one row per new lead the speed-to-lead step looked at (``src/lending/speed_to_lead.py``).
+
+    The timings Josh is shown (``python -m src.lending.speed_to_lead --report``): when the lead arrived, when the
+    intro-text tag and the call-cascade tag reached GHL, and why either was withheld. The calls themselves are GHL's
+    (``call_dispositions`` with ``call_source = 'ghl'``). Unique per lead, so a retried delivery never starts a
+    second cascade. No phone or email is stored here."""
+
+    __tablename__ = "speed_to_lead"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    source: Mapped[str] = mapped_column(String(20), nullable=False)  # lendingflow | web
+    lead_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    ghl_contact_id: Mapped[Optional[str]] = mapped_column(String(64))
+    received_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_now, server_default=text("now()"))
+    text_status: Mapped[Optional[str]] = mapped_column(String(30))
+    text_tagged_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    call_status: Mapped[Optional[str]] = mapped_column(String(30))
+    call_block_reason: Mapped[Optional[str]] = mapped_column(String(60))
+    call_tagged_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    voice_eligible: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default=text("false"))
+    # The call queue: when the lead was queued and why (outside_hours / delayed / waiting_turn / a temporary gate
+    # reason), and when the queue worker released it (cascade started) or expired it.
+    queued_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    queue_reason: Mapped[Optional[str]] = mapped_column(String(60))
+    released_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    recheck_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))  # a not-now lead waits until then
+    alerted_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))  # "left the queue" post sent
+
+    __table_args__ = (
+        Index("uq_speed_to_lead_source_lead", "source", "lead_id", unique=True),
+        Index("ix_speed_to_lead_held_text", "source", "received_at",
+              postgresql_where=text("text_status = 'held_for_window'")),
+        Index("ix_speed_to_lead_queued", "received_at", postgresql_where=text("call_status = 'queued'")),
+        Index("ix_speed_to_lead_call_tagged_at", "call_tagged_at"),
+        CheckConstraint("source IN ('lendingflow', 'web')", name="ck_speed_to_lead_source"),
+    )
+
+
+class LendingSpeedToLeadNotice(LendingBase):
+    """P2.1 call queue: one row per queue notice posted to the lead-alerts channel (``kind`` = morning / backlog, one
+    per Eastern day), so the minute worker posts each once."""
+
+    __tablename__ = "speed_to_lead_notices"
+
+    kind: Mapped[str] = mapped_column(String(30), primary_key=True)
+    day: Mapped[date] = mapped_column(Date, primary_key=True)
+    posted_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_now,
+                                                server_default=text("now()"))
+
+
+
+class LendingInstantQuote(LendingBase):
+    """One instant quote issued by POST /api/lending/instant-quote, indicative or rejected.
+
+    The audit record: the request and result exactly as issued, the rules that fired and whether any
+    lender value was a placeholder. ``id`` is the public quote_id. ``api_key_label`` is a hash prefix of
+    the caller's key, never the key.
+    """
+
+    __tablename__ = "instant_quotes"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4,
+                                          server_default=text("gen_random_uuid()"))
+    status: Mapped[str] = mapped_column(String(20), nullable=False)
+    reason: Mapped[Optional[str]] = mapped_column(String(60))
+    request: Mapped[dict] = mapped_column(JSONB, nullable=False)
+    result: Mapped[dict] = mapped_column(JSONB, nullable=False)
+    rules_fired: Mapped[list] = mapped_column(JSONB, nullable=False, default=list, server_default=text("'[]'::jsonb"))
+    unconfirmed: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    api_key_label: Mapped[str] = mapped_column(String(16), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_now, server_default=text("now()"))
+
+    __table_args__ = (
+        CheckConstraint("status IN ('indicative', 'rejected')", name="ck_lending_instant_quotes_status"),
+        Index("ix_lending_instant_quotes_created_at", "created_at"),
+    )
+
+
+class LendingAfterHoursConversation(LendingBase):
+    """One after-hours inquiry answered by the night responder (``src/lending/after_hours_conversation.py``): the
+    three qualifying questions, then a call slot for the next business morning.
+
+    ``state`` is what the lead is being asked now; ``prompted_state`` is the state whose message has gone out, so a
+    message is due while the two differ and a reply counts only once they match. ``contact_key`` is the phone, or
+    the lower-cased email for a lead reached by email: one open conversation per contact. ``offered_slots`` and
+    ``chosen_slot_start`` are slot start times; ``handled_message_ids`` are the inbound messages already applied (a
+    redelivered webhook changes nothing). ``sending_claimed_at`` is set while one worker is sending the due message;
+    ``sent_messages`` holds a receipt per send (state, template version, provider message id, status, time).
+    Answers are free text from the lead: never logged or posted."""
+
+    __tablename__ = "after_hours_conversations"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    inquiry_key: Mapped[str] = mapped_column(String(200), nullable=False)
+    source: Mapped[str] = mapped_column(String(40), nullable=False)
+    channel: Mapped[str] = mapped_column(String(8), nullable=False)
+    contact_key: Mapped[str] = mapped_column(String(320), nullable=False)
+    phone: Mapped[Optional[str]] = mapped_column(String(20))  # phone_utils.normalize
+    email: Mapped[Optional[str]] = mapped_column(String(320))  # lower-cased
+    ghl_contact_id: Mapped[Optional[str]] = mapped_column(String(64))
+    first_name: Mapped[Optional[str]] = mapped_column(String(100))
+    state: Mapped[str] = mapped_column(String(16), nullable=False, default=QUESTION_STATES[0],
+                                       server_default=text(f"'{QUESTION_STATES[0]}'"))
+    prompted_state: Mapped[Optional[str]] = mapped_column(String(16))
+    answers: Mapped[list] = mapped_column(JSONB, nullable=False, default=list, server_default=text("'[]'::jsonb"))
+    offered_slots: Mapped[list] = mapped_column(JSONB, nullable=False, default=list, server_default=text("'[]'::jsonb"))
+    chosen_slot_start: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    slot_reprompts: Mapped[int] = mapped_column(SmallInteger, nullable=False, default=0, server_default=text("0"))
+    booking_ref: Mapped[Optional[str]] = mapped_column(String(64))
+    closed_reason: Mapped[Optional[str]] = mapped_column(String(16))
+    handled_message_ids: Mapped[list] = mapped_column(JSONB, nullable=False, default=list,
+                                                      server_default=text("'[]'::jsonb"))
+    sending_claimed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    send_attempts: Mapped[int] = mapped_column(SmallInteger, nullable=False, default=0, server_default=text("0"))
+    sent_messages: Mapped[list] = mapped_column(JSONB, nullable=False, default=list, server_default=text("'[]'::jsonb"))
+    ghl_tagged_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))  # night tag added in GHL
+    ghl_untagged_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))  # and removed
+    opened_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_now, server_default=text("now()"))
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_now, server_default=text("now()"))
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    closed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+
+    __table_args__ = (
+        CheckConstraint(f"state IN ({', '.join(repr(s) for s in CONVERSATION_STATES)})",
+                        name="ck_after_hours_conversations_state"),
+        CheckConstraint(f"channel IN ({', '.join(repr(c) for c in CONVERSATION_CHANNELS)})",
+                        name="ck_after_hours_conversations_channel"),
+        Index("uq_after_hours_conversations_inquiry", "inquiry_key", unique=True),
+        Index("uq_after_hours_conversations_open_contact", "contact_key", unique=True,
+              postgresql_where=text(f"state IN ({', '.join(repr(s) for s in CONVERSATION_OPEN_STATES)})")),
+        Index("ix_after_hours_conversations_ghl_contact", "ghl_contact_id",
+              postgresql_where=text("ghl_contact_id IS NOT NULL")),
+        Index("ix_after_hours_conversations_open", "updated_at",
+              postgresql_where=text(f"state IN ({', '.join(repr(s) for s in CONVERSATION_OPEN_STATES)})")),
+    )

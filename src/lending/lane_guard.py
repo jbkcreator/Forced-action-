@@ -4,16 +4,26 @@ from __future__ import annotations
 import re
 from typing import Optional
 
-from config.lending_lane import BACKFLIP_DENY_DOMAINS, BACKFLIP_DENY_PHONES, BACKFLIP_DENY_WORDS
+from config.lending_lane import (
+    BACKFLIP_DENY_DOMAINS,
+    BACKFLIP_DENY_PHONES,
+    BACKFLIP_DENY_WORDS,
+)
+from packages.agent_core.lane_guard import lane_violation
 from src.services.phone_utils import normalize
 
 # A US number in any common spelling: +1 656-209-6700, (656) 209 6700, 656.209.6700, 16562096700.
 _PHONE = re.compile(r"(?<!\d)(?:\+?1[\s.\-]?)?\(?\d{3}\)?[\s.\-]?\d{3}[\s.\-]?\d{4}(?!\d)")
 _DENIED_PHONES = frozenset(BACKFLIP_DENY_PHONES)
+# The send gate's fixed rules (packages/agent_core/lane_guard.py), as the labels this function returns.
+_GATE_LABELS = {"blocked_domain": "domain", "blocked_number": "phone", "blocked_name": "word"}
 
 
 def backflip_hit(*values: Optional[str]) -> Optional[str]:
-    """``"word"``, ``"domain"`` or ``"phone"`` for the first Backflip match in any value, else None."""
+    """``"word"``, ``"domain"`` or ``"phone"`` for the first Backflip match in any value, else None.
+
+    Also applies the send gate's own rules, so a job the check lets through is never blocked by the gate.
+    """
     for value in values:
         if not value:
             continue
@@ -24,4 +34,7 @@ def backflip_hit(*values: Optional[str]) -> Optional[str]:
             return "domain"
         if any(normalize(match) in _DENIED_PHONES for match in _PHONE.findall(value)):
             return "phone"
+        gate_rule = lane_violation({"value": value})
+        if gate_rule is not None:
+            return _GATE_LABELS[gate_rule]
     return None

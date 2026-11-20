@@ -4,17 +4,22 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 import logging
 from datetime import date, datetime, time, timedelta
-from typing import Mapping, Optional
+from typing import TYPE_CHECKING, Mapping, Optional
 from zoneinfo import ZoneInfo
 
 from sqlalchemy import text
 
+from config.lending_closing import OWNER_LABELS
 from config.lending_compliance import DEFAULT_TZ
 from config.lending_dispositions import (
     ANSWERED_CODES, AUTO_DIALER_LABEL, AUTO_DIALER_UNKNOWN_CAMPAIGN, BOOKED_CODE, BOOKED_STAGE_KEYS, GATED_CODES, LIVE_CONVERSATION_CODES, LONG_CONVERSATION_SECONDS, NURTURE_CODE,
-    NURTURE_SENT_CODES, SHARED_SEAT_LABELS, SHOWED_STAGE_KEYS, TRANSFER_CODES,
+    NURTURE_SENT_CODES, SCOREBOARD_BLOCKER_LINES, SCOREBOARD_STAGE_ITEMS, SHARED_SEAT_LABELS, SHOWED_STAGE_KEYS, TRANSFER_CODES,
 )
 from config.lending_followup import GHL_CALLER_SEAT
+from src.lending.cora_inbox import slack_safe
+
+if TYPE_CHECKING:
+    from src.lending.scoreboard_pipeline import Blocker, PipelineData
 
 logger = logging.getLogger(__name__)
 
@@ -101,6 +106,9 @@ class ScoreboardData:
     # B1: GHL Booked stage entries today (all callers); None when the count could not be read. The rows' ``booked``
     # stays the caller-reported BOOKED disposition.
     booked_stage: Optional[int] = None
+    # P2.5: active deals, deals per stage and the daily blockers (scoreboard_pipeline.build_pipeline); the closing board
+    # only. None = not read (hourly board, Cora's pipeline tool).
+    pipeline: Optional["PipelineData"] = None
 
 
 def _bounds(day: date) -> tuple[datetime, datetime]:
@@ -216,6 +224,7 @@ def build_scoreboard(db, day: date, campaign_names: Optional[Mapping[str, str]] 
 
 
 MAX_TABLE_ROWS = 12  # a Slack section holds 3000 chars
+SLACK_SECTION_LIMIT = 2900  # Slack refuses a section over 3000 characters
 MAX_NAME_CHARS = 40
 UNKNOWN_CALLER = "(unknown)"
 DISPLAY_NAMES = {GHL_CALLER_SEAT: "GHL phone calls", UNKNOWN_CALLER: "No caller logged"}
@@ -230,8 +239,11 @@ def _show_rate(r: Row) -> str:
 
 
 def _name(raw: str) -> str:
+    """Display form: markup characters stripped, shortened, and & < > escaped (a borrower can type a first name, and
+    Slack would otherwise turn <!channel> or <url|label> into a ping or a link)."""
     clean = DISPLAY_NAMES.get(raw, raw).replace("*", "").replace("`", "'")
-    return clean if len(clean) <= MAX_NAME_CHARS else clean[:MAX_NAME_CHARS - 1] + "…"
+    short = clean if len(clean) <= MAX_NAME_CHARS else clean[:MAX_NAME_CHARS - 1] + "…"
+    return slack_safe(short)
 
 
 def _extras(r: Row) -> list[str]:
@@ -330,16 +342,61 @@ def _clock(moment: datetime) -> str:
     return f"{moment.hour % 12 or 12}:{moment.minute:02d} {'am' if moment.hour < 12 else 'pm'} ET"
 
 
+NO_CALLS = "_No calls logged today._"
+PIPELINE_UNAVAILABLE = "_Pipeline unavailable: the deal stages could not be read (see the scoreboard log)._"
+
+
+def _stage_line(pipeline: "PipelineData") -> str:
+    if not pipeline.by_stage:
+        return "_no deals in the pipeline_"
+    shown = pipeline.by_stage[:SCOREBOARD_STAGE_ITEMS]
+    rest = len(pipeline.by_stage) - len(shown)
+    return " · ".join([f"{_name(s.stage_name)} {s.deals}" for s in shown] + ([f"_{rest} more stage(s)_"] if rest else []))
+
+
+def _fit(lines: list[str], limit: int = SLACK_SECTION_LIMIT) -> str:
+    """Join, dropping trailing lines until the text fits one Slack section (an escaped name can be 4x longer)."""
+    while len(lines) > 2 and len("\n".join(lines)) > limit:
+        lines = lines[:-2] + ["_… cut to fit Slack_"]
+    return "\n".join(lines)[:limit]
+
+
+def _blocker_line(b: "Blocker") -> str:
+    who = _name(b.first_name or "Borrower") + (f" (…{b.phone_last4})" if b.phone_last4 else "")
+    missing = f" · {b.missing} document(s) missing" if b.missing else ""
+    return f"• {who} · {_name(b.stage_name)} · {b.days} days · waiting on {OWNER_LABELS.get(b.owner, b.owner)}{missing}"
+
+
+def pipeline_text(pipeline: "PipelineData") -> str:
+    """The closing board's pipeline section: active deals, deals per stage, then the deals stuck more than 3 days
+    (oldest first, up to SCOREBOARD_BLOCKER_LINES; first name and last 4 digits only)."""
+    if not pipeline.available:
+        return f"*Pipeline*\n{PIPELINE_UNAVAILABLE}"
+    lines = [(f"*Pipeline* — {pipeline.active} active deal(s), {pipeline.open_deals} open (funded, lost and nurture "
+              "left out)"), _stage_line(pipeline)]
+    if not pipeline.blockers:
+        return _fit(lines + ["*Stuck more than 3 days* — none"])
+    owners = " · ".join(f"{OWNER_LABELS.get(owner, owner)} {n}" for owner, n in pipeline.blockers_by_owner)
+    shown = pipeline.blockers[:SCOREBOARD_BLOCKER_LINES]
+    lines.append(f"*Stuck more than 3 days* — {len(pipeline.blockers)} ({owners})")
+    return _fit(lines + [_blocker_line(b) for b in shown] + _more(len(pipeline.blockers), len(shown)))
+
+
 def format_slack(data: ScoreboardData, day: date, as_of: Optional[datetime] = None) -> str:
     """Plain mrkdwn version: the notification preview and the fallback when blocks are unavailable.
     ``as_of`` (Eastern) marks an hourly day-so-far board; without it this is the closing 7:20pm board."""
     totals = " | ".join(f"{k} {v}" for k, v in _totals(data))
     span = f"as of {_clock(as_of)}" if as_of else "through 7:15pm ET"
-    out = [f"*{_title(day)}* ({span})", f"TOTAL: {totals}", "", "*By caller*", _table(data.by_caller)]
+    out = [f"*{_title(day)}* ({span})", f"TOTAL: {totals}"]
+    if as_of is None and not data.total.dials:
+        out.append(NO_CALLS)
+    out += ["", "*By caller*", _table(data.by_caller)]
     if as_of is None:
         for title, rows in _breakdowns(data):
             out += ["", f"*{title}*", _table(rows)]
         out += ["", f"*{NUMBER_TITLE}*", _number_table(data.by_number)]
+        if data.pipeline is not None:
+            out += ["", pipeline_text(data.pipeline)]
     return "\n".join(out)
 
 
@@ -361,8 +418,12 @@ def format_blocks(data: ScoreboardData, day: date, as_of: Optional[datetime] = N
     ]
     if as_of is not None:
         return blocks
+    if not data.total.dials:
+        blocks.insert(4, {"type": "context", "elements": [{"type": "mrkdwn", "text": NO_CALLS}]})
     for title, rows in _breakdowns(data):
         blocks.append(_section(f"*{title}*\n{_table(rows)}"))
     if data.by_number:
         blocks.append(_section(f"*{NUMBER_TITLE}*\n{_number_table(data.by_number)}"))
+    if data.pipeline is not None:
+        blocks += [{"type": "divider"}, _section(pipeline_text(data.pipeline))]
     return blocks

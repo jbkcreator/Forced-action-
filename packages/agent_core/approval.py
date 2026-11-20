@@ -13,7 +13,7 @@ from collections.abc import Set
 from dataclasses import dataclass
 
 from .pending_actions import PendingAction, PendingActionQueue, is_expired
-from .redaction import slack_safe
+from .redaction import mask_url_tokens, slack_safe
 
 _SECTION_TEXT_LIMIT = 2800
 _HEADER_LIMIT = 150
@@ -53,14 +53,20 @@ def _field_text(value: object) -> str:
     return json.dumps(value, sort_keys=True, ensure_ascii=False, default=str)
 
 
+def _card_safe(value: str) -> str:
+    """Approval cards also hide link tokens: the approver sees where a link goes, not the credential in it. The
+    message is still sent exactly as drafted."""
+    return slack_safe(mask_url_tokens(value))
+
+
 def _payload_preview(action: PendingAction) -> str:
     """The draft as a person reads it: labelled fields, then the message itself as a quote."""
     payload = dict(action.payload)
     body_key = next((key for key in _BODY_FIELDS if isinstance(payload.get(key), str)), None)
-    lines = [f"*{_FIELD_LABELS.get(key, key.replace('_', ' ').capitalize())}:* {slack_safe(_field_text(value))}"
+    lines = [f"*{_FIELD_LABELS.get(key, key.replace('_', ' ').capitalize())}:* {_card_safe(_field_text(value))}"
              for key, value in sorted(payload.items()) if key != body_key and value not in (None, "")]
     if body_key:
-        body = slack_safe(payload[body_key])
+        body = _card_safe(payload[body_key])
         if len(body) > _SECTION_TEXT_LIMIT:
             body = body[:_SECTION_TEXT_LIMIT] + "…"
         lines.append("\n".join(f"> {line}" if line else ">" for line in body.splitlines() or [""]))

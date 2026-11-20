@@ -17,6 +17,7 @@ from migrations.apply_lending_call_dispositions_dialer import apply_to
 from migrations.apply_lending_ghl_stage_events import apply_to as apply_to_stage_events
 from migrations.apply_lending_pr319_client_feedback import apply_to as apply_to_feedback
 from migrations.apply_lending_followup_call_tracking import apply_to as apply_to_followup
+from migrations.apply_lending_doc_chase import apply_to as apply_to_doc_chase
 from src.lending.models import LENDING_SCHEMA, LendingCallDisposition
 
 
@@ -45,6 +46,7 @@ def lending_db():
     apply_to_feedback(conn)
     apply_to_stage_events(conn)
     apply_to_followup(conn)  # call_source column (checked first, so no lock on the live table)
+    apply_to_doc_chase(conn)  # P2.4 ghl_opportunity_stage, written by the stage webhook
     session = Session(bind=conn, join_transaction_mode="create_savepoint")
     yield session
     session.close()
@@ -93,6 +95,13 @@ def _slack_test_posts_on(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _not_a_lendingflow_recipient(monkeypatch):
+    """The GHL email sender asks whether each recipient is a LendingFlow lead; tests never read the shared database
+    for it. Tests that cover the LendingFlow sender patch their own answer."""
+    monkeypatch.setattr("src.lending.email_identity.is_lendingflow_recipient", lambda email, phone: False)
+
+
+@pytest.fixture(autouse=True)
 def _no_live_web_lead_sink(monkeypatch):
     """A test must never push a website lead into the real Next Deal Lending GHL account."""
     monkeypatch.setattr("src.lending.web_lead_ghl.get_live_sink", lambda: None)
@@ -125,10 +134,13 @@ def inbox_writes(monkeypatch):
 
 @pytest.fixture
 def web_leads_db(lending_db):
-    """lending_db plus lending.web_leads (rolled back with the test)."""
+    """lending_db plus lending.web_leads (rolled back with the test), including the P2.1 AI-call consent columns that
+    apply_lending_speed_to_lead adds to an existing table."""
+    from migrations.apply_lending_speed_to_lead import apply_to as apply_speed_to_lead
     from migrations.apply_lending_web_leads import apply_to as apply_web_leads
 
     apply_web_leads(lending_db.get_bind())
+    apply_speed_to_lead(lending_db.get_bind())
     return lending_db
 
 
@@ -203,3 +215,75 @@ def no_cold_leads(monkeypatch):
     """The cold-lead check reads Postgres before every GHL text and email; tests see no cold leads by default.
     Tests of the check itself swap in their own session factory."""
     monkeypatch.setattr("src.lending.cold_leads._session_factory", _NotHalted)
+
+
+@pytest.fixture(autouse=True)
+def night_responder_send_passes(monkeypatch):
+    """A webhook that makes a night responder message due starts a send pass on its own session with the real GHL
+    senders: in tests the pass is recorded, never run. Tests of the pass call ``process_due`` directly."""
+    passes: list[str] = []
+    # A developer's own .env may switch the night responder on: every test starts with it off and no calendar.
+    from config.settings import get_settings
+
+    monkeypatch.setattr(get_settings(), "lending_after_hours_conversation_enabled", False, raising=False)
+    monkeypatch.setattr(get_settings(), "lending_after_hours_calendar_id", None, raising=False)
+    monkeypatch.setattr("src.lending.reply_webhook.run_send_cycle_now", lambda: passes.append("reply"))
+    monkeypatch.setattr("src.api.lending_ghl_router.run_send_cycle_now", lambda: passes.append("intake"))
+    return passes
+
+
+@pytest.fixture
+def conversations_db(lending_db, monkeypatch):
+    """lending_db plus lending.after_hours_conversations (rolled back with the test). A stop reply's opt-out is
+    recorded here instead of written: the opt-out lists live in tables these tests do not create."""
+    from migrations.apply_lending_after_hours_conversations import apply_to as apply_conversations
+
+    apply_conversations(lending_db.get_bind())
+    lending_db.opt_outs = []
+    monkeypatch.setattr("src.lending.after_hours_conversation.propagate_opt_out",
+                        lambda db, **fields: lending_db.opt_outs.append(fields))
+    return lending_db
+
+
+@pytest.fixture
+def closing_db():
+    """P2.4 tables in a throwaway schema inside one rolled-back transaction. No DDL touches live ``lending`` tables:
+    every ``lending.`` in a statement on this connection is rewritten to the throwaway schema."""
+    import uuid
+
+    from sqlalchemy import event
+
+    from config.settings import get_settings
+    from migrations.apply_lending_doc_chase import apply_to as apply_doc_chase
+    from src.lending.models import LendingGhlStageEvent
+
+    url = get_settings().database_url
+    if not url:
+        pytest.skip("requires a live Postgres DATABASE_URL")
+    engine = create_engine(str(url), connect_args={"connect_timeout": 20})
+    try:
+        conn = engine.connect()
+    except Exception:
+        engine.dispose()
+        pytest.skip("Postgres is not reachable")
+    schema = f"p24t_{uuid.uuid4().hex[:10]}"
+    tx = conn.begin()
+    conn.execute(text("SET LOCAL lock_timeout = '5s'"))
+    conn.execute(text("SET LOCAL statement_timeout = '30s'"))
+    conn.execute(text(f'CREATE SCHEMA "{schema}"'))
+    LendingGhlStageEvent.__table__.create(conn.execution_options(schema_translate_map={LENDING_SCHEMA: schema}))
+    conn.execute(text(f'CREATE TABLE "{schema}".loan_files (id BIGSERIAL PRIMARY KEY, borrower_phone VARCHAR(20), '
+                      "partner_id BIGINT, created_at TIMESTAMPTZ NOT NULL DEFAULT now())"))
+
+    @event.listens_for(conn, "before_cursor_execute", retval=True)
+    def _to_schema(_conn, _cursor, statement, parameters, _context, _many):
+        return statement.replace(f"{LENDING_SCHEMA}.", f"{schema}."), parameters
+
+    apply_doc_chase(conn, schema)
+    session = Session(bind=conn, join_transaction_mode="create_savepoint")
+    session.info["schema"] = schema
+    yield session
+    session.close()
+    tx.rollback()
+    conn.close()
+    engine.dispose()

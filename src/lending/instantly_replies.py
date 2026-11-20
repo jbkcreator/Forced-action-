@@ -27,17 +27,20 @@ import json
 import logging
 import re
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Optional
 
 from sqlalchemy import text
 
 from config.lending_compliance import OptOutChannel
+from config.lending_text_back import BOOKING_LINK
 from config.lending_standing_sends import INSTANTLY_REPLY_TEMPLATE
+from packages.agent_core.lane_guard import LaneViolation
 from packages.agent_core.redaction import mask_emails
 from src.lending.compliance import propagate_opt_out
 from src.lending.cora_inbox import add_to_inbox_safely, slack_safe
 from src.lending.cora_tools import borrower_draft_problem
+from src.lending.web_leads import DeliveryError
 
 logger = logging.getLogger(__name__)
 
@@ -65,9 +68,33 @@ _STOP_PHRASES = re.compile(
     r"(?:do not|don'?t) (?:email|e-mail|contact|message)|"
     r"(?:do not|don'?t) send (?:me |us )?(?:any ?more|more|further|another)|"
     r"(?:do not|don'?t) want (?:any ?more|more|further|your) (?:e-?mails?|messages)|"
+    r"(?:remove|delete|take) (?:my|our) (?:\w+ ){0,3}(?:from|off) (?:your|the|this|that|any|all) (?:\w+ )?"
+    r"(?:list|lists|mailing|database|records|system)|"
     r"no (?:more|further) (?:e-?mails?|messages|contact))\b",
     re.IGNORECASE,
 )
+# Words that could mean "stop" in wording the phrases above miss ("please remove", "this is spam", "leave us alone").
+# The webhook treats any of them as a STOP on the spot (the safe default: missing an opt-out is the bigger risk), so a
+# STOP never waits for Cora's sweep or the AI model; the model still sorts every other reply.
+_POSSIBLE_STOP = re.compile(
+    r"\b(?:cease(?: and desist| (?:all |any |further |more )?(?:contact|communication\w*|emailing|e-?mails?|"
+    r"sending|messaging|calling|texting))|unsubscrib\w*|harass\w*|leave (?:me|us) alone|(?:please |pls )?stop (?:it|this|that|now)|"
+    r"(?:remove|delete|take) (?:me|us|my|our) (?:\w+ )?(?:name|email|e-?mail|address|number|info|details|from|off)|"
+    r"(?:this (?:is|was)|it'?s|reported? (?:as|you as)|mark(?:ed|ing)? (?:as|you as)) spam|spammer|"
+    r"no longer (?:want|wish) to (?:receive|hear|get)|"
+    r"never (?:email|contact|call|text|message)|not (?:email|contact) (?:me|us))\b", re.IGNORECASE)
+# "don't call me", "never text me", "stop emailing me": a negated contact verb. It switches the callback guard below off,
+# so "delete my info, don't call me" is still a stop even though it says "call me".
+_NEGATED_CONTACT = re.compile(
+    r"\b(?:don'?t|do not|never|stop|quit|no more)\s+(?:\w+\s+){0,2}(?:call|text|phone|ring|reach|contact|e-?mail|message)\w*\b",
+    re.IGNORECASE)
+# A lead asking us to call, text or reach them ("call me at my new number", "give me a call"). Wording that only *could*
+# mean stop is not suppressed on the spot when the same reply asks for contact: it goes to triage, where the model
+# decides (and a real stop is still suppressed by the sweep). Clear stop requests are not affected.
+_ASKS_FOR_CONTACT = re.compile(
+    r"\b(?:(?<!not )(?<!n't )(?<!never )(?:call|phone|text|ring|reach) (?:me|us)|give (?:me|us) a (?:call|ring)|"
+    r"call(?:ing)? (?:me )?back|callback|my (?:new|updated|correct|current|cell|mobile|direct) (?:number|phone|cell))\b",
+    re.IGNORECASE)
 # A line that is only a stop word, with at most a short lead-in or tail ("STOP", "Please stop", "No thanks, stop",
 # "Remove"), so "can't stop thinking about it" is not one. Checked word by word, not with a regex: the reply is text
 # anyone can send, and a nested-quantifier pattern here backtracks exponentially (PR #428 re-review).
@@ -149,6 +176,16 @@ def is_stop_request(reply: str) -> bool:
     return bool(_STOP_PHRASES.search(own) or any(is_stop_line(line) for line in own.splitlines()))
 
 
+def could_mean_stop(reply: str) -> bool:
+    """A stop request, or any wording that could be one. Decided in the webhook, before anything else runs."""
+    if is_stop_request(reply):
+        return True
+    own = new_reply_text(reply)
+    if not _POSSIBLE_STOP.search(own):
+        return False
+    return bool(_NEGATED_CONTACT.search(own)) or not _ASKS_FOR_CONTACT.search(own)
+
+
 def parse_event(body: Mapping[str, Any]) -> Optional[InstantlyEvent]:
     """The event, or None when it is not one this module handles or carries no lead address."""
     event_type = (_pick(body, "event_type", "event", "type") or "").lower()
@@ -189,7 +226,7 @@ _INSERT = text("""
 
 def record_event(db, event: InstantlyEvent) -> RecordResult:
     """Store the event once. Does not commit."""
-    stop = event.event_type == EVENT_UNSUBSCRIBED or is_stop_request(event.reply_text)
+    stop = event.event_type == EVENT_UNSUBSCRIBED or could_mean_stop(event.reply_text)
     reply_id = db.execute(_INSERT, {
         "dedup_key": event.dedup_key[:200], "event_type": event.event_type, "lead_email": event.lead_email[:320],
         "first_name": (event.first_name or None) and event.first_name[:100], "campaign_id": event.campaign_id,
@@ -208,6 +245,12 @@ _SUPPRESSED = text("""
     UPDATE lending.instantly_replies SET suppressed_at = now(), opt_out_event_id = :event_id, processed_at = now(),
            last_error = NULL
      WHERE id = :id AND suppressed_at IS NULL
+""")
+
+
+_EMAIL_SUPPRESSED = text("""
+    SELECT EXISTS (SELECT 1 FROM lending.suppression_list WHERE email = :e)
+        OR EXISTS (SELECT 1 FROM email_opt_outs WHERE email = :e)
 """)
 
 
@@ -239,6 +282,8 @@ def queue_suppression_for_cora(db, reply_id: int, email: str, event_id: Optional
 
 # ── Cora's sweep: classify, draft, triage ────────────────────────────────────
 
+SIGN_OFF = "Next Deal Lending"
+
 CLASSIFY_PROMPT = """You triage replies to Next Deal Lending's cold emails. Next Deal Lending funds real-estate \
 investors (fix and flip, bridge, ground-up, DSCR rental loans). Josh is the loan officer.
 
@@ -252,10 +297,11 @@ wrong person, out-of-office or other auto-reply, no reply needed).
 - "subject": the reply subject, normally "Re: " plus their subject. Empty string for "dead" and "stop".
 - "body": the answer to send, from Next Deal Lending. Empty string for "dead" and "stop".
 
-Rules for the body: short, plain and friendly; answer what they asked; invite a quick call with Josh and ask for a \
-day and time that works; sign off "Next Deal Lending". Never quote or promise any number: no rates, terms, points, \
-fees, LTV, amounts or timelines; anything about pricing is "indicative, subject to underwriting" and for the call \
-with Josh. Never say a loan is approved or committed. Never mention any other company."""
+Rules for the body: short (a few sentences), plain and friendly; answer what they asked; invite a quick call with \
+Josh and include his booking link exactly as written here: """ + BOOKING_LINK + """ ; sign off "Next Deal Lending". \
+Never quote or promise any number: no rates, terms, points, fees, LTV, amounts or timelines; anything about pricing \
+is "indicative, subject to underwriting" and for the call with Josh. Never say a loan is approved or committed. \
+Never mention Backflip or any other company."""
 
 
 @dataclass(frozen=True)
@@ -290,6 +336,18 @@ def _parse_triage(raw: str) -> Triage:
     return Triage(intent, summary, subject, body)
 
 
+def with_booking_link(body: str) -> str:
+    """The body with Josh's booking link: kept as is when the model included it, else added on its own line before
+    the "Next Deal Lending" sign-off (or at the end when there is none)."""
+    if BOOKING_LINK in body:
+        return body
+    line = f"Pick a time that works for you: {BOOKING_LINK}"
+    head, _, last = body.rstrip().rpartition("\n")
+    if head and last.strip().lower() == SIGN_OFF.lower():
+        return f"{head.rstrip()}\n\n{line}\n\n{last.strip()}"
+    return f"{body.rstrip()}\n\n{line}"
+
+
 def classify_reply(client: Any, model: str, *, subject: Optional[str], reply: str,
                    rules: tuple[str, ...] = ()) -> Triage:
     """One model call; a draft that quotes numbers is redrafted once, then refused."""
@@ -303,7 +361,7 @@ def classify_reply(client: Any, model: str, *, subject: Optional[str], reply: st
         triage = _parse_triage(raw)
         problem = borrower_draft_problem({"subject": triage.subject, "body": triage.body}) if triage.body else None
         if problem is None:
-            return triage
+            return replace(triage, body=with_booking_link(triage.body)) if triage.body else triage
         messages += [{"role": "assistant", "content": raw},
                      {"role": "user", "content": f"Redraft: {problem}. Return the same JSON shape."}]
     raise TriageError("the draft kept quoting numbers")
@@ -372,7 +430,8 @@ class ReplyProcessor:
     def __init__(self, *, session_factory: Callable[[], Any], client: Any, model: str, enqueue: Enqueue,
                  post_card: PostCard, post_triage: Poster, post_notice: Poster,
                  rules: Callable[[], list[str]] = lambda: [],
-                 block_address: Blocker = lambda email: False) -> None:
+                 block_address: Blocker = lambda email: False,
+                 hand_off: Optional[Callable[[Mapping[str, Any]], Any]] = None) -> None:
         self._session_factory = session_factory
         self._client = client
         self._model = model
@@ -382,6 +441,7 @@ class ReplyProcessor:
         self._post_notice = post_notice
         self._rules = rules
         self._block_address = block_address
+        self._hand_off = hand_off
 
     def run(self, limit: int = BATCH_SIZE) -> SweepResult:
         result = SweepResult()
@@ -447,11 +507,37 @@ class ReplyProcessor:
         error = None
         if triage.intent in DRAFT_INTENTS:
             if row["email_account"] and row["reply_to_uuid"]:
-                action_id = self._draft(row, triage)
-                result.drafted += 1
+                try:
+                    action_id = self._draft(row, triage)
+                    result.drafted += 1
+                except LaneViolation:  # blocked by the send gate's Backflip check: no card, the team sees the error
+                    error = "the drafted answer names Backflip, so the send gate blocked it"
             else:
                 error = "reply has no Instantly inbox or email id, so it cannot be answered in the thread"
+        if triage.intent == "deal" and self._hand_off is not None:
+            self._hand_off_deal(db, row)
         self._finish(db, row, triage, action_id, error, result)
+
+    def _hand_off_deal(self, db, row: Mapping[str, Any]) -> None:
+        """A Deal reply becomes a GHL contact and pipeline card. Best effort: a failure never stops the reply being
+        triaged and answered; it is raised to Cora's inbox so the team adds the contact by hand."""
+        try:
+            with db.begin_nested():  # a failed read must not abort the sweep's transaction
+                opted_out = bool(db.execute(_EMAIL_SUPPRESSED, {"e": row["lead_email"].strip().lower()}).scalar())
+            if opted_out:
+                logger.info("[instantly-replies] reply %s not handed to GHL: the address has opted out", row["id"])
+                return
+            if self._hand_off is not None:
+                self._hand_off(row)
+        except Exception as exc:  # the step name and status carry no address; the class alone for anything else
+            detail = str(exc)[:120] if isinstance(exc, DeliveryError) else type(exc).__name__
+            logger.error("[instantly-replies] reply %s not handed to GHL (%s)", row["id"], detail)
+            add_to_inbox_safely(
+                db, event_type="instantly_ghl_handoff_failed", dedup_key=str(row["id"]), target_channel="ops",
+                summary=f"A Deal reply from {mask_emails(row['lead_email'])} may be only partly in GHL ({detail}): "
+                        "check the contact, its tag and the pipeline card, and finish by hand",
+                payload={"instantly_reply_id": row["id"], "email_masked": mask_emails(row["lead_email"]),
+                         "error": detail})
 
     def _suppress_model_stop(self, db, row: Mapping[str, Any], triage: Triage, result: SweepResult) -> None:
         """A stop request in wording the phrase check missed: marked as a STOP first, so a failed opt-out is retried

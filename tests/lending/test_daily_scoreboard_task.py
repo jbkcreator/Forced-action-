@@ -6,6 +6,8 @@ from types import SimpleNamespace
 import pytest
 from pydantic import SecretStr
 
+from src.lending.scoreboard import Row, ScoreboardData
+from src.lending.scoreboard_pipeline import PipelineData
 from src.tasks import lending_daily_scoreboard as task
 
 NOON_ET = datetime(2026, 10, 6, 16, 0, tzinfo=timezone.utc)
@@ -16,6 +18,17 @@ TEN_AM_UTC = datetime(2026, 10, 6, 14, 0, tzinfo=timezone.utc)  # 10:00 ET
 SEVEN_PM_ET_ON_THE_HOUR = datetime(2026, 10, 6, 23, 0, tzinfo=timezone.utc)  # 19:00 ET
 EIGHT_PM_UTC_PLUS = datetime(2026, 10, 7, 0, 0, tzinfo=timezone.utc)  # 20:00 ET on Oct 6: after the last (19:00) hourly post
 WINTER_TEN_AM_UTC = datetime(2026, 12, 1, 15, 0, tzinfo=timezone.utc)  # 10:00 ET in standard time (UTC-5)
+
+
+def data(dials: int = 1) -> ScoreboardData:
+    return ScoreboardData(by_caller=[], by_campaign=[], by_hook=[], total=Row("TOTAL", dials, 0, 0, 0, 0))
+
+
+def settings(**over):
+    values = dict(lending_daily_channel="C1", lending_dial_tasks_channel="CALLS", lending_slack_bot_token=SecretStr("xoxb-t"),
+                  lending_scoreboard_export_enabled=False, lending_ledger_export_folder_id="")
+    values.update(over)
+    return SimpleNamespace(**values)
 
 
 @pytest.fixture
@@ -33,13 +46,13 @@ def wired(monkeypatch):
     def fake_session():
         yield object()
 
-    monkeypatch.setattr(task, "get_settings", lambda: SimpleNamespace(
-        lending_daily_channel="C1", lending_dial_tasks_channel="CALLS", lending_slack_bot_token=SecretStr("xoxb-t")))
+    monkeypatch.setattr(task, "get_settings", lambda: settings())
     monkeypatch.setattr(task.time, "sleep", lambda s: None)
     monkeypatch.setattr(task, "lending_session", fake_session)
     monkeypatch.setattr(task, "campaign_names", lambda: {})
     monkeypatch.setattr(task, "build_scoreboard",
-                        lambda db, day, names: days.append(day) or SimpleNamespace(total=SimpleNamespace(dials=1)))
+                        lambda db, day, names: days.append(day) or data())
+    monkeypatch.setattr(task, "build_pipeline", lambda db, now: PipelineData())
     monkeypatch.setattr(task, "format_slack", lambda data, day, **kw: f"board {day}" + (" hourly" if kw.get("as_of") else ""))
     monkeypatch.setattr(task, "format_blocks", lambda data, day, **kw: [{"type": "divider"}])
     monkeypatch.setattr("slack_sdk.WebClient", FakeClient)
@@ -239,7 +252,7 @@ def test_client_approved_scoreboard_definitions_are_pinned():
 
 def test_an_hourly_board_with_no_dials_yet_is_not_posted(wired, monkeypatch):
     posted, _ = wired
-    monkeypatch.setattr(task, "build_scoreboard", lambda db, day, names: SimpleNamespace(total=SimpleNamespace(dials=0)))
+    monkeypatch.setattr(task, "build_scoreboard", lambda db, day, names: data(dials=0))
     assert task.main(["--hourly"], now=TEN_AM_UTC) == 0 and posted == []
     assert task.main([], now=SEVEN_PM_UTC) == 0 and len(posted) == 1  # the closing board still posts
 
@@ -253,3 +266,114 @@ def test_section_tables_leave_out_xfer_while_transfers_are_not_recorded():
     row = Row("Maria", 21, 7, 4, 2, 2, 1, 5)
     blocks = format_blocks(ScoreboardData([row], [row], [row], row, [], [row], [row]), date(2026, 10, 5))
     assert not any("transferred" in b["text"]["text"] for b in blocks if b["type"] == "section")
+
+
+# ── P2.5: zero-dial closing board, pipeline and Drive export ────────────────
+
+@pytest.fixture
+def export_wired(wired, monkeypatch):
+    posted, _ = wired
+    uploads, notices, pipelines = [], [], []
+    monkeypatch.setattr(task, "build_scoreboard", lambda db, day, names: data(dials=0))
+    monkeypatch.setattr(task, "build_pipeline", lambda db, now: pipelines.append(now) or PipelineData())
+    monkeypatch.setattr(task, "get_settings", lambda: settings(lending_scoreboard_export_enabled=True,
+                                                               lending_ledger_export_folder_id="F1"))
+    monkeypatch.setattr("src.lending.drive_upload.DriveUploader", lambda: lambda *a: uploads.append(a))
+    monkeypatch.setattr("src.lending.ops_alerts.post_ops_notice", lambda m: notices.append(m) or True)
+    return posted, uploads, notices, pipelines
+
+
+def test_a_zero_dial_closing_board_posts_reads_the_pipeline_and_exports(export_wired):
+    posted, uploads, notices, pipelines = export_wired
+    assert task.main([], now=SEVEN_PM_UTC) == 0
+    assert len(posted) == 1 and len(pipelines) == 1 and notices == []
+    assert [(u[0], u[1], u[2]) for u in uploads] == [("F1", "2026-10-06", "scoreboard.csv")]
+
+
+def test_the_hourly_board_reads_no_pipeline_and_exports_nothing(export_wired, monkeypatch):
+    posted, uploads, _, pipelines = export_wired
+    monkeypatch.setattr(task, "build_scoreboard", lambda db, day, names: data(dials=3))
+    assert task.main(["--hourly"], now=TEN_AM_UTC) == 0
+    assert len(posted) == 1 and pipelines == [] and uploads == []
+
+
+def test_a_failed_export_is_noticed_and_never_reposts_the_board(export_wired, monkeypatch, caplog):
+    posted, _, notices, _ = export_wired
+
+    def broken():
+        def upload(*a):
+            raise RuntimeError("drive 503 folder=F1")
+        return upload
+
+    monkeypatch.setattr("src.lending.drive_upload.DriveUploader", broken)
+    assert task.main([], now=SEVEN_PM_UTC) == 0  # 0: run.sh would retry a non-zero exit and post the board again
+    assert len(posted) == 1 and len(notices) == 1 and "not exported to Drive (RuntimeError)" in notices[0]
+    assert "folder=F1" not in caplog.text and "scoreboard export for 2026-10-06 failed (RuntimeError)" in caplog.text
+
+
+def test_export_off_uploads_nothing_and_raises_no_notice(export_wired, monkeypatch):
+    posted, uploads, notices, _ = export_wired
+    monkeypatch.setattr(task, "get_settings", lambda: settings(lending_scoreboard_export_enabled=False,
+                                                               lending_ledger_export_folder_id="F1"))
+    assert task.main([], now=SEVEN_PM_UTC) == 0 and len(posted) == 1 and uploads == [] and notices == []
+
+
+def test_export_on_without_a_folder_is_noticed(export_wired, monkeypatch):
+    posted, uploads, notices, _ = export_wired
+    monkeypatch.setattr(task, "get_settings", lambda: settings(lending_scoreboard_export_enabled=True,
+                                                               lending_ledger_export_folder_id=""))
+    assert task.main([], now=SEVEN_PM_UTC) == 0 and len(posted) == 1 and uploads == []
+    assert len(notices) == 1 and "LENDING_LEDGER_EXPORT_FOLDER_ID is not set" in notices[0]
+
+
+def test_a_failed_slack_post_still_exports_the_numbers(export_wired, monkeypatch):
+    _, uploads, _, _ = export_wired
+
+    class Boom:
+        def __init__(self, token):
+            pass
+
+        def chat_postMessage(self, **kw):
+            raise RuntimeError("slack down")
+
+    monkeypatch.setattr("slack_sdk.WebClient", Boom)
+    assert task.main([], now=SEVEN_PM_UTC) == 1  # nothing posted: run.sh retries the post
+    assert len(uploads) == 1  # exported after the failed post, so a Slack outage cannot lose the day's numbers
+
+
+
+def test_the_board_posts_before_the_export_so_a_slow_drive_never_delays_it(export_wired, monkeypatch):
+    posted, uploads, _, _ = export_wired
+    order = []
+    monkeypatch.setattr("src.lending.drive_upload.DriveUploader", lambda: lambda *a: order.append("export"))
+
+    class Client:
+        def __init__(self, token):
+            pass
+
+        def chat_postMessage(self, **kw):
+            order.append("post")
+
+    monkeypatch.setattr("slack_sdk.WebClient", Client)
+    assert task.main([], now=SEVEN_PM_UTC) == 0 and order == ["post", "export"]
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_a_broken_export_module_never_stops_the_board(export_wired, monkeypatch, caplog, enabled):
+    posted, uploads, _, _ = export_wired
+    monkeypatch.setattr(task, "get_settings", lambda: settings(lending_scoreboard_export_enabled=enabled,
+                                                               lending_ledger_export_folder_id="F1"))
+    monkeypatch.setitem(__import__("sys").modules, "src.lending.scoreboard_export", None)  # import raises
+    assert task.main([], now=SEVEN_PM_UTC) == 0 and len(posted) == 1 and uploads == []
+    assert ("scoreboard export for 2026-10-06 failed (ModuleNotFoundError)" in caplog.text) is enabled
+
+
+def test_the_scoreboard_does_not_import_the_ledger_export():
+    """A fresh interpreter, so no module is reloaded inside this test run."""
+    import subprocess
+    import sys
+
+    code = ("import sys, src.tasks.lending_daily_scoreboard; "
+            "print('src.lending.ledger_export' in sys.modules)")
+    out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=120)
+    assert out.returncode == 0 and out.stdout.strip().splitlines()[-1] == "False"

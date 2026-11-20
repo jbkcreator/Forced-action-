@@ -1213,6 +1213,10 @@ COUNTY_ID=hillsborough
 # Lending LendingFlow intake (T-11) — retry GHL delivery of leads not yet in GoHighLevel, then emit the
 # LendingFlowLeadCreated event + pre-qual hand-off. No-op while LENDING_LENDINGFLOW_ENABLED=false.
 */5 * * * * $PROJECT/scripts/cron/run.sh src.tasks.lending_lendingflow_sweep
+# Lending P2.1 speed-to-lead call queue — every minute: release one queued lead (fresh first, then oldest) inside
+# the callers' hours after re-checking every rule, expire leads queued 72 h, post the morning summary / backlog
+# alert. No-op while LENDING_SPEED_TO_LEAD_ENABLED=false.
+* * * * * $PROJECT/scripts/cron/run.sh src.tasks.lending_speed_to_lead_queue
 */5 * * * * $PROJECT/scripts/cron/run.sh src.tasks.lending_partner_sweep
 # Lending test traffic (Q35, Q42) — tag new rows from test email domains and test partners is_test and log each
 # one in lending.test_data_cleanup_log, so reports, the audience export and seat caps leave them out.
@@ -1261,7 +1265,8 @@ COUNTY_ID=hillsborough
 0 5 * * * flock /tmp/lending_ledger_export.lock $PROJECT/scripts/cron/run.sh src.tasks.lending_ledger_export
 55 5 * * * flock -w 3000 /tmp/lending_ledger_export.lock $PROJECT/scripts/cron/run.sh src.tasks.lending_ledger_export --retry || $PROJECT/scripts/cron/run.sh src.tasks.lending_ledger_export --alert-stalled
 
-# Lending 7:20pm ET scoreboard to Slack (Part 5.6; dialer stops 7:15pm). Two lines because ET is UTC-4 until Nov 1 and UTC-5 after; the task posts only when it is 19:xx ET.
+# Lending 7:20pm ET scoreboard to Slack (Part 5.6; dialer stops 7:15pm), also on zero-dial days, with the pipeline; its
+# numbers go to Drive NDL Ledger Exports/{date}/scoreboard.csv first when LENDING_SCOREBOARD_EXPORT_ENABLED (P2.5). Two lines because ET is UTC-4 until Nov 1 and UTC-5 after; the task posts only when it is 19:xx ET.
 20 23 * * * $PROJECT/scripts/cron/run.sh src.tasks.lending_daily_scoreboard
 20 0 * * * $PROJECT/scripts/cron/run.sh src.tasks.lending_daily_scoreboard
 # David's end-of-day activity + flagged leads to LENDING_DAVID_CHANNEL (#isa-daily), after the 7:20pm board. Same two-line DST pattern; posts only at 19:xx ET.

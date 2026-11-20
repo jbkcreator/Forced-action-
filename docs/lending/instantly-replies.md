@@ -15,6 +15,23 @@ everywhere.
 | ...dead | Triage only. Never a suppression: only a STOP or unsubscribe suppresses | |
 | any other event | Answered 200 and ignored | |
 
+**Decided in the webhook, not the sweep.** The webhook also treats any wording that could mean stop as a STOP on the
+spot (`instantly_replies.could_mean_stop`: cease, unsubscribe, harass, "leave us alone", "stop this/it/now", "remove /
+delete / take me|us|my ... name|email|number|from", "this is spam", "no longer want to receive", "never email me", on top
+of the phrases above). The wording is specific on purpose, so ordinary replies ("we no longer have that property",
+"please stop by Tuesday", "remove the prepayment penalty", an out-of-office) are not suppressed; they go to the model.
+A possible STOP is suppressed within seconds and never waits for Cora's sweep or the AI model (it also works while the
+model is down). If one is wrong, lift the suppression by hand.
+
+**Which phones an email-only STOP reaches** (`compliance._with_linked_phones`): phones on lending contacts, website and
+LendingFlow leads, partners, and the traced emails in the cold calling lists (`lending.calling_pool_staging`); then,
+for a cold contact held only in GHL and the dialer, the GHL contact found by that email and every dialer load of that
+GHL contact id (`ghl_email_lookup.py`, read only, one attempt per email, 4 s timeout, 30 s for the batch, at most 10 emails; every email is asked, even one already linked to a phone). Each phone
+gets its own opt-out event, so the dialer removal retry and the GHL do-not-disturb sync cover it. If the GHL search
+fails the email is still suppressed; only the phone link is missed (logged `[ghl-email-lookup] GHL search failed`) and
+a `stop_phone_link_failed` item goes to Cora's inbox (no address in it), so a person checks the dialer and GHL for that
+contact by hand.
+
 Only the lead's own words count for STOP: the quoted earlier email (which may say "Reply STOP to unsubscribe") is
 ignored. A line that is only "stop" with a short lead-in ("Please stop", "No thanks, stop") counts; "can't stop
 thinking about this deal" does not. The model is told to choose **stop** whenever a reply could be read as asking
@@ -65,3 +82,81 @@ Instantly's webhook field names (`lead_email`, `email_account`, `email_id`, `rep
 (`POST /api/v2/emails/reply` with `eaccount`, `reply_to_uuid`, `subject`, `body`) follow Instantly's public
 reference, not a captured delivery. Turn on `LENDING_GHL_LOG_PAYLOAD_SHAPE` for the first test reply to log the
 field names (never values), and check the first approved answer lands in the thread.
+
+## Deal replies become GHL contacts (off until `LENDING_INSTANTLY_GHL_HANDOFF_ENABLED=true`)
+
+Cold emails and the first answer stay in Instantly. When the model reads a reply as **Deal** (and only then), Cora's sweep
+hands the lead to the Next Deal Lending GHL account (`src/lending/instantly_ghl_handoff.py`):
+
+- the GHL contact is **found by email** (a contact search, exact match) and used as it is; only when there is none is it created,
+  from the email alone (no do-not-disturb, tags, source or phone in the create, so nothing an earlier STOP or the dialer set is
+  overwritten);
+- the tag `ndl-instantly-interested` is added. `ndl-cold` is removed (so the agents' later emails to this contact go through GHL)
+  **only when GHL email is open for the contact**. A cold-imported contact carries Email do-not-disturb, which the GHL email rail
+  refuses (`blocked_consent`), so it **keeps `ndl-cold` and its Instantly route** for follow-up emails; its do-not-disturb is never lifted
+  here, and a note on the contact says so. The first answer is a Cora draft sent inside the Instantly thread, so it is not affected;
+- a pipeline card is created at the new-lead stage (`LENDING_GHL_PIPELINE_ID`, `LENDING_GHL_STAGE_NEW_LEAD`) when the contact
+  has none; a card already in any stage is never moved. Without those two settings the lead is contact-only;
+- a note says the contact came from an Instantly reply;
+- if the lead gives a phone number in the reply (their own words, not the quoted email), it is put on the contact, but only when no
+  other GHL contact owns that number and this contact has no phone of its own; otherwise it is left off and the note says why (a
+  shared office line can never redirect the hand-over to another contact). That number is not consent to text;
+- nothing is written while the lending emergency halt is on.
+
+An address that opted out is never handed over, and neither is a GHL contact that already carries the `lending-opt-out` tag or Call do-not-disturb. Do-not-disturb is never lifted: texts still need consent. A failed hand-over
+never blocks the triage or the answer; it raises a `instantly_ghl_handoff_failed` item in Cora's inbox (no address in it) so
+the team adds the contact by hand. Built from the team's recommendation for open question P1.3 #1: switch it on once Josh
+confirms.
+
+Limits to know before switching it on (read at Cora's start-up: restart `fa-lending-cora` to change the setting):
+
+- The contact is matched by **email only**. A cold contact loaded into GHL by phone with no email on file is not found, so a second
+  contact is created. Check the first few hand-overs.
+- A failure part-way (for example the tag step) leaves a **partly built** contact. The reply is not retried; the inbox item names the
+  step that failed, and the team finishes the contact, tag and card by hand.
+- Moving a cold-imported contact fully to GHL email (removing `ndl-cold` and lifting its Email do-not-disturb) is **not done here**: it
+  needs Josh's decision on the client rule that a cold lead gets no GHL email. Until then those contacts keep getting follow-up emails
+  through Instantly. A contact whose GHL email is open does move to the GHL rail (the rail follows the tag, and the GHL rail does not add
+  the cold-email footer).
+- An address in `lending.suppression_list` or `email_opt_outs` is never handed over. A phone number the lead types in the reply is not checked against the
+  suppression lists before it is put on the contact (the call gate tags suppressed numbers afterwards); several contacts sharing one email use the lowest id.
+- The hand-over runs inside Cora's sweep and makes about eight GHL calls; a GHL outage can slow that sweep by up to a few minutes.
+
+## Only NDL campaigns, the block list and the unsubscribe link
+
+- **Only NDL campaigns reach Cora.** The Instantly workspace is shared with other campaigns. The webhook ignores (answers 200, stores
+  nothing) an event whose `campaign_id` is not the NDL passthrough campaign (`LENDING_INSTANTLY_CAMPAIGN_ID`) or one of
+  `LENDING_INSTANTLY_EXTRA_CAMPAIGN_IDS` (comma separated). An event that names no campaign is accepted, so a STOP is never dropped; with
+  no NDL campaign configured nothing is filtered. **If NDL runs a second campaign, add its id to `LENDING_INSTANTLY_EXTRA_CAMPAIGN_IDS`: an opt-out from a campaign that is not listed is ignored.** Instantly's field names are unverified: check `campaign_id` in the first delivery's
+  logged payload shape. Ids are compared case-insensitively; an ignored event is logged as a warning with the campaign id.
+- **Every opt-out goes onto Instantly's block list.** Any opt-out that carries an email (the unsubscribe link, the opt-out mailbox, an
+  Instantly STOP, an email opt-out from Forced Action) is added to the NDL workspace block list by `compliance._propagate`, best effort:
+  at most 10 per batch and 15 s (each call can take up to 20 s), never raises; it runs inside the opt-out's transaction, so it also
+  covers Forced Action unsubscribes (the shared-unsubscribe design). Test and internal addresses are not excluded. A phone-only opt-out has no address to add.
+- **The unsubscribe link is on NDL's own host.** The cold-email footer link points at `LENDING_UNSUBSCRIBE_BASE_URL` +
+  `/api/lending/email/unsubscribe?token=...` (served by `lending-api`: GET only shows an Unsubscribe button, POST opts out and is the RFC 8058 one-click target; a valid signed link is never rate limited, requests with an invalid token are, per IP), never at the Forced Action app. Cold email
+  stays off until the setting is set (for example `https://api.nextdeallending.com`, which nginx already routes `/api/lending/` to
+  lending-api). A valid link is an opt-out on every channel (`propagate_opt_out`). Instantly's own `List-Unsubscribe` header
+  (`insert_unsubscribe_header`) stays on Instantly's domain; its unsubscribes arrive as `lead_unsubscribed` events.
+
+**Block-list retry.** An opt-out does not call Instantly inside its own transaction any more: `compliance._propagate` queues each
+opted-out address in `lending.instantly_block_queue` (idempotent per address; a failed write is logged and never breaks the opt-out),
+and Cora's minute sweep (`BlockListSweep`) sends up to 10 pending addresses per pass to Instantly's block list. A failed attempt is
+retried with a growing wait (1 minute doubling to 1 hour); an address Instantly already holds (HTTP 409) counts as done; after 12 failed
+tries the row is marked `failed` and an `instantly_block_failed` item (no address) goes to Cora's inbox so a person adds it by hand.
+A `failed` row, or one `done` more than a day ago, is queued again by a new opt-out for the same address. Rows stay pending while `LENDING_INSTANTLY_API_KEY` is unset. **Run `migrations/apply_lending_instantly_block_queue.py` before
+deploying**: without the table an opt-out is still recorded, but its address is not queued.
+
+
+**A callback request or a number correction is not a STOP.** Wording that only *could* mean stop ("remove my number", "delete my info", "take my
+email off") is not suppressed on the spot when the same reply asks us to call, text or reach the lead ("call me at my new number", "give me a
+call", "my new number is ..."): it goes to triage, where the model decides (a real stop in wording the phrases miss is still suppressed by
+Cora's sweep). The guard never applies to a clear stop: a strict phrase ("remove me", "remove my email address from your list", "take my number
+off your list", "unsubscribe", "this is spam"), or a negated contact verb in the same reply ("delete my info, don't call me", "never call me
+again"), is still suppressed within seconds, whatever else the reply says.
+
+**Prerequisites of the email-only STOP lookup.** It reads the traced emails in `lending.calling_pool_staging`
+(`migrations/apply_lending_calling_pool_staging.py`) and the GHL contact id on `lending.dialer_load_records`
+(`migrations/apply_lending_dialer_load_ghl_contact_id.py`). If either migration has not been run the opt-out still completes: each lookup
+runs in its own savepoint and a failure is logged by class and that source is skipped (a failed dialer-load lookup also raises the
+`stop_phone_link_failed` inbox item, no address in it, so a person checks the dialer and GHL by hand). Run both migrations anyway.
