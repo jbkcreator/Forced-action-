@@ -1434,7 +1434,7 @@ class LendingPartnerFileUpload(LendingBase):
     __table_args__ = (Index("idx_lending_partner_file_uploads_file", "file_id"),)
 
 
-_CALLING_LIST_KEYS_SQL = "list_key IN ('verified_maturity', 'cash_buyer', 'wholesaler')"
+_CALLING_LIST_KEYS_SQL = "list_key IN ('verified_maturity', 'cash_buyer', 'investor_purchase', 'wholesaler')"
 
 
 class LendingPrListPull(LendingBase):
@@ -1449,6 +1449,9 @@ class LendingPrListPull(LendingBase):
 
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
     list_key: Mapped[str] = mapped_column(String(30), nullable=False)
+    state: Mapped[str] = mapped_column(String(2), nullable=False, default="FL", server_default=text("'FL'"))
+    # manual (an operator approved the exact export count) or nightly (bought under the nightly export cap)
+    run_kind: Mapped[str] = mapped_column(String(10), nullable=False, default="manual", server_default=text("'manual'"))
     window_start: Mapped[date] = mapped_column(Date, nullable=False)
     window_end: Mapped[date] = mapped_column(Date, nullable=False)
     criteria: Mapped[Any] = mapped_column(JSONB, nullable=False)  # every criteria set bought, in order
@@ -1463,7 +1466,9 @@ class LendingPrListPull(LendingBase):
     __table_args__ = (
         CheckConstraint(_CALLING_LIST_KEYS_SQL, name="ck_lending_pr_list_pulls_list"),
         CheckConstraint("status IN ('running', 'done', 'failed')", name="ck_lending_pr_list_pulls_status"),
+        CheckConstraint("run_kind IN ('manual', 'nightly')", name="ck_lending_pr_list_pulls_run_kind"),
         Index("idx_lending_pr_list_pulls_list_window", "list_key", "window_start", "window_end"),
+        Index("idx_lending_pr_list_pulls_started", "run_kind", "started_at"),
     )
 
 
@@ -1513,12 +1518,19 @@ class LendingPrListRecord(LendingBase):
     match_strength: Mapped[Optional[str]] = mapped_column(String(10))  # confirmed / likely, when it qualifies
     exclusion_reason: Mapped[Optional[str]] = mapped_column(String(40))
     contact_key: Mapped[Optional[str]] = mapped_column(String(64))  # sha256 of the normalized person to reach
+    # The Forced Action property this record matched (parcel, then address), in counties FA holds parcels for.
+    property_id: Mapped[Optional[int]] = mapped_column(Integer)
+    match_method: Mapped[Optional[str]] = mapped_column(String(30))  # parcel / address / no_match
+    match_confidence: Mapped[Optional[float]] = mapped_column(Numeric(4, 3))
+    linked_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
     raw: Mapped[Any] = mapped_column(JSONB, nullable=False)
     first_seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_now, server_default=text("now()"))
     last_seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_now, server_default=text("now()"))
 
     __table_args__ = (
         CheckConstraint(_CALLING_LIST_KEYS_SQL, name="ck_lending_pr_list_records_list"),
+        Index("idx_lending_pr_list_records_unlinked", "list_key", postgresql_where=text("linked_at IS NULL")),
+        Index("idx_lending_pr_list_records_first_seen", "first_seen_at"),
         CheckConstraint("match_strength IS NULL OR match_strength IN ('confirmed', 'likely')",
                         name="ck_lending_pr_list_records_strength"),
         CheckConstraint("qualifies = (exclusion_reason IS NULL)", name="ck_lending_pr_list_records_qualifies"),

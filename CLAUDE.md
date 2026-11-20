@@ -101,8 +101,11 @@ python -m src.lending.uncalled_alarm_worker  # T-10 alarm worker (systemd fa-len
 PYTHONPATH=. python migrations/apply_lending_ghl_call_gate_state.py  # G5: lending.ghl_call_gate_state (one row: last success / failing since / alerted) (idempotent)
 python -m src.lending.ghl_call_gate [--dry-run | --clear]  # G5 (cron every minute, off until LENDING_GHL_CALL_GATE_ENABLED=true): tags ndl-do-not-call-now on contacts on Josh's 8 GHL smart lists (GHL_CALL_LIST_TAGS) that cannot be called now (emergency stop, suppression, dial_blocks, DNC result; LendingFlow needs no scrub), removes it when allowed; lead-type tags never touched; docs/lending/ghl-call-gate.md
 python -m src.lending.ghl_list_scrub [--dry-run]  # D1/D4 (cron hourly, off until LENDING_GHL_LIST_SCRUB_ENABLED=true): Tracerfy scrub of listed non-LendingFlow numbers with no scrub or one 6+ days old, capped by LENDING_GHL_LIST_SCRUB_MAX_CREDITS
-# PropertyRadar daily target-lender maturity pull (separate cron, disabled until PROPERTY_RADAR_ENABLED=true — see scripts/cron/crontab.txt)
+# PropertyRadar daily target-lender maturity pull (cron line DISABLED: superseded by the nightly calling-list pipeline below)
 python -m src.tasks.property_radar_maturity_pull --mode daily --state FL
+PYTHONPATH=. python migrations/apply_lending_pr_list_nightly.py  # nightly calling lists: pr_list_pulls.state/run_kind, pr_list_records property link columns, investor_purchase list, enrichment_usage_logs.trace_type (idempotent, RUN BEFORE deploying)
+python -m src.tasks.lending_pr_nightly --stage pull|trace|dnc|load [--apply]  # nightly PropertyRadar FL+GA (Verified maturity 165 days out, Cash buyers, Investor purchases): pull+link 06:30, trace 08:30, DNC 10:30, BatchDialer load 09:xx ET; caps per ET night (LENDING_PR_NIGHTLY_*, 0 = spend nothing) count what the night spent, so retries never pay twice; GHL via ghl_load_sync (tags ndl + ndl-sig-*); off until LENDING_PR_NIGHTLY_ENABLED; docs/lending/pr-nightly-pipeline.md
+python -m src.tasks.lending_pr_daily_export [--dry-run]  # daily calling-list CSVs to Drive "FA Exports/{ET day}/" (no full phone/email), manifest last; off until LENDING_PR_EXPORT_ENABLED + LENDING_PR_EXPORT_FOLDER_ID
 
 # FA Max agent worker (separate process, WP-T2-2 — see docs/PLATFORM-OPERATIONS-GUIDE.md)
 python -m src.agents.fa_max.worker

@@ -4,11 +4,13 @@ from __future__ import annotations
 import json
 import logging
 from collections.abc import Sequence
-from datetime import date
+from datetime import date, datetime
 from typing import Any, Mapping, Optional
 
 from sqlalchemy import text
 from sqlalchemy.exc import DBAPIError
+
+from config.lending_calling_lists import DEFAULT_PULL_STATE
 
 logger = logging.getLogger(__name__)
 
@@ -35,11 +37,22 @@ _UPSERT_RECORDS = text(
 
 
 def start_pull(db, list_key: str, window_start: date, window_end: date,
-               criteria: Sequence[Mapping[str, Any]], matching_count: int) -> int:
+               criteria: Sequence[Mapping[str, Any]], matching_count: int, *,
+               state: str = DEFAULT_PULL_STATE, run_kind: str = "manual") -> int:
     return int(db.execute(text(
-        "INSERT INTO lending.pr_list_pulls (list_key, window_start, window_end, criteria, matching_count) "
-        "VALUES (:k, :s, :e, CAST(:c AS jsonb), :m) RETURNING id"
-    ), {"k": list_key, "s": window_start, "e": window_end, "c": json.dumps(list(criteria)), "m": matching_count}).scalar())
+        "INSERT INTO lending.pr_list_pulls (list_key, state, run_kind, window_start, window_end, criteria, matching_count) "
+        "VALUES (:k, :st, :rk, :s, :e, CAST(:c AS jsonb), :m) RETURNING id"
+    ), {"k": list_key, "st": state, "rk": run_kind, "s": window_start, "e": window_end,
+        "c": json.dumps(list(criteria)), "m": matching_count}).scalar())
+
+
+def nightly_exports_since(db, since: datetime) -> int:
+    """Exports the nightly pulls started since ``since`` consumed: what the night's cap has already spent, so a
+    retried run never spends it again."""
+    return int(db.execute(text(
+        "SELECT coalesce(sum(exports_consumed), 0) FROM lending.pr_list_pulls "
+        "WHERE run_kind = 'nightly' AND started_at >= :since"
+    ), {"since": since}).scalar())
 
 
 def store_records(db, pull_id: int, rows: Sequence[Mapping[str, Any]]) -> int:

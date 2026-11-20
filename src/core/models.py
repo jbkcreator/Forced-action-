@@ -4305,6 +4305,9 @@ class EnrichmentUsageLog(Base):
     # the same rows (idempotency guard for apply_degraded_discount).
     quality_discounted: Mapped[bool] = mapped_column(Boolean, default=False, server_default="false", nullable=False)
     caller: Mapped[Optional[str]] = mapped_column(String(40))   # QUALITY-v2.2 Q2: seat name for P&L attribution
+    # Tracerfy mode a trace was sent as (normal / advanced); the skip-trace ledger reads it so an address is
+    # never sent twice in the same mode. Added by migrations/apply_lending_pr_list_nightly.py.
+    trace_type: Mapped[Optional[str]] = mapped_column(String(20))
 
     __table_args__ = (
         Index("idx_enrichment_purpose_created", "purpose", "created_at"),

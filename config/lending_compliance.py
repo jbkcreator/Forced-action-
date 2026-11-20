@@ -155,6 +155,15 @@ GHL_LOAD_SYNC_POOL_TAGS: dict[str, str] = {
     "lendingflow": "lendingflow",  # LendingFlow phones are warm, so the sync skips them; mapped for completeness
     "website": "web-lead",  # website phones are warm too (skipped); mapped for completeness
 }
+# Nightly PropertyRadar calling lists (src/tasks/lending_pr_nightly.py): their GHL contacts also get the NDL tag and
+# one signal tag. These are not call lists: the call gate must never treat them as one, so they stay out of
+# GHL_CALL_LIST_TAGS.
+GHL_TAG_NDL = "ndl"
+GHL_CALLING_LIST_SIGNAL_TAGS: dict[str, str] = {
+    "verified_maturity": "ndl-sig-maturity",
+    "cash_buyer": "ndl-sig-cash-purchase",
+    "investor_purchase": "ndl-sig-portfolio",
+}
 GHL_LOAD_SYNC_BATCH_SIZE = 200       # rows per run
 GHL_LOAD_SYNC_MAX_ATTEMPTS = 5       # then status 'failed' and one ops notice
 GHL_LOAD_SYNC_HALT_CHECK_EVERY = 10  # rows between emergency-halt rechecks inside a run
@@ -261,5 +270,7 @@ def validate_lending_compliance_config() -> None:
         raise ValueError("GHL_CALL_LIST_TAGS must be distinct and must not contain GHL_DO_NOT_CALL_NOW_TAG")
     if not set(GHL_LOAD_SYNC_POOL_TAGS.values()) <= set(GHL_CALL_LIST_TAGS):
         raise ValueError("GHL_LOAD_SYNC_POOL_TAGS must map pools to tags in GHL_CALL_LIST_TAGS")
+    if ({GHL_TAG_NDL, *GHL_CALLING_LIST_SIGNAL_TAGS.values()} & set(GHL_CALL_LIST_TAGS)):
+        raise ValueError("the NDL and signal tags must not be call-list tags")
     if min(GHL_LOAD_SYNC_BATCH_SIZE, GHL_LOAD_SYNC_MAX_ATTEMPTS, GHL_LOAD_SYNC_HALT_CHECK_EVERY) < 1:
         raise ValueError("GHL load sync batch size, max attempts and halt check interval must be positive")

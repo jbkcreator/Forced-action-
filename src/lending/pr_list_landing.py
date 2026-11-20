@@ -71,18 +71,47 @@ class PullLocked(RuntimeError):
     """Another calling-list pull is running (or crashed without releasing the lock)."""
 
 
+def _holder_pid(path: Path) -> Optional[int]:
+    try:
+        text_ = path.read_text(encoding="utf-8").strip()
+    except FileNotFoundError:
+        return None
+    parts = text_.split()
+    return int(parts[1]) if len(parts) == 2 and parts[0] == "pid" and parts[1].isdigit() else None
+
+
+def _process_running(pid: int) -> bool:
+    """POSIX only (production). Elsewhere a lock is always treated as held: on Windows ``os.kill(pid, 0)`` would
+    send Ctrl+C to that process."""
+    if os.name != "posix":
+        return True
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
 def acquire_pull_lock(*, root: Optional[Path] = None) -> Path:
     """One pull at a time on this machine: two pulls at once could buy the same records. The lock file is
-    created atomically (O_EXCL) and names the process holding it; a crashed run leaves it behind and it
-    must be removed by hand after checking that no pull is running."""
+    created atomically (O_EXCL) and names the process holding it. A lock left by a process that is no longer
+    running (a crashed run) is taken over once, so the nightly job is never blocked by it."""
     folder = root or LANDING_ROOT
     folder.mkdir(parents=True, exist_ok=True)
     path = folder / ".pull.lock"
-    try:
-        fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-    except FileExistsError:
-        raise PullLocked(f"another pull holds {path} ({path.read_text(encoding='utf-8').strip()}); if none is "
-                         "running, delete that file and try again") from None
+    for attempt in range(2):
+        try:
+            fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            break
+        except FileExistsError:
+            holder = _holder_pid(path)
+            if attempt == 0 and holder is not None and not _process_running(holder):
+                path.unlink(missing_ok=True)  # the holder died without releasing it
+                continue
+            raise PullLocked(f"another pull holds {path} (pid {holder}); if none is running, delete that file "
+                             "and try again") from None
     with os.fdopen(fd, "w", encoding="utf-8") as handle:
         handle.write(f"pid {os.getpid()}")
     return path

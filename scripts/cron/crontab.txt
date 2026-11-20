@@ -1172,7 +1172,10 @@ COUNTY_ID=hillsborough
 # write capacity. Adjust if ordering with a Dev 2 staging sweep is required.
 # Backlog run (one-time): invoke manually with --mode backlog.
 # Guard: job no-ops when PROPERTY_RADAR_ENABLED=false (default).
-0 2 * * * $PROJECT/scripts/cron/run.sh src.tasks.property_radar_maturity_pull --mode daily --state FL
+# DISABLED: replaced by the nightly calling-list pipeline below (src.tasks.lending_pr_nightly), which covers the same
+# named-lender maturities (plus private money, FL + GA). Left on, it would buy and dial them a second time through
+# property_radar_records once PROPERTY_RADAR_ENABLED=true.
+# 0 2 * * * $PROJECT/scripts/cron/run.sh src.tasks.property_radar_maturity_pull --mode daily --state FL
 
 # PropertyRadar runner — pull -> stage -> link -> handoff (Developer 4).
 # DISABLED: PropertyRadar monitoring is off until Josh turns it on. Uncomment to enable;
@@ -1185,8 +1188,24 @@ COUNTY_ID=hillsborough
 # trace, before the Monday dialer scrub/load. No credit spend (reads existing traces only);
 # phone-less rows are staged too so a later trace joins without a re-extract.
 # DISABLED until Josh turns PropertyRadar on — enable alongside the pull/runner above.
+# Superseded by the nightly calling-list pipeline below; keep disabled while that runs (it would dial twice).
 # Dry check first: PYTHONPATH=. python -m src.tasks.lending_pr_maturity_bridge
 # 0 3 * * * $PROJECT/scripts/cron/run.sh src.tasks.lending_pr_maturity_bridge --apply
+
+# Nightly PropertyRadar calling lists (FL + GA): Verified maturity (5.5 months out), Cash buyers, Investor purchases.
+# pull (+ link to FA properties) -> trace -> DNC overnight; BatchDialer load at 09:xx ET (two UTC lines cover daylight
+# saving; the job acts only during 09:xx ET); the GHL load sync (*/5) then pushes the loads to GHL tagged ndl +
+# ndl-sig-*. Every cap is per ET night and counts what the night already spent, so run.sh retries never spend twice.
+# Idle until LENDING_PR_NIGHTLY_ENABLED=true (+ PROPERTY_RADAR_ENABLED=true, PROPERTY_RADAR_MODE=live and the caps).
+# Dry check first: PYTHONPATH=. python -m src.tasks.lending_pr_nightly --stage pull
+30 6 * * * flock -n /tmp/lending_pr_nightly.lock $PROJECT/scripts/cron/run.sh src.tasks.lending_pr_nightly --stage pull --apply
+30 8 * * * flock -n /tmp/lending_pr_nightly.lock $PROJECT/scripts/cron/run.sh src.tasks.lending_pr_nightly --stage trace --apply
+30 10 * * * flock -n /tmp/lending_pr_nightly.lock $PROJECT/scripts/cron/run.sh src.tasks.lending_pr_nightly --stage dnc --apply
+5 13,14 * * * flock -n /tmp/lending_pr_nightly.lock $PROJECT/scripts/cron/run.sh src.tasks.lending_pr_nightly --stage load --apply
+# Daily calling-list export to Drive "FA Exports/{ET day}/" after the load; --retry redoes an unfinished day and
+# alerts. No-op until LENDING_PR_EXPORT_ENABLED=true and LENDING_PR_EXPORT_FOLDER_ID is set.
+45 14 * * * flock /tmp/lending_pr_daily_export.lock $PROJECT/scripts/cron/run.sh src.tasks.lending_pr_daily_export
+45 15 * * * flock -w 3000 /tmp/lending_pr_daily_export.lock $PROJECT/scripts/cron/run.sh src.tasks.lending_pr_daily_export --retry || $PROJECT/scripts/cron/run.sh src.tasks.lending_pr_daily_export --alert-stalled
 
 # Lending call dispositions — retry Google Sheet / Slack #dial-tasks delivery for
 # calls whose first delivery failed or whose result was changed by the caller.

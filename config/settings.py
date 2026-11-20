@@ -1051,6 +1051,20 @@ class AppSettings(BaseSettings):
 	# LENDING_DRIVE_SERVICE_ACCOUNT_KEY_PATH (else the Sheets key) with the drive scope; the folder is "NDL Ledger Exports", shared with that account
 	lending_ledger_export_enabled: bool = Field(default=False, env="LENDING_LEDGER_EXPORT_ENABLED")
 	lending_ledger_export_folder_id: str = Field(default="", env="LENDING_LEDGER_EXPORT_FOLDER_ID")
+	# Nightly PropertyRadar calling-list pipeline (src/tasks/lending_pr_nightly.py): pull -> link -> trace -> DNC at
+	# night, BatchDialer load at 09:xx ET (GHL follows through LENDING_GHL_LOAD_SYNC_ENABLED). Every cap is per ET night
+	# and counts what the night already spent, so a retried run never spends it again; 0 = that stage spends nothing.
+	# Also needs PROPERTY_RADAR_ENABLED=true and PROPERTY_RADAR_MODE=live.
+	lending_pr_nightly_enabled: bool = Field(default=False, env="LENDING_PR_NIGHTLY_ENABLED")
+	lending_pr_nightly_states: str = Field(default="FL,GA", env="LENDING_PR_NIGHTLY_STATES")
+	lending_pr_nightly_max_exports: int = Field(default=0, env="LENDING_PR_NIGHTLY_MAX_EXPORTS")
+	lending_pr_nightly_max_paid_exports: int = Field(default=0, env="LENDING_PR_NIGHTLY_MAX_PAID_EXPORTS")
+	lending_pr_nightly_trace_max_credits: int = Field(default=0, env="LENDING_PR_NIGHTLY_TRACE_MAX_CREDITS")
+	lending_pr_nightly_dnc_max_credits: int = Field(default=0, env="LENDING_PR_NIGHTLY_DNC_MAX_CREDITS")
+	# Daily calling-list export to Drive "FA Exports" (src/tasks/lending_pr_daily_export.py): counts and property facts,
+	# never a full phone or email; same Drive service account as the ledger export
+	lending_pr_export_enabled: bool = Field(default=False, env="LENDING_PR_EXPORT_ENABLED")
+	lending_pr_export_folder_id: str = Field(default="", env="LENDING_PR_EXPORT_FOLDER_ID")
 	# Drive service account (shared with the P1.1 job queue); blank = LENDING_SHEETS_SERVICE_ACCOUNT_KEY_PATH
 	lending_drive_service_account_key_path: str = Field(default="", env="LENDING_DRIVE_SERVICE_ACCOUNT_KEY_PATH")
 	# Opt-out mailbox listener (src/lending/email_opt_out.py): reads mail sent to LENDING_OPTOUT_ADDRESS over IMAP.

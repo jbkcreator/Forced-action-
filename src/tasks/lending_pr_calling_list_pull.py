@@ -33,7 +33,9 @@ from dataclasses import dataclass, field
 from datetime import date
 from typing import Optional
 
-from config.lending_calling_lists import CALLING_LISTS, DEFAULT_MAX_PAID_EXPORTS, EXPORT_FIELDS, WINDOWED_LISTS
+from config.lending_calling_lists import (
+    CALLING_LISTS, DEFAULT_MAX_PAID_EXPORTS, DEFAULT_PULL_STATE, EXPORT_FIELDS, PULL_STATES, WINDOWED_LISTS,
+)
 from src.core.database import get_db_context
 from src.lending import pr_calling_list_store as store
 from src.lending import pr_list_landing as landing
@@ -50,6 +52,7 @@ BUY_PAGE = 500  # RadarIDs per purchase: one PropertyRadar page, stored and comm
 def _parse_args(argv: Optional[list[str]]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Pull a PropertyRadar calling list into lending.pr_list_records.")
     parser.add_argument("--list", dest="list_key", choices=CALLING_LISTS, required=True)
+    parser.add_argument("--state", choices=PULL_STATES, default=DEFAULT_PULL_STATE, help="state to search (default FL)")
     parser.add_argument("--from", dest="start", type=date.fromisoformat, help="recording window start (cash_buyer, wholesaler)")
     parser.add_argument("--to", dest="end", type=date.fromisoformat, help="recording window end, inclusive")
     parser.add_argument("--as-of", type=date.fromisoformat, default=None, help="date the maturity window counts from (default today)")
@@ -73,6 +76,8 @@ class PullPlan:
     already_stored: int
     free_remaining: int
     reused: dict[str, dict] = field(default_factory=dict)
+    matched_ids: frozenset[str] = frozenset()  # every RadarID the searches matched (bought, stored or excluded)
+    excluded: int = 0  # matches left to another list (``exclude``)
 
     @property
     def total(self) -> int:
@@ -84,30 +89,35 @@ class PullPlan:
 
     def summary(self) -> dict:
         return {"matching_by_search": self.matching, "already_stored": self.already_stored,
-                "reused_from_other_lists": len(self.reused),
+                "reused_from_other_lists": len(self.reused), "left_to_another_list": self.excluded,
                 "to_buy_by_search": {k: len(v) for k, v in self.to_buy.items()}, "exports_to_buy": self.total,
                 "free_allowance_remaining": self.free_remaining, "paid_exports": self.paid}
 
 
 def plan_pull(port: PropertyRadarPort, sets: Sequence[CriteriaSet], stored: set[str],
-              held_elsewhere: Callable[[list[str]], dict[str, dict]] = lambda ids: {}) -> PullPlan:
-    """Free: list every search's RadarIDs, drop the stored ones and any repeated across searches, and
-    set aside the ones another list already bought (``held_elsewhere`` returns their stored records)."""
+              held_elsewhere: Callable[[list[str]], dict[str, dict]] = lambda ids: {},
+              exclude: frozenset[str] = frozenset()) -> PullPlan:
+    """Free: list every search's RadarIDs, drop the stored ones and any repeated across searches, drop the
+    ones ``exclude`` leaves to another list, and set aside the ones another list already bought
+    (``held_elsewhere`` returns their stored records)."""
     seen = set(stored)
     to_buy, matching = {}, {}
-    already = 0
+    matched: set[str] = set()
+    already = excluded = 0
     for criteria_set in sets:
         ids = port.list_radar_ids(criteria_set.criteria)
         matching[criteria_set.label] = len(ids)
+        matched.update(ids)
         new = [i for i in dict.fromkeys(ids) if i not in seen]
         already += sum(1 for i in ids if i in stored)
+        excluded += sum(1 for i in new if i in exclude)
         seen.update(new)
-        to_buy[criteria_set.label] = new
+        to_buy[criteria_set.label] = [i for i in new if i not in exclude]
     reused = held_elsewhere([i for ids in to_buy.values() for i in ids])
     to_buy = {label: [i for i in ids if i not in reused] for label, ids in to_buy.items()}
     free_remaining = port.cost_preview(sets[0].criteria).quantity_free_remaining
     return PullPlan(to_buy=to_buy, matching=matching, already_stored=already, free_remaining=free_remaining,
-                    reused=reused)
+                    reused=reused, matched_ids=frozenset(matched), excluded=excluded)
 
 
 def _current(sold: Optional[date], window: PullWindow) -> bool:
@@ -153,11 +163,12 @@ def reusable_elsewhere(list_key: str, window: PullWindow,
     return current
 
 
-def make_plan(db, port: PropertyRadarPort, list_key: str, sets: Sequence[CriteriaSet], window: PullWindow) -> PullPlan:
+def make_plan(db, port: PropertyRadarPort, list_key: str, sets: Sequence[CriteriaSet], window: PullWindow,
+              exclude: frozenset[str] = frozenset()) -> PullPlan:
     bought = bought_for_window(list_key, window, store.stored_transfer_dates(db, list_key),
                                landed_transfer_dates(list_key))
     return plan_pull(port, sets, bought, held_elsewhere=reusable_elsewhere(
-        list_key, window, lambda ids: store.raw_held_by_other_lists(db, list_key, ids)))
+        list_key, window, lambda ids: store.raw_held_by_other_lists(db, list_key, ids)), exclude=exclude)
 
 
 class PaidCapReached(RuntimeError):
@@ -265,7 +276,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         if args.list_key in WINDOWED_LISTS and (args.start is None or args.end is None):
             raise ValueError(f"--from and --to are required for {args.list_key}")
         window: PullWindow = pull_window(args.list_key, as_of=as_of, start=args.start, end=args.end)
-        sets = build_criteria_sets(args.list_key, as_of=as_of, window=window)
+        sets = build_criteria_sets(args.list_key, as_of=as_of, window=window, state=args.state)
     except ValueError as exc:
         logger.error("[calling-list] %s", exc)
         return EXIT_BAD_ARGS
@@ -322,7 +333,7 @@ def main(argv: Optional[list[str]] = None) -> int:
 def _run_live(db, port: PropertyRadarPort, args: argparse.Namespace, sets: Sequence[CriteriaSet],
               window: PullWindow, plan: PullPlan, as_of: date) -> int:
     pull_id = store.start_pull(db, args.list_key, window.start, window.end,
-                               [{"label": s.label, "criteria": s.criteria} for s in sets], plan.total)
+                               [{"label": s.label, "criteria": s.criteria} for s in sets], plan.total, state=args.state)
     db.commit()
     progress = PullProgress()
     status, error = "done", None

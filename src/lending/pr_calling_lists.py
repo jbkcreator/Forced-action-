@@ -16,19 +16,25 @@ from typing import Any, Mapping, Optional
 from config.lending_calling_lists import (
     CASH_BUYER,
     CASH_BUYER_PORTFOLIO_RANGE,
+    COMPANY_OWNED_ONLY_STATES,
     CONFIRMED,
+    DEFAULT_PULL_STATE,
     HARD_MONEY_LENDER_NAMES,
     HOLD_UNKNOWN,
+    INVESTOR_PURCHASE,
     LIKELY,
     MATURITY_DAYS_OUT,
     MATURITY_OUTSIDE_WINDOW,
-    PULL_STATE,
+    MATURITY_TRIGGER_DAYS,
+    NIGHTLY_LOOKBACK_DAYS,
+    PULL_STATES,
     RESOLD_AFTER_HOLD_LIMIT,
     SELLER_UNKNOWN,
     VERIFIED_MATURITY,
     WHOLESALER,
     WHOLESALER_FLIP_TYPES,
     WHOLESALER_MAX_HOLD_MONTHS,
+    WINDOWED_LISTS,
     date_range_value,
     maturity_recording_windows,
 )
@@ -53,41 +59,68 @@ class PullWindow:
 
 
 def pull_window(list_key: str, *, as_of: date, start: Optional[date], end: Optional[date]) -> PullWindow:
-    """The window recorded on the pull: the maturity dates for Verified maturity, else the recording dates."""
-    if list_key == VERIFIED_MATURITY:
+    """The window recorded on the pull: the maturity dates for Verified maturity (90-180 days out unless given),
+    else the recording dates."""
+    if list_key == VERIFIED_MATURITY and start is None and end is None:
         near, far = (as_of + timedelta(days=d) for d in MATURITY_DAYS_OUT)
         return PullWindow(near, far)
     if start is None or end is None or start > end:
-        raise ValueError(f"{list_key} needs a recording window with start <= end")
+        raise ValueError(f"{list_key} needs a window with start <= end")
     return PullWindow(start, end)
 
 
-def build_criteria_sets(list_key: str, *, as_of: date, window: PullWindow) -> list[CriteriaSet]:
-    state = {"name": "State", "value": [PULL_STATE]}
+def nightly_window(list_key: str, *, as_of: date) -> PullWindow:
+    """The nightly search window, ``NIGHTLY_LOOKBACK_DAYS`` long. Verified maturity: maturity dates ending
+    ``MATURITY_TRIGGER_DAYS`` after ``as_of``. Other lists: recording dates ending yesterday."""
     if list_key == VERIFIED_MATURITY:
-        common = [state, {"name": "isSameMailingOrExempt", "value": [0]}, {"name": "isListedForSale", "value": [0]}]
+        end = as_of + timedelta(days=MATURITY_TRIGGER_DAYS)
+    elif list_key in WINDOWED_LISTS:
+        end = as_of - timedelta(days=1)
+    else:
+        raise ValueError(f"{list_key} has no nightly window")
+    return PullWindow(end - timedelta(days=NIGHTLY_LOOKBACK_DAYS - 1), end)
+
+
+def _investor_owner(state: str) -> dict:
+    """Florida: not owner-occupied. A company-owned-only state: company ownership instead (its owner-occupied
+    flag is unreliable, and only companies may be called there)."""
+    if state in COMPANY_OWNED_ONLY_STATES:
+        return {"name": "OwnershipType", "value": ["Corporate"]}
+    return {"name": "isSameMailingOrExempt", "value": [0]}
+
+
+def build_criteria_sets(list_key: str, *, as_of: date, window: PullWindow,
+                        state: str = DEFAULT_PULL_STATE) -> list[CriteriaSet]:
+    """The searches for one list in one state. Verified maturity's ``window`` holds maturity dates: each assumed
+    term searches the recording dates that mature inside it."""
+    if state not in PULL_STATES:
+        raise ValueError(f"unsupported pull state: {state!r}")
+    in_state = {"name": "State", "value": [state]}
+    investor = _investor_owner(state)
+    if list_key == VERIFIED_MATURITY:
+        common = [in_state, investor, {"name": "isListedForSale", "value": [0]}]
         private = [{"name": "FirstLoanType", "value": ["P"]}]
         lender = [{"name": "FirstLenderOriginal", "value": list(HARD_MONEY_LENDER_NAMES)}]
         sets = []
-        for term, (rec_start, rec_end) in maturity_recording_windows(as_of).items():
+        for term, (rec_start, rec_end) in maturity_recording_windows(window.start, window.end).items():
             recorded = {"name": "FirstDate", "value": [date_range_value(rec_start, rec_end)]}
             sets.append(CriteriaSet(f"{term}yr_private", common + [recorded] + private))
             sets.append(CriteriaSet(f"{term}yr_hard_money_lender", common + [recorded] + lender))
         return sets
     recorded = {"name": "LastTransferRecDate", "value": [date_range_value(window.start, window.end)]}
+    low, high = CASH_BUYER_PORTFOLIO_RANGE
+    portfolio = {"name": "NumberPropertiesOwned", "value": [[low, high]]}
     if list_key == CASH_BUYER:
-        low, high = CASH_BUYER_PORTFOLIO_RANGE
         return [CriteriaSet("cash_buyers", [
-            state, recorded,
-            {"name": "LastTransferDownPaymentPercent", "value": [[100, None]]},
-            {"name": "isSameMailingOrExempt", "value": [0]},
-            {"name": "NumberPropertiesOwned", "value": [[low, high]]},
+            in_state, recorded, {"name": "LastTransferDownPaymentPercent", "value": [[100, None]]}, investor, portfolio,
         ])]
+    if list_key == INVESTOR_PURCHASE:
+        return [CriteriaSet("investor_purchases", [in_state, recorded, investor, portfolio])]
     if list_key == WHOLESALER:
         # The hold limit is also a search criterion, so records resold too late to qualify are never bought;
         # shape_record still applies it to every stored record.
         return [CriteriaSet("flips", [
-            state, recorded, {"name": "LastTransferType", "value": list(WHOLESALER_FLIP_TYPES)},
+            in_state, recorded, {"name": "LastTransferType", "value": list(WHOLESALER_FLIP_TYPES)},
             {"name": "PriorTransferMonthsSince", "value": [[0, WHOLESALER_MAX_HOLD_MONTHS]]},
         ])]
     raise ValueError(f"unknown calling list: {list_key!r}")

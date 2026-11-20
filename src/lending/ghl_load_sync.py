@@ -11,8 +11,9 @@ not yet handled (``ghl_sync_status IS NULL``) and:
 - the same phone already pushed for the same pool by an earlier load (a reload) -> ``skipped_already_in_ghl``;
 - pools missing from GHL_LOAD_SYNC_POOL_TAGS -> ``skipped_unmapped`` (logged; a new pool never reaches GHL unmapped);
 - everything else -> contact upsert with cold-lead do-not-disturb (calls allowed), then add-tags: the pool's call-list
-  tag, ``ndl-cold``, ``ndl-state-<xx>`` when the state is known and ``ndl-src-<source>`` for wholesaler lists
-  -> ``pushed``. While the GHL call gate is on, the contact also gets ``ndl-do-not-call-now`` so it enters Josh's
+  tag, ``ndl-cold``, ``ndl-state-<xx>`` when the state is known, ``ndl-src-<source>`` for wholesaler lists, and
+  ``ndl`` plus the signal tag (``ndl-sig-maturity`` / ``-cash-purchase`` / ``-portfolio``) for the nightly
+  PropertyRadar calling lists -> ``pushed``. While the GHL call gate is on, the contact also gets ``ndl-do-not-call-now`` so it enters Josh's
   lists held until the gate's checks pass. The emergency halt is rechecked during the run; rows not reached stay
   pending.
 
@@ -42,6 +43,7 @@ from typing import Any, Optional
 from sqlalchemy import text
 
 from config.lending_compliance import (
+    GHL_CALLING_LIST_SIGNAL_TAGS,
     GHL_DO_NOT_CALL_NOW_TAG,
     GHL_LOAD_SYNC_BATCH_SIZE,
     GHL_LOAD_SYNC_HALT_CHECK_EVERY,
@@ -49,6 +51,7 @@ from config.lending_compliance import (
     GHL_LOAD_SYNC_MAX_ATTEMPTS,
     GHL_LOAD_SYNC_POOL_TAGS,
     GHL_TAG_COLD_LEAD,
+    GHL_TAG_NDL,
 )
 from config.lending_wholesalers import GHL_TAG_SOURCE_PREFIX, GHL_TAG_STATE_PREFIX, WHOLESALER_STATES
 from config.settings import get_settings
@@ -91,6 +94,8 @@ _PENDING = text("""
            END AS state,
            CASE WHEN d.source_record_ref LIKE 'wholesaler:%'
                 THEN split_part(d.source_record_ref, ':', 2) END AS wholesaler_source,
+           CASE WHEN d.source_record_ref LIKE 'pr_list:%'
+                THEN split_part(d.source_record_ref, ':', 2) END AS calling_list,
            (EXISTS (SELECT 1 FROM lending.web_leads w WHERE w.phone = d.phone)
             OR EXISTS (SELECT 1 FROM lending.lendingflow_leads l WHERE l.phone = d.phone)) AS warm,
            (EXISTS (SELECT 1 FROM lending.suppression_list s WHERE s.phone = d.phone)
@@ -146,6 +151,9 @@ def sync_tags(row: Mapping[str, Any]) -> Optional[list[str]]:
     source = str(row.get("wholesaler_source") or "").strip().lower()
     if source:
         tags.append(f"{GHL_TAG_SOURCE_PREFIX}{source}")
+    signal = GHL_CALLING_LIST_SIGNAL_TAGS.get(str(row.get("calling_list") or ""))
+    if signal:
+        tags.extend([GHL_TAG_NDL, signal])
     return tags
 
 

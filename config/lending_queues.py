@@ -37,6 +37,8 @@ SOURCE_TAG_QUEUES: dict[str, str] = {
     "wholesaler_sunbiz": WHOLESALERS, "wholesaler_hunter": WHOLESALERS,
     # PropertyRadar resales inside 30 days (config/lending_calling_lists.py): the same partner pitch.
     "wholesaler_propertyradar": WHOLESALERS,
+    # PropertyRadar purchases (cash or financed) by investors owning 2-99 properties: the cash-buyer pitch.
+    "investor_purchase_propertyradar": TRANSACTION_READY,
 }
 # No source tag is nurture-only any more (List 2 and List 4 both moved to real
 # ranked queues above); kept as a mechanism for a future list that genuinely has

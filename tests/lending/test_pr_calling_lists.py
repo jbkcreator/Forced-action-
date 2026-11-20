@@ -199,6 +199,7 @@ class MemoryStore:
     def __init__(self, stored=(), fail_on_store=False):
         self.stored, self.fail_on_store = set(stored), fail_on_store
         self.pulls, self.rows, self.updates = [], [], []
+        self.pull_states = []
 
     def stored_radar_ids(self, db, list_key):
         return set(self.stored)
@@ -211,8 +212,9 @@ class MemoryStore:
     def raw_held_by_other_lists(self, db, list_key, ids):
         return {i: raw for i, raw in self.held_elsewhere.items() if i in ids}
 
-    def start_pull(self, db, list_key, start, end, criteria, matching):
+    def start_pull(self, db, list_key, start, end, criteria, matching, *, state="FL", run_kind="manual"):
         self.pulls.append((list_key, start, end, matching))
+        self.pull_states.append((state, run_kind))
         return 7
 
     def store_records(self, db, pull_id, rows):

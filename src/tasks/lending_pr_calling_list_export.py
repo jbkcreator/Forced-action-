@@ -24,7 +24,7 @@ from typing import Any, Optional
 from sqlalchemy import text
 
 from config.lending_calling_lists import (
-    CASH_BUYER, HARD_MONEY_LENDER_NAMES, LANDING_ROOT, VERIFIED_MATURITY, WHOLESALER,
+    CASH_BUYER, HARD_MONEY_LENDER_NAMES, INVESTOR_PURCHASE, LANDING_ROOT, VERIFIED_MATURITY, WHOLESALER,
 )
 from config.lending_queues import SOURCE_TAG_QUEUES
 from src.core.database import get_db_context
@@ -36,6 +36,7 @@ logger = logging.getLogger(__name__)
 
 _HARD_MONEY = {name.upper() for name in HARD_MONEY_LENDER_NAMES}
 WHOLESALER_SOURCE_TAG = "wholesaler_propertyradar"
+INVESTOR_PURCHASE_SOURCE_TAG = "investor_purchase_propertyradar"
 
 _PEOPLE_SQL = text("""
     SELECT DISTINCT ON (r.contact_key)
@@ -156,11 +157,18 @@ def cash_buyer_record(person: dict[str, Any], phone: str) -> dict[str, Any]:
     }
 
 
+def investor_purchase_record(person: dict[str, Any], phone: str) -> dict[str, Any]:
+    """An investor who owns 2-99 properties and just bought another (cash or financed): the same Transaction
+    ready pitch as a cash buyer, under its own source tag so the signal stays visible."""
+    return {**cash_buyer_record(person, phone), "source_tag": INVESTOR_PURCHASE_SOURCE_TAG}
+
+
 # list -> (people query, record builder, the queue its records must land in)
 LIST_EXPORTS = {
     VERIFIED_MATURITY: (_PEOPLE_SQL, dialer_record, "verified_maturity"),
     WHOLESALER: (_SUBJECT_PEOPLE_SQL, wholesaler_record, "wholesalers"),
     CASH_BUYER: (_PEOPLE_SQL, cash_buyer_record, "transaction_ready"),
+    INVESTOR_PURCHASE: (_PEOPLE_SQL, investor_purchase_record, "transaction_ready"),
 }
 
 
