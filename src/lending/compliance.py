@@ -214,6 +214,21 @@ def _stored_scrubs(db, phones: list[str]) -> dict[str, ScrubResult]:
     return {r[0]: ScrubResult(r[1], r[2], _is_yes(r[3]), r[4], r[5]) for r in rows}
 
 
+def fresh_scrubs(db, phones: Sequence[str], *, now: Optional[datetime] = None,
+                 fresh_only: bool = True) -> dict[str, ScrubResult]:
+    """The dialer gate's view of each phone's do-not-call check: the freshest result across FA's cache and
+    lending's own, kept only when it is within ``DNC_SCRUB_MAX_AGE_DAYS`` (a phone missing here counts as not
+    checked, exactly as the gate treats it). ``fresh_only=False`` keeps older results too: whether a phone was
+    ever checked, so it is not paid for again."""
+    if not phones:
+        return {}
+    scrubs = _stored_scrubs(db, list(phones))
+    if not fresh_only:
+        return scrubs
+    cutoff = (now or datetime.now(timezone.utc)) - timedelta(days=DNC_SCRUB_MAX_AGE_DAYS)
+    return {phone: scrub for phone, scrub in scrubs.items() if scrub.checked_at >= cutoff}
+
+
 def _verdict(phone: str, scrub: ScrubResult) -> GateResult:
     if scrub.litigator:
         return _blocked(phone, ReasonCode.LITIGATOR)

@@ -257,3 +257,11 @@ def _extract_principal(persons: list[dict]) -> Optional[str]:
             name = " ".join(p for p in parts if p)
             return name or None
     return None
+
+
+# Public names for the helpers above: the lending calling-list pulls (src/lending/pr_calling_lists.py)
+# read the same PropertyRadar fields the same way.
+parse_date = _parse_date
+parse_term = _parse_term
+compute_maturity = _compute_maturity
+extract_principal = _extract_principal

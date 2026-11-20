@@ -18,7 +18,7 @@ from __future__ import annotations
 import logging
 import time
 from dataclasses import dataclass, field
-from typing import Iterator, Optional, Protocol
+from typing import Iterator, Optional, Protocol, Sequence
 
 import requests
 
@@ -85,6 +85,17 @@ class AllowanceInfo:
         return self.quantity_free_remaining + self.quantity_purchased_remaining
 
 
+@dataclass(frozen=True)
+class CostPreview:
+    """A Purchase=0 preview: what the criteria match and what the account has left. Never billed.
+
+    ``quantity_free_remaining`` is the monthly allowance still unused; PropertyRadar returns it on a
+    Purchase=0 request that names any billable field (a RadarID-only request does not carry it).
+    """
+    total_count: int
+    quantity_free_remaining: int
+
+
 # ---------------------------------------------------------------------------
 # Protocol
 # ---------------------------------------------------------------------------
@@ -98,11 +109,20 @@ class PropertyRadarPort(Protocol):
         """Return the current monthly export allowance."""
         ...
 
+    def cost_preview(self, criteria: list[dict]) -> CostPreview:
+        """Match count and remaining free allowance via Purchase=0 (never billed)."""
+        ...
+
+    def list_radar_ids(self, criteria: list[dict]) -> list[str]:
+        """Every matching RadarID. Free: a RadarID-only request is never billed."""
+        ...
+
     def purchase(
-        self, criteria: list[dict], max_records: Optional[int] = None
+        self, criteria: list[dict], max_records: Optional[int] = None,
+        fields: Optional[Sequence[str]] = None,
     ) -> Iterator[PropertyRadarRecord]:
         """Yield matching records, paged, at most ``max_records`` when given.
-        Each record costs 1 export credit."""
+        Each record costs 1 export credit. ``fields`` defaults to the maturity pull's set."""
         ...
 
 
@@ -139,11 +159,23 @@ class FakePropertyRadarPort:
     def allowance(self) -> AllowanceInfo:
         return self.canned_allowance
 
+    def cost_preview(self, criteria: list[dict]) -> CostPreview:
+        self.count_calls.append(criteria)
+        return CostPreview(total_count=len(self.canned_records),
+                           quantity_free_remaining=self.canned_allowance.quantity_free_remaining)
+
+    def list_radar_ids(self, criteria: list[dict]) -> list[str]:
+        self.count_calls.append(criteria)
+        return [raw["RadarID"] for raw in self.canned_records]
+
     def purchase(
-        self, criteria: list[dict], max_records: Optional[int] = None
+        self, criteria: list[dict], max_records: Optional[int] = None,
+        fields: Optional[Sequence[str]] = None,
     ) -> Iterator[PropertyRadarRecord]:
         self.purchase_calls.append(criteria)
-        for raw in self.canned_records[:max_records]:
+        wanted = next((c["value"] for c in criteria if c.get("name") == "RadarID"), None)
+        records = [r for r in self.canned_records if wanted is None or r["RadarID"] in wanted]
+        for raw in records[:max_records]:
             yield PropertyRadarRecord(radar_id=raw["RadarID"], raw=raw)
 
 
@@ -196,6 +228,34 @@ class LivePropertyRadarPort:
         )
         return int(body.get("totalResultCount") or body.get("resultCount") or 0)
 
+    def cost_preview(self, criteria: list[dict]) -> CostPreview:
+        """Purchase=0 with one billable field: PropertyRadar then reports the remaining free
+        allowance (confirmed 2026-11-03). Nothing is bought; Limit=1 keeps the response small."""
+        body = self._post(
+            params={"Purchase": 0, "Limit": 1, "Fields": "RadarID,Owner"},
+            body={"Criteria": criteria},
+        )
+        if "quantityFreeRemaining" not in body:
+            raise RuntimeError("PropertyRadar cost preview did not report the remaining allowance")
+        return CostPreview(
+            total_count=int(body.get("totalResultCount") or 0),
+            quantity_free_remaining=int(body["quantityFreeRemaining"]),
+        )
+
+    def list_radar_ids(self, criteria: list[dict]) -> list[str]:
+        """Page through every matching RadarID. PropertyRadar's API reference: a request for RadarID
+        only is not charged whatever Purchase says (balance checked unchanged, 2026-11-03)."""
+        ids: list[str] = []
+        while True:
+            body = self._post(
+                params={"Purchase": 1, "Limit": _PAGE_SIZE, "Start": len(ids), "Fields": "RadarID"},
+                body={"Criteria": criteria},
+            )
+            page = [str(r["RadarID"]) for r in body.get("results", []) if r.get("RadarID")]
+            ids.extend(page)
+            if not page or len(ids) >= int(body.get("totalResultCount", 0)):
+                return ids
+
     def allowance(self) -> AllowanceInfo:
         """Return an UNVERIFIED placeholder — PropertyRadar has no free
         pre-purchase quota/allowance endpoint.
@@ -222,7 +282,8 @@ class LivePropertyRadarPort:
         )
 
     def purchase(
-        self, criteria: list[dict], max_records: Optional[int] = None
+        self, criteria: list[dict], max_records: Optional[int] = None,
+        fields: Optional[Sequence[str]] = None,
     ) -> Iterator[PropertyRadarRecord]:
         # Every returned record is billed, so a cap must shrink the page
         # request itself rather than stop reading a page already bought.
@@ -236,7 +297,7 @@ class LivePropertyRadarPort:
                     "Purchase": 1,
                     "Limit": limit,
                     "Start": start,
-                    "Fields": ",".join(_EXPORT_FIELDS),
+                    "Fields": ",".join(fields or _EXPORT_FIELDS),
                 },
                 body={"Criteria": criteria},
             )
