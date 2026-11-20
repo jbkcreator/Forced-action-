@@ -137,6 +137,24 @@ All 13 results exist in BatchDialer (group "Lending", created). Only the three b
   Booked excludes `booking_blocked`; Showed comes from GHL stage events (see "GHL showed feed" below), not the log.
 - The post goes out at 7:20pm ET, after the dialer stops at 7:15pm, so every call of the day is counted.
 - A fourth table, by caller-ID number, shows dials, answered (`ANSWERED_CODES`: a person picked up) and answer rate, to spot numbers that drop or get spam-flagged.
+- **Zero-dial days and the pipeline (P2.5).** The closing board always posts, also on a day with no calls ("No calls
+  logged today"). Under the call tables it shows the pipeline from `lending.ghl_opportunity_stage` (P2.4): active deals
+  (P2.4's deal stages, `config/lending_closing.ACTIVE_STAGE_KEYS`: Application, Ready to fund, Submitted to lender;
+  leads are not deals), open deals (every stage but `CLOSED_STAGE_KEYS`: Funded, Lost, Nurture; leads included),
+  deals per stage (up to `SCOREBOARD_STAGE_ITEMS`, then counted), and the deals stuck more than 3 days
+  (P2.4's `stuck_deals()`: oldest first, up to `SCOREBOARD_BLOCKER_LINES`, first name and last 4 digits, who it is
+  waiting on). Test deals are left out. If the stage tables cannot be read the board still posts, with the pipeline
+  marked unavailable. The counts are only as complete as the stage moves the GHL stage webhook receives.
+- **Drive export (P2.5).** Right after the post (so a slow Drive never delays it), and also after a failed post (so a
+  Slack outage cannot lose them), the board's numbers go to Drive `NDL Ledger Exports/{ET date}/scoreboard.csv`
+  (`day, section, name, metric, value`: totals, each breakdown, active deals, deals per stage, stuck deals per owner;
+  no borrower name, phone or email; names go through the ledger's `redact`). Off until `LENDING_SCOREBOARD_EXPORT_ENABLED=true`; uses the ledger export's
+  `LENDING_LEDGER_EXPORT_FOLDER_ID` and Drive key. The switch is read before the export code is loaded, so a broken
+  export never stops the board. A failed export is logged and posted to `LENDING_OPS_NOTICE_CHANNEL`; a posted board
+  never exits non-zero, so cron never posts it twice. A retry after a
+  failed post replaces the file. The file is not in the nightly `manifest.json`.
+- **Post time:** the brief (P2.5) says 7:00pm ET; the board stays at 7:20pm so calls up to the 7:15pm dialer stop are
+  counted, until Josh confirms (PR Client blockers). The hourly boards (10:00 to 19:00 ET) still skip a day with no dials.
 - Not built: abandon rate per campaign. The dialer feed carries no abandoned-call signal and multi-line power dial is not live; add it when BatchDialer reports abandons.
 - Test calls count like real ones. Run with `--force` only after the Friday test, or filter by a test campaign.
 

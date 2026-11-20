@@ -1075,6 +1075,8 @@ class AppSettings(BaseSettings):
 	# LENDING_DRIVE_SERVICE_ACCOUNT_KEY_PATH (else the Sheets key) with the drive scope; the folder is "NDL Ledger Exports", shared with that account
 	lending_ledger_export_enabled: bool = Field(default=False, env="LENDING_LEDGER_EXPORT_ENABLED")
 	lending_ledger_export_folder_id: str = Field(default="", env="LENDING_LEDGER_EXPORT_FOLDER_ID")
+	# P2.5: the 7:20pm closing scoreboard's numbers to Drive (scoreboard.csv in the same folder); needs the folder id above
+	lending_scoreboard_export_enabled: bool = Field(default=False, env="LENDING_SCOREBOARD_EXPORT_ENABLED")
 	# P1.3: a "Deal" reply to an NDL cold email creates the GHL contact + pipeline card and swaps ndl-cold for
 	# ndl-instantly-interested (src/lending/instantly_ghl_handoff.py). Off until Josh confirms (open question P1.3 #1).
 	lending_instantly_ghl_handoff_enabled: bool = Field(default=False, env="LENDING_INSTANTLY_GHL_HANDOFF_ENABLED")

@@ -15,10 +15,10 @@ setting skips that post and logs it; it never lands in another channel.
 | #deals | `LENDING_DEALS_CHANNEL` | Cora | R-1 routing posts (Routed / Held / Declined) with Details, Decline / Approved / Funded and Re-route buttons |
 | #deals | `LENDING_PARTNER_CHANNEL` | Lending | Partner file cards; partner notice not delivered |
 | #isa-daily | `LENDING_DAVID_CHANNEL` | Lending | David's end-of-day recap only |
-| #lending-daily | `LENDING_DAILY_CHANNEL` | Lending | 7:20pm closing scoreboard; hourly scoreboard 10am-6pm ET |
+| #lending-daily | `LENDING_DAILY_CHANNEL` | Lending | 7:20pm closing scoreboard (also on zero-dial days, with the pipeline and stuck deals, P2.5); hourly scoreboard 10am-7pm ET (skipped while there are no dials) |
 | #dial-tasks | `LENDING_DIAL_TASKS_CHANNEL` | Lending | After-call results; 9am confirmation tasks; missing-disposition and unknown-code alerts; web-lead and LendingFlow sweep alerts; soft-approval cards and PDF; enrichment deal threads |
 | #dial-tasks | `LENDING_DNC_ALERT_CHANNEL` | Lending | "DNC not propagated" and "DNC removal pending" |
-| #dial-tasks | `LENDING_OPS_NOTICE_CHANNEL` | Lending | Opt-out mailbox alerts; GHL webhook-failure alerts |
+| #dial-tasks | `LENDING_OPS_NOTICE_CHANNEL` | Lending | Opt-out mailbox alerts; GHL webhook-failure alerts; scoreboard numbers not exported to Drive (P2.5) |
 
 Every alert above that Cora tracks is also raised in her inbox (key `ops`, `ops_notice`, `dnc`, `replies`,
 `dial_tasks`, `daily`, `deals`), so a post that is skipped or refused still reaches #cora's digest.
