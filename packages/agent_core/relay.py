@@ -14,7 +14,7 @@ from enum import Enum
 from typing import Any
 
 from .halt import HaltSwitch
-from .lane_guard import lane_block_reason, lane_violation
+from .lane_guard import LANE_BLOCK_PREFIX, LaneViolation, lane_block_reason, lane_violation
 from .pending_actions import ActionStatus, PendingAction, PendingActionQueue, payload_deadline
 
 logger = logging.getLogger(__name__)
@@ -94,6 +94,14 @@ class Relay:
             self._queue.mark_failed(action_id, reason)
             return DispatchResult(DispatchOutcome.NOT_ENABLED, reason)
 
+        # The Backflip check runs before every other send-time check, so a blocked send always writes the SECURITY log.
+        rule = lane_violation(action.payload)
+        if rule is not None:
+            reason = lane_block_reason(rule)
+            logger.error("relay SECURITY: action %s blocked by lane deny rule %s; nothing sent", action_id, rule)
+            self._queue.mark_blocked(action_id, reason)
+            return DispatchResult(DispatchOutcome.BLOCKED, reason)
+
         # An expired draft never sends, whatever the send check says (a deferred send may clear only after it).
         now = self._queue.now()
         deadline = payload_deadline(action)
@@ -110,16 +118,15 @@ class Relay:
             self._queue.mark_blocked(action_id, reason)
             return DispatchResult(DispatchOutcome.BLOCKED, reason)
 
-        # Last stop before egress: the frozen payload is exactly what would go out.
-        rule = lane_violation(action.payload)
-        if rule is not None:
-            reason = lane_block_reason(rule)
-            logger.error("relay SECURITY: action %s blocked by lane deny rule %s; nothing sent", action_id, rule)
-            self._queue.mark_blocked(action_id, reason)
-            return DispatchResult(DispatchOutcome.BLOCKED, reason)
-
         try:
             provider_ref = executor(action.payload)
+        except LaneViolation as exc:
+            # An executor that finds a Backflip name only in what it adds (a footer): blocked, not failed, with the
+            # standard reason so the Backflip block alerts find it. Nothing was sent.
+            reason = f"{LANE_BLOCK_PREFIX}: {exc}"
+            logger.error("relay SECURITY: action %s blocked by its executor's lane check; nothing sent", action_id)
+            self._queue.mark_blocked(action_id, reason)
+            return DispatchResult(DispatchOutcome.BLOCKED, reason)
         except Exception as exc:
             # Payload values can carry contact details; log the id and the error type only.
             logger.error("relay: executor for %s failed on action %s (%s)", action.channel, action_id,

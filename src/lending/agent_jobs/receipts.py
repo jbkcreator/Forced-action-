@@ -1,7 +1,8 @@
 """The receipt Cora writes to "NDL Jobs/done/{job_id}.json" (brief section 6), plus decisions D8 and D15.
 
 Spec fields: status, action_id, provider_message_id, edited_body, timestamp. Added: job_id, rail, reason,
-template_version, created_by. No phone number or email address is ever written. For an Instantly email, ``sent``
+template_version, created_by, approval ("approved" by a person, "automatic" for a graduated template, null when
+nobody decided). No phone number or email address is ever written. For an Instantly email, ``sent``
 means Instantly accepted it for its next sending slot (``rail`` says which).
 """
 from __future__ import annotations
@@ -11,6 +12,8 @@ from typing import Any, Mapping, Optional
 from zoneinfo import ZoneInfo
 
 from config.lending_compliance import DEFAULT_TZ
+from config.lending_standing_sends import AUTO_GRADUATED_ACTOR
+from packages.agent_core.lane_guard import LANE_BLOCK_PREFIX
 from packages.agent_core.pending_actions import ActionStatus, PendingAction
 
 _OPEN = frozenset({ActionStatus.PENDING, ActionStatus.REVISING, ActionStatus.APPROVED, ActionStatus.SENDING})
@@ -20,8 +23,8 @@ _EDIT_FIELDS = ("body", "stage", "tag", "title")
 
 def build_receipt(row: Mapping[str, Any], status: str, *, now: datetime, action_id: Optional[int] = None,
                   provider_message_id: Optional[str] = None, edited_body: Optional[str] = None,
-                  reason: Optional[str] = None) -> dict[str, Any]:
-    return {"job_id": row["job_id"], "status": status, "action_id": action_id,
+                  reason: Optional[str] = None, approval: Optional[str] = None) -> dict[str, Any]:
+    return {"approval": approval, "job_id": row["job_id"], "status": status, "action_id": action_id,
             "provider_message_id": provider_message_id, "edited_body": edited_body, "rail": row.get("rail"),
             "reason": reason, "template_version": row.get("template_version"), "created_by": row.get("created_by"),
             "timestamp": now.astimezone(ZoneInfo(DEFAULT_TZ)).isoformat(timespec="seconds")}
@@ -39,6 +42,8 @@ def _edited_body(action: PendingAction) -> Optional[str]:
 
 def _blocked_status(reason: str) -> str:
     lowered = reason.lower()
+    if LANE_BLOCK_PREFIX.lower() in lowered:
+        return "blocked_lane"
     if "expired" in lowered:
         return "expired"
     if any(word in lowered for word in _CONSENT_WORDS):
@@ -52,7 +57,9 @@ def receipt_for(row: Mapping[str, Any], action: Optional[PendingAction], *, now:
         return build_receipt(row, "error", now=now, reason="the approval draft is missing")
     if action.status in _OPEN:
         return None
-    common = {"now": now, "action_id": action.action_id}
+    approval = ("automatic" if action.decided_by == AUTO_GRADUATED_ACTOR
+                else "approved" if action.decided_by and action.status is ActionStatus.SENT else None)
+    common = {"now": now, "action_id": action.action_id, "approval": approval}
     if action.status is ActionStatus.SENT:
         edited = _edited_body(action)
         return build_receipt(row, "edited_sent" if edited is not None else "sent", provider_message_id=action.provider_ref,

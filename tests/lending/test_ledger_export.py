@@ -45,7 +45,9 @@ def test_every_table_is_written_even_when_empty():
     assert set(files) == {f"{name}.csv" for name in le.TABLES}
     for data in files.values():
         assert parse(data) == []
-        assert data.decode().splitlines()[0].startswith("ghl_contact_id,contact_id,phone_last4")
+    for name, data in files.items():
+        header = data.decode().splitlines()[0]
+        assert header.startswith("ghl_contact_id,contact_id,phone_last4") == (name != "cohorts.csv")
 
 
 def test_no_full_phone_or_email_appears_in_any_file():
@@ -346,3 +348,22 @@ def test_cora_send_touch_is_keyed_by_its_ghl_id():
                                    "direction": "outbound", "outcome": "sent"}])
     row = parse(le.build_files(data)["touches.csv"])[0]
     assert row["ghl_contact_id"] == "g9" and row["kind"] == "cora_ghl_email" and "ghl_contact_id" not in le.TABLES["touches"]
+
+
+def test_cohorts_csv_has_no_contact_columns():
+    data = le.LedgerData(cohorts=[{"batch_id": 1, "name": "Nov", "purchased_at": DAY, "leads_bought": 10,
+                                   "leads_delivered": 4, "funded_30d": None, "funded_to_date": 1}])
+    lines = le.build_files(data)["cohorts.csv"].decode().splitlines()
+    assert lines[0].startswith("batch_id,name,purchased_at") and "phone_last4" not in lines[0]
+    assert lines[1].startswith("1,Nov,") and ",," in lines[1]  # an open window is blank
+
+
+def test_a_test_contacts_row_with_no_phone_is_left_out_by_its_ghl_id():
+    class Db:
+        def execute(self, query, params):
+            return type("R", (), {"mappings": lambda self: [
+                {"phone": None, "ghl_contact_id": "g-test", "kind": "cora_ghl_email"},
+                {"phone": None, "ghl_contact_id": "g-real", "kind": "cora_ghl_email"}]})()
+
+    rows = le._rows(Db(), None, frozenset(), frozenset({"g-test"}))
+    assert [r["ghl_contact_id"] for r in rows] == ["g-real"]

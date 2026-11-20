@@ -49,6 +49,7 @@ def build_draft(job: AgentJob, contact: GhlContact, rail: Rail) -> EgressDraft:
     # not_after: the agent's deadline; agent_core caps a revision's expiry at it and the relay never sends after it.
     payload = {"job_id": str(job.job_id), "ghl_contact_id": job.ghl_contact_id,
                "template_version": job.template_version, "not_after": job.expires_at.isoformat(),
+               "contact_label": job.contact_label,
                **_fields(job, contact, channel)}
     last4 = f" (…{contact.phone[-4:]})" if contact.phone else ""
     summary = (f"🤖 {job.created_by} · {job.template_version} · via {_RAIL_LABEL[rail]}\n"

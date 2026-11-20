@@ -1227,18 +1227,40 @@ def sync_ghl_dnd(db, ghl_dnd: Optional[Callable[[str], bool]] = None) -> int:
     return len(done)
 
 
-_LINKED_PHONES = text(
+_LINKED_PHONES_BASE = (
     "SELECT lower(email), phone FROM lending.contacts WHERE lower(email) = ANY(:emails) AND phone IS NOT NULL "
     "UNION SELECT lower(email), phone FROM lending.web_leads WHERE lower(email) = ANY(:emails) AND phone IS NOT NULL "
     "UNION SELECT lower(email), phone FROM lending.lendingflow_leads "
     "WHERE lower(email) = ANY(:emails) AND phone IS NOT NULL "
     "UNION SELECT lower(email), phone FROM lending.partners WHERE lower(email) = ANY(:emails) AND phone IS NOT NULL"
 )
+# The traced emails in the cold calling lists (apply_lending_calling_pool_staging.py): a second query, so a database
+# without that table still links the phones from the tables every deployment has.
+_LINKED_PHONES_TABLES = text(_LINKED_PHONES_BASE)
+_LINKED_PHONES_COLD_LISTS = text(
+    "SELECT lower(email), normalized_phone FROM lending.calling_pool_staging "
+    "WHERE lower(email) = ANY(:emails) AND normalized_phone IS NOT NULL"
+)
+
+
+def _alert_unlinked_stop(db, emails: list[str]) -> None:
+    """An email-only STOP whose phones could not be looked up in GHL: the email is suppressed, but its phone may
+    still be dialed. Raised to Cora's inbox (no address in it) so a person checks the dialer and GHL by hand."""
+    from src.lending.cora_inbox import add_to_inbox_safely
+
+    digest = hashlib.sha256("|".join(sorted(emails)).encode()).hexdigest()[:16]
+    add_to_inbox_safely(
+        db, event_type="stop_phone_link_failed", dedup_key=f"stop-link:{digest}", target_channel="ops",
+        summary=(f"{len(emails)} email-only STOP(s) could not be linked to a phone (GHL lookup failed or was cut "
+                 "short). The email is suppressed; check the dialer and GHL for that contact by hand."),
+        payload={"emails_unlinked": len(emails)})
 
 
 def _with_linked_phones(db, opt_outs: list[_OptOut]) -> list[_OptOut]:
     """An email-only opt-out also blocks every phone that email is on file with in lending (ADR 0028: an opt-out
-    blocks every channel; the web form tells leads to email optout@ to stop calls). Every linked phone gets its own
+    blocks every channel; the web form tells leads to email optout@ to stop calls). Phones come from lending's
+    contacts, leads and partners, the traced emails in the cold calling lists, then the GHL contact and its dialer
+    loads (``ghl_email_lookup``). Every linked phone gets its own
     event, so the dialer-removal retry and the GHL DND sync (both keyed on the event's phone) cover each one. Only
     the first keeps the FA row id (one event per FA row: the poller's dedup key). FA's stores get the phones too
     (source DIALER_OPT_OUT_SOURCE, which the poller skips, so nothing loops)."""
@@ -1248,10 +1270,28 @@ def _with_linked_phones(db, opt_outs: list[_OptOut]) -> list[_OptOut]:
     if not emails:
         return opt_outs
     by_email: dict[str, set[str]] = defaultdict(set)
-    for email, raw in db.execute(_LINKED_PHONES, {"emails": emails}).fetchall():
-        phone = normalize_phone(raw)
-        if phone:
-            by_email[email].add(phone)
+    for query in (_LINKED_PHONES_TABLES, _LINKED_PHONES_COLD_LISTS):
+        try:
+            with db.begin_nested():  # a missing table or a failed read must never abort the opt-out itself
+                rows = db.execute(query, {"emails": emails}).fetchall()
+        except Exception as exc:  # class only: SQL errors embed the addresses
+            logger.error("[opt-out] a linked-phone lookup failed (%s); the opt-out continues without it",
+                         type(exc).__name__)
+            continue
+        for email, raw in rows:
+            phone = normalize_phone(raw)
+            if phone:
+                by_email[email].add(phone)
+    from src.lending.ghl_email_lookup import phones_for_emails
+
+    # A cold contact held only in GHL and the dialer is on none of those tables: ask GHL (and the dialer loads of the
+    # GHL contact) for the emails that found no phone above.
+    # An email already on a lending row is asked too: the GHL contact and its dialer loads can hold another phone.
+    unlinked: list[str] = []
+    for email, found in phones_for_emails(db, emails, unlinked).items():
+        by_email[email] |= found
+    if unlinked:
+        _alert_unlinked_stop(db, unlinked)
     resolved: list[_OptOut] = []
     for o in opt_outs:
         linked = sorted(by_email.get(o.email, ())) if o.email and not o.phone else []
@@ -1322,6 +1362,9 @@ def _propagate(db, opt_outs: list[_OptOut], dialer_remover: Optional[DialerRemov
             ),
             {"phones": phones, "hashes": [phone_hash(p) for p in phones]},
         )
+    from src.lending.instantly_blocklist import enqueue as queue_block_list_entries
+
+    queue_block_list_entries(db, sorted({o.email for o in opt_outs if o.email}))  # Cora's sweep sends them to Instantly
     stores_at = datetime.now(timezone.utc)
 
     removed_at = _remove_from_dialer(phones, dialer_remover, RemovalReason.OPT_OUT)

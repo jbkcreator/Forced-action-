@@ -545,10 +545,10 @@ def test_missing_lead_id_is_stored_with_an_id_derived_from_phone_and_email():
     assert parse_lendingflow({"phone": "7275550100", "email": "a@example.com"}).vendor_lead_id == parsed.vendor_lead_id
 
 
-def test_missing_lead_id_gets_the_no_lead_id_tag():
+def test_missing_lead_id_gets_no_extra_tag():
     from src.lending.lendingflow_ghl import _tags
-    assert "lendingflow-no-lead-id" in _tags({"consent_status": "present", "vendor_lead_id": "missing:abc"})
-    assert "lendingflow-no-lead-id" not in _tags({"consent_status": "present", "vendor_lead_id": "LF-1"})
+    assert _tags({"consent_status": "present", "vendor_lead_id": "missing:abc"}) == ["lendingflow"]
+    assert _tags({"consent_status": "present", "vendor_lead_id": "LF-1"}) == ["lendingflow"]
 
 
 def test_missing_lead_id_is_logged_by_row_id_only(lf_db, caplog):

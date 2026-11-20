@@ -26,6 +26,7 @@ never see a real unsubscribe event to sync back.
 from __future__ import annotations
 
 from html import escape as _html_escape
+from typing import Optional
 
 from config.settings import get_settings
 from src.services import instantly_service as instantly
@@ -39,7 +40,7 @@ PASSTHROUGH_CAMPAIGN_NAME = "Relay Passthrough (RELAY-v2.2 R2)"
 _FA_MAX_VENTURE = "fa_max_lending"
 
 
-def build_passthrough_body(body_text: str, recipient: str, venture) -> str:
+def build_passthrough_body(body_text: str, recipient: str, venture, unsubscribe_link: Optional[str] = None) -> str:
     """Wrap plain-text body in the passthrough campaign's required HTML shell.
 
     Escapes the text, converts newlines to <br>, and appends the CAN-SPAM
@@ -54,7 +55,7 @@ def build_passthrough_body(body_text: str, recipient: str, venture) -> str:
     brand+address+unsubscribe footer, unchanged.
     """
     nl_to_br = _html_escape(body_text).replace("\r\n", "\n").replace("\n", "<br>\n")
-    unsub = unsubscribe_url(recipient)
+    unsub = unsubscribe_link or unsubscribe_url(recipient)
 
     identity_lines = [venture.brand_name, venture.postal_address]
     phone = getattr(venture, "outbound_contact_phone", None)
