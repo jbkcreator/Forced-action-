@@ -394,6 +394,20 @@ def run_trace(db, leads: list[Lead], *, folder: Path, trace_limit: int, balance:
             "trace_credits_spent": start_balance - balance(), "left_untraced": len(leads) - position}
 
 
+_RECORD_PLACES_SQL = text("""
+    SELECT DISTINCT ON (radar_id) radar_id, state, ownership_type FROM lending.pr_list_records
+     WHERE radar_id = ANY(:ids) ORDER BY radar_id, last_seen_at DESC
+""")
+
+
+def record_places(db, radar_ids: Sequence[str]) -> dict[str, dict[str, Optional[str]]]:
+    """radar_id -> the state and entity status the dialer gate judges (a Georgia owner must be a company). A trace
+    subject key has no record of its own; its people are Florida sellers (Wholesalers are a Florida list)."""
+    rows = db.execute(_RECORD_PLACES_SQL, {"ids": list(radar_ids)}).all() if radar_ids else []
+    return {row.radar_id: {"state": row.state or "FL",
+                           "entity_status": "LLC" if row.ownership_type == "Corporate" else None} for row in rows}
+
+
 def run_dnc(db, radar_ids: Sequence[str], *, folder: Path, run_id: str, scrubber, max_phones: int,
             next_phone: bool = False) -> dict[str, int]:
     """Do-not-call check on each traced person's first phone, at most ``max_phones`` (the credits left);
@@ -401,7 +415,9 @@ def run_dnc(db, radar_ids: Sequence[str], *, folder: Path, run_id: str, scrubber
     from src.lending.compliance import filter_loadable
 
     best = _next_phones(db, radar_ids) if next_phone else _traced_best_phones(db, radar_ids)
-    records = [{"phone": phone, "state": "FL", "source_record_ref": f"pr_list:{rid}"} for rid, phone in best.items()]
+    places = record_places(db, list(best))
+    records = [{"phone": phone, "source_record_ref": f"pr_list:{rid}",
+                **places.get(rid, {"state": "FL", "entity_status": None})} for rid, phone in best.items()]
     if len(records) > max_phones:
         logger.warning("[list-trace] %d phones to check but %d credits left; checking the first %d",
                        len(records), max_phones, max_phones)

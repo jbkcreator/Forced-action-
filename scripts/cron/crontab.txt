@@ -1207,6 +1207,13 @@ COUNTY_ID=hillsborough
 # runner's lock so it never stages a pull that is still running.
 0 3 * * * flock /tmp/property_radar_runner.lock $PROJECT/scripts/cron/run.sh src.tasks.lending_pr_maturity_bridge --apply --if-enabled
 
+# PropertyRadar morning BatchDialer load: the pr_maturity records the bridge staged overnight, at 09:xx ET (two UTC
+# lines cover daylight saving; only the one landing in 09:xx ET acts). Only phones not already loaded; the dialer
+# load's own gates apply. Do-not-call credits capped per ET day (LENDING_PR_DIALER_AUTOLOAD_MAX_SCRUB_CREDITS, counted
+# across retries). The GHL load sync (*/5) pushes the loads to GHL. Idle until LENDING_PR_DIALER_AUTOLOAD_ENABLED=true.
+# Dry check first: PYTHONPATH=. python -m src.tasks.lending_pr_dialer_autoload
+5 13,14 * * * flock -n /tmp/lending_pr_dialer_autoload.lock $PROJECT/scripts/cron/run.sh src.tasks.lending_pr_dialer_autoload --apply
+
 # Daily FA export (Cora P3.1): yesterday's (ET) PropertyRadar leads (loans coming due, cash purchases,
 # investor-owned portfolios) as one CSV in Drive "FA Exports" and as GHL contacts tagged NDL.
 # Off until LENDING_FA_EXPORT_ENABLED=true + LENDING_FA_EXPORT_FOLDER_ID; GHL push LENDING_FA_EXPORT_GHL_ENABLED.
