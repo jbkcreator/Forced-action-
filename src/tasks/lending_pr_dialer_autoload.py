@@ -6,21 +6,27 @@ with their traced phones into the newest calling-pool staging run, and this job 
 every new BatchDialer load into the NDL GHL account.
 
 What it loads: the staged ``pr_maturity`` records in a launch queue (their source tag decides the campaign), one per
-phone, leaving out phones already active in BatchDialer and Georgia owners who are not companies. Everything else
-is the dialer load's own gates (src/lending/dialer_load.py): suppression, homestead, attempt limits, do-not-call
-and litigator, calling hours, emergency halt.
+phone, leaving out phones already active in BatchDialer. The dialer load's checks that cost nothing (Georgia
+owners who are not companies, homestead, suppression, attempt history, numbers worked from GHL, a fresh do-not-call
+result) run first, so a number that can never load never takes a do-not-call credit; the dialer load
+(src/lending/dialer_load.py) then runs every gate again: do-not-call and litigator, calling hours, emergency halt.
 
 Do-not-call spend: a phone with a fresh check costs nothing; any other phone costs one Tracerfy credit.
 LENDING_PR_DIALER_AUTOLOAD_MAX_SCRUB_CREDITS caps those credits per ET day. Before each Tracerfy call the job writes
 how many phones it sends (``data/pr_dialer_autoload/scrubs-<ET day>.log``), and the cap counts from that file, so a
 run that fails and is retried by run.sh never spends the day's credits twice. Phones over the cap wait for the next
-morning.
+morning. A do-not-call check that fails (Tracerfy timeout or error) fails the run and alerts; the credits it
+may have used stay counted.
 
-Usage (cron 13:05 and 14:05 UTC; acts only during 09:xx ET):
+Two passes a day, 09:xx and 12:xx ET: the dialer load only loads a number inside its own calling hours (8am
+recipient local), so a Mountain or Pacific number blocked at 09:xx loads at 12:xx (Hawaii numbers still never do).
+
+Usage (cron 13:05, 14:05, 16:05 and 17:05 UTC; acts only during 09:xx and 12:xx ET):
     python -m src.tasks.lending_pr_dialer_autoload                 # dry run: what would load, nothing sent
     python -m src.tasks.lending_pr_dialer_autoload --apply [--any-hour]
 
-Exit codes: 0 ok (also when switched off or outside 09:xx ET), 1 some loads failed (safe to run again), 3 refused.
+Exit codes: 0 ok (also when switched off or outside the load hours), 1 some loads or do-not-call checks failed (safe
+to run again), 3 refused.
 """
 from __future__ import annotations
 
@@ -28,7 +34,8 @@ import argparse
 import json
 import logging
 import os
-from collections.abc import Callable, Iterable, Mapping, Sequence
+from collections import Counter
+from collections.abc import Callable, Mapping, Sequence
 from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
@@ -39,7 +46,7 @@ from sqlalchemy import text
 logger = logging.getLogger(__name__)
 
 ET = ZoneInfo("America/New_York")
-LOAD_HOUR_ET = 9  # two UTC cron lines cover daylight saving; only the one landing in 09:xx ET acts
+LOAD_HOURS_ET = frozenset({9, 12})  # two UTC cron lines per pass cover daylight saving; only those landing here act
 SPEND_ROOT = Path(__file__).resolve().parents[2] / "data" / "pr_dialer_autoload"
 EXIT_OK, EXIT_FAILED, EXIT_REFUSED = 0, 1, 3
 
@@ -51,7 +58,7 @@ def day_of(now: datetime) -> date:
 
 
 def in_load_hour(now: datetime) -> bool:
-    return now.astimezone(ET).hour == LOAD_HOUR_ET
+    return now.astimezone(ET).hour in LOAD_HOURS_ET
 
 
 # ── the day's do-not-call credits ───────────────────────────────────────────
@@ -77,51 +84,72 @@ def _record_sent(day: date, phones: int, root: Optional[Path] = None) -> None:
         os.fsync(handle.fileno())
 
 
-def capped_scrubber(scrubber: Callable[[list[str]], list[dict]], *, day: date, cap: int,
-                    root: Optional[Path] = None) -> Callable[[list[str]], list[dict]]:
+class CappedScrubber:
     """The scrubber, never sending more phones than the day's credits left. The count is written before the call,
     so a run that dies mid-call still counts what it sent. Phones over the cap are not checked, and the dialer
-    load blocks an unchecked phone, so it is never loaded."""
+    load blocks an unchecked phone, so it is never loaded. ``failed`` counts phones sent but not answered (the
+    call raised, or Tracerfy returned no row for them): the dialer load swallows that error, so the run reads it
+    here."""
 
-    def scrub(phones: list[str]) -> list[dict]:
-        left = max(0, cap - credits_spent(day, root))
+    def __init__(self, scrubber: Callable[[list[str]], list[dict]], *, day: date, cap: int,
+                 root: Optional[Path] = None) -> None:
+        self._scrubber, self._day, self._cap, self._root = scrubber, day, cap, root
+        self.failed = 0
+
+    def __call__(self, phones: list[str]) -> list[dict]:
+        from src.services.phone_utils import normalize as normalize_phone
+
+        left = max(0, self._cap - credits_spent(self._day, self._root))
         sending = list(phones)[:left]
         if len(sending) < len(phones):
             logger.warning("[pr-autoload] %d phone(s) over the day's do-not-call credits; left for tomorrow",
                            len(phones) - len(sending))
         if not sending:
             return []
-        _record_sent(day, len(sending), root)
-        return scrubber(sending)
-
-    return scrub
+        _record_sent(self._day, len(sending), self._root)
+        try:
+            rows = self._scrubber(sending)
+        except Exception:
+            self.failed += len(sending)
+            raise
+        answered = {normalize_phone(str(row.get("phone") or "")) for row in rows}
+        self.failed += sum(1 for phone in sending if normalize_phone(phone) not in answered)
+        return rows
 
 
 # ── choosing what to load ───────────────────────────────────────────────────
 
-def select_records(records: Iterable[Mapping[str, Any]], *, active_phones: set[str], fresh_phones: set[str],
-                   credits_left: int, georgia_blocked: Callable[[Mapping[str, Any]], bool]) -> tuple[list[dict], dict]:
-    """Records to load, in dial order: one per phone, never a phone already loaded or a Georgia owner who may not be
-    called. A phone with a fresh do-not-call check always goes (it costs nothing); others only while the day's
-    credits last."""
-    from src.lending.dial_order import sort_for_load
+_VERDICT = "_pre_check_verdict"
 
-    counts = {"staged": 0, "no_phone": 0, "already_loaded": 0, "georgia_not_a_company": 0, "duplicate_phone": 0,
-              "needs_check": 0, "waiting_for_credits": 0}
+
+def select_records(records: Sequence[Mapping[str, Any]], verdicts: Sequence[Optional[str]], *,
+                   active_phones: set[str], credits_left: int) -> tuple[list[dict], dict]:
+    """Records to load, in dial order: one per phone, never a phone already loaded. ``verdicts`` (one per record)
+    is the dialer load's free checks: None = allowed on a fresh do-not-call result (always goes, it costs
+    nothing), SCRUB_FAILED = needs a do-not-call check (goes while the day's credits last), anything else = blocked
+    (never takes a credit)."""
+    from src.lending.dial_order import sort_for_load
+    from src.lending.dialer_load import REASON_SCRUB_FAILED
+
+    counts: dict[str, Any] = {"staged": 0, "no_phone": 0, "already_loaded": 0, "blocked_before_check": 0,
+                              "duplicate_phone": 0, "needs_check": 0, "waiting_for_credits": 0}
+    blocked_by_reason: Counter = Counter()
     chosen: list[dict] = []
     seen: set[str] = set()
-    for record in sort_for_load([dict(r) for r in records]):
+    for record in sort_for_load([{**r, _VERDICT: v} for r, v in zip(records, verdicts, strict=True)]):
+        verdict = record.pop(_VERDICT)
         counts["staged"] += 1
         phone = record.get("phone")
         if not phone:
             counts["no_phone"] += 1
         elif phone in active_phones:
             counts["already_loaded"] += 1
-        elif georgia_blocked(record):
-            counts["georgia_not_a_company"] += 1
+        elif verdict is not None and verdict != REASON_SCRUB_FAILED:
+            counts["blocked_before_check"] += 1
+            blocked_by_reason[verdict] += 1
         elif phone in seen:
             counts["duplicate_phone"] += 1
-        elif phone in fresh_phones:
+        elif verdict is None:
             seen.add(phone)
             chosen.append(record)
         elif counts["needs_check"] < credits_left:
@@ -130,6 +158,7 @@ def select_records(records: Iterable[Mapping[str, Any]], *, active_phones: set[s
             chosen.append(record)
         else:
             counts["waiting_for_credits"] += 1
+    counts["blocked_by_reason"] = dict(blocked_by_reason)
     counts["to_load"] = len(chosen)
     return chosen, counts
 
@@ -143,16 +172,25 @@ def staged_pr_records(db) -> list[dict]:
     return launch_queue_records([r for r in staged_pool_records(db) if r["staging_pool"] == POOL_NAME])
 
 
-def plan_load(db, *, day: date, cap: int, root: Optional[Path] = None) -> tuple[list[dict], dict]:
-    from src.lending.compliance import _georgia_blocked, fresh_scrubs
+def pre_check_verdicts(db, records: Sequence[Mapping[str, Any]]) -> list[Optional[str]]:
+    """The dialer load's gates up to the do-not-call check, without calling Tracerfy (as its own pre-scrub refusal
+    check does): None = allowed, else the block reason (SCRUB_FAILED = not checked yet)."""
+    from src.lending.compliance import filter_loadable
+    from src.lending.dialer_load import no_scrub
 
+    if not records:
+        return []
+    results = filter_loadable([dict(r) for r in records], db, scrubber=no_scrub)
+    return [None if r.allowed else r.reason.value for r in results]
+
+
+def plan_load(db, *, day: date, cap: int, root: Optional[Path] = None) -> tuple[list[dict], dict]:
     records = staged_pr_records(db)
     phones = sorted({r["phone"] for r in records if r.get("phone")})
     active = {row[0] for row in db.execute(_ACTIVE_PHONES_SQL, {"p": phones})} if phones else set()
-    fresh = set(fresh_scrubs(db, phones)) if phones else set()
     left = max(0, cap - credits_spent(day, root))
-    chosen, counts = select_records(records, active_phones=active, fresh_phones=fresh, credits_left=left,
-                                    georgia_blocked=_georgia_blocked)
+    chosen, counts = select_records(records, pre_check_verdicts(db, records), active_phones=active,
+                                    credits_left=left)
     counts["credits_left_today"] = left
     return chosen, counts
 
@@ -166,7 +204,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     parser = argparse.ArgumentParser(description="Morning BatchDialer load of the staged PropertyRadar leads.")
     parser.add_argument("--apply", action="store_true", help="load BatchDialer (default: dry run)")
     parser.add_argument("--any-hour", action="store_true",
-                        help="run outside 09:xx ET (the dialer load still enforces calling hours)")
+                        help="run outside the load hours (the dialer load still enforces calling hours)")
     args = parser.parse_args(argv)
     settings = get_settings()
     now = datetime.now(timezone.utc)
@@ -174,7 +212,8 @@ def main(argv: Optional[list[str]] = None) -> int:
         logger.info("[pr-autoload] off (LENDING_PR_DIALER_AUTOLOAD_ENABLED=false)")
         return EXIT_OK
     if args.apply and not args.any_hour and not in_load_hour(now):
-        logger.info("[pr-autoload] outside %02d:xx ET; the other cron line runs it", LOAD_HOUR_ET)
+        logger.info("[pr-autoload] outside the load hours (%s ET); another cron line runs it",
+                    ", ".join(f"{h:02d}:xx" for h in sorted(LOAD_HOURS_ET)))
         return EXIT_OK
     cap = max(0, settings.lending_pr_dialer_autoload_max_scrub_credits)
     summary, code = _run(now, cap, apply=args.apply)
@@ -208,15 +247,18 @@ def _load(db, records: Sequence[dict], counts: dict, *, now: datetime, day: date
     missing = dialer.missing_for_load() if hasattr(dialer, "missing_for_load") else []
     if missing:
         return {**counts, "refused": f"unconfirmed dialer endpoint(s): {', '.join(missing)}"}, EXIT_REFUSED
+    scrubber = CappedScrubber(tracerfy_scrub, day=day, cap=cap)
     try:
         report = run_dialer_load(list(records), db, run_id=f"pr-autoload-{now:%Y%m%dT%H%M%SZ}", dry_run=False,
-                                 scrubber=capped_scrubber(tracerfy_scrub, day=day, cap=cap), dialer=dialer,
-                                 commit=db.commit, now=now)
+                                 scrubber=scrubber, dialer=dialer, commit=db.commit, now=now)
     except LoadRefused as exc:
         db.rollback()
         return {**counts, "refused": str(exc)}, EXIT_REFUSED
     loaded = {k: v for k, v in report.as_dict().items() if not isinstance(v, (list, dict))}  # counts, never phones
-    return {**counts, "load": loaded}, EXIT_FAILED if report.failed else EXIT_OK
+    summary = {**counts, "load": loaded}
+    if scrubber.failed:
+        summary["do_not_call_check_failed"] = scrubber.failed
+    return summary, EXIT_FAILED if report.failed or scrubber.failed else EXIT_OK
 
 
 def _notify(message: str, *, failed: bool) -> None:

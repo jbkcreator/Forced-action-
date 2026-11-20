@@ -1071,7 +1071,7 @@ class AppSettings(BaseSettings):
 	# BatchDialer load -> GHL contact sync (src/lending/ghl_load_sync.py): every active dialer load pushed to GHL as a cold contact
 	lending_ghl_load_sync_enabled: bool = Field(default=False, env="LENDING_GHL_LOAD_SYNC_ENABLED")
 	# Morning BatchDialer load of the PropertyRadar pool the bridge stages (src/tasks/lending_pr_dialer_autoload.py,
-	# 09:xx ET): only phones not already loaded. The cap is Tracerfy do-not-call credits per ET day (a phone with a
+	# 09:xx and 12:xx ET): only phones not already loaded. The cap is Tracerfy do-not-call credits per ET day (a phone with a
 	# fresh check costs nothing); 0 = only phones already checked are loaded
 	lending_pr_dialer_autoload_enabled: bool = Field(default=False, env="LENDING_PR_DIALER_AUTOLOAD_ENABLED")
 	lending_pr_dialer_autoload_max_scrub_credits: int = Field(default=0, env="LENDING_PR_DIALER_AUTOLOAD_MAX_SCRUB_CREDITS")

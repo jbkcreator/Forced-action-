@@ -68,7 +68,7 @@ def landed_radar_ids(list_key: str, *, root: Optional[Path] = None) -> set[str]:
 
 
 class PullLocked(RuntimeError):
-    """Another calling-list pull is running (or crashed without releasing the lock)."""
+    """Another calling-list pull is running."""
 
 
 def _holder_pid(path: Path) -> Optional[int]:
@@ -80,42 +80,42 @@ def _holder_pid(path: Path) -> Optional[int]:
     return int(parts[1]) if len(parts) == 2 and parts[0] == "pid" and parts[1].isdigit() else None
 
 
-def _process_running(pid: int) -> bool:
-    """POSIX only (production). Elsewhere a lock is always treated as held: on Windows ``os.kill(pid, 0)`` would
-    send Ctrl+C to that process."""
-    if os.name != "posix":
-        return True
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True
-    return True
+@dataclass(frozen=True)
+class PullLock:
+    path: Path
+    fd: int
 
 
-def acquire_pull_lock(*, root: Optional[Path] = None) -> Path:
-    """One pull at a time on this machine: two pulls at once could buy the same records. The lock file is
-    created atomically (O_EXCL) and names the process holding it. A lock left by a process that is no longer
-    running (a crashed run) is taken over once; an unreadable lock is never taken over."""
+def acquire_pull_lock(*, root: Optional[Path] = None) -> PullLock:
+    """One pull at a time on this machine: two pulls at once could buy the same records. An exclusive ``flock``
+    on the lock file, held by the open descriptor until release: the kernel drops it when the holder exits, so a
+    crashed run never leaves a lock behind and two processes can never both take one over. POSIX only
+    (production)."""
+    import fcntl
+
     folder = root or LANDING_ROOT
     folder.mkdir(parents=True, exist_ok=True)
     path = folder / ".pull.lock"
-    for attempt in range(2):
+    for _ in range(3):
+        fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o644)
         try:
-            fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-            break
-        except FileExistsError:
-            holder = _holder_pid(path)
-            if attempt == 0 and holder is not None and not _process_running(holder):
-                path.unlink(missing_ok=True)  # the holder died without releasing it
-                continue
-            raise PullLocked(f"another pull holds {path} (pid {holder}); if none is running, delete that file "
-                             "and try again") from None
-    with os.fdopen(fd, "w", encoding="utf-8") as handle:
-        handle.write(f"pid {os.getpid()}")
-    return path
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            os.close(fd)
+            raise PullLocked(f"another pull holds {path} (pid {_holder_pid(path)})") from None
+        try:
+            current = os.stat(path).st_ino == os.fstat(fd).st_ino
+        except FileNotFoundError:
+            current = False
+        if current:
+            os.ftruncate(fd, 0)
+            os.write(fd, f"pid {os.getpid()}".encode())
+            return PullLock(path=path, fd=fd)
+        os.close(fd)  # the holder released and removed this file between our open and lock: lock the new one
+    raise PullLocked(f"could not lock {path}; another pull keeps replacing it")
 
 
-def release_pull_lock(path: Path) -> None:
-    path.unlink(missing_ok=True)
+def release_pull_lock(lock: PullLock) -> None:
+    """Removed while still locked, so a process waiting on the old file sees it is gone and locks the new one."""
+    lock.path.unlink(missing_ok=True)
+    os.close(lock.fd)

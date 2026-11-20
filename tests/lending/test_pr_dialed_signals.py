@@ -19,8 +19,7 @@ from config.property_radar_campaigns import (
 from config.property_radar_handoff import CAMPAIGN_OPPORTUNITY_TYPES, DIALER_TRACE_CAMPAIGNS
 from src.lending import pr_maturity_bridge as bridge
 from src.lending.queues import assign_queue
-from src.services.property_radar.lead_handoff import StagedLead
-from src.tasks.property_radar_lead_handoff import dialer_trace_eligible
+from src.tasks.property_radar_lead_handoff import DialerLead, dialer_trace_eligible
 
 
 # ── campaigns ───────────────────────────────────────────────────────────────
@@ -58,17 +57,21 @@ def test_loans_coming_due_still_go_to_verified_maturity():
 # ── dialer-only trace ───────────────────────────────────────────────────────
 
 def _lead(**kw):
-    base = dict(radar_id="R1", campaign="cash_purchase", status="active", state="FL", county_fips="12057",
-                county_name="Hillsborough", owner_name="SMITH JOHN")
-    return StagedLead(**{**base, **kw})
+    base = dict(radar_id="R1", status="active", property_state="FL", ownership_type="Individual",
+                owner_name="SMITH JOHN", principal_name=None, property_address="1 MAIN ST", city="TAMPA",
+                state="FL", zip="33602")
+    return DialerLead(**{**base, **kw})
 
 
 @pytest.mark.parametrize("lead,eligible", [
-    (_lead(), True),                                                   # a Florida person may be called
-    (_lead(status="sold"), False),                                     # sold since it was bought
-    (_lead(state="GA", owner_name="PEACH HOLDINGS LLC"), True),        # a Georgia company
-    (_lead(state="GA", owner_name="DOE JANE"), False),                 # a Georgia person: never traced
-    (_lead(state="GA", owner_name="ACME CORPORATION"), True),
+    (_lead(), True),                                                                  # a Florida person
+    (_lead(status="sold"), False),                                                    # sold since it was bought
+    (_lead(property_state="GA", owner_name="PEACH HOLDINGS LLC"), True),              # a Georgia company
+    (_lead(property_state="GA", owner_name="DOE JANE"), False),                       # a Georgia person: never traced
+    (_lead(property_state="GA", owner_name="ACME CORPORATION"), True),
+    (_lead(property_state="GA", owner_name="PEACHTREE PARTNERS", ownership_type="Corporate"), True),  # no suffix
+    (_lead(property_state="GA", owner_name="DOE JANE", state="FL"), False),           # GA property, FL mailing
+    (_lead(property_state="FL", owner_name="DOE JANE", state="GA"), True),            # FL property, GA mailing
 ])
 def test_only_leads_the_dialer_may_call_are_traced(lead, eligible):
     assert dialer_trace_eligible(lead) is eligible
@@ -106,6 +109,51 @@ def test_a_dry_run_of_a_dialer_only_campaign_spends_nothing(monkeypatch):
 
     monkeypatch.setattr(handoff_task, "_dialer_trace", lambda *a: pytest.fail("traced on a dry run"))
     assert _stages(monkeypatch).handoff(_Session(), "cash_purchase", False, None) == {"dialer_trace_planned": 1}
+
+
+def test_the_dialer_trace_goes_to_the_owners_mailing_address(monkeypatch):
+    from src.services.property_radar import live_trace
+    from src.services.skip_trace_ledger import trace_key
+    from src.tasks import property_radar_lead_handoff as handoff_task
+
+    row = dict(radar_id=7, status="active", property_state="FL", ownership_type="Company", owner_name="ACME LLC",
+               principal_name=None, property_address="9 OAK AVE", city="ATLANTA", state="GA", zip="30303")
+
+    class Session:
+        def execute(self, statement, params=None):
+            sql = str(statement)
+            if "to_regclass" in sql:
+                return SimpleNamespace(scalar=lambda: "property_radar_traced_contacts")
+            assert "mailing_address" in sql and "NOT EXISTS" in sql and params == {"campaign": "cash_purchase"}
+            return SimpleNamespace(mappings=lambda: SimpleNamespace(all=lambda: [row]))
+
+    from config.settings import get_settings
+    monkeypatch.setattr(get_settings(), "property_radar_enabled", True, raising=False)
+    seen = {}
+
+    def already_traced(session, vendor, keys):
+        seen["keys"] = keys
+        return {}
+
+    def trace(leads, **kw):
+        seen["leads"] = leads
+        return live_trace.TraceOutcome()
+
+    monkeypatch.setattr(handoff_task, "already_traced", already_traced)
+    monkeypatch.setattr(handoff_task, "trace_staged_leads", trace)
+    handoff_task._dialer_trace(Session(), "cash_purchase")
+    lead = seen["leads"][0]
+    assert (lead.radar_id, lead.property_address, lead.city, lead.state) == ("7", "9 OAK AVE", "ATLANTA", "GA")
+    assert seen["keys"] == {trace_key("9 OAK AVE", "30303")}  # ledger key = the address sent
+    assert live_trace._submit_row(lead)["address"] == "9 OAK AVE"
+
+
+def test_the_dialer_trace_query_falls_back_to_the_property_address():
+    from src.tasks.property_radar_lead_handoff import _DIALER_LEADS_SQL
+
+    sql = " ".join(str(_DIALER_LEADS_SQL).split())
+    assert "coalesce(nullif(r.mailing_address, ''), r.property_address) AS property_address" in sql
+    assert "r.state AS property_state" in sql and "r.ownership_type" in sql
 
 
 def test_the_dialer_trace_refuses_while_property_radar_is_off(monkeypatch):
