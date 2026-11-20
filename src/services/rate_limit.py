@@ -96,8 +96,10 @@ def is_allowed(request: Request, scope: str, limit: int, window_seconds: int) ->
     `scope` namespaces the limiter (e.g. 'leaderboard') so different endpoints
     have independent buckets.
     """
-    ip = _client_ip(request)
-    key = f"rl:{scope}:{ip}"
+    return _allowed(f"rl:{scope}:{_client_ip(request)}", limit, window_seconds)
+
+
+def _allowed(key: str, limit: int, window_seconds: int) -> bool:
     try:
         if redis_available():
             return _redis_check(key, limit, window_seconds)
@@ -110,6 +112,22 @@ def is_allowed(request: Request, scope: str, limit: int, window_seconds: int) ->
 def enforce_or_429(request: Request, scope: str, limit: int, window_seconds: int) -> None:
     """Raise HTTPException(429) if the IP has exceeded the limit; else return."""
     if not is_allowed(request, scope, limit, window_seconds):
+        raise HTTPException(
+            status_code=429,
+            detail={
+                "error": "rate_limited",
+                "scope": scope,
+                "retry_after_seconds": window_seconds,
+                "message": "Too many requests — please slow down.",
+            },
+            headers={"Retry-After": str(window_seconds)},
+        )
+
+
+def enforce_bucket_or_429(scope: str, bucket: str, limit: int, window_seconds: int) -> None:
+    """Like enforce_or_429, but counts on ``bucket`` (e.g. an API-key hash) instead of the caller's IP,
+    so a client cannot reset its limit by sending a different X-Forwarded-For."""
+    if not _allowed(f"rl:{scope}:bucket:{bucket}", limit, window_seconds):
         raise HTTPException(
             status_code=429,
             detail={

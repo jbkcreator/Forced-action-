@@ -1599,3 +1599,31 @@ class LendingSpeedToLeadNotice(LendingBase):
     day: Mapped[date] = mapped_column(Date, primary_key=True)
     posted_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_now,
                                                 server_default=text("now()"))
+
+
+
+class LendingInstantQuote(LendingBase):
+    """One instant quote issued by POST /api/lending/instant-quote, indicative or rejected.
+
+    The audit record: the request and result exactly as issued, the rules that fired and whether any
+    lender value was a placeholder. ``id`` is the public quote_id. ``api_key_label`` is a hash prefix of
+    the caller's key, never the key.
+    """
+
+    __tablename__ = "instant_quotes"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4,
+                                          server_default=text("gen_random_uuid()"))
+    status: Mapped[str] = mapped_column(String(20), nullable=False)
+    reason: Mapped[Optional[str]] = mapped_column(String(60))
+    request: Mapped[dict] = mapped_column(JSONB, nullable=False)
+    result: Mapped[dict] = mapped_column(JSONB, nullable=False)
+    rules_fired: Mapped[list] = mapped_column(JSONB, nullable=False, default=list, server_default=text("'[]'::jsonb"))
+    unconfirmed: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    api_key_label: Mapped[str] = mapped_column(String(16), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_now, server_default=text("now()"))
+
+    __table_args__ = (
+        CheckConstraint("status IN ('indicative', 'rejected')", name="ck_lending_instant_quotes_status"),
+        Index("ix_lending_instant_quotes_created_at", "created_at"),
+    )
