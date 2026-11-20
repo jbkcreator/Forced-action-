@@ -239,8 +239,16 @@ def default_stages(trace_results: Optional[Path] = None, gap_from_days: Optional
         yield from _batches(records, STAGE_BATCH_SIZE)
 
     def handoff(session: Session, campaign: str, apply: bool, commit: Optional[Callable[[], None]]) -> dict[str, int]:
+        from config.property_radar_handoff import DIALER_TRACE_CAMPAIGNS
         from config.settings import get_settings
         settings = get_settings()
+        if campaign in DIALER_TRACE_CAMPAIGNS:
+            # Dialed, never handed to FA Max: trace for the calling-pool bridge and stop there.
+            if not apply:
+                return {"dialer_trace_planned": 1}
+            from src.tasks.property_radar_lead_handoff import _dialer_trace
+            contacts = _dialer_trace(session, campaign)
+            return {"traced_for_dialer": len(contacts)}
         if trace_results:
             contacts = load_trace_contacts(trace_results)
         elif apply:

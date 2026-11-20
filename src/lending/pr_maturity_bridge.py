@@ -45,17 +45,21 @@ CAMPAIGN_TAG = POOL_CAMPAIGN_TAGS["verified_maturity"]
 #   list_1 = FL maturity, list_5 = GA maturity, list_8 = private-money maturity
 #     -> Verified maturity (rank 1)
 #   list_9 = stalled flips, list_6 = auction winners -> Transaction ready (rank 2)
+#   list_2 = cash buyers (cash_purchase), investor_portfolio_propertyradar = portfolio owners' purchases
+#     -> Transaction ready
 # maturity_target_lender carries both FL and GA records, so it splits by state
 # (list_1 FL / list_5 GA); List 5 is the Georgia maturity list, not a catch-all.
 CAMPAIGN_SOURCE_TAG = {
     "private_maturity": "list_8",
     "stalled_flip": "list_9",
     "auction_winner": "list_6",
+    "cash_purchase": "list_2",
+    "investor_portfolio": "investor_portfolio_propertyradar",
 }
 
 
-# Campaigns that have a dialer source list; other staged campaigns (cash_purchase, investor_portfolio) are
-# never dialed, so the bridge leaves them out and they never take a phone a dialed record needs.
+# Campaigns that have a dialer source list; any other staged campaign is never dialed, so the bridge leaves it
+# out and it never takes a phone a dialed record needs.
 DIALED_CAMPAIGNS = ("maturity_target_lender", *CAMPAIGN_SOURCE_TAG)
 
 

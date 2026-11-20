@@ -17,6 +17,11 @@ CAMPAIGN_SOURCE_TYPES: dict[str, str] = {
     "maturity_target_lender": "maturity",
 }
 
+# Campaigns traced for the dialer only: the runner traces them live and the calling-pool bridge stages them, but
+# they create no FA Max opportunity (a cash buyer or a portfolio owner is not a refinance lead). A campaign must not
+# be in both this set and CAMPAIGN_OPPORTUNITY_TYPES.
+DIALER_TRACE_CAMPAIGNS: frozenset[str] = frozenset({"cash_purchase", "investor_portfolio"})
+
 # County FIPS codes the thin path admits (Hillsborough, Pinellas).
 THIN_PATH_COUNTY_FIPS: frozenset[str] = frozenset({"12057", "12103"})
 

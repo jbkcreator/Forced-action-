@@ -15,9 +15,11 @@ CAMPAIGN_CRITERIA — keyed by (state, campaign_key). Each value is a list of
     private_maturity        List 8 — first loan coded Private by PropertyRadar
     stalled_flip            List 9 — financed (private) purchase, not resold
     auction_winner          List 6 — trustee-sale buyers
-  Cora P3.1 export signals (no source list, so the calling-pool bridge never dials them):
+  Cora P3.1 signals, also dialed (Transaction ready; traced for the dialer without an FA Max handoff,
+  config/property_radar_handoff.DIALER_TRACE_CAMPAIGNS):
     cash_purchase           100% down purchase in the last 90 days, not owner-occupied
-    investor_portfolio      company-owned, not owner-occupied, bought in the last 12 months
+    investor_portfolio      company-owned, not owner-occupied, owner holds 3-99 properties, bought in the
+                            last 12 months
   PropertyRadar does not code the named hard-money lenders as Private, so
   maturity_target_lender and private_maturity never overlap. stalled_flip
   and private_maturity overlap as a loan ages, so they share seen_ids
@@ -111,10 +113,13 @@ CASH_PURCHASE_WINDOW_DAYS: tuple[int, int] = (90, 0)
 CASH_PURCHASE_MIN_DOWN_PERCENT: int = 100
 
 # Cora P3.1 investor-owned portfolios: company-owned, not owner-occupied, bought in the last
-# 12 months. PropertyRadar has no "properties owned" criterion, so the portfolio size is
-# counted over the staged records by the export (INVESTOR_PORTFOLIO_MIN_PROPERTIES).
+# 12 months, by an owner holding INVESTOR_PORTFOLIO_MIN..MAX properties (PropertyRadar's
+# NumberPropertiesOwned, a search criterion: checked by a live free count, 2026-11-20). The
+# export still counts the owner's leads across the staged records too. 100+ properties are
+# institutional funds, not borrowers.
 INVESTOR_PORTFOLIO_WINDOW_DAYS: tuple[int, int] = (365, 0)
 INVESTOR_PORTFOLIO_MIN_PROPERTIES: int = 3
+INVESTOR_PORTFOLIO_MAX_PROPERTIES: int = 99
 
 # Campaigns whose records are maturing-loan leads.
 MATURITY_CAMPAIGNS: frozenset[str] = frozenset({"maturity_target_lender", "private_maturity"})
@@ -305,6 +310,8 @@ def _investor_portfolio(state: str, daily_since: Optional[date] = None) -> list[
         _CORPORATE,
         _NOT_OWNER_OCCUPIED,
         _NOT_LISTED,
+        {"name": "NumberPropertiesOwned",
+         "value": [[INVESTOR_PORTFOLIO_MIN_PROPERTIES, INVESTOR_PORTFOLIO_MAX_PROPERTIES]]},
         _date_window_criterion("LastTransferRecDate", INVESTOR_PORTFOLIO_WINDOW_DAYS, daily_since),
         # Loans the maturity campaigns buy are not bought again here (records with no first loan
         # are left out too: PropertyRadar has no NOT, and a range never matches a blank date).

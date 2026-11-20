@@ -57,10 +57,41 @@ _SET_LINK_SQL = """
 """
 
 
+# Every county Forced Action holds parcels for, with its FIPS code: read each run, so a county links the night
+# its parcels are first loaded, Florida or Georgia, without a code change.
+_LINKABLE_COUNTIES_SQL = """
+    SELECT c.county_id, btrim(c.fips) AS fips FROM counties c
+     WHERE nullif(btrim(c.fips), '') IS NOT NULL
+       AND EXISTS (SELECT 1 FROM properties p WHERE p.county_id = c.county_id)
+"""
+_FLORIDA_STATE_FIPS = "12"
+
+
+def _full_fips(fips: str) -> str:
+    """Five digits. A three-digit code is a Florida county (every county loaded before Georgia was added)."""
+    return fips if len(fips) == 5 else f"{_FLORIDA_STATE_FIPS}{fips.zfill(3)}"
+
+
+def linkable_counties(session: Session) -> dict[str, str]:
+    """FIPS -> FA county slug: the configured counties plus every county with a FIPS code and parcels. A failed
+    lookup falls back to the configured counties (linking is best effort; the pull must not fail on it)."""
+    fips_to_slug = dict(COUNTY_FIPS_TO_SLUG)
+    try:
+        with session.begin_nested():
+            rows = session.execute(text(_LINKABLE_COUNTIES_SQL)).mappings().all()
+    except SQLAlchemyError:
+        logger.exception("PropertyRadar linkable-county lookup failed; linking the configured counties only")
+        return fips_to_slug
+    for row in rows:
+        fips_to_slug.setdefault(_full_fips(row["fips"]), row["county_id"])
+    return fips_to_slug
+
+
 def link_unlinked(session: Session, *, batch_size: int = 500) -> dict[str, int]:
     """Link unlinked records in loaded counties. Returns counts per outcome."""
     counts = {LINKED: 0, NO_MATCH: 0, COUNTY_MISMATCH: 0}
-    fips_to_slug = dict(COUNTY_FIPS_TO_SLUG)
+    fips_to_slug = linkable_counties(session)
+    logger.info("PropertyRadar linking %d county FIPS code(s): %s", len(fips_to_slug), ", ".join(sorted(fips_to_slug)))
     if not fips_to_slug:
         return counts
 

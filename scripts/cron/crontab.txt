@@ -1194,12 +1194,18 @@ COUNTY_ID=hillsborough
 # The flag also moves the maturity window's near edge from 240 to 198 days (5.5-month trigger); right after
 # switching it on, pull the loans between the two edges once by hand:
 #   python -m src.tasks.property_radar_runner --apply --mode backlog --state FL --campaign maturity_target_lender --gap-from-days 240
-# Only campaigns the live trace covers (CAMPAIGN_OPPORTUNITY_TYPES) are scheduled: private_maturity and
-# investor_portfolio records would be bought but never traced. No cash_purchase line: Florida cash buyers
-# come from the calling lists (lending.pr_list_records). Georgia cash purchases are not pulled yet.
+# Only campaigns the live trace covers are scheduled: maturity_target_lender (traced for the FA Max handoff) and
+# cash_purchase / investor_portfolio (traced for the dialer only, DIALER_TRACE_CAMPAIGNS; the bridge stages them
+# for Transaction ready). private_maturity records would be bought but never traced, so it has no line.
+# Run each new campaign's backlog by hand once before its first scheduled night, e.g.:
+#   python -m src.tasks.property_radar_runner --apply --mode backlog --state GA --campaign cash_purchase
 # run.sh never retries this module: a retry after a purchase began would buy the window again.
 10 2 * * * flock /tmp/property_radar_runner.lock $PROJECT/scripts/cron/run.sh src.tasks.property_radar_runner --apply --cron --mode daily --state FL --campaign maturity_target_lender
 17 2 * * * flock /tmp/property_radar_runner.lock $PROJECT/scripts/cron/run.sh src.tasks.property_radar_runner --apply --cron --mode daily --state GA --campaign maturity_target_lender
+24 2 * * * flock /tmp/property_radar_runner.lock $PROJECT/scripts/cron/run.sh src.tasks.property_radar_runner --apply --cron --mode daily --state FL --campaign cash_purchase
+31 2 * * * flock /tmp/property_radar_runner.lock $PROJECT/scripts/cron/run.sh src.tasks.property_radar_runner --apply --cron --mode daily --state GA --campaign cash_purchase
+38 2 * * * flock /tmp/property_radar_runner.lock $PROJECT/scripts/cron/run.sh src.tasks.property_radar_runner --apply --cron --mode daily --state FL --campaign investor_portfolio
+45 2 * * * flock /tmp/property_radar_runner.lock $PROJECT/scripts/cron/run.sh src.tasks.property_radar_runner --apply --cron --mode daily --state GA --campaign investor_portfolio
 
 # PropertyRadar -> calling pool bridge: stage property_radar_records (+ traced phones) as the pr_maturity
 # pool the dialer reads. No credit spend (reads existing traces only). --if-enabled: does nothing while
@@ -1207,7 +1213,8 @@ COUNTY_ID=hillsborough
 # runner's lock so it never stages a pull that is still running.
 0 3 * * * flock /tmp/property_radar_runner.lock $PROJECT/scripts/cron/run.sh src.tasks.lending_pr_maturity_bridge --apply --if-enabled
 
-# PropertyRadar morning BatchDialer load: the pr_maturity records the bridge staged overnight, at 09:xx ET (two UTC
+# PropertyRadar morning BatchDialer load: the pr_maturity records the bridge staged overnight (loans coming due,
+# cash purchases, investor-owned portfolios), at 09:xx ET (two UTC
 # lines cover daylight saving; only the one landing in 09:xx ET acts). Only phones not already loaded; the dialer
 # load's own gates apply. Do-not-call credits capped per ET day (LENDING_PR_DIALER_AUTOLOAD_MAX_SCRUB_CREDITS, counted
 # across retries). The GHL load sync (*/5) pushes the loads to GHL. Idle until LENDING_PR_DIALER_AUTOLOAD_ENABLED=true.
