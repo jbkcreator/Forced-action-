@@ -25,6 +25,9 @@ docker compose logs -f lifecycle
 # Run a single scraper
 python -m src.scrappers.foreclosures.foreclosure_engine
 
+# Daily Florida real estate LLC CSV to Drive: the state's public SFTP daily filings file (doc/cor/yyyymmddc.txt) -> active FL LLCs filed in the last 30 days named REI/Homes/Investments/Capital (src/scrappers/sunbiz/daily_filings.py, config/sunbiz_re_llc.py) -> Drive LENDING_SUNBIZ_LLC_EXPORT_FOLDER_ID/{date}/ via the lending Drive service account (cron 11:00 UTC + 13:30 UTC --retry, flock; also catches up 3 days a late file missed; off until SUNBIZ_RE_LLC_EXPORT_ENABLED; needs SUNBIZ_SFTP_USERNAME/PASSWORD; paramiko; docs/sunbiz-re-llc-export.md)
+python -m src.tasks.sunbiz_re_llc_export [--day YYYY-MM-DD] [--dry-run] [--retry]
+
 # Rescore all properties
 python -m src.services.cds_engine --rescore-all
 
