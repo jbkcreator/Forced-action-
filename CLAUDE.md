@@ -112,6 +112,9 @@ python -m src.lending.ghl_call_gate [--dry-run | --clear]  # G5 (cron every minu
 python -m src.lending.ghl_list_scrub [--dry-run]  # D1/D4 (cron hourly, off until LENDING_GHL_LIST_SCRUB_ENABLED=true): Tracerfy scrub of listed non-LendingFlow numbers with no scrub or one 6+ days old, capped by LENDING_GHL_LIST_SCRUB_MAX_CREDITS
 # PropertyRadar daily target-lender maturity pull (separate cron, disabled until PROPERTY_RADAR_ENABLED=true — see scripts/cron/crontab.txt)
 python -m src.tasks.property_radar_maturity_pull --mode daily --state FL
+# PropertyRadar nightly runner lines (FL + GA): maturity_target_lender (traced for the FA Max handoff) and cash_purchase / investor_portfolio (traced for the dialer only, config/property_radar_handoff.DIALER_TRACE_CAMPAIGNS; bridge stages them as list_2 / investor_portfolio_propertyradar -> Transaction ready). Linking covers every county with a FIPS code and FA parcels (src/services/property_radar/linking.linkable_counties)
+python -m src.tasks.lending_pr_dialer_autoload [--apply]  # 09:xx and 12:xx ET (cron 13,14,16,17:05 UTC; 12:xx loads numbers whose 8am local had not come): loads the pr_maturity records the bridge staged (loans coming due, cash purchases, investor portfolios) into BatchDialer, phones not already loaded only, dialer-load gates apply (free ones before a DNC credit is spent; a failed DNC check fails the run); Tracerfy DNC credits capped per ET day (LENDING_PR_DIALER_AUTOLOAD_MAX_SCRUB_CREDITS, counted across retries in data/pr_dialer_autoload/); GHL follows via ghl_load_sync; off until LENDING_PR_DIALER_AUTOLOAD_ENABLED
+PYTHONPATH=. python migrations/apply_enrichment_usage_trace_type.py  # enrichment_usage_logs.trace_type (the PropertyRadar trace code already writes it) (idempotent, RUN BEFORE the first live trace)
 
 # FA Max agent worker (separate process, WP-T2-2 — see docs/PLATFORM-OPERATIONS-GUIDE.md)
 python -m src.agents.fa_max.worker

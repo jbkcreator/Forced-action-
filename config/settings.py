@@ -1070,6 +1070,11 @@ class AppSettings(BaseSettings):
 	lending_ghl_call_gate_enabled: bool = Field(default=False, env="LENDING_GHL_CALL_GATE_ENABLED")
 	# BatchDialer load -> GHL contact sync (src/lending/ghl_load_sync.py): every active dialer load pushed to GHL as a cold contact
 	lending_ghl_load_sync_enabled: bool = Field(default=False, env="LENDING_GHL_LOAD_SYNC_ENABLED")
+	# Morning BatchDialer load of the PropertyRadar pool the bridge stages (src/tasks/lending_pr_dialer_autoload.py,
+	# 09:xx and 12:xx ET): only phones not already loaded. The cap is Tracerfy do-not-call credits per ET day (a phone with a
+	# fresh check costs nothing); 0 = only phones already checked are loaded
+	lending_pr_dialer_autoload_enabled: bool = Field(default=False, env="LENDING_PR_DIALER_AUTOLOAD_ENABLED")
+	lending_pr_dialer_autoload_max_scrub_credits: int = Field(default=0, env="LENDING_PR_DIALER_AUTOLOAD_MAX_SCRUB_CREDITS")
 	# DNC scrub of numbers on Josh's GHL call lists (src/lending/ghl_list_scrub.py): website and cold leads, never LendingFlow
 	lending_ghl_list_scrub_enabled: bool = Field(default=False, env="LENDING_GHL_LIST_SCRUB_ENABLED")
 	lending_ghl_list_scrub_max_credits: int = Field(default=100, env="LENDING_GHL_LIST_SCRUB_MAX_CREDITS")  # hard Tracerfy credit cap per hourly run (1 credit per number)

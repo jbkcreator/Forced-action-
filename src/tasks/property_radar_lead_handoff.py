@@ -23,7 +23,9 @@ from __future__ import annotations
 
 import argparse
 import logging
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Optional
 
 from sqlalchemy import text
 
@@ -116,6 +118,85 @@ def _live_trace(session, campaign: str, *, thin_path_only: bool) -> dict[str, Le
                 outcome.submitted, outcome.skipped_already_traced, outcome.skipped_unkeyable,
                 outcome.skipped_cap, outcome.skipped_no_result)
     return {**_stored_contacts(session, [lead.radar_id for lead in leads]), **outcome.contacts}
+
+
+@dataclass(frozen=True)
+class DialerLead:
+    """A staged dialer-only record to trace. ``property_address``/``city``/``state``/``zip`` hold the address the
+    trace is sent to (the owner's mailing address, else the property), the names trace_staged_leads reads;
+    ``property_state`` is where the property is, which decides the Georgia rule."""
+
+    radar_id: str
+    status: str
+    property_state: Optional[str]
+    ownership_type: Optional[str]
+    owner_name: Optional[str]
+    principal_name: Optional[str]
+    property_address: Optional[str]
+    city: Optional[str]
+    state: Optional[str]
+    zip: Optional[str]
+
+
+# These owners mostly do not live at the property (not owner-occupied): the calling-list trace found ~62% at the
+# mailing address against ~7% at the property. A record whose contacts are already stored is not traced again.
+_DIALER_LEADS_SQL = text("""
+    SELECT r.radar_id, r.status, r.state AS property_state, r.ownership_type, r.owner_name, r.principal_name,
+           coalesce(nullif(r.mailing_address, ''), r.property_address) AS property_address,
+           CASE WHEN nullif(r.mailing_address, '') IS NULL THEN r.city ELSE r.mailing_city END AS city,
+           CASE WHEN nullif(r.mailing_address, '') IS NULL THEN r.state ELSE r.mailing_state END AS state,
+           CASE WHEN nullif(r.mailing_address, '') IS NULL THEN r.zip ELSE r.mailing_zip END AS zip
+      FROM property_radar_records r
+     WHERE r.campaign = :campaign
+       AND NOT EXISTS (SELECT 1 FROM property_radar_traced_contacts t WHERE t.radar_id = r.radar_id)
+     ORDER BY r.id
+""")
+
+
+def dialer_trace_eligible(lead: DialerLead) -> bool:
+    """A staged dialer-only lead worth paying Tracerfy for: still active, and not a Georgia owner who may not be
+    cold-called (natural persons; the dialer load would block them after the trace was paid for). Classified
+    exactly as the calling-pool bridge stages it (PropertyRadar's ownership type and the owner name)."""
+    from config.lending_compliance import GEORGIA_ALLOWED_ENTITY_TYPES
+    from src.lending.pr_maturity_bridge import map_entity_status
+
+    if lead.status != "active":
+        return False
+    if (lead.property_state or "").strip().upper() == "GA":
+        return map_entity_status(lead.ownership_type, lead.owner_name) in GEORGIA_ALLOWED_ENTITY_TYPES
+    return True
+
+
+def _dialer_trace(session, campaign: str) -> dict[str, LeadContacts]:
+    """Trace a dialer-only campaign (config/property_radar_handoff.DIALER_TRACE_CAMPAIGNS): the same live trace,
+    ledger and spend cap as ``_live_trace``, but no FA Max handoff follows, so the FA Max screening (handed-off
+    leads, Backflip feed) does not apply; the dialer load runs its own gates. Contacts land in
+    property_radar_traced_contacts, where the calling-pool bridge picks them up. Returns the contacts traced by
+    this run."""
+    settings = get_settings()
+    if not settings.property_radar_enabled:
+        raise RuntimeError("the dialer trace needs PROPERTY_RADAR_ENABLED=true")
+    if session.execute(text("SELECT to_regclass('property_radar_traced_contacts')")).scalar() is None:
+        raise RuntimeError("property_radar_traced_contacts is missing: run "
+                           "migrations/apply_property_radar_traced_contacts.py first")
+    all_leads = [DialerLead(**{**row, "radar_id": str(row["radar_id"])})
+                 for row in session.execute(_DIALER_LEADS_SQL, {"campaign": campaign}).mappings().all()]
+    leads = [lead for lead in all_leads if dialer_trace_eligible(lead)]
+    logger.info("PropertyRadar dialer trace %s: %d of %d untraced staged leads are eligible", campaign, len(leads),
+                len(all_leads))
+    keys = {trace_key(lead.property_address, lead.zip) for lead in leads}
+    outcome = trace_staged_leads(
+        leads,
+        ledger=already_traced(session, "tracerfy", keys),
+        submit=_tracerfy_submit,
+        write_ledger=lambda entries: _write_usage_ledger(session, entries),
+        write_contacts=lambda contacts: _write_traced_contacts(session, contacts),
+        cap=RunSpendCap(settings.skip_trace_max_run_cost_cents),
+    )
+    logger.info("PropertyRadar dialer trace %s: submitted=%d already_traced=%d unkeyable=%d capped=%d no_result=%d",
+                campaign, outcome.submitted, outcome.skipped_already_traced, outcome.skipped_unkeyable,
+                outcome.skipped_cap, outcome.skipped_no_result)
+    return outcome.contacts
 
 
 def run(
