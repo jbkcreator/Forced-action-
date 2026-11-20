@@ -46,10 +46,6 @@ def _brief_result(tool_name: str, result_json: str) -> str:
     if "error" in data:
         return f"error: {str(data['error'])[:60]}"
 
-    if tool_name == "query_db":
-        count = data.get("count", "?")
-        return f"{count} row(s) returned"
-
     if tool_name == "evaluate_deal":
         return data.get("status", "evaluated")
 
@@ -95,13 +91,7 @@ class StepTracker:
         icon = _TOOL_ICONS.get(tool_name, "⚙️")
         label = _TOOL_LABELS.get(tool_name, tool_name)
         with self._lock:
-            if tool_name == "query_db":
-                # Italic label on first line; SQL code snippet on its own line
-                # so Slack doesn't try to italicise a multiline block.
-                sql = str(tool_input.get("sql", ""))[:80].replace("\n", " ")
-                snippet = f"`{sql}…`" if len(sql) == 80 else f"`{sql}`"
-                self._current = f"{icon} _{label}…_\n> {snippet}"
-            elif tool_name == "search_opportunity":
+            if tool_name == "search_opportunity":
                 name = tool_input.get("name", "")[:40]
                 self._current = f"{icon} _{label}: *{name}*…_"
             elif tool_name == "evaluate_deal":
@@ -118,9 +108,11 @@ class StepTracker:
         label = _TOOL_LABELS.get(tool_name, tool_name)
         brief = _brief_result(tool_name, result_json)
         status_icon = "❌" if brief.startswith("error:") else "✅"
+        # Database steps show only the label: the SQL and its result stay out of Slack.
+        step = f"{icon} {label}" if tool_name == "query_db" else f"{icon} {label}: {brief}"
         with self._lock:
             self._current = None
-            self._steps.append(f"{status_icon} {icon} {label}: {brief}")
+            self._steps.append(f"{status_icon} {step}")
         self._push()
 
     def writing(self) -> None:
