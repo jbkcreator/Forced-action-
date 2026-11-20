@@ -253,6 +253,71 @@ def test_without_the_switch_there_is_no_wording_check():
     assert check(_auto_action()) is None and engine.writes == []
 
 
+# ── team decision Q18 at send time: a cold or partner message approved automatically while Q14 and Q19 were both on
+# goes back for approval if either is turned off before the relay sends it ─────────────────────────────────────────
+
+_FLAGS = ("lending_graduation_count_rejections", "lending_graduated_approved_wording_only")
+
+
+def _set_flags(monkeypatch, q14: bool, q19: bool) -> None:
+    from config.settings import get_settings
+
+    for name, value in zip(_FLAGS, (q14, q19)):
+        monkeypatch.setattr(get_settings(), name, value, raising=False)
+
+
+def _cold_email():
+    from dataclasses import replace
+    return replace(_auto_action(subject="Your loan"), channel="instantly_cold_email", tool_name="agent_job:send_email",
+                   recipient_phone=None, recipient_email="sarah@example.com")
+
+
+def _partner_text():
+    return _auto_action(partner_contact=True)
+
+
+# Send-check answers in order: not suppressed, then no email opt-out (cold email) or text consent (text), still graduated.
+@pytest.mark.parametrize("make_action, answers", [(_cold_email, (False, False, True)),
+                                                  (_partner_text, (False, True, True))])
+def test_a_cold_or_partner_message_approved_with_both_flags_on_still_sends_while_both_stay_on(
+        monkeypatch, make_action, answers):
+    _set_flags(monkeypatch, True, True)
+    engine = _Engine(*answers)
+    check = cora_agent.make_send_check(engine, carrier_approved=True, text_window=lambda p: True,
+                                       email_window=lambda p: True)
+    assert check(make_action()) is None and engine.writes == []
+
+
+@pytest.mark.parametrize("q14, q19", [(False, True), (True, False)])
+@pytest.mark.parametrize("make_action, answers", [(_cold_email, (False, False, True)),
+                                                  (_partner_text, (False, True, True))])
+def test_turning_off_either_flag_sends_a_queued_cold_or_partner_message_back_for_approval(
+        monkeypatch, make_action, answers, q14, q19):
+    _set_flags(monkeypatch, q14, q19)
+    engine = _Engine(*answers)
+    check = cora_agent.make_send_check(engine, carrier_approved=True, text_window=lambda p: True,
+                                       email_window=lambda p: True)
+    reason = check(make_action())
+    assert isinstance(reason, cora_agent.SendDeferred) and "back for approval" in reason
+    assert engine.writes == [{"action_id": 7, "auto_actor": "auto:graduated"}]
+
+
+def test_with_a_flag_off_an_automatic_message_that_is_not_cold_or_partner_still_sends(monkeypatch):
+    _set_flags(monkeypatch, False, False)
+    engine = _Engine(False, True, True)
+    check = cora_agent.make_send_check(engine, carrier_approved=True, text_window=lambda p: True)
+    assert check(_auto_action()) is None and engine.writes == []
+
+
+def test_with_a_flag_off_a_person_approved_cold_email_still_sends(monkeypatch):
+    from dataclasses import replace
+
+    _set_flags(monkeypatch, False, False)
+    engine = _Engine(False, False)
+    check = cora_agent.make_send_check(engine, email_window=lambda p: True)
+    assert check(replace(_cold_email(), decided_by="U_JOSH")) is None and engine.writes == []
+
+
 # ── review follow-ups ───────────────────────────────────────────────────────
 
 def test_a_failed_row_or_an_old_done_row_is_queued_again_by_a_new_opt_out_but_a_recent_one_is_not(queue_db):
