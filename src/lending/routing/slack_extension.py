@@ -7,7 +7,8 @@ back arrive here. Nothing is served over HTTP.
   * ``respond`` runs before Slack is acked, so a form's validation errors can ride in the ack.
   * ``handle`` runs after the ack: the ``/lenders`` command, and a click on Decline / Approved / Funded.
 
-P-1's ``/partners`` command and form (``src/lending/partner_slack.py``) ride on the same hook.
+P-1's ``/partners`` command and form (``src/lending/partner_slack.py``) ride on the same hook, and so do P3.3's Milo
+Confirm / Cancel clicks (``src/lending/milo/slack_card.py``).
 
 Anything that is not R-1's or P-1's is left alone (returns None / False), so Cora's own approval cards and chat keep
 working.
@@ -19,6 +20,7 @@ import threading
 from typing import Any, Callable, Optional
 
 from src.lending import partner_slack
+from src.lending.milo import slack_card as milo_card
 from src.lending.routing import slack_actions, slack_admin
 
 logger = logging.getLogger(__name__)
@@ -28,6 +30,16 @@ COMMAND = "/lenders"
 
 def _in_thread(fn: Callable[..., None], *args: Any) -> None:
     threading.Thread(target=fn, args=args, daemon=True, name="routing-slack").start()
+
+
+def _milo_click(payload: dict[str, Any], web_client: Any) -> None:
+    from src.lending.db import lending_session
+
+    try:
+        milo_card.handle_action(payload, web_client, approvers=slack_admin.allowed_user_ids(),
+                                submitter=milo_card.milo_submitter(), session_factory=lending_session)
+    except Exception as exc:  # class only: SQL errors embed bound parameters
+        logger.error("[routing-slack] Milo card click failed (%s)", type(exc).__name__)
 
 
 class RoutingSlack:
@@ -65,6 +77,9 @@ class RoutingSlack:
             return True
         if slack_actions.is_routing_action(payload):
             slack_actions.handle_action(payload, self._web)
+            return True
+        if milo_card.is_milo_action(payload):
+            self._later(_milo_click, payload, self._web)  # the Milo fill can take a while: never inside the ack
             return True
         return (slack_admin.is_routing_submission(payload) or slack_actions.is_decline_submission(payload)
                 or partner_slack.is_partner_submission(payload))  # answered in respond

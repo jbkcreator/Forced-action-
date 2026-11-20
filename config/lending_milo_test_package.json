@@ -1,0 +1,32 @@
+{
+  "package_ref": "TEST-CORA-P3.3-001",
+  "is_test": true,
+  "product": "fix_and_flip",
+  "entity_name": "TEST - Cora P3.3 Holdings LLC",
+  "address": {
+    "line1": "100 Test Street",
+    "line2": "",
+    "city": "Tampa",
+    "state": "FL",
+    "zip_code": "33602"
+  },
+  "property_type": "1_4_unit",
+  "refinance": false,
+  "purchase_price": 200000,
+  "rehab": 50000,
+  "arv": 350000,
+  "guarantors": [
+    {
+      "name": "TEST - Cora P3.3",
+      "fico": 720,
+      "owned_rentals": 2,
+      "fix_flip_exits_24m": 3,
+      "ground_up_exits_24m": 0,
+      "foreign_national": false
+    }
+  ],
+  "comps": null,
+  "deal_facts": {
+    "Note": "Test package for the Cora P3.3 Milo pre-fill proof. Not a real borrower."
+  }
+}

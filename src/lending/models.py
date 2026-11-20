@@ -1934,3 +1934,53 @@ class LendingAfterHoursConversation(LendingBase):
         Index("ix_after_hours_conversations_open", "updated_at",
               postgresql_where=text(f"state IN ({', '.join(repr(s) for s in CONVERSATION_OPEN_STATES)})")),
     )
+
+
+class LendingMiloSubmission(LendingBase):
+    """One Central Lending Milo application per loan package (P3.3).
+
+    Claimed (``pending``) before anything is sent, so a repeated Slack click or CLI run cannot create a
+    second application at Central; only ``--force`` re-sends a package that is ``submitted``.
+    ``application`` is the mapped Milo field set that was sent; ``milo_ref`` is Milo's loan id or URL.
+    """
+
+    __tablename__ = "milo_submissions"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    package_ref: Mapped[str] = mapped_column(String(80), nullable=False, unique=True)
+    status: Mapped[str] = mapped_column(String(20), nullable=False)
+    is_test: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default=text("false"))
+    application: Mapped[dict] = mapped_column(JSONB, nullable=False)
+    milo_ref: Mapped[Optional[str]] = mapped_column(String(300))
+    error: Mapped[Optional[str]] = mapped_column(String(300))
+    requested_by: Mapped[Optional[str]] = mapped_column(String(64))
+    attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=1, server_default=text("1"))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_now, server_default=text("now()"))
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_now, server_default=text("now()"))
+
+    __table_args__ = (
+        CheckConstraint("status IN ('pending', 'submitted', 'failed')", name="ck_lending_milo_submissions_status"),
+    )
+
+
+class LendingMiloCard(LendingBase):
+    """One Slack Confirm / Cancel card for a Milo application (P3.3). ``application`` is exactly what the card showed,
+    so Confirm sends that and nothing else. ``status``: open -> confirmed | cancelled; a confirm that sent nothing
+    (no filler connected, or the duplicate guard refused) leaves it open."""
+
+    __tablename__ = "milo_cards"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    package_ref: Mapped[str] = mapped_column(String(80), nullable=False)
+    application: Mapped[dict] = mapped_column(JSONB, nullable=False)
+    is_test: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default=text("false"))
+    channel: Mapped[Optional[str]] = mapped_column(String(32))
+    message_ts: Mapped[Optional[str]] = mapped_column(String(64))
+    status: Mapped[str] = mapped_column(String(16), nullable=False, default="open", server_default=text("'open'"))
+    decided_by: Mapped[Optional[str]] = mapped_column(String(64))
+    decided_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_now, server_default=text("now()"))
+
+    __table_args__ = (
+        CheckConstraint("status IN ('open', 'confirmed', 'cancelled')", name="ck_lending_milo_cards_status"),
+    )
