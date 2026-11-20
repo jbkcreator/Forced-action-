@@ -44,6 +44,9 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
     parser.add_argument("--staging-run-id", help="staging run to read (default: newest)")
     parser.add_argument("--live", action="store_true", help="load the dialer and commit (default: dry run)")
     parser.add_argument("--run-id", help="identifier for this run (default: timestamped)")
+    parser.add_argument("--allow-outside-call-window", action="store_true",
+                        help="load numbers outside calling hours (only that check is skipped); "
+                             "the campaign must not be dialed until calling hours")
     return parser.parse_args(argv)
 
 
@@ -81,7 +84,8 @@ def main(argv: list[str] | None = None) -> int:
             if args.live:
                 report = run_dialer_load(records, session, run_id=run_id, dry_run=False,
                                          scrubber=tracerfy_scrub, dialer=dialer,
-                                         commit=session.commit)
+                                         commit=session.commit,
+                                         allow_outside_call_window=args.allow_outside_call_window)
             else:
                 report = run_dialer_load(records, session, run_id=run_id, dry_run=True)
                 session.rollback()

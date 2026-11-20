@@ -1180,22 +1180,37 @@ COUNTY_ID=hillsborough
 # this job runs BEFORE the main scraper window so it does not compete for DB
 # write capacity. Adjust if ordering with a Dev 2 staging sweep is required.
 # Backlog run (one-time): invoke manually with --mode backlog.
-# Guard: job no-ops when PROPERTY_RADAR_ENABLED=false (default).
+# Guard: job no-ops when PROPERTY_RADAR_ENABLED=false (default), and when
+# PROPERTY_RADAR_STATEWIDE_ENABLED=true (the runner lines below take over).
 0 2 * * * $PROJECT/scripts/cron/run.sh src.tasks.property_radar_maturity_pull --mode daily --state FL
 
-# PropertyRadar runner — pull -> stage -> link -> handoff (Developer 4).
-# DISABLED: PropertyRadar monitoring is off until Josh turns it on. Uncomment to enable;
-# the runner also refuses --apply while PROPERTY_RADAR_ENABLED=false. An --apply run traces staged
-# records live through Tracerfy (ledger-gated, SKIP_TRACE_MAX_RUN_COST_CENTS cap); no CSV step.
-# 30 2 * * * $PROJECT/scripts/cron/run.sh src.tasks.property_radar_runner --apply --mode daily --state FL
+# PropertyRadar runner (Cora P3.1): pull -> stage -> link -> handoff, one line per state and campaign,
+# Florida and Georgia statewide. --cron: every line does nothing until PROPERTY_RADAR_STATEWIDE_ENABLED=true
+# (and the runner refuses --apply while PROPERTY_RADAR_ENABLED=false). The lines share one lock so two
+# billed pulls never overlap. Guards per pull: PROPERTY_RADAR_PER_RUN_CAP and PROPERTY_RADAR_MONTHLY_CAP
+# (a pull over either is refused, nothing bought). An --apply run traces staged records live through
+# Tracerfy (ledger-gated, SKIP_TRACE_MAX_RUN_COST_CENTS cap). A campaign's first run has no watermark and
+# takes the whole backlog window: run it by hand once (--mode backlog) before switching the flag on.
+# The flag also moves the maturity window's near edge from 240 to 198 days (5.5-month trigger); right after
+# switching it on, pull the loans between the two edges once by hand:
+#   python -m src.tasks.property_radar_runner --apply --mode backlog --state FL --campaign maturity_target_lender --gap-from-days 240
+# Only campaigns the live trace covers (CAMPAIGN_OPPORTUNITY_TYPES) are scheduled: private_maturity and
+# investor_portfolio records would be bought but never traced. No cash_purchase line: Florida cash buyers
+# come from the calling lists (lending.pr_list_records). Georgia cash purchases are not pulled yet.
+# run.sh never retries this module: a retry after a purchase began would buy the window again.
+10 2 * * * flock /tmp/property_radar_runner.lock $PROJECT/scripts/cron/run.sh src.tasks.property_radar_runner --apply --cron --mode daily --state FL --campaign maturity_target_lender
+17 2 * * * flock /tmp/property_radar_runner.lock $PROJECT/scripts/cron/run.sh src.tasks.property_radar_runner --apply --cron --mode daily --state GA --campaign maturity_target_lender
 
-# PropertyRadar -> calling pool bridge: stage property_radar_records (+ traced phones joined
-# by address+zip) as the pr_maturity pool the dialer reads. Runs after the 02:00 pull and any
-# trace, before the Monday dialer scrub/load. No credit spend (reads existing traces only);
-# phone-less rows are staged too so a later trace joins without a re-extract.
-# DISABLED until Josh turns PropertyRadar on — enable alongside the pull/runner above.
-# Dry check first: PYTHONPATH=. python -m src.tasks.lending_pr_maturity_bridge
-# 0 3 * * * $PROJECT/scripts/cron/run.sh src.tasks.lending_pr_maturity_bridge --apply
+# PropertyRadar -> calling pool bridge: stage property_radar_records (+ traced phones) as the pr_maturity
+# pool the dialer reads. No credit spend (reads existing traces only). --if-enabled: does nothing while
+# PROPERTY_RADAR_STATEWIDE_ENABLED=false. Only campaigns with a dialer source list are staged. Shares the
+# runner's lock so it never stages a pull that is still running.
+0 3 * * * flock /tmp/property_radar_runner.lock $PROJECT/scripts/cron/run.sh src.tasks.lending_pr_maturity_bridge --apply --if-enabled
+
+# Daily FA export (Cora P3.1): yesterday's (ET) PropertyRadar leads (loans coming due, cash purchases,
+# investor-owned portfolios) as one CSV in Drive "FA Exports" and as GHL contacts tagged NDL.
+# Off until LENDING_FA_EXPORT_ENABLED=true + LENDING_FA_EXPORT_FOLDER_ID; GHL push LENDING_FA_EXPORT_GHL_ENABLED.
+30 9 * * * $PROJECT/scripts/cron/run.sh src.tasks.lending_fa_export
 
 # Lending call dispositions — retry Google Sheet / Slack #dial-tasks delivery for
 # calls whose first delivery failed or whose result was changed by the caller.
@@ -1207,6 +1222,10 @@ COUNTY_ID=hillsborough
 # Lending LendingFlow intake (T-11) — retry GHL delivery of leads not yet in GoHighLevel, then emit the
 # LendingFlowLeadCreated event + pre-qual hand-off. No-op while LENDING_LENDINGFLOW_ENABLED=false.
 */5 * * * * $PROJECT/scripts/cron/run.sh src.tasks.lending_lendingflow_sweep
+# Lending P2.1 speed-to-lead call queue — every minute: release one queued lead (fresh first, then oldest) inside
+# the callers' hours after re-checking every rule, expire leads queued 72 h, post the morning summary / backlog
+# alert. No-op while LENDING_SPEED_TO_LEAD_ENABLED=false.
+* * * * * $PROJECT/scripts/cron/run.sh src.tasks.lending_speed_to_lead_queue
 */5 * * * * $PROJECT/scripts/cron/run.sh src.tasks.lending_partner_sweep
 # Lending test traffic (Q35, Q42) — tag new rows from test email domains and test partners is_test and log each
 # one in lending.test_data_cleanup_log, so reports, the audience export and seat caps leave them out.
@@ -1255,7 +1274,8 @@ COUNTY_ID=hillsborough
 0 5 * * * flock /tmp/lending_ledger_export.lock $PROJECT/scripts/cron/run.sh src.tasks.lending_ledger_export
 55 5 * * * flock -w 3000 /tmp/lending_ledger_export.lock $PROJECT/scripts/cron/run.sh src.tasks.lending_ledger_export --retry || $PROJECT/scripts/cron/run.sh src.tasks.lending_ledger_export --alert-stalled
 
-# Lending 7:20pm ET scoreboard to Slack (Part 5.6; dialer stops 7:15pm). Two lines because ET is UTC-4 until Nov 1 and UTC-5 after; the task posts only when it is 19:xx ET.
+# Lending 7:20pm ET scoreboard to Slack (Part 5.6; dialer stops 7:15pm), also on zero-dial days, with the pipeline; its
+# numbers go to Drive NDL Ledger Exports/{date}/scoreboard.csv first when LENDING_SCOREBOARD_EXPORT_ENABLED (P2.5). Two lines because ET is UTC-4 until Nov 1 and UTC-5 after; the task posts only when it is 19:xx ET.
 20 23 * * * $PROJECT/scripts/cron/run.sh src.tasks.lending_daily_scoreboard
 20 0 * * * $PROJECT/scripts/cron/run.sh src.tasks.lending_daily_scoreboard
 # David's end-of-day activity + flagged leads to LENDING_DAVID_CHANNEL (#isa-daily), after the 7:20pm board. Same two-line DST pattern; posts only at 19:xx ET.

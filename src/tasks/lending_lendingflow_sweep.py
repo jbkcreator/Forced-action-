@@ -26,6 +26,8 @@ from config.lending_lendingflow import GHL_ALERT_AFTER_MINUTES, GHL_GIVE_UP_AFTE
 from config.settings import get_settings
 from src.lending.slack_channels import BOT_TOKEN, report_unset
 from src.lending import bd_result_to_ghl, ghl_result_to_bd, lendingflow_dialer, lendingflow_events
+from config.lending_speed_to_lead import SOURCE_LENDINGFLOW
+from src.lending import speed_to_lead
 from src.lending.db import lending_session
 from src.lending.lead_arrival_alert import alert_josh
 from src.lending.disposition_delivery import _configured_slack, _slack_client
@@ -98,7 +100,7 @@ def run() -> int:
     if not get_settings().lending_lendingflow_enabled:
         return 0
     sink = get_live_sink()
-    delivered = deliver_and_follow_up(sink)
+    delivered = deliver_and_follow_up(sink, after_delivery=speed_to_lead.live_step(SOURCE_LENDINGFLOW))
     released = release_held_and_commit(sink)
     logger.info("[lendingflow] sweep delivered=%d intro_released=%d", delivered, released)
     alert_undelivered()

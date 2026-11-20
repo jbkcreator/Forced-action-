@@ -6,6 +6,8 @@ Run: gunicorn src.lending.api:app -k uvicorn.workers.UvicornWorker --bind 127.0.
 Deliberately does not import src.api.main, so a lending deploy or crash never touches fa-api. A new
 lending router is mounted here, never in src/api/main.py.
 """
+import logging
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
@@ -14,6 +16,7 @@ from src.api.lending_ghl_router import router as lending_ghl_router
 from src.lending.booking_webhook import router as lending_booking_webhook_router
 from src.lending.reply_webhook import router as lending_reply_webhook_router
 from src.lending.instantly_webhook import router as lending_instantly_webhook_router
+from src.api.lending_email_unsubscribe_router import router as lending_email_unsubscribe_router
 from src.lending.soft_approval_webhook import router as lending_soft_approval_router
 from src.api.lending_web_router import router as lending_web_router
 from src.lending.lendingflow_webhook import router as lending_lendingflow_router
@@ -22,8 +25,13 @@ from src.lending.lead_arrival_alert import alert_josh
 from src.lending.enrichment.service import on_lead_created as enrich_on_lead_created
 from src.lending.enrichment.webhook import router as lending_enrichment_router
 from src.api.lending_partner_router import router as lending_partner_router
+from src.api.lending_doc_upload_router import UploadTokenLogFilter, router as lending_doc_upload_router
+from src.api.lending_instant_quote_router import router as lending_instant_quote_router
 
 app = FastAPI(title="Lending API", docs_url=None, redoc_url=None)
+# Borrower upload links carry their token in the path: the access logs record it redacted.
+for _access_logger in ("uvicorn.access", "gunicorn.access"):
+    logging.getLogger(_access_logger).addFilter(UploadTokenLogFilter())
 # The website form posts cross-origin when the site is served from another host; the allowed
 # origins are the same WL_ALLOWED_ORIGINS fa-api reads. Server-to-server webhooks ignore CORS.
 app.add_middleware(
@@ -36,6 +44,7 @@ app.include_router(lending_ghl_router)
 app.include_router(lending_booking_webhook_router)
 app.include_router(lending_reply_webhook_router)
 app.include_router(lending_instantly_webhook_router)
+app.include_router(lending_email_unsubscribe_router)
 app.include_router(lending_soft_approval_router)
 app.include_router(lending_web_router)
 app.include_router(lending_lendingflow_router)
@@ -45,6 +54,8 @@ lendingflow_events.subscribe(enrich_on_lead_created)
 # T-05: alert Josh's phone (Slack @-mention) the moment a LendingFlow lead arrives.
 lendingflow_events.subscribe(alert_josh)
 app.include_router(lending_partner_router)
+app.include_router(lending_doc_upload_router)
+app.include_router(lending_instant_quote_router)
 
 
 @app.get("/health")

@@ -1,11 +1,16 @@
 """P1.4 Standing Sends Tracker: when an agent message type (template version) graduates to standing auto-send.
 
 Brief P1.4: "Automatically graduate a message type to standing auto-send after 25 approvals with under 10% edits."
-Read literally (client decision, Nov 12): only approvals count toward the 25, the edit rate is edited approvals over
-approvals, and a rejection neither helps nor blocks graduation (it is shown on the tracker). Graduation happens on its
-own, with no confirm step; it can be revoked with ``python -m src.lending.standing_sends --revoke``.
+Read literally (team decision, Nov 12): only approvals count toward the 25, the edit rate is edited approvals over
+approvals, and a rejection neither helps nor blocks graduation (it is shown on the tracker). With
+``LENDING_GRADUATION_COUNT_REJECTIONS=true`` (the team's recommendation for open question P1.4 #1, off until Josh
+confirms) a rejection counts against it: (edited + rejected) / (approved + rejected) must be under the limit.
+Graduation happens on its own, with no confirm step; it can be revoked with ``python -m src.lending.standing_sends
+--revoke``.
 """
 from __future__ import annotations
+
+from config.lending_closing import TEMPLATES as _DOC_CHASE_TEMPLATES
 
 GRADUATION_MIN_APPROVALS = 25
 GRADUATION_MAX_EDIT_RATE = 0.10  # strictly under: 10% edited does not graduate
@@ -27,4 +32,7 @@ MORNING_CARD_LIMIT = 10
 CORA_SMS_TEMPLATE = "CORA-SMS-v1"
 CORA_EMAIL_TEMPLATE = "CORA-EMAIL-v1"
 INSTANTLY_REPLY_TEMPLATE = "INSTANTLY-REPLY-v1"
-APPROVAL_ONLY_TEMPLATES = frozenset({CORA_SMS_TEMPLATE, CORA_EMAIL_TEMPLATE, INSTANTLY_REPLY_TEMPLATE})
+# P2.4 document request and Day 2/5/8 chase drafts: each waits for Josh's Approve tap (13 Nov report); nothing sends
+# them automatically, so they never graduate.
+DOC_CHASE_TEMPLATES = frozenset(v for t in _DOC_CHASE_TEMPLATES.values() for v in (t.version_sms, t.version_email))
+APPROVAL_ONLY_TEMPLATES = frozenset({CORA_SMS_TEMPLATE, CORA_EMAIL_TEMPLATE, INSTANTLY_REPLY_TEMPLATE}) | DOC_CHASE_TEMPLATES

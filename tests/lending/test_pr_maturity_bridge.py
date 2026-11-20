@@ -9,7 +9,7 @@ from src.lending.pr_maturity_bridge import (
     POOL_NAME,
     SOURCE_TABLE,
     _compose_address,
-    _first_phone,
+    first_phone,
     _phones_in_other_pools,
     _pick_phone,
     _to_decimal,
@@ -64,8 +64,8 @@ class TestHelpers:
         assert _to_decimal("oops") is None
 
     def test_first_phone_normalizes_and_skips_junk(self):
-        assert _first_phone(["not-a-number", "(813) 555-0142"]) == "+18135550142"
-        assert _first_phone([]) is None
+        assert first_phone(["not-a-number", "(813) 555-0142"]) == "+18135550142"
+        assert first_phone([]) is None
 
 
 class TestBuildPoolRow:
@@ -152,7 +152,7 @@ class TestRunSelection:
         record = TestBuildPoolRow()._record()
         monkeypatch.setattr(bridge, "latest_run_id", lambda session: latest)
         monkeypatch.setattr(bridge, "_iter_record_pages", lambda session, state: iter([[record]]))
-        monkeypatch.setattr(bridge, "_load_trace_contacts", lambda session, keys: {})
+        monkeypatch.setattr(bridge, "load_trace_contacts", lambda session, keys: {})
         monkeypatch.setattr(bridge, "_phones_in_other_pools", lambda session, run_id, state=None: set())
         monkeypatch.setattr(bridge, "_clear_previous_rows",
                             lambda session, run_id, state: calls["cleared"].append(run_id))
@@ -177,7 +177,7 @@ class TestRunSelection:
         r1, r2 = TestBuildPoolRow()._record(radar_id="R1"), TestBuildPoolRow()._record(radar_id="R2")
         monkeypatch.setattr(bridge, "_iter_record_pages", lambda session, state: iter([[r1], [r2]]))
         shared = {"phones": ["8135550142"], "emails": []}
-        monkeypatch.setattr(bridge, "_load_trace_contacts",
+        monkeypatch.setattr(bridge, "load_trace_contacts",
                             lambda session, keys: {k: shared for k in keys})
         bridge.extract_pr_maturity_pool(session=None, dry_run=False)
         assert [r["phone_available"] for r in calls["written"]] == [True, False]
@@ -200,11 +200,11 @@ def test_traced_contacts_are_read_from_the_table_the_live_trace_writes_by_radar_
         {"radar_id": "R1", "phones": ["8135550111"], "emails": ["a@b.co"]},
         {"radar_id": "R2", "phones": None, "emails": None},
     ]
-    got = bridge._load_trace_contacts(session, ["R1", "R2"])
+    got = bridge.load_trace_contacts(session, ["R1", "R2"])
     sql = str(session.execute.call_args.args[0])
     assert "property_radar_traced_contacts" in sql and "radar_id" in sql and "trace_key" not in sql
     assert got == {"R1": {"phones": ["8135550111"], "emails": ["a@b.co"]}, "R2": {"phones": [], "emails": []}}
-    assert bridge._load_trace_contacts(session, []) == {}
+    assert bridge.load_trace_contacts(session, []) == {}
 
 
 class TestPickPhone:
@@ -251,3 +251,19 @@ def test_state_scoped_run_also_reserves_other_states_of_our_pool():
     session = _PhoneSession([])
     _phones_in_other_pools(session, "run-1", "fl")
     assert session.params == {"run_id": "run-1", "pool": "pr_maturity", "state": "FL"}
+
+
+def test_bridge_reads_only_campaigns_with_a_dialer_list():
+    from unittest.mock import MagicMock
+
+    from src.lending import pr_maturity_bridge as bridge
+
+    seen = []
+
+    class _Session:
+        def execute(self, sql, params):
+            seen.append(params)
+            return MagicMock(**{"mappings.return_value.all.return_value": []})
+
+    assert list(bridge._iter_record_pages(_Session(), state=None)) == []
+    assert set(seen[0]["dialed"]) == {"maturity_target_lender", "private_maturity", "stalled_flip", "auction_winner"}

@@ -30,6 +30,7 @@ from sqlalchemy.engine import Engine
 from sqlalchemy.orm import Session
 
 from config.lending_agent_jobs import COLD_EMAIL_CHANNEL
+from config.lending_standing_sends import AUTO_GRADUATED_ACTOR
 from config.lending_compliance import CALL_WINDOW_END, CALL_WINDOW_START, DEFAULT_TZ
 from config.settings import AppSettings, get_settings
 from packages.agent_core.agent_loop import AgentLoop, MessagesClient
@@ -40,16 +41,26 @@ from packages.agent_core.memory import AgentMemory
 from packages.agent_core.pending_actions import PendingAction, PendingActionQueue
 from packages.agent_core.relay import EgressExecutor, Relay, SendCheck, SendDeferred
 from packages.agent_core.revision import DraftReviser, RevisionFailed
-from packages.agent_core.send_gate import SendGate
+from packages.agent_core.send_gate import SendGate, lane_checked_enqueue
 from packages.agent_core.slack_session import InboundMessage, SlackSession, run_socket_mode
 from packages.agent_core.store import AgentStore
 from packages.agent_core.thread_history import build_history
 from packages.agent_core.tools import ToolContext, ToolRegistry
 from src.lending.agent_jobs.drive import google_job_folders
-from src.lending.agent_jobs.worker import JobQueueWorker, make_check
+from src.lending.agent_jobs.worker import JobQueueWorker, make_check, may_send_without_card
 from src.lending.attempt_log import lending_ghl_readers
 from src.lending.compliance import text_window_open
+from src.lending.closing.blockers import (
+    card_day,
+    claim_card_day,
+    post_blocker_card,
+    record_post,
+    release_card_day,
+)
+from src.lending.closing.doc_chase import chase_id_of, run_chase_sweep
+from src.lending.closing.doc_copies import DriveCopyStep, live_copier
 from src.lending.consent import has_text_consent
+from src.lending.backflip_alerts import raise_backflip_blocks
 from src.lending.cora_channels import ChannelDirectory
 from src.lending.cora_inbox import format_inbox_context, items_on_post, surface_new_items
 from src.lending.cora_prompt import CORA_BASE_PROMPT, REVISION_PROMPT
@@ -58,14 +69,20 @@ from src.lending.global_halt import EmergencyHalt
 from src.lending.ghl_crm import GhlCrmWriter, get_crm_writer
 from src.lending.ghl_email import GhlEmailSender, get_email_sender
 from src.lending.ghl_sms import GhlSmsSender, get_sender
+from src.lending.instantly_blocklist import BlockListSweep
+from src.lending.instantly_ghl_handoff import get_handoff
 from src.lending.instantly_client import InstantlyAccount, block_address, lending_instantly_account, send_reply
 from src.lending.instantly_email import NdlInstantlySender, get_ndl_instantly_sender
+from src.lending.after_hours_responder import run_send_cycle
 from src.lending.instantly_replies import CHANNEL as INSTANTLY_CHANNEL, ReplyProcessor
 from src.lending.standing_sends import (
     StandingSendsStep,
     auto_approval_lapsed,
     make_edit_recorder,
     make_is_graduated,
+    label_names,
+    make_wording_ok,
+    return_for_approval,
 )
 from src.lending.ops_alerts import post_ops_notice, post_replies_notice
 from src.lending.cora_morning_digest import post_morning_digest
@@ -102,6 +119,7 @@ _SUPPRESSED = text("""
 """)
 # An Instantly answer also honours FA's email opt-outs (an unsubscribe Instantly reported to FA's webhook reaches the
 # lending list only on the opt-out poller's next pass).
+_CHASE_OPEN = text("SELECT EXISTS (SELECT 1 FROM lending.doc_chases WHERE id = :id AND status = 'open')")
 _EMAIL_OPTED_OUT = text("SELECT EXISTS (SELECT 1 FROM email_opt_outs WHERE lower(email) = :e)")
 
 _MODEL_UNAVAILABLE = "I couldn't reach my language model just now. Nothing was sent; please try again in a minute."
@@ -118,6 +136,11 @@ class CoraServices(NamedTuple):
     queue: Optional[PendingActionQueue] = None  # the drafts table the session, gate and relay share
     agent_jobs: Optional[Callable[[], Any]] = None  # P1.1: one pass of the Drive job queue worker
     standing_sends: Optional[Callable[[], Any]] = None  # P1.4: graduates templates that meet the rule
+    after_hours_responder: Optional[Callable[[], Any]] = None  # sends the night responder's due messages
+    closing_blockers: Optional[Callable[[], bool]] = None  # P2.4: the 7 AM stuck-deal card; True when posted
+    doc_chase: Optional[Callable[[], int]] = None  # P2.4: queues due document requests and reminders
+    block_list: Optional[Callable[[], Any]] = None  # P1.3: sends queued opt-out addresses to Instantly's block list
+    backflip_alerts: Optional[Callable[[], int]] = None  # queues each new Backflip block for the inbox digest
 
 
 def lending_channel_ids(settings: AppSettings) -> dict[str, str]:
@@ -150,6 +173,16 @@ def make_inbox_digest(engine: Engine, chat: ChatPort, channel: str,
             return surface_new_items(db, chat, channel=channel, channel_ids=channel_ids)
 
     return digest
+
+
+def make_backflip_alerts(engine: Engine) -> Callable[[], int]:
+    """One sweep's Backflip block alerts, committed on their own so a failure never touches the digest."""
+
+    def alerts() -> int:
+        with Session(engine) as db, db.begin():
+            return raise_backflip_blocks(db)
+
+    return alerts
 
 
 def make_inbox_context(engine: Engine) -> Callable[[str, str], str]:
@@ -196,31 +229,50 @@ def email_window_open(phone: Optional[str], *, now: Optional[datetime] = None) -
 
 def make_send_check(engine: Engine, *, carrier_approved: bool = False,
                     text_window: Callable[[str], bool] = text_window_open,
-                    email_window: Callable[[Optional[str]], bool] = email_window_open) -> SendCheck:
+                    email_window: Callable[[Optional[str]], bool] = email_window_open,
+                    wording_ok: Optional[Callable[..., bool]] = None) -> SendCheck:
     """Lending rule run by the relay right before a send. Returns a reason to block, or None.
 
     A text also waits for the carrier (10DLC) approval (LENDING_SMS_CARRIER_APPROVED) and for the borrower's
     8am-8pm window, and an email (GHL or Instantly) for the recipient's 8am-8pm window: these are deferrals, so an
     approved send stays approved and goes on a later sweep once they hold, or is blocked when the draft expires. An
     action approved automatically (P1.4 graduation) whose template has since been revoked is held too, and the next
-    sweep sends it back for a person's approval."""
+    sweep sends it back for a person's approval. An automatically approved cold email or partner message goes back for
+    approval at once while LENDING_GRADUATION_COUNT_REJECTIONS (Q14) or LENDING_GRADUATED_APPROVED_WORDING_ONLY (Q19)
+    is off (team decision Q18), so one queued while both were on cannot send after either is turned off. With
+    ``wording_ok`` (LENDING_GRADUATED_APPROVED_WORDING_ONLY) an
+    automatically approved action is re-checked against the approved wording too, so one queued before the switch was
+    turned on cannot send wording nobody approved: it goes back for approval at once."""
 
     def check(action: PendingAction) -> Optional[str]:
         phone = normalize(action.recipient_phone) if action.recipient_phone else None
         email = (action.recipient_email or "").strip().lower() or None
         if not phone and not email:
             return "no recipient recorded, so opt-out status cannot be verified"
+        chase_id = chase_id_of(action.deal_ref)
         with engine.connect() as conn:
+            if chase_id is not None and not conn.execute(_CHASE_OPEN, {"id": chase_id}).scalar():
+                return "the document chase is closed"  # P2.4: all documents in, or the deal funded or lost
             if conn.execute(_SUPPRESSED, {"p": phone, "e": email}).scalar():
                 return "recipient is suppressed or marked do-not-contact"
             if action.channel in INSTANTLY_CHANNELS and conn.execute(_EMAIL_OPTED_OUT, {"e": email}).scalar():
                 return "recipient is suppressed or marked do-not-contact"
             if action.channel in SMS_CHANNELS and not (phone and has_text_consent(conn, phone)):
                 return "no text consent on record for this number"
-            if auto_approval_lapsed(conn, action.decided_by, action.payload.get("template_version")):
+            if auto_approval_lapsed(conn, action.decided_by, action.payload.get("template_version"),
+                                    channel=action.channel):
                 # P1.4: its template was revoked after the automatic approval. Held, never sent; the next sweep
                 # sends it back for a person's approval (standing_sends.return_ungraduated_auto_approvals).
                 return SendDeferred("its message type no longer auto-sends; going back for approval")
+        if action.decided_by == AUTO_GRADUATED_ACTOR and not may_send_without_card(action.channel, action.payload):
+            return_for_approval(engine, action.action_id,
+                                reason="a cold or partner message, and Q14 or Q19 is off")
+            return SendDeferred("cold and partner messages need a card while Q14 or Q19 is off; going back for approval")
+        if (wording_ok is not None and action.decided_by == AUTO_GRADUATED_ACTOR
+                and not wording_ok(action.payload.get("template_version") or "", action.channel, action.payload,
+                                   label_names(action.payload.get("contact_label")))):
+            return_for_approval(engine, action.action_id)
+            return SendDeferred("its wording is not approved wording; going back for approval")
         if action.channel in SMS_CHANNELS:
             if not carrier_approved:
                 return SendDeferred("texting is not approved by the carrier yet (10DLC)")
@@ -319,7 +371,7 @@ def build_egress_executors() -> dict[str, EgressExecutor]:
 
 def build_agent_jobs(settings: AppSettings, *, engine: Engine, gate: SendGate, queue: PendingActionQueue,
                      approval_channel: str,
-                     is_graduated: Callable[[str], bool] = lambda _: False) -> Optional[JobQueueWorker]:
+                     is_graduated: Callable[..., bool] = lambda *_: False) -> Optional[JobQueueWorker]:
     """The P1.1 Drive job queue worker, or None (logged) while it is switched off or not configured."""
     if not settings.lending_agent_jobs_enabled:
         logger.info("[cora] agent job queue off (LENDING_AGENT_JOBS_ENABLED=false)")
@@ -331,7 +383,8 @@ def build_agent_jobs(settings: AppSettings, *, engine: Engine, gate: SendGate, q
         return None
     instantly_ready = get_ndl_instantly_sender() is not None
     return JobQueueWorker(engine, folders, gate, queue, crm.read_contact, approval_channel=approval_channel,
-                          check=make_check(engine, instantly_ready=instantly_ready), is_graduated=is_graduated)
+                          check=make_check(engine, instantly_ready=instantly_ready), is_graduated=is_graduated,
+                          wording_ok=make_wording_ok(engine) if get_settings().lending_graduated_approved_wording_only else None)
 
 
 def _ts_seconds(ts: Optional[str]) -> float:
@@ -487,7 +540,8 @@ def build_session(config: AgentCoreConfig, store: AgentStore, chat: ChatPort, bo
 
 def run_sweep(services: CoraServices) -> None:
     """One pass: expire stale drafts, triage new Instantly replies, retry missing approval cards, run the agent job
-    queue, graduate templates (P1.4), post the inbox digest and the 7:30 AM
+    queue, graduate templates (P1.4), raise new Backflip blocks, post the 7 AM closing blocker card and queue
+    document chase steps (P2.4), post the inbox digest and the 7:30 AM
     morning digest (always, even while halted: the halt stops sends to borrowers, not Cora's own channel), then
     send approved actions."""
     expired = services.session.expire_stale_actions()
@@ -522,6 +576,31 @@ def run_sweep(services: CoraServices) -> None:
             if graduated:
                 logger.info("[cora] graduated to standing auto-send: %s",
                             ", ".join(t.template_version for t in graduated))
+    for name, step in (("closing blocker card", services.closing_blockers), ("document chase", services.doc_chase)):
+        if step is None:
+            continue
+        try:
+            step()
+        except Exception as exc:  # class only: SQL errors embed bound parameters; never skip the sends below
+            logger.error("[cora] %s failed (%s); retrying next sweep", name, type(exc).__name__)
+    if services.block_list is not None:
+        try:
+            services.block_list()
+        except Exception as exc:  # class only; the rows stay pending and are retried next sweep
+            logger.error("[cora] Instantly block list step failed (%s); retrying next sweep", type(exc).__name__)
+    if services.backflip_alerts is not None:
+        try:
+            services.backflip_alerts()
+        except Exception as exc:  # class only; the blocks are found again next sweep
+            logger.error("[cora] Backflip block alerts failed (%s); retrying next sweep", type(exc).__name__)
+    if services.after_hours_responder is not None:
+        try:
+            night_sends = services.after_hours_responder()
+        except Exception as exc:  # class only; a due message stays due and is retried next sweep
+            logger.error("[cora] night responder pass failed (%s); retrying next sweep", type(exc).__name__)
+        else:
+            if night_sends:
+                logger.info("[cora] night responder %s", night_sends)
     if services.inbox_digest is not None:
         try:
             surfaced = services.inbox_digest()
@@ -602,7 +681,9 @@ def build_live_services(settings: AppSettings) -> Optional[CoraServices]:
     store = AgentStore(engine, config.db_schema)
     services = build_session(config, store, chat,
                              bot_user_id, messages_client=messages_client, send_check=make_send_check(
-                                 engine, carrier_approved=settings.lending_sms_carrier_approved),
+                                 engine, carrier_approved=settings.lending_sms_carrier_approved,
+                                 wording_ok=make_wording_ok(engine)
+                                 if settings.lending_graduated_approved_wording_only else None),
                              toolkit_factory=toolkit_factory, inbox_context=make_inbox_context(engine),
                              executors=build_egress_executors(), extension=RoutingSlack(web),
                              record_edits=True)
@@ -610,12 +691,78 @@ def build_live_services(settings: AppSettings) -> Optional[CoraServices]:
     worker = build_agent_jobs(settings, engine=engine, gate=services.gate, queue=services.queue,
                               approval_channel=config.approval_channel_id or "",
                               is_graduated=make_is_graduated(engine))
-    return services._replace(web_client=web, inbox_digest=digest,
+    closing_blockers, doc_chase = build_closing_steps(settings, engine=engine, chat=chat, gate=services.gate,
+                                                      config=config, queue=services.queue)
+    return services._replace(web_client=web, inbox_digest=digest, backflip_alerts=make_backflip_alerts(engine),
                              morning_digest=make_morning_digest(engine, store, chat, config),
                              instantly_replies=make_instantly_replies(engine, store, config, messages_client,
                                                                       services.gate),
                              agent_jobs=worker.run_once if worker is not None else None,
-                             standing_sends=make_standing_sends_step(engine))
+                             standing_sends=make_standing_sends_step(engine),
+                             closing_blockers=closing_blockers, doc_chase=doc_chase,
+                             block_list=BlockListSweep(engine),
+                             after_hours_responder=run_send_cycle)
+
+
+def build_closing_steps(settings: AppSettings, *, engine: Engine, chat: ChatPort, gate: SendGate,
+                        config: AgentCoreConfig, queue: Optional[PendingActionQueue] = None
+                        ) -> tuple[Optional[Callable[[], bool]], Optional[Callable[[], int]]]:
+    """P2.4 sweep steps, each on its own transaction; None while its flag is off. The card goes to Cora's channel
+    and every draft to #approvals, with the borrower's text consent read in the same transaction."""
+    approvals = (config.approval_channel_id or "") if config is not None else ""
+
+    posted_days: set = set()  # cards this process posted: a later stale claim never reposts them
+
+    def blocker_card() -> bool:
+        """Claim the day in its own committed transaction, then post. Released only when nothing was posted (an
+        error before the first message); a failed commit after the post keeps the claim, so no second card."""
+        if not config.slack_channel_id:
+            return False
+        now = datetime.now(timezone.utc)
+        if card_day(now) in posted_days:
+            return False
+        with Session(engine) as db, db.begin():
+            day = claim_card_day(db, now)
+        if day is None:
+            return False
+
+        def mark_posted(channel: str, ts: Optional[str]) -> None:
+            posted_days.add(day)  # first: even if the commit below fails, this process never posts it again
+            with Session(engine) as posted_db, posted_db.begin():
+                record_post(posted_db, day, channel, ts)
+
+        release = False
+        try:
+            with Session(engine) as db, db.begin():
+                try:
+                    return post_blocker_card(db, chat, gate, channel=config.slack_channel_id,
+                                             approvals_channel=approvals, now=now, claimed=True,
+                                             on_posted=mark_posted,
+                                             text_consent=lambda phone: has_text_consent(db, phone))
+                except Exception:
+                    release = True
+                    raise
+        finally:
+            if release:
+                with Session(engine) as db, db.begin():
+                    release_card_day(db, day)
+
+    copy_step = (DriveCopyStep(lambda: Session(engine), folder_id=settings.lending_doc_upload_drive_folder_id,
+                               copier=live_copier(), notify=post_ops_notice)
+                 if settings.lending_doc_chase_enabled and settings.lending_doc_upload_drive_folder_id else None)
+
+    def chase_sweep() -> int:
+        with Session(engine) as db, db.begin():
+            queued = run_chase_sweep(db, gate, approvals_channel=approvals,
+                                     text_consent=lambda phone: has_text_consent(db, phone),
+                                     find_draft=queue.find_by_idempotency_key if queue is not None else None,
+                                     block_draft=queue.block_pending if queue is not None else None)
+        if copy_step is not None:  # own transaction, time budget and pause: Drive never holds the chase or the sweep
+            copy_step()
+        return queued
+
+    return (blocker_card if settings.lending_closing_blockers_enabled else None,
+            chase_sweep if settings.lending_doc_chase_enabled else None)
 
 
 def make_standing_sends_step(engine: Engine) -> Callable[[], Any]:
@@ -632,10 +779,11 @@ def make_instantly_replies(engine: Engine, store: AgentStore, config: AgentCoreC
     memory = AgentMemory(store)
     instantly = lending_instantly_account()
     processor = ReplyProcessor(
-        session_factory=lambda: Session(engine), client=messages_client, model=config.model, enqueue=queue.enqueue,
+        session_factory=lambda: Session(engine), client=messages_client, model=config.model, enqueue=lane_checked_enqueue(queue),
         post_card=gate.post_card, post_triage=post_replies_notice, post_notice=post_ops_notice,
         rules=lambda: [rule.rule_text for rule in memory.active_rules()],
-        block_address=(lambda email: block_address(instantly, email)) if instantly else (lambda email: False))
+        block_address=(lambda email: block_address(instantly, email)) if instantly else (lambda email: False),
+        hand_off=get_handoff())
     return processor.run
 
 

@@ -1,13 +1,14 @@
 """GHL email sender for booking reminders, and the worker's email outcomes. No network, no database."""
 from __future__ import annotations
 
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 
 import pytest
 
 from config.lending_reminders import MAX_SEND_ATTEMPTS
 from config.settings import get_settings
-from src.lending import reminder_worker
+from src.lending import email_identity, reminder_worker
 from src.lending.ghl_email import GhlEmailSender, get_email_sender
 from src.lending.ghl_sms import GhlAccount, GhlSmsError
 
@@ -147,3 +148,87 @@ def test_rejected_email_is_retried_then_failed(writes):
     assert _send(sender, _row(attempts=0)) == "retry"
     assert _send(sender, _row(attempts=MAX_SEND_ATTEMPTS)) == "failed"
     assert writes == [("requeue", "send_failed_retry", True), ("record", "failed", "send_failed", "email", None)]
+
+
+# -- LendingFlow leads: From David, BCC Josh, never CC (client request, Nov 17) ---------------------------------------
+
+LF_SENDER, LF_BCC = "lf-sender@nextdeallending.com", "lf-bcc@nextdeallending.com"
+_real_is_lendingflow_recipient = email_identity.is_lendingflow_recipient
+
+
+def _lendingflow(monkeypatch, answer):
+    def check(email, phone):
+        if isinstance(answer, Exception):
+            raise answer
+        return answer
+    monkeypatch.setattr(email_identity, "is_lendingflow_recipient", check)
+
+
+def _lendingflow_settings(monkeypatch, *, sender=LF_SENDER, bcc=LF_BCC):
+    s = get_settings()
+    monkeypatch.setattr(s, "lending_lendingflow_email_from", sender, raising=False)
+    monkeypatch.setattr(s, "lending_lendingflow_email_bcc", bcc, raising=False)
+
+
+def test_email_to_a_lendingflow_lead_is_from_the_lendingflow_sender_with_bcc_only(monkeypatch):
+    _lendingflow(monkeypatch, True)
+    _lendingflow_settings(monkeypatch, sender=f" {LF_SENDER.upper()} ", bcc=f"{LF_BCC}, {LF_BCC}")
+    request = Recorder(Resp(200, {"contact": {"id": "ct1"}}), Resp(201, {"messageId": "m1"}))
+    GhlEmailSender(ACCOUNT, FROM, request=request)(TO, "s", "b", phone=PHONE)
+    body = request.calls[1][2]["json"]
+    assert body["emailFrom"] == LF_SENDER and body["emailBcc"] == [LF_BCC]
+    assert "emailCc" not in body
+
+
+def test_email_to_anyone_else_keeps_the_usual_sender_and_no_bcc(monkeypatch):
+    _lendingflow(monkeypatch, False)
+    _lendingflow_settings(monkeypatch)
+    request = Recorder(Resp(200, {"contact": {"id": "ct1"}}), Resp(201, {"messageId": "m1"}))
+    GhlEmailSender(ACCOUNT, FROM, request=request)(TO, "s", "b", phone=PHONE)
+    body = request.calls[1][2]["json"]
+    assert body["emailFrom"] == FROM and "emailBcc" not in body and "emailCc" not in body
+
+
+@pytest.mark.parametrize("sender,bcc", [(None, LF_BCC), (LF_SENDER, ""), (LF_SENDER, "not-an-address"), ("sender", LF_BCC)])
+def test_email_to_a_lendingflow_lead_is_refused_without_the_lendingflow_sender(monkeypatch, sender, bcc):
+    _lendingflow(monkeypatch, True)
+    _lendingflow_settings(monkeypatch, sender=sender, bcc=bcc)
+    request = Recorder()
+    with pytest.raises(GhlSmsError) as err:
+        GhlEmailSender(ACCOUNT, FROM, request=request)(TO, "s", "b")
+    assert request.calls == [] and not err.value.ambiguous
+    assert "LENDING_LENDINGFLOW_EMAIL_FROM" in str(err.value)
+
+
+def test_email_is_refused_when_the_lendingflow_check_is_unreadable(monkeypatch):
+    _lendingflow(monkeypatch, RuntimeError(f"db down for {TO}"))
+    request = Recorder()
+    with pytest.raises(GhlSmsError) as err:
+        GhlEmailSender(ACCOUNT, FROM, request=request)(TO, "s", "b")
+    assert request.calls == [] and not err.value.ambiguous and TO not in str(err.value)
+
+
+class _OneAnswer:
+    def __init__(self, answer):
+        self.answer, self.params = answer, None
+
+    @contextmanager
+    def __call__(self):
+        yield self
+
+    def execute(self, statement, params):
+        self.params = params
+        return type("R", (), {"scalar": lambda _self: self.answer})()
+
+
+def test_lendingflow_check_matches_lowercased_email_and_normalised_phone(monkeypatch):
+    session = _OneAnswer(True)
+    monkeypatch.setattr(email_identity, "_session_factory", session)
+    assert _real_is_lendingflow_recipient("  Jane@Example.com ", "(813) 555-8601") is True
+    assert session.params == {"e": "jane@example.com", "p": "+18135558601"}
+
+
+def test_lendingflow_check_without_email_or_phone_reads_nothing(monkeypatch):
+    session = _OneAnswer(True)
+    monkeypatch.setattr(email_identity, "_session_factory", session)
+    assert _real_is_lendingflow_recipient(None, None) is False and session.params is None

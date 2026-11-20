@@ -30,7 +30,7 @@ from typing import Any, Callable, Mapping, Optional, Protocol, Sequence
 
 from sqlalchemy import text
 
-from config.lending_compliance import RemovalReason
+from config.lending_compliance import ReasonCode, RemovalReason
 from config.lending_dialer import POOL_CAMPAIGN_TAGS
 from config.settings import get_settings
 from src.lending.global_halt import is_globally_halted
@@ -436,6 +436,19 @@ def _cards(db, loadable: Sequence["_Loadable"]) -> dict[str, dict[str, str]]:
     return cards
 
 
+def rail_blocks(rail: Mapping[str, ReasonCode], *, allow_outside_call_window: bool) -> dict[str, ReasonCode]:
+    """The call-time rail's blocks. With ``allow_outside_call_window`` (loading ahead of calling hours into
+    a campaign nobody is dialing yet) only the calling-hours block is dropped; attempt limits, attempt
+    history and a stale scrub still block."""
+    if not allow_outside_call_window:
+        return dict(rail)
+    kept = {phone: reason for phone, reason in rail.items() if reason is not ReasonCode.OUTSIDE_CALL_WINDOW}
+    if len(kept) < len(rail):
+        logger.warning("[dialer-load] calling-hours check bypassed for %d number(s) (--allow-outside-call-window); "
+                       "the campaign must not be dialed before calling hours", len(rail) - len(kept))
+    return kept
+
+
 def _raise_if_refused(unmapped_pools: Sequence[str], duplicate_phones: int) -> None:
     if unmapped_pools:
         raise LoadRefused(f"no campaign tag for pool(s): {', '.join(unmapped_pools)}")
@@ -474,6 +487,7 @@ def run_dialer_load(
     now: Optional[datetime] = None,
     backflip_check: Optional[bool] = None,
     dnc_scrub: bool = True,
+    allow_outside_call_window: bool = False,
 ) -> LoadReport:
     """Gate every record, then (live only) load the survivors into dialer.
 
@@ -515,7 +529,8 @@ def run_dialer_load(
     # eligibility, not dial time, so they skip it.
     if not dry_run:
         rail_candidates = [i for i in range(len(records)) if i not in blocks and phones[i]]
-        rail = dial_blocks(db, sorted({phones[i] for i in rail_candidates}), now=now, check_scrub=dnc_scrub)
+        rail = rail_blocks(dial_blocks(db, sorted({phones[i] for i in rail_candidates}), now=now, check_scrub=dnc_scrub),
+                           allow_outside_call_window=allow_outside_call_window)
         blocks.update({i: rail[phones[i]].value for i in rail_candidates if phones[i] in rail})
     blocks.update({i: REASON_NEEDS_SCRUB for i in pending_scrub if i not in conflict_blocks})
     report.needs_scrub_backflip_blocked = sum(1 for i in pending_scrub if i in conflict_blocks)

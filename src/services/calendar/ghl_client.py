@@ -165,6 +165,37 @@ class GHLCalendarClient:
             if ev.get("appointmentStatus") not in ("cancelled", "showed_cancelled")
         ]
 
+    def get_free_slots(
+        self, *, calendar_id: str, start: datetime, end: datetime, timezone_name: str
+    ) -> list[datetime]:
+        """The start times this calendar accepts a booking at in [start, end).
+
+        Unlike ``get_busy`` (the gaps between events), this is GHL's own
+        bookable list, so the calendar's opening hours, buffers and booking
+        rules are already applied. Response shape (public reference, not yet
+        confirmed live): ``{"2026-11-23": {"slots": ["2026-11-23T09:00:00-05:00",
+        ...]}, "traceId": "..."}``; anything that is not a date entry with a
+        ``slots`` list is ignored.
+        """
+        resp = self._request(
+            "GET",
+            f"/calendars/{calendar_id}/free-slots",
+            params={
+                "startDate": _to_epoch_ms(start),
+                "endDate": _to_epoch_ms(end),
+                "timezone": timezone_name,
+            },
+        )
+        if not resp.ok:
+            raise CalendarUnavailable(
+                f"GHL free-slots failed for {calendar_id!r}: HTTP {resp.status_code}"
+            )
+        slots: list[datetime] = []
+        for day in (resp.json() or {}).values():
+            if isinstance(day, dict) and isinstance(day.get("slots"), list):
+                slots.extend(_parse_timestamp(value) for value in day["slots"])
+        return sorted(slot for slot in slots if start <= slot < end)
+
     def get_event(self, *, calendar_id: str, event_id: str) -> Optional[CalendarEvent]:
         resp = self._request("GET", f"/calendars/events/appointments/{event_id}")
         if resp.status_code == 404:
@@ -187,7 +218,13 @@ class GHLCalendarClient:
         summary: str,
         attendee_email: str,
         description: str = "",
+        contact_id: Optional[str] = None,
     ) -> CalendarEvent:
+        # A live call with contactEmail alone was refused (HTTP 422 "Invalid
+        # contact details"): GHL books against an existing contact. A caller
+        # that knows the contact passes its id; without one the email is
+        # still sent, as before.
+        contact = {"contactId": contact_id} if contact_id else {"contactEmail": attendee_email}
         resp = self._request(
             "POST",
             "/calendars/events/appointments",
@@ -199,10 +236,7 @@ class GHLCalendarClient:
                 "startTime": start.isoformat(),
                 "endTime": end.isoformat(),
                 "appointmentStatus": "confirmed",
-                # GHL resolves/creates the contact by email on this endpoint
-                # per the v2 docs; confirm against a live call before trusting
-                # this creates vs. requires an existing contactId.
-                "contactEmail": attendee_email,
+                **contact,
                 "notes": description,
             },
         )
@@ -211,7 +245,25 @@ class GHLCalendarClient:
                 f"GHL create appointment failed: HTTP {resp.status_code} {resp.text[:300]}"
             )
         raw = resp.json()
-        return self._to_event(raw.get("appointment") or raw)
+        raw = raw.get("appointment") or raw
+        # A live create answered 2xx without the startTime a read returns, so
+        # only the id is required of this response; the times are the ones
+        # just requested. No id means the appointment exists but cannot be
+        # named: unknown, never retried.
+        event_id = raw.get("id")
+        if not event_id:
+            raise CalendarOutcomeUnknown(
+                f"GHL accepted the appointment but returned no id (keys: {sorted(raw)})"
+            )
+        return CalendarEvent(
+            event_id=event_id,
+            start=_parse_timestamp(raw["startTime"]) if raw.get("startTime") else start,
+            end=_parse_timestamp(raw["endTime"]) if raw.get("endTime") else end,
+            summary=raw.get("title") or summary,
+            attendee_email=raw.get("contactEmail") or raw.get("email") or attendee_email or None,
+            html_link=None,
+            status="confirmed",
+        )
 
     def cancel_event(self, *, calendar_id: str, event_id: str) -> None:
         resp = self._request(
