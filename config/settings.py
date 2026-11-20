@@ -922,6 +922,12 @@ class AppSettings(BaseSettings):
 	# Backflip borrower conflict check on the lending load. Off for launch: there is no
 	# Backflip export, and a missing or stale feed blocks every record when it is on.
 	lending_backflip_check_enabled: bool = Field(default=False, env="LENDING_BACKFLIP_CHECK_ENABLED")
+	# Instant quote endpoint (POST /api/lending/instant-quote on lending-api). Off until the client's go;
+	# callers send the key in X-Api-Key. Unset key = every caller refused.
+	lending_instant_quote_enabled: bool = Field(default=False, env="LENDING_INSTANT_QUOTE_ENABLED")
+	lending_instant_quote_api_key: Optional[SecretStr] = Field(default=None, env="LENDING_INSTANT_QUOTE_API_KEY")
+	# Second program's 1-exit new-construction rule. Off until the client approves that program in writing.
+	lending_instant_quote_exit_rule_enabled: bool = Field(default=False, env="LENDING_INSTANT_QUOTE_EXIT_RULE_ENABLED")
 	# T-07 Minute-5 pre-qualification PDF. Off until Josh + compliance review the template.
 	lending_prequal_pdf_enabled: bool = Field(default=False, env="LENDING_PREQUAL_PDF_ENABLED")
 	# Placeholder range: +/- this percent around the requested amount, clamped to fitting lenders' limits.
@@ -988,11 +994,16 @@ class AppSettings(BaseSettings):
 	# T-09 intro SMS. Off: the tag that starts the GHL intro workflow is never added, so nobody is texted. Turn on only after
 	# Josh confirms LendingFlow's consent and DNC check. Needs the id of the GHL contact custom field "intro_name".
 	lending_intro_sms_enabled: bool = Field(default=False, env="LENDING_INTRO_SMS_ENABLED")
+	# P2.1 Speed-to-Lead call cascade (src/lending/speed_to_lead.py). Off: the tag that starts the GHL "NDL - Speed to
+	# Lead" workflow (Josh -> David -> Voice AI at 2 min) is never added, so nobody is called by it.
+	lending_speed_to_lead_enabled: bool = Field(default=False, env="LENDING_SPEED_TO_LEAD_ENABLED")
 	# After-hours voicemail / answering-service intake (POST /webhooks/lending/after-hours-intake); closed (503) while off
 	lending_after_hours_intake_enabled: bool = Field(default=False, env="LENDING_AFTER_HOURS_INTAKE_ENABLED")
 	# Carrier (10DLC) approval for lending texts Cora sends after Approve; until true an approved text waits (then blocks at expiry)
 	lending_sms_carrier_approved: bool = Field(default=False, env="LENDING_SMS_CARRIER_APPROVED")
 	lending_ghl_cf_intro_name: Optional[str] = Field(default=None, env="LENDING_GHL_CF_INTRO_NAME")
+	# GHL contact custom field "lead_id": every LendingFlow push writes our lendingflow_leads.lead_uuid; unset = not written
+	lending_ghl_cf_lead_id: Optional[str] = Field(default=None, env="LENDING_GHL_CF_LEAD_ID")
 	# T-12 background enrichment card + routing. Off: no card is built, the deal-facts webhook returns 503.
 	lending_enrichment_enabled: bool = Field(default=False, env="LENDING_ENRICHMENT_ENABLED")
 	# Street View Static API (metadata lookup only; the key is never put in a posted link). Unset = no Street View.
@@ -1064,6 +1075,12 @@ class AppSettings(BaseSettings):
 	# LENDING_DRIVE_SERVICE_ACCOUNT_KEY_PATH (else the Sheets key) with the drive scope; the folder is "NDL Ledger Exports", shared with that account
 	lending_ledger_export_enabled: bool = Field(default=False, env="LENDING_LEDGER_EXPORT_ENABLED")
 	lending_ledger_export_folder_id: str = Field(default="", env="LENDING_LEDGER_EXPORT_FOLDER_ID")
+	# P1.3: a "Deal" reply to an NDL cold email creates the GHL contact + pipeline card and swaps ndl-cold for
+	# ndl-instantly-interested (src/lending/instantly_ghl_handoff.py). Off until Josh confirms (open question P1.3 #1).
+	lending_instantly_ghl_handoff_enabled: bool = Field(default=False, env="LENDING_INSTANTLY_GHL_HANDOFF_ENABLED")
+	# P1.4: when true, a rejection counts against graduation: (edited + rejected) / (approved + rejected) must be under 10%
+	# (src/lending/standing_sends.py). Off until Josh confirms (open question P1.4 #1); off = the brief's rule.
+	lending_graduation_count_rejections: bool = Field(default=False, env="LENDING_GRADUATION_COUNT_REJECTIONS")
 	# Drive service account (shared with the P1.1 job queue); blank = LENDING_SHEETS_SERVICE_ACCOUNT_KEY_PATH
 	lending_drive_service_account_key_path: str = Field(default="", env="LENDING_DRIVE_SERVICE_ACCOUNT_KEY_PATH")
 	# Opt-out mailbox listener (src/lending/email_opt_out.py): reads mail sent to LENDING_OPTOUT_ADDRESS over IMAP.
@@ -1110,6 +1127,15 @@ class AppSettings(BaseSettings):
 	# (defined above). Cold email stays off until the key, the passthrough campaign id and the footer postal address
 	# (CAN-SPAM) are all set.
 	lending_instantly_campaign_id: str = Field(default="", env="LENDING_INSTANTLY_CAMPAIGN_ID")
+	# More NDL campaign ids (comma separated) whose replies reach Cora, besides the passthrough campaign above. Events from
+	# any other campaign in the shared Instantly workspace are ignored (src/lending/instantly_webhook.py).
+	lending_instantly_extra_campaign_ids: str = Field(default="", env="LENDING_INSTANTLY_EXTRA_CAMPAIGN_IDS")
+	# Public host of NDL's cold-email unsubscribe link, e.g. https://api.nextdeallending.com (served by lending-api at
+	# /api/lending/email/unsubscribe). Unset = cold email stays off: the link must never point at the Forced Action host.
+	lending_unsubscribe_base_url: str = Field(default="", env="LENDING_UNSUBSCRIBE_BASE_URL")
+	# P1.4 (Q19): a graduated agent message sends without a card only when its wording matches wording Josh approved for that
+	# template (names and numbers filled in); anything else gets an approval card. Off until Josh confirms.
+	lending_graduated_approved_wording_only: bool = Field(default=False, env="LENDING_GRADUATED_APPROVED_WORDING_ONLY")
 	lending_instantly_sender_email: str = Field(default="", env="LENDING_INSTANTLY_SENDER_EMAIL")
 	lending_email_footer_brand: str = Field(default="Next Deal Lending", env="LENDING_EMAIL_FOOTER_BRAND")
 	lending_email_footer_postal_address: str = Field(default="", env="LENDING_EMAIL_FOOTER_POSTAL_ADDRESS")

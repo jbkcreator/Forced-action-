@@ -2,16 +2,18 @@
 chat tools use (src/lending/cora_tools.py), so the existing executors send it unchanged.
 
 Every payload also carries ``job_id``, ``ghl_contact_id`` and ``template_version`` (shown on the card, read back for
-the receipt). The recipient comes from the GHL contact, never from the job file. A cold email's body is stored
+the receipt). A message to a partner (``ndl-partner``) also carries ``partner_contact: true``, so the relay's send
+check can tell it apart without reading GHL again (team decision Q18). The recipient comes from the GHL contact, never from the job file. A cold email's body is stored
 without the CAN-SPAM footer: the Instantly sender adds it at send time, so a Revise can never edit or duplicate it
 (decision D22). The summary is plain text: the approval card escapes Slack markup and masks contact details.
 """
 from __future__ import annotations
 
 from datetime import datetime, time
+from typing import Optional
 from zoneinfo import ZoneInfo
 
-from config.lending_agent_jobs import COLD_EMAIL_CHANNEL, JOB_TYPES
+from config.lending_agent_jobs import COLD_EMAIL_CHANNEL, JOB_TYPES, PARTNER_TAG
 from config.lending_compliance import DEFAULT_TZ
 from packages.agent_core.tools import EgressDraft
 from src.lending.agent_jobs.checks import Rail
@@ -44,12 +46,19 @@ def _fields(job: AgentJob, contact: GhlContact, channel: str) -> dict:
     return {"title": job.body.strip(), "due_at": due.isoformat(), "assignee": job.task_assignee}
 
 
+def is_partner(contact: Optional[GhlContact]) -> bool:
+    return contact is not None and PARTNER_TAG in (contact.tags or ())
+
+
 def build_draft(job: AgentJob, contact: GhlContact, rail: Rail) -> EgressDraft:
     channel = COLD_EMAIL_CHANNEL if job.type == "send_email" and rail == "instantly" else JOB_TYPES[job.type]
     # not_after: the agent's deadline; agent_core caps a revision's expiry at it and the relay never sends after it.
     payload = {"job_id": str(job.job_id), "ghl_contact_id": job.ghl_contact_id,
                "template_version": job.template_version, "not_after": job.expires_at.isoformat(),
+               "contact_label": job.contact_label,
                **_fields(job, contact, channel)}
+    if is_partner(contact):
+        payload["partner_contact"] = True
     last4 = f" (…{contact.phone[-4:]})" if contact.phone else ""
     summary = (f"🤖 {job.created_by} · {job.template_version} · via {_RAIL_LABEL[rail]}\n"
                f"{job.contact_label or job.ghl_contact_id}{last4}: {job.reason or job.type}")

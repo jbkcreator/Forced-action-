@@ -19,8 +19,6 @@ from config.lending_lendingflow import (
     GHL_TAG_INTRO_READY,
     GHL_TAG_LENDINGFLOW,
     INTRO_NAME_FALLBACK,
-    GHL_TAG_NO_LEAD_ID,
-    is_missing_lead_id,
 )
 from config.settings import get_settings
 from src.lending.cold_leads import reconcile_warm_contact
@@ -32,10 +30,7 @@ logger = logging.getLogger(__name__)
 
 
 def _tags(lead: Mapping[str, Any]) -> list[str]:
-    tags = [GHL_TAG_LENDINGFLOW]
-    if is_missing_lead_id(lead.get("vendor_lead_id") or ""):
-        tags.append(GHL_TAG_NO_LEAD_ID)
-    return tags
+    return [GHL_TAG_LENDINGFLOW]
 
 
 def _intro_ready_tags(lead: Mapping[str, Any]) -> list[str]:
@@ -87,20 +82,31 @@ class LendingFlowGhlSink:
                                    email=lead.get("email"))
         ready = _intro_ready_tags(lead)
         if ready:  # its own call, after the other tags are in place; a failure fails the push and the sweep retries it
-            self.add_intro_ready_tag(contact_id)
+            # Re-armed on the lead's first push only: a returning borrower's contact still carries the tag from the last
+            # inquiry. A retried push (a later step failed after the tag went on) only adds it, so no second text.
+            self.add_intro_ready_tag(contact_id, rearm=int(lead.get("ghl_attempts") or 0) == 0)
         pipeline_card = self._ensure_pipeline_card(lead, contact_id)
         self._add_note(lead, contact_id)
         return PushResult(contact_id=contact_id, pipeline_card=pipeline_card, intro_ready_tagged=bool(ready))
 
-    def add_intro_ready_tag(self, contact_id: str) -> None:
-        """Starts the GHL intro-SMS workflow. Re-adding a tag that is already there does not start it again."""
+    def add_intro_ready_tag(self, contact_id: str, *, rearm: bool = False) -> None:
+        """Starts the GHL intro-SMS workflow. GHL starts it only when the tag is newly added, so with ``rearm`` the tag
+        is removed first (a returning borrower's contact still has it from an earlier inquiry)."""
+        if rearm:
+            self._call("remove intro-ready tag", "DELETE", f"/contacts/{contact_id}/tags",
+                       json={"tags": [GHL_TAG_INTRO_READY]})
         self._call("add intro-ready tag", "POST", f"/contacts/{contact_id}/tags", json={"tags": [GHL_TAG_INTRO_READY]})
 
     def _upsert_contact(self, lead: Mapping[str, Any]) -> str:
         body: dict[str, Any] = {"locationId": self._account.location_id, "phone": lead["phone"]}
-        intro_name_field = get_settings().lending_ghl_cf_intro_name
-        if intro_name_field:  # set before the ready tag is added, so the workflow never reads an empty greeting
-            body["customFields"] = [{"id": intro_name_field, "value": _intro_name(lead)}]
+        settings = get_settings()
+        custom_fields: list[dict[str, str]] = []
+        if settings.lending_ghl_cf_intro_name:  # set before the ready tag is added, so the workflow never reads an empty greeting
+            custom_fields.append({"id": settings.lending_ghl_cf_intro_name, "value": _intro_name(lead)})
+        if settings.lending_ghl_cf_lead_id:  # our lead_uuid; LendingFlow's own id has its own field (not filled yet)
+            custom_fields.append({"id": settings.lending_ghl_cf_lead_id, "value": str(lead["lead_uuid"])})
+        if custom_fields:
+            body["customFields"] = custom_fields
         if lead.get("first_name"):
             body["firstName"] = lead["first_name"]
         if lead.get("last_name"):
