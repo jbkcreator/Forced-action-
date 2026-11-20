@@ -10,6 +10,10 @@ to the ad platforms. Past borrowers are not included: no lending table holds the
   @gmail.com / @googlemail.com); phone E.164 with "+" for Google, E.164 digits without "+" for Meta.
 * Each email and each phone appears once per file; files hold hash values only, never raw contact data, and are
   written owner-only. The last KEEP_NIGHTS files per platform are kept.
+* Files are named by the Eastern date of the run. After both are written, a counts-only summary
+  (``audience_counts_{day}.json``: rows per platform, contacts per source) marks the day finished; the nightly ledger
+  export reads it, so the counts it reports are the counts of the staged files. Summaries hold no contact data and are
+  kept, so a ledger backfill still finds them.
 * Logs: counts only.
 
 Off until LENDING_AUDIENCE_EXPORT_ENABLED=true and LENDING_AUDIENCE_EXPORT_DIR is set. Cron nightly:
@@ -21,6 +25,7 @@ from __future__ import annotations
 import argparse
 import csv
 import hashlib
+import json
 import logging
 import os
 from collections import Counter
@@ -28,7 +33,8 @@ from collections.abc import Iterable, Iterator
 from dataclasses import dataclass, field
 from datetime import date, datetime, timezone
 from pathlib import Path
-from typing import Optional, Sequence
+from typing import Callable, Optional, Sequence, TextIO
+from zoneinfo import ZoneInfo
 
 from sqlalchemy import text
 
@@ -39,10 +45,14 @@ from config.lending_audience_export import (
     KEEP_NIGHTS,
     META_FILE,
     META_HEADERS,
+    SUMMARY_FILE,
 )
+from config.lending_compliance import DEFAULT_TZ
 from src.services.phone_utils import normalize
 
 logger = logging.getLogger(__name__)
+
+ET = ZoneInfo(DEFAULT_TZ)
 
 _CONTACTS = text("""
     WITH leads AS (
@@ -121,8 +131,8 @@ def eligible_contacts(db) -> Iterator[Contact]:
             yield Contact(source, phone, email)
 
 
-def _write(path: Path, headers: Sequence[str], rows: list[tuple[str, str]]) -> None:
-    """The file is created owner-only before any hash is written (a leftover partial is removed first, since an
+def _write_atomic(path: Path, fill: Callable[[TextIO], None]) -> None:
+    """The file is created owner-only before anything is written (a leftover partial is removed first, since an
     existing file keeps its old mode), and a partial file is never left behind when the write fails."""
     partial = path.with_suffix(".partial")
     partial.unlink(missing_ok=True)
@@ -130,13 +140,39 @@ def _write(path: Path, headers: Sequence[str], rows: list[tuple[str, str]]) -> N
         with os.fdopen(os.open(partial, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), "w", newline="",
                        encoding="utf-8") as handle:
             os.chmod(partial, 0o600)  # the umask can only remove bits; this pins the mode whatever it is
-            writer = csv.writer(handle)
-            writer.writerow(headers)
-            writer.writerows(rows)
+            fill(handle)
         os.replace(partial, path)
     except BaseException:
         partial.unlink(missing_ok=True)
         raise
+
+
+def _write(path: Path, headers: Sequence[str], rows: list[tuple[str, str]]) -> None:
+    def fill(handle: TextIO) -> None:
+        writer = csv.writer(handle)
+        writer.writerow(headers)
+        writer.writerows(rows)
+
+    _write_atomic(path, fill)
+
+
+def _write_summary(directory: Path, day: date, result: ExportResult, now: datetime) -> None:
+    """Counts only, written after both files: its presence means that day's export finished."""
+    summary = {"day": day.isoformat(), "generated_at": now.isoformat(), "google_rows": result.google_rows,
+               "meta_rows": result.meta_rows, "contacts_by_source": dict(result.contacts_by_source)}
+    _write_atomic(directory / SUMMARY_FILE.format(day=day.isoformat()),
+                  lambda handle: json.dump(summary, handle, sort_keys=True))
+
+
+def read_summary(directory: Path, day: date) -> Optional[ExportResult]:
+    """The counts of the files dated ``day``, or None when that day's export never finished (no summary)."""
+    path = directory / SUMMARY_FILE.format(day=day.isoformat())
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return None
+    return ExportResult(contacts_by_source=Counter({str(k): int(v) for k, v in data["contacts_by_source"].items()}),
+                        google_rows=int(data["google_rows"]), meta_rows=int(data["meta_rows"]))
 
 
 def _prune(directory: Path, pattern: str, keep: int) -> None:
@@ -145,8 +181,10 @@ def _prune(directory: Path, pattern: str, keep: int) -> None:
 
 
 def export(db, directory: Optional[Path], *, day: Optional[date] = None, dry_run: bool = False) -> ExportResult:
-    """Build both files for ``day`` (UTC today by default). ``dry_run`` counts only and writes nothing."""
-    day = day or datetime.now(timezone.utc).date()
+    """Build both files for ``day`` (today in Eastern time by default, the date convention the ledger export reads
+    them by), then the counts-only summary. ``dry_run`` counts only and writes nothing."""
+    now = datetime.now(timezone.utc)
+    day = day or now.astimezone(ET).date()
     contacts = list(eligible_contacts(db))
     result = ExportResult(contacts_by_source=Counter(c.source for c in contacts))
     google = hashed_rows(contacts, platform="google")
@@ -162,6 +200,7 @@ def export(db, directory: Optional[Path], *, day: Optional[date] = None, dry_run
         _write(path, headers, rows)
         _prune(directory, pattern, KEEP_NIGHTS)
         result.files.append(path)
+    _write_summary(directory, day, result, now)
     return result
 
 

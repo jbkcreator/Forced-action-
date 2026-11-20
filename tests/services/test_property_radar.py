@@ -302,6 +302,7 @@ class TestBudgetGuard:
         port = self._port_with(count=100, remaining=5000)
         with patch("src.tasks.property_radar_maturity_pull.settings") as mock_settings:
             mock_settings.property_radar_per_run_cap = 5000
+            mock_settings.property_radar_monthly_cap = 10000
             result = _check_budget(port, [], "FL", "maturity_target_lender")
         assert result == 100
 
@@ -311,6 +312,7 @@ class TestBudgetGuard:
         port = self._port_with(count=200, remaining=50)
         with patch("src.tasks.property_radar_maturity_pull.settings") as mock_settings:
             mock_settings.property_radar_per_run_cap = 5000
+            mock_settings.property_radar_monthly_cap = 10000
             with pytest.raises(RuntimeError, match="budget guard"):
                 _check_budget(port, [], "FL", "maturity_target_lender")
 
@@ -320,6 +322,7 @@ class TestBudgetGuard:
         port = self._port_with(count=2000, remaining=10000)
         with patch("src.tasks.property_radar_maturity_pull.settings") as mock_settings:
             mock_settings.property_radar_per_run_cap = 500
+            mock_settings.property_radar_monthly_cap = 10000
             with pytest.raises(RuntimeError, match="per-run cap"):
                 _check_budget(port, [], "FL", "maturity_target_lender")
 
@@ -334,6 +337,7 @@ class TestBudgetGuard:
         )
         with patch("src.tasks.property_radar_maturity_pull.settings") as mock_settings:
             mock_settings.property_radar_per_run_cap = 500
+            mock_settings.property_radar_monthly_cap = 10000
             result = _check_budget(port, [], "FL", "maturity_target_lender")
         assert result == 0
 
@@ -352,6 +356,7 @@ class TestBudgetGuard:
         )
         with patch("src.tasks.property_radar_maturity_pull.settings") as mock_settings:
             mock_settings.property_radar_per_run_cap = 5000
+            mock_settings.property_radar_monthly_cap = 10000
             result = _check_budget(port, [], "FL", "maturity_target_lender")
         assert result == 100
 
@@ -366,6 +371,7 @@ class TestBudgetGuard:
         )
         with patch("src.tasks.property_radar_maturity_pull.settings") as mock_settings:
             mock_settings.property_radar_per_run_cap = 500
+            mock_settings.property_radar_monthly_cap = 10000
             with pytest.raises(RuntimeError, match="per-run cap"):
                 _check_budget(port, [], "FL", "maturity_target_lender")
 
@@ -848,6 +854,7 @@ class TestMaxRecords:
         )
         with patch("src.tasks.property_radar_maturity_pull.settings") as mock_settings:
             mock_settings.property_radar_per_run_cap = 5000
+            mock_settings.property_radar_monthly_cap = 10000
             assert _check_budget(port, [], "FL", "stalled_flip", max_records=10) == 10
 
 
@@ -1051,3 +1058,30 @@ class TestSharedSeenIds:
         session = _SeenSession()
         _load_seen_ids(session, "GA", "auction_winner")
         assert list(session.params["cs"]) == ["auction_winner"]
+
+
+class TestMonthlyCap:
+    """Cora P3.1: a pull that would take the month's exports past PROPERTY_RADAR_MONTHLY_CAP is refused."""
+
+    def _port(self, count: int):
+        port = MagicMock()
+        port.count.return_value = count
+        port.allowance.return_value = MagicMock(verified=False, total_remaining=0)
+        return port
+
+    def test_refuses_when_month_total_would_pass_the_cap(self):
+        from src.tasks.property_radar_maturity_pull import _check_budget
+
+        with patch("src.tasks.property_radar_maturity_pull.settings") as mock_settings:
+            mock_settings.property_radar_per_run_cap = 5000
+            mock_settings.property_radar_monthly_cap = 10000
+            with pytest.raises(RuntimeError, match="monthly cap"):
+                _check_budget(self._port(600), [], "GA", "cash_purchase", month_used=9500)
+
+    def test_allows_a_pull_that_lands_exactly_on_the_cap(self):
+        from src.tasks.property_radar_maturity_pull import _check_budget
+
+        with patch("src.tasks.property_radar_maturity_pull.settings") as mock_settings:
+            mock_settings.property_radar_per_run_cap = 5000
+            mock_settings.property_radar_monthly_cap = 10000
+            assert _check_budget(self._port(500), [], "GA", "cash_purchase", month_used=9500) == 500

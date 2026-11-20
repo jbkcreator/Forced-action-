@@ -49,7 +49,7 @@ def verify_unsubscribe_token(token: str) -> Optional[str]:
     return payload.get("email")
 
 
-def unsubscribe_url(email: str) -> str:
+def unsubscribe_url(email: str, *, base_url: Optional[str] = None, path: str = "/api/email/unsubscribe") -> str:
     """One-click unsubscribe link for `email`, landing on the public
     /api/email/unsubscribe endpoint (src/api/email_unsubscribe_router.py),
     which cascades the opt-out across every channel via suppress_contact().
@@ -57,6 +57,6 @@ def unsubscribe_url(email: str) -> str:
     R3) so Relay's outbound emails can mint the same link without importing
     a DBPR-specific template module."""
     settings = get_settings()
-    base = (settings.app_base_url or "https://app.forcedactionleads.com").rstrip("/")
+    base = (base_url or settings.app_base_url or "https://app.forcedactionleads.com").rstrip("/")
     token = mint_unsubscribe_token(email)
-    return f"{base}/api/email/unsubscribe?token={token}"
+    return f"{base}{path}?token={token}"

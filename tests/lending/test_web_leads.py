@@ -161,6 +161,28 @@ def test_a_call_only_lead_stores_the_call_box_and_never_gains_text_consent(web_l
     assert web_leads_db.execute(text("SELECT count(*) FROM lending.text_consents WHERE phone = :p"), {"p": PHONE}).scalar() == 0
 
 
+def test_the_ai_call_box_is_parsed_and_capped():
+    from config.lending_web import AI_CALL_CONSENT_TEXT
+
+    data = _data(ai_call_consent="yes", ai_call_consent_text=AI_CALL_CONSENT_TEXT)
+    assert data.ai_call_consent is True and data.ai_call_consent_text == AI_CALL_CONSENT_TEXT
+    assert _data().ai_call_consent is False and _data().ai_call_consent_text is None
+    assert len(_data(ai_call_consent_text="x" * 5000).ai_call_consent_text) == 2000
+
+
+def test_the_ai_call_box_is_stored_with_its_wording_check(web_leads_db):
+    from config.lending_web import AI_CALL_CONSENT_TEXT
+
+    lead_id, _ = save_web_lead(web_leads_db, _data(call_consent="yes", ai_call_consent="yes",
+                                                   ai_call_consent_text=AI_CALL_CONSENT_TEXT))
+    row = _row(web_leads_db, lead_id)
+    assert row["ai_call_consent"] is True and row["ai_call_consent_text_matches"] is True
+    other_id, _ = save_web_lead(web_leads_db, _data(phone="(813) 555-0199", ai_call_consent="yes",
+                                                    ai_call_consent_text="Some other wording"))
+    assert _row(web_leads_db, other_id)["ai_call_consent_text_matches"] is False  # stored, flagged as not matching
+    assert has_text_consent(web_leads_db, PHONE) is False  # an AI call box is not consent to text
+
+
 def test_a_text_only_lead_does_not_record_call_consent(web_leads_db):
     lead_id, _ = save_web_lead(web_leads_db, _data(sms_consent="yes", consent_text=SMS_CONSENT_TEXT))
     row = _row(web_leads_db, lead_id)

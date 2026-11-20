@@ -2,7 +2,14 @@ from __future__ import annotations
 
 from datetime import timedelta
 
-from packages.agent_core.approval import ApprovalAction, apply_click, render_action_card, render_decided_card
+import pytest
+
+from packages.agent_core.approval import (
+    ApprovalAction,
+    apply_click,
+    render_action_card,
+    render_decided_card,
+)
 from packages.agent_core.pending_actions import ActionStatus, PendingActionQueue
 from packages.agent_core.redaction import mask_emails, mask_long_digit_runs
 
@@ -103,3 +110,37 @@ def test_reject_and_revise(queue: PendingActionQueue) -> None:
     outcome = apply_click(queue, ApprovalAction.REVISE, revised, APPROVER, APPROVERS)
     assert outcome.accepted and not outcome.dispatch
     assert queue.get(revised).status is ActionStatus.REVISING
+
+
+TOKEN = "Zk3n8QvR2xYp7LmA9cTb4WsE6uHf1JdG0oKiNqVrXyU"  # made up, 43 URL-safe characters like a real upload token
+
+
+def test_card_masks_an_upload_link_token_but_sends_it_unchanged(queue: PendingActionQueue) -> None:
+    link = f"https://api.example.com/api/lending/docs/{TOKEN}"
+    payload = {"to_phone": "+18135550101", "body": f"Hi Mark, upload here: {link} Reply STOP to opt out.",
+               "upload_link": link}
+    action_id = queue.enqueue(tool_name="doc_chase", channel="ghl_sms", payload=payload, summary="Docs request")
+    action = queue.get(action_id)
+    for blocks in (render_action_card(action), render_decided_card(action, "Approved")):
+        rendered = str(blocks)
+        assert TOKEN not in rendered and TOKEN[-8:] not in rendered
+        assert "https://api.example.com/api/lending/docs/[…]" in rendered
+    assert action.payload["body"] == payload["body"] and action.payload["upload_link"] == link
+
+
+@pytest.mark.parametrize("text", [
+    "https://drive.google.com/drive/folders/1hQroR2KdfqzEsjVOgkLtaNvDlpc8GIJB",  # 33 chars, but shown elsewhere
+    "https://calendly.com/next-deal-lending/intro-call",
+    "see https://example.com/a/b and call",
+])
+def test_ordinary_links_outside_cards_are_not_touched_by_slack_safe(text) -> None:
+    from packages.agent_core.redaction import slack_safe
+    assert slack_safe(text) == text
+
+
+def test_url_token_mask_only_hits_long_random_segments() -> None:
+    from packages.agent_core.redaction import mask_url_tokens
+    assert mask_url_tokens(f"go: https://x.test/d/{TOKEN}.") == "go: https://x.test/d/[…]."
+    assert mask_url_tokens("https://calendly.com/next-deal-lending/intro-call") == \
+        "https://calendly.com/next-deal-lending/intro-call"
+    assert mask_url_tokens(f"bare {TOKEN} not a link") == f"bare {TOKEN} not a link"

@@ -10,7 +10,9 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from pydantic import SecretStr
 
+from config.lending_text_back import BOOKING_LINK
 from src.lending import instantly_client, instantly_replies, instantly_webhook
+from src.lending.cora_tools import borrower_draft_problem
 from src.lending.instantly_replies import (
     InstantlyEvent,
     ReplyProcessor,
@@ -599,3 +601,47 @@ def test_an_event_is_stored_once(lending_db):
     stop = InstantlyEvent(event_type="reply_received", lead_email=LEAD, dedup_key="reply:test-em-2", reply_text="STOP")
     assert instantly_replies.record_event(lending_db, stop).stop_request is True
     apply_to(lending_db.connection())  # idempotent
+
+
+def test_a_draft_blocked_by_the_backflip_check_gets_no_card_and_is_recorded_as_an_error():
+    from packages.agent_core.lane_guard import LaneViolation
+
+    session = FakeSession([row()])
+    proc, calls = processor(session, FakeModel(DEAL))
+
+    def refused(**kwargs):
+        raise LaneViolation("blocked")
+
+    proc._enqueue = refused
+    result = proc.run()
+    assert result.drafted == 0 and result.triaged == 1 and calls.cards == []
+    done = session.params("SET status = 'done'")[0]
+    assert done["action_id"] is None and "Backflip" in done["error"]
+
+
+# ── reply rules (team decision Q21) ──────────────────────────────────────────
+
+def test_the_prompt_carries_the_reply_rules():
+    prompt = instantly_replies.CLASSIFY_PROMPT
+    assert BOOKING_LINK in prompt and "indicative, subject to underwriting" in prompt
+    assert "short" in prompt and "Never mention Backflip" in prompt
+
+
+def test_a_draft_without_the_booking_link_gets_it_before_the_sign_off():
+    triage = classify_reply(FakeModel(DEAL), "m", subject="Re: Funding", reply="Yes, I have a deal")
+    assert triage.body == ("Thanks Mark, Josh can walk you through it on a quick call. What day and time works?\n\n"
+                           f"Pick a time that works for you: {BOOKING_LINK}\n\nNext Deal Lending")
+
+
+def test_a_draft_that_has_the_booking_link_is_left_as_written():
+    body = f"Happy to help. Book a call with Josh: {BOOKING_LINK}\nNext Deal Lending"
+    assert instantly_replies.with_booking_link(body) == body
+
+
+def test_a_draft_without_a_sign_off_gets_the_link_at_the_end():
+    assert instantly_replies.with_booking_link("Happy to help.") == (
+        f"Happy to help.\n\nPick a time that works for you: {BOOKING_LINK}")
+
+
+def test_the_booking_link_passes_the_number_check():
+    assert borrower_draft_problem({"body": instantly_replies.with_booking_link("Hi")}) is None

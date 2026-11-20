@@ -25,11 +25,19 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--apply", action="store_true", help="write rows (default: dry run)")
     ap.add_argument("--state", choices=["FL", "GA"], help="limit to one state")
+    ap.add_argument("--if-enabled", action="store_true",
+                    help="cron: do nothing while PROPERTY_RADAR_STATEWIDE_ENABLED is false")
     return ap.parse_args(argv)
 
 
 def main(argv: list[str] | None = None) -> int:
     args = _parse_args(argv)
+    if args.if_enabled:
+        from config.settings import get_settings
+
+        if not get_settings().property_radar_statewide_enabled:
+            logger.info("lending_pr_maturity_bridge: PROPERTY_RADAR_STATEWIDE_ENABLED is false, nothing done")
+            return 0
     with get_db_context() as session:
         summary = extract_pr_maturity_pool(session, dry_run=not args.apply, state=args.state)
         if args.apply:

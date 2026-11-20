@@ -26,10 +26,17 @@ def test_sms_payload_matches_existing_executor_keys() -> None:
     draft = build_draft(_job(), CONTACT, "ghl")
     assert draft.channel == "ghl_sms"
     assert draft.payload == {"job_id": JOB_ID, "ghl_contact_id": "ghl-123", "template_version": "LF-D2-SMS-v1",
-                             "not_after": (NOW + timedelta(days=1)).isoformat(),
+                             "not_after": (NOW + timedelta(days=1)).isoformat(), "contact_label": "Mark T., Tampa",
                              "to_phone": "+18135550142", "body": "Hi Mark, any questions?"}
     assert (draft.recipient_phone, draft.recipient_email, draft.contact_ref) == (
         "+18135550142", "mark@example.com", "ghl:ghl-123")
+
+
+def test_a_message_to_a_partner_is_marked_so_the_send_check_can_tell() -> None:
+    partner = GhlContact(contact_id="ghl-123", phone="+18135550142", email="mark@example.com",
+                         dnd_channels=frozenset(), tags=frozenset({"ndl-partner"}))
+    assert build_draft(_job(), partner, "ghl").payload["partner_contact"] is True
+    assert "partner_contact" not in build_draft(_job(), CONTACT, "ghl").payload
 
 
 def test_warm_email_payload_has_subject() -> None:

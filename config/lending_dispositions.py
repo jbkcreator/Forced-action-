@@ -167,6 +167,11 @@ LONG_CONVERSATION_SECONDS = 120  # "2+ min conversations": talk time of at least
 TRANSFER_CODES: frozenset[str] = frozenset()
 # Hourly posts at 10:00 through 19:00 ET; the 7:20pm closing board follows the 7:00pm one.
 HOURLY_POST_HOURS_ET = tuple(range(10, 20))
+# P2.5 closing board: stuck deals listed one per line, oldest first (the rest are counted); the board's numbers go to
+# Drive NDL Ledger Exports/{ET date}/ under this name (src/lending/scoreboard_export.py).
+SCOREBOARD_BLOCKER_LINES = 10
+SCOREBOARD_STAGE_ITEMS = 12  # stages listed on the pipeline line, most deals first (the rest are counted)
+SCOREBOARD_EXPORT_FILE = "scoreboard.csv"
 
 # Sheet columns. Held / Gate Passed / Packet are added when WP-GL-5/6 write them.
 SHEET_COLUMNS = (

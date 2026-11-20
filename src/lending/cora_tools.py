@@ -15,17 +15,21 @@ from config.lending_standing_sends import CORA_EMAIL_TEMPLATE, CORA_SMS_TEMPLATE
 from collections.abc import Callable, Iterator, Mapping
 from contextlib import AbstractContextManager, contextmanager
 from dataclasses import dataclass
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
+from decimal import Decimal
 from typing import Any, Literal, Optional
 from zoneinfo import ZoneInfo
 
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from config.lending_compliance import DEFAULT_TZ
+from config.lending_instant_quote import MAX_DEAL_AMOUNT as MAX_QUOTE_AMOUNT
 from config.lending_reply_agent import QUOTED_NUMBER_PATTERNS
+from config.settings import get_settings
 from packages.agent_core.governance import SafetyLevel
 from packages.agent_core.memory import AgentMemory, MemoryFull
 from packages.agent_core.tools import EgressDraft, Tool, ToolContext, ToolInputError
@@ -40,6 +44,8 @@ from src.lending.attempt_log import (
     summary,
     to_csv,
 )
+from src.lending.closing.doc_chase import open_chase_summaries, start_chase
+from src.lending.closing.drafts import Recipient
 from src.lending.contracts import BorrowerProfile, LoanRequest
 from src.lending.cora_channels import (
     MAX_READ_HOURS,
@@ -49,7 +55,11 @@ from src.lending.cora_channels import (
     SlackChannel,
 )
 from src.lending.cora_inbox import OPEN_STATUSES, close_item, get_item, open_items, slack_safe
+from src.lending.instant_quote import Guarantor, QuoteRequest, quote
+from src.lending.instant_quote.engine import BorrowerType, Purpose
+from src.lending.instant_quote.store import QuoteStore, SqlQuoteStore, audit_record
 from src.lending.lender_fit import evaluate_lender_fit
+from src.lending.partner_service import PartnerLinkNotConfigured
 from src.lending.scoreboard import build_scoreboard
 from src.lending.slack_names import name_and_ref, names_by_phone, readable_ref
 from src.services.phone_utils import normalize
@@ -155,6 +165,9 @@ LENDING_TABLES_HELP = (
 )
 
 
+QUOTE_CALLER = "cora"  # api_key_label on lending.instant_quotes for a quote Cora ran
+
+
 class _Input(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -185,6 +198,24 @@ class BookingsInput(_Input):
 class LenderFitInput(_Input):
     borrower: BorrowerProfile = Field(default_factory=BorrowerProfile)
     loan: LoanRequest
+
+
+class QuoteGuarantorInput(_Input):
+    fico: int = Field(..., ge=300, le=850, description="Soft-pull FICO.")
+    completed_deals: int = Field(..., ge=0, description="Completed deals in the last 3 years (ask; never assume 0).")
+    exits: int = Field(0, ge=0, description="Completed new-construction exits.")
+
+
+class InstantQuoteInput(_Input):
+    state: str = Field(..., min_length=2, max_length=2, description="Property state, e.g. FL.")
+    zip_code: str = Field(..., pattern=r"^\d{5}$", description="Property ZIP code.")
+    borrower_type: BorrowerType
+    guarantors: list[QuoteGuarantorInput] = Field(..., min_length=1, max_length=10)
+    purpose: Purpose
+    purchase_price: Decimal = Field(..., gt=0, le=MAX_QUOTE_AMOUNT)
+    rehab: Decimal = Field(..., ge=0, le=MAX_QUOTE_AMOUNT)
+    arv: Decimal = Field(..., gt=0, le=MAX_QUOTE_AMOUNT, description="After-repair value.")
+    existing_debt: Optional[Decimal] = Field(None, ge=0, le=MAX_QUOTE_AMOUNT, description="Refinance only.")
 
 
 class AttemptLogInput(_Input):
@@ -239,6 +270,12 @@ class DraftAddNoteInput(_Input):
     lead_ref: str = Field(..., pattern=r"^web_lead:\d+$", description="Only website leads are in GHL today.")
     body: str = Field(..., min_length=1, max_length=CRM_FIELD_LIMITS["ghl_note"][1], pattern=r"\S",
                       description="Internal note text.")
+
+
+class StartChaseInput(_Input):
+    lead_ref: str = Field(..., pattern=_LEAD_REF.pattern, description="From find_lead, e.g. web_lead:12.")
+    quote_id: Optional[str] = Field(default=None, pattern=r"^[0-9a-fA-F-]{36}$",
+                                    description="The borrower's instant quote id, when there is one.")
 
 
 class InboxListInput(_Input):
@@ -402,7 +439,8 @@ class CoraToolkit:
                  inbox_session: Optional[Callable[[], AbstractContextManager[Session]]] = None,
                  attempt_messages: Optional[MessageReader] = None,
                  attempt_recordings: Optional[RecordingCheck] = None,
-                 ledger_manifest: Optional[Callable[[], Optional[dict]]] = None) -> None:
+                 ledger_manifest: Optional[Callable[[], Optional[dict]]] = None,
+                 quote_store: Optional[QuoteStore] = None) -> None:
         """``channels`` is the channels Cora's bot is in: listed, read and routed to. ``inbox_session``
         overrides where the inbox tools read and write; tests pass their rolled-back session.
         ``attempt_messages`` reads a lead's GHL messages for the attempt log (None: calls only);
@@ -415,6 +453,7 @@ class CoraToolkit:
         self._attempt_messages = attempt_messages
         self._attempt_recordings = attempt_recordings
         self._ledger_manifest = ledger_manifest
+        self._quote_store = quote_store
 
     @contextmanager
     def _inbox(self) -> Iterator[Session]:
@@ -574,6 +613,36 @@ class CoraToolkit:
         return {"internal_only": "Never quote rates, terms or approval to a borrower from this.",
                 **result.model_dump(mode="json")}
 
+    def instant_quote(self, args: InstantQuoteInput, _: ToolContext) -> dict[str, Any]:
+        """The same quote the instant-quote endpoint gives, saved to the same audit table (caller "cora"), for Josh
+        to read before anything reaches a borrower (team decision Q36)."""
+        from config.settings import get_settings
+
+        settings = get_settings()
+        if not settings.lending_instant_quote_enabled:
+            raise ToolInputError("instant quotes are switched off (LENDING_INSTANT_QUOTE_ENABLED)")
+        request = QuoteRequest(
+            state=args.state.upper(), zip_code=args.zip_code, borrower_type=args.borrower_type,
+            guarantors=tuple(Guarantor(g.fico, g.completed_deals, g.exits) for g in args.guarantors),
+            purpose=args.purpose, purchase_price=args.purchase_price, rehab=args.rehab, arv=args.arv,
+            existing_debt=args.existing_debt)
+        result = quote(request, new_construction_exit_rule=settings.lending_instant_quote_exit_rule_enabled)
+        try:
+            quote_id = (self._quote_store or SqlQuoteStore()).save(audit_record(request, result, QUOTE_CALLER))
+        except Exception as exc:  # class only: SQL errors embed bound parameters
+            logger.error("[cora-tools] instant quote audit write failed (%s); quote withheld", type(exc).__name__)
+            raise ToolInputError("the quote could not be saved, so it is not shown; try again") from None
+        return {"internal_only": "For Josh first. Indicative, subject to underwriting: never send it to a borrower "
+                                 "as a rate, term or approval.",
+                "quote_id": quote_id, "status": result.status, "reason": result.reason,
+                "loan_amount": result.loan_amount, "rehab_funding": result.rehab_funding,
+                "purchase_advance": result.purchase_advance, "effective_ltc": result.effective_ltc,
+                "cuts": [{"reason": c.reason, "pct": c.pct} for c in result.cuts],
+                "fee_surcharge_pct": result.fee_surcharge_pct,
+                "conditions": [{"code": c.code, "amount": c.amount} for c in result.conditions],
+                "borrower_score": result.borrower_score, "unconfirmed": result.unconfirmed,
+                "notes": list(result.notes), "disclaimer": result.disclaimer}
+
     def attempt_log(self, args: AttemptLogInput, context: ToolContext) -> dict[str, Any]:
         with self._read_only() as session:
             try:
@@ -655,6 +724,32 @@ class CoraToolkit:
             by = f" by <@{item['decided_by']}>" if item["decided_by"] else ""
             raise ToolInputError(f"#{item_id} is already {item['status']}{by}; nothing changed")
         return item
+
+    def start_document_chase(self, args: StartChaseInput, context: ToolContext) -> dict[str, Any]:
+        if not get_settings().lending_doc_chase_enabled:
+            raise ToolInputError("the document chase is switched off (LENDING_DOC_CHASE_ENABLED)")
+        lead = self._lead(args.lead_ref)
+        first_name = (lead.name or "").split()[0] if (lead.name or "").strip() else None
+        recipient = Recipient(first_name, lead.phone, lead.email, lead.ghl_contact_id)
+        for attempt in (1, 2):  # a start racing another one for the same borrower gets the chase that won
+            try:
+                with self._inbox() as session:
+                    started = start_chase(session, recipient, lead_ref=lead.ref,
+                                          accepted_by=f"slack:{context.user_id}", quote_id=args.quote_id)
+                break
+            except IntegrityError:
+                if attempt == 2:
+                    raise
+            except (PartnerLinkNotConfigured, ValueError) as error:
+                raise ToolInputError(str(error)) from error
+        note = ("a chase was already open for this borrower; it carries on" if started.reused else
+                "the document request goes to #approvals as a card within a minute; confirm it to the user")
+        return {"chase": started.chase_id, "reused": started.reused,
+                "documents_requested": list(started.missing), "note": note}
+
+    def document_chases(self, _: NoInput, __: ToolContext) -> dict[str, Any]:
+        with self._read_only() as session:
+            return {"open_chases": open_chase_summaries(session, datetime.now(timezone.utc))}
 
     def dismiss_inbox(self, args: InboxDismissInput, context: ToolContext) -> dict[str, Any]:
         with self._inbox() as session:
@@ -802,6 +897,10 @@ class CoraToolkit:
             Tool("check_lender_fit", "Run a borrower and loan through the five-lender rules matrix. Internal "
                  "analysis only: never present it to a borrower as a rate, term or approval.", LenderFitInput, read,
                  self.lender_fit),
+            Tool("get_instant_quote", "Indicative instant quote for a deal (state, ZIP, borrower type, guarantor "
+                 "FICOs and deal counts, purpose, price, rehab, ARV): loan amount, leverage cuts, conditions. "
+                 "Saved for audit. For Josh first: never send it to a borrower as a rate, term or approval.",
+                 InstantQuoteInput, write, self.instant_quote, approver_only=True),
             Tool("get_attempt_log", "Every outbound attempt (call, voicemail, text, email) on one LendingFlow lead "
                  "since it arrived, automated or by a person, whether the lead ever replied, and the replacement "
                  "rule result: refund evidence. Attaches the CSV to the thread.", AttemptLogInput, read,
@@ -824,6 +923,12 @@ class CoraToolkit:
             Tool("route_inbox_item", "Post a digest item to a team channel I am in (see list_channels) and close it. "
                  "The approver's request is the approval.", InboxRouteInput, write, self.route_inbox,
                  approver_only=True),
+            Tool("start_document_chase", "When an approver says a borrower accepted the term sheet: open the document "
+                 "chase (the lender's checklist, an upload link, reminders on day 2, 5 and 8, each held for "
+                 "approval). The approver's request is the approval.", StartChaseInput, write,
+                 self.start_document_chase, approver_only=True),
+            Tool("get_document_chases", "Open document chases: what each borrower has uploaded, what is missing, "
+                 "and which reminder went last and goes next.", NoInput, read, self.document_chases),
             Tool("list_channels", "The Slack channels I am in, with their purpose. Someone has to invite me to a "
                  "channel before I can read or post there.", NoInput, read, self.list_channels),
             Tool("read_channel", f"Recent top-level messages in a channel I am in, bot alerts included, oldest "

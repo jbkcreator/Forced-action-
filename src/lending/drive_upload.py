@@ -63,10 +63,14 @@ def ensure_folder(service: Any, parent_id: str, name: str) -> str:
     return created["id"]
 
 
+SIMPLE_UPLOAD_MAX_BYTES = 5 * 1024 * 1024  # Drive's limit for a one-request (multipart) upload
+
+
 def upload_bytes(service: Any, folder_id: str, name: str, data: bytes, mime: str = "text/csv") -> str:
     from googleapiclient.http import MediaInMemoryUpload
 
-    media = MediaInMemoryUpload(data, mimetype=mime, resumable=False)
+    # Larger files (borrower documents up to 10 MB) go as a resumable upload; small CSVs stay one request.
+    media = MediaInMemoryUpload(data, mimetype=mime, resumable=len(data) > SIMPLE_UPLOAD_MAX_BYTES)
     existing = _find(service, folder_id, name, folder=False)
     if existing:
         _run("replace file", service.files().update(fileId=existing, media_body=media, supportsAllDrives=True))

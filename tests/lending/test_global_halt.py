@@ -12,7 +12,7 @@ from sqlalchemy.pool import StaticPool
 
 from packages.agent_core.chatport import FakeChatPort, PostResult
 from packages.agent_core.slack_session import InboundMessage
-from src.lending import global_halt, lendingflow, lendingflow_ghl, prequal_ghl
+from src.lending import global_halt, lendingflow, lendingflow_ghl
 from src.lending.dialer_load import LoadRefused, run_dialer_load
 from src.lending.ghl_account import GhlAccount
 from src.lending.ghl_sms import GhlSmsError, GhlSmsSender
@@ -60,9 +60,9 @@ def _message(text_value: str, user: str = JOSH) -> InboundMessage:
 
 
 def _command(chat: FakeChatPort, cora_halt: CoraHalt, alert_channel: str | None = "C_NDL",
-             instantly=None) -> EmergencyHalt:
+             instantly=None, cascades=lambda: None) -> EmergencyHalt:
     return EmergencyHalt(chat=chat, cora_halt=cora_halt, approver_ids={JOSH}, alert_channel=alert_channel,
-                         instantly_sender=lambda: instantly)
+                         instantly_sender=lambda: instantly, cascade_stopper=cascades)
 
 
 class FakeInstantlyCampaign:
@@ -192,7 +192,10 @@ def _recorded_ghl_posts(monkeypatch) -> list[str]:
 
     monkeypatch.setattr(ghl_webhook, "ghl_post_once", post_once)
     monkeypatch.setattr(ghl_webhook, "ghl_post_multipart", post_multipart)
-    monkeypatch.setattr(prequal_ghl, "get_settings", lambda: SimpleNamespace(lending_prequal_email_from=None))
+    from src.lending import email_identity
+
+    monkeypatch.setattr(email_identity, "get_settings", lambda: SimpleNamespace(
+        lending_lendingflow_email_from="lf-sender@nextdeallending.com", lending_lendingflow_email_bcc="lf-bcc@nextdeallending.com"))
     return calls
 
 
@@ -299,3 +302,20 @@ def test_halt_survives_an_instantly_exception(halt_db) -> None:
     assert is_globally_halted()
     alert = next(post for post in chat.posts if post["channel"] == "C_NDL")
     assert "could NOT be paused" in alert["text"]
+
+
+def test_the_halt_stops_speed_to_lead_calls_in_progress_and_says_how_many(halt_db) -> None:
+    chat, cora_halt = FakeChatPort(default_channel="C_CORA"), CoraHalt()
+    assert _command(chat, cora_halt, cascades=lambda: 2)(_message("@Cora emergency halt")) is True
+    assert is_globally_halted()
+    assert any("speed-to-lead calls in progress (2 stopped)" in p["text"] for p in chat.posts)
+
+
+def test_a_failed_speed_to_lead_stop_never_blocks_the_halt(halt_db) -> None:
+    def broken():
+        raise RuntimeError("GHL down")
+
+    chat, cora_halt = FakeChatPort(default_channel="C_CORA"), CoraHalt()
+    assert _command(chat, cora_halt, cascades=broken)(_message("@Cora emergency halt")) is True
+    assert is_globally_halted() and cora_halt.halted_by == JOSH
+    assert not any("speed-to-lead" in p["text"] for p in chat.posts)

@@ -11,7 +11,8 @@ from src.lending.instantly_email import InstantlySendError, NdlInstantly, NdlIns
 
 ACCOUNT = NdlInstantly(api_key="ndl-key", base_url="https://api.instantly.ai", campaign_id="camp-ndl",
                        sender_email="josh@ndl-mail.com", footer_brand="Next Deal Lending",
-                       footer_postal_address="1 Main St, Tampa, FL 33602", footer_phone="(656) 221-1100")
+                       footer_postal_address="1 Main St, Tampa, FL 33602", footer_phone="(656) 221-1100",
+                       unsubscribe_base_url="https://api.ndl.example.test")
 
 
 class FakeResponse:
@@ -50,10 +51,8 @@ def _not_halted(monkeypatch):
 @pytest.fixture(autouse=True)
 def _unsubscribe_link(monkeypatch):
     """The real link is signed with SUBSCRIBER_JWT_SECRET, which CI does not set; the footer only needs a link."""
-    from src.services.relay import channels_email
-
-    monkeypatch.setattr(channels_email, "unsubscribe_url",
-                        lambda email: "https://app.example.test/api/email/unsubscribe?token=test-token")
+    monkeypatch.setattr(instantly_email, "unsubscribe_url",
+                        lambda email, base_url=None, path="": f"{base_url}{path}?token=test-token")
 
 
 def test_send_adds_lead_with_footer_and_unsubscribe() -> None:
@@ -69,7 +68,8 @@ def test_send_adds_lead_with_footer_and_unsubscribe() -> None:
     assert lead["custom_variables"]["ra_subject"] == "Your refinance"
     assert "Hi Mark,<br>" in body
     assert "Next Deal Lending" in body and "1 Main St, Tampa, FL 33602" in body
-    assert "/api/email/unsubscribe?token=" in body
+    assert 'href="https://api.ndl.example.test/api/lending/email/unsubscribe?token=test-token"' in body
+    assert "forcedactionleads" not in body
 
 
 def test_send_returns_lead_id() -> None:
@@ -119,7 +119,8 @@ def _settings(**overrides) -> SimpleNamespace:
                   lending_instantly_campaign_id="camp-ndl", lending_instantly_sender_email="josh@ndl-mail.com",
                   lending_email_footer_brand="Next Deal Lending",
                   lending_email_footer_postal_address="1 Main St, Tampa, FL 33602",
-                  lending_email_footer_phone="(656) 221-1100", instantly_api_key=SecretStr("fa-key"))
+                  lending_email_footer_phone="(656) 221-1100", instantly_api_key=SecretStr("fa-key"),
+                  lending_unsubscribe_base_url="https://api.ndl.example.test")
     values.update(overrides)
     return SimpleNamespace(**values)
 
@@ -140,6 +141,19 @@ def test_not_configured_without_postal_address(monkeypatch) -> None:
     _use(monkeypatch, _settings(lending_email_footer_postal_address=""))
     assert instantly_email.ndl_instantly() is None
     assert instantly_email.get_ndl_instantly_sender() is None
+
+
+def test_cold_email_is_off_without_an_unsubscribe_host(monkeypatch) -> None:
+    _use(monkeypatch, _settings(lending_unsubscribe_base_url=""))
+    assert instantly_email.ndl_instantly() is None
+
+
+def test_a_send_without_an_unsubscribe_host_is_refused_and_never_uses_the_fa_host() -> None:
+    account = NdlInstantly(**{**ACCOUNT.__dict__, "unsubscribe_base_url": ""})
+    fake = FakeInstantly(_routes())
+    with pytest.raises(InstantlySendError, match="unsubscribe host"):
+        NdlInstantlySender(account, fake).send("m@example.com", "S", "B")
+    assert fake.calls == []
 
 
 def test_never_uses_fa_instantly_key(monkeypatch) -> None:
@@ -219,3 +233,23 @@ def test_setup_campaign_adds_the_unsubscribe_header() -> None:
     instantly_email.setup_campaign("ndl-key", "https://api.instantly.ai", "josh@ndl-mail.com", fake)
     created = next(kwargs["json"] for method, path, kwargs in fake.calls if (method, path) == ("POST", "/api/v2/campaigns"))
     assert created["insert_unsubscribe_header"] is True
+
+
+def test_a_footer_naming_backflip_stops_the_send() -> None:
+    account = NdlInstantly(**{**ACCOUNT.__dict__, "footer_brand": "Backflip Lending"}) if hasattr(ACCOUNT, "__dict__") \
+        else ACCOUNT._replace(footer_brand="Backflip Lending")
+    fake = FakeInstantly(_routes())
+    with pytest.raises(InstantlySendError, match="Backflip"):
+        NdlInstantlySender(account, fake).send("m@example.com", "S", "clean body")
+    assert fake.calls == []
+
+
+def test_a_footer_block_is_a_lane_block_the_relay_stores_as_blocked_and_the_digest_finds() -> None:
+    from packages.agent_core.lane_guard import LaneViolation
+
+    account = NdlInstantly(**{**ACCOUNT.__dict__, "footer_brand": "Backflip Lending"})
+    fake = FakeInstantly(_routes())
+    with pytest.raises(instantly_email.InstantlyLaneBlock) as raised:
+        NdlInstantlySender(account, fake).send("m@example.com", "S", "clean body")
+    assert isinstance(raised.value, InstantlySendError) and isinstance(raised.value, LaneViolation)
+    assert fake.calls == []  # no request went to Instantly

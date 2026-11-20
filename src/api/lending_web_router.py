@@ -8,6 +8,7 @@ by design, so it is rate limited per IP and has a honeypot field.
 from __future__ import annotations
 
 import logging
+from datetime import datetime, timezone
 from typing import Optional
 
 from fastapi import APIRouter, BackgroundTasks, Depends, Form, HTTPException, Request
@@ -15,9 +16,13 @@ from sqlalchemy.orm import Session
 
 from config.lending_web import RATE_LIMIT_PER_WINDOW, RATE_LIMIT_SCOPE, RATE_LIMIT_WINDOW_SECONDS
 from src.api.deps import get_db
+from src.lending.after_hours_responder import run_send_cycle_now
 from src.lending.db import lending_session
 from src.lending.web_lead_ghl import get_live_sink
-from src.lending.web_leads import InvalidWebLead, build_input, deliver_pending, merge_into_existing, save_web_lead, will_be_contacted
+from config.lending_speed_to_lead import SOURCE_WEB
+from src.lending import speed_to_lead
+from src.lending.web_leads import (InvalidWebLead, build_input, deliver_pending, merge_into_existing,
+                                  open_night_conversation, save_web_lead, will_be_contacted)
 from src.services.rate_limit import client_ip, enforce_or_429
 
 logger = logging.getLogger(__name__)
@@ -29,7 +34,7 @@ def deliver_in_background(lead_id: int) -> None:
     """Runs after the response. Never raises: the saved row and the sweep cover any failure."""
     try:
         with lending_session() as db:
-            deliver_pending(db, get_live_sink(), lead_id=lead_id)
+            deliver_pending(db, get_live_sink(), lead_id=lead_id, after_delivery=speed_to_lead.live_step(SOURCE_WEB))
     except Exception as exc:
         logger.error("[lending-web] background delivery crashed lead=%s: %s", lead_id, type(exc).__name__)
 
@@ -54,6 +59,8 @@ def create_web_lead(
     deal_drop_optin: Optional[str] = Form(default=None),  # box 3: the weekly Deal Drop by email
     consent_text: Optional[str] = Form(default=None),
     call_consent_text: Optional[str] = Form(default=None),
+    ai_call_consent: Optional[str] = Form(default=None),  # box 4 (P2.1): calls from the AI voice assistant only
+    ai_call_consent_text: Optional[str] = Form(default=None),
     page_url: Optional[str] = Form(default=None),
     company_website: Optional[str] = Form(default=None),  # honeypot: hidden on the page, bots fill it
     db: Session = Depends(get_db),
@@ -71,6 +78,7 @@ def create_web_lead(
                 "property_state": property_state, "credit_band": credit_band, "occupancy": occupancy,
                 "sms_consent": sms_consent, "call_consent": call_consent, "deal_drop_optin": deal_drop_optin,
                 "consent_text": consent_text, "call_consent_text": call_consent_text, "page_url": page_url,
+                "ai_call_consent": ai_call_consent, "ai_call_consent_text": ai_call_consent_text,
             },
             ip_address=client_ip(request),
             user_agent=request.headers.get("user-agent"),
@@ -81,6 +89,7 @@ def create_web_lead(
         lead_id, created = save_web_lead(db, data)
         enriched = False if created else merge_into_existing(db, lead_id, data)
         contact = created and will_be_contacted(db, lead_id)
+        night = created and open_night_conversation(db, lead_id, data, datetime.now(timezone.utc))
         db.commit()
     except Exception as exc:
         db.rollback()
@@ -88,4 +97,6 @@ def create_web_lead(
         raise HTTPException(status_code=500, detail="We could not save your request. Please call us.") from exc
     if created or enriched:
         background_tasks.add_task(deliver_in_background, lead_id)
+    if night:
+        background_tasks.add_task(run_send_cycle_now)  # the night responder's first question, right away
     return {"received": True, "will_contact": contact} if created else {"received": True, "duplicate": True}
