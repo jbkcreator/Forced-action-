@@ -29,7 +29,7 @@ from config.lending_after_hours_conversation import (ANSWER_MAX_CHARS, BOOKED, B
                                                      CONVERSATION_TTL_HOURS, GREETING, HANDLED_MESSAGE_IDS_KEPT,
                                                      MAX_SLOT_REPROMPTS, MORNING_END_HOUR, MORNING_START_HOUR,
                                                      OPEN_STATES, QUESTION_STATES, QUESTIONS, SLOT_CHOICE,
-                                                     SLOT_CHOSEN, SLOT_OFFER, SLOT_TIMEZONE)
+                                                     SLOT_CHOSEN, SLOT_OFFER, SLOT_TIMEZONE, SOURCE_INBOUND_TEXT)
 from src.lending.compliance import propagate_opt_out
 from src.lending.instantly_replies import is_stop_request
 from src.services.phone_utils import normalize
@@ -80,10 +80,13 @@ def next_turn(state: str, answers: Sequence[str], message: str, *, offered_slot_
     """Apply one inbound message to a conversation in ``state``. Pure: no clock, no database."""
     kept = tuple(answers)
     body = (message or "").strip()
-    if state not in OPEN_STATES or state == SLOT_CHOSEN or not body:
+    if state not in OPEN_STATES or not body:
         return Turn(OUTCOME_IGNORED, state, kept)
+    # Checked before anything else, so a stop request counts in every open state, a pending booking included.
     if is_stop_request(body):
         return Turn(OUTCOME_OPTED_OUT, CLOSED, kept, closed_reason=CLOSED_OPTED_OUT)
+    if state == SLOT_CHOSEN:
+        return Turn(OUTCOME_IGNORED, state, kept)
     if state in QUESTION_STATES:
         position = QUESTION_STATES.index(state)
         following = QUESTION_STATES[position + 1] if position + 1 < len(QUESTION_STATES) else SLOT_CHOICE
@@ -94,6 +97,12 @@ def next_turn(state: str, answers: Sequence[str], message: str, *, offered_slot_
     if slot_reprompts >= MAX_SLOT_REPROMPTS:
         return Turn(OUTCOME_UNCLEAR_SLOT, CLOSED, kept, closed_reason=CLOSED_UNCLEAR_SLOT)
     return Turn(OUTCOME_REPROMPT, SLOT_CHOICE, kept)
+
+
+def inbound_text_inquiry_key(message_id: str) -> str:
+    """The inquiry key of a conversation opened by an inbound text: the text's own message id, so a redelivery of
+    that text is recognised (:func:`record_reply`) and opens nothing."""
+    return f"after_hours:{SOURCE_INBOUND_TEXT}:{message_id}"
 
 
 def question_message(state: str, first_name: Optional[str]) -> str:
@@ -196,7 +205,7 @@ def mark_prompted(db, conversation_id: int, state: str, *, now: datetime,
 # The newest open conversation for the sender; locked so two webhook deliveries apply one at a time.
 _FIND_OPEN = text("""
     SELECT id, channel, phone, email, state, prompted_state, answers, offered_slots, slot_reprompts,
-           handled_message_ids
+           handled_message_ids, chosen_slot_start
       FROM lending.after_hours_conversations
      WHERE state = ANY(:open_states) AND expires_at > :now
        AND (ghl_contact_id = CAST(:ghl_contact_id AS text) OR phone = CAST(:phone AS text))
@@ -204,31 +213,56 @@ _FIND_OPEN = text("""
      LIMIT 1
        FOR UPDATE
 """)
+# A message already applied to, or that opened, any of the sender's conversations, finished ones included: a
+# redelivery after a booking or a close must not open a new conversation or answer a newer one.
+_ALREADY_APPLIED = text("""
+    SELECT EXISTS (
+        SELECT 1 FROM lending.after_hours_conversations
+         WHERE (ghl_contact_id = CAST(:ghl_contact_id AS text) OR phone = CAST(:phone AS text))
+           AND (handled_message_ids @> CAST(:message_ids AS jsonb) OR inquiry_key = :inquiry_key))
+""")
+# A stop request releases the step claim: a booking or send still running for this conversation then records
+# nothing (the booker also rechecks the conversation, src/lending/after_hours_calendar.py).
 _APPLY_TURN = text("""
     UPDATE lending.after_hours_conversations
        SET state = :state, answers = CAST(:answers AS jsonb), prompted_state = :prompted_state,
            chosen_slot_start = :chosen_slot_start, slot_reprompts = :slot_reprompts,
            closed_reason = :closed_reason, closed_at = :closed_at,
            handled_message_ids = CAST(:handled_message_ids AS jsonb),
+           sending_claimed_at = CASE WHEN CAST(:release_claim AS boolean) THEN NULL ELSE sending_claimed_at END,
            ghl_contact_id = COALESCE(ghl_contact_id, :ghl_contact_id), updated_at = :now
      WHERE id = :id
 """)
 
 
+def already_applied(db, *, message_id: str, phone: Optional[str] = None,
+                    ghl_contact_id: Optional[str] = None) -> bool:
+    """True when this inbound message has already been applied to, or opened, one of the sender's conversations."""
+    norm_phone = normalize(phone) if phone else None
+    if not (norm_phone or ghl_contact_id):
+        return False
+    return bool(db.execute(_ALREADY_APPLIED, {
+        "ghl_contact_id": ghl_contact_id, "phone": norm_phone, "message_ids": json.dumps([message_id]),
+        "inquiry_key": inbound_text_inquiry_key(message_id)[:200]}).scalar())
+
+
 def record_reply(db, *, message_id: str, body: str, now: datetime, phone: Optional[str] = None,
                  ghl_contact_id: Optional[str] = None) -> str:
-    """Apply an inbound message to the sender's open conversation and return the outcome. Does not commit."""
+    """Apply an inbound message to the sender's open conversation and return the outcome. Does not commit. A stop
+    request is applied whatever the conversation is waiting for; any other message only once its question went out."""
     norm_phone = normalize(phone) if phone else None
     if not (norm_phone or ghl_contact_id):
         return OUTCOME_NO_CONVERSATION
+    if already_applied(db, message_id=message_id, phone=norm_phone, ghl_contact_id=ghl_contact_id):
+        return OUTCOME_DUPLICATE
     row = db.execute(_FIND_OPEN, {"open_states": list(OPEN_STATES), "now": now, "ghl_contact_id": ghl_contact_id,
                                   "phone": norm_phone}).mappings().first()
     if row is None:
         return OUTCOME_NO_CONVERSATION
     handled = list(row["handled_message_ids"])
-    if message_id in handled:
+    if message_id in handled:  # a concurrent delivery applied it while this one waited for the row lock
         return OUTCOME_DUPLICATE
-    if row["prompted_state"] != row["state"]:
+    if row["prompted_state"] != row["state"] and not is_stop_request(body or ""):
         return OUTCOME_NOT_AWAITING
     offered = list(row["offered_slots"])
     turn = next_turn(row["state"], row["answers"], body, offered_slot_count=len(offered),
@@ -236,11 +270,13 @@ def record_reply(db, *, message_id: str, body: str, now: datetime, phone: Option
     if turn.outcome == OUTCOME_IGNORED:
         return OUTCOME_IGNORED
     reprompted = turn.outcome == OUTCOME_REPROMPT
-    chosen = datetime.fromisoformat(offered[turn.chosen_slot_index]) if turn.chosen_slot_index is not None else None
+    chosen = (datetime.fromisoformat(offered[turn.chosen_slot_index]) if turn.chosen_slot_index is not None
+              else row["chosen_slot_start"])
     db.execute(_APPLY_TURN, {
         "id": row["id"], "state": turn.state, "answers": json.dumps(list(turn.answers)),
         # A repeated slot offer is due again: clearing prompted_state is what queues it.
         "prompted_state": None if reprompted else row["prompted_state"],
+        "release_claim": turn.outcome == OUTCOME_OPTED_OUT,
         "chosen_slot_start": chosen, "slot_reprompts": row["slot_reprompts"] + (1 if reprompted else 0),
         "closed_reason": turn.closed_reason, "closed_at": now if turn.state in (CLOSED, BOOKED) else None,
         "handled_message_ids": json.dumps([*handled, message_id][-HANDLED_MESSAGE_IDS_KEPT:]),

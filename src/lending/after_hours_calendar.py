@@ -15,20 +15,26 @@ is read again just before it is booked, so one taken since the offer is reported
 no answer raises: it may exist, and the responder never repeats it. After a booking the lead's GHL card is moved to
 Booked; a failed move never undoes the booking.
 
+Slots come from the calendar's own bookable times when the client can list them (GHL free slots: opening hours,
+buffers and booking rules included), else from the gaps between its events. A lead who asks to stop while the
+booking is pending is never booked: the conversation and the lead's consent are checked just before the appointment
+is made, and again right after it; an appointment made in that gap is cancelled.
+
 Logs carry ids only, never phones, names or addresses.
 """
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timedelta
-from typing import Callable, Optional, Sequence
+from datetime import datetime, time, timedelta
+from typing import Callable, Optional, Protocol, Sequence, runtime_checkable
 from zoneinfo import ZoneInfo
 
 from sqlalchemy import text
 
-from config.lending_after_hours_conversation import SLOT_DURATION_MINUTES, SLOT_TIMEZONE
+from config.lending_after_hours_conversation import CHANNEL_SMS, SLOT_CHOSEN, SLOT_DURATION_MINUTES, SLOT_TIMEZONE
 from src.lending.after_hours_responder import (BOOKING_BOOKED, BOOKING_REFUSED, BOOKING_SLOT_TAKEN, Booker,
                                                BookingOutcome, BookingRequest, SlotFinder)
+from src.lending.consent import has_text_consent
 from src.services.calendar.availability import BusyBlock
 from src.services.calendar.client import CalendarClient, CalendarOutcomeUnknown, CalendarUnavailable
 from src.services.email_suppression import is_email_suppressed
@@ -40,7 +46,17 @@ APPOINTMENT_TITLE = "Next Deal Lending call: {name}"
 # (request, email) -> the lead's GHL contact id, or None when it cannot be resolved.
 ContactResolver = Callable[[BookingRequest, Optional[str]], Optional[str]]
 
+
+@runtime_checkable
+class BookableSlotSource(Protocol):
+    """A calendar that lists the times it accepts a booking at (the GHL calendar's free slots)."""
+
+    def get_free_slots(self, *, calendar_id: str, start: datetime, end: datetime,
+                       timezone_name: str) -> list[datetime]: ...
+
+
 _CONTACT_EMAIL = text("SELECT email FROM lending.contacts WHERE phone = :phone AND email IS NOT NULL")
+_CONVERSATION_STATE = text("SELECT state FROM lending.after_hours_conversations WHERE id = :id")
 
 
 def open_slots(busy: Sequence[BusyBlock], window_start: datetime, window_end: datetime) -> list[datetime]:
@@ -57,6 +73,32 @@ def open_slots(busy: Sequence[BusyBlock], window_start: datetime, window_end: da
             slots.append(start)
         start += span
     return slots
+
+
+def _still_wanted(db, request: BookingRequest, email: Optional[str]) -> bool:
+    """The conversation still waits for this booking (a stop request closes it) and the lead can still be reached
+    on its channel: text consent for a text conversation, an unsuppressed address for any email used."""
+    if db.execute(_CONVERSATION_STATE, {"id": request.conversation_id}).scalar() != SLOT_CHOSEN:
+        return False
+    if request.channel == CHANNEL_SMS and not has_text_consent(db, request.phone or ""):
+        return False
+    return not (email and is_email_suppressed(db, email))
+
+
+def _cancel_unwanted(client: CalendarClient, calendar_id: str, request: BookingRequest, event_id: str) -> None:
+    try:
+        client.cancel_event(calendar_id=calendar_id, event_id=event_id)
+        logger.warning("[after-hours-calendar] id=%s the lead asked to stop while the booking was made: "
+                       "appointment %s cancelled", request.conversation_id, event_id)
+    except Exception as exc:  # class only: calendar errors can embed the lead's details
+        logger.error("[after-hours-calendar] id=%s the lead asked to stop while the booking was made, and "
+                     "appointment %s could not be cancelled (%s): cancel it by hand", request.conversation_id,
+                     event_id, type(exc).__name__)
+
+
+def _local_day_end(moment: datetime) -> datetime:
+    local = moment.astimezone(ZoneInfo(SLOT_TIMEZONE))
+    return datetime.combine(local.date() + timedelta(days=1), time(0), tzinfo=local.tzinfo)
 
 
 def _booking_email(db, request: BookingRequest) -> Optional[str]:
@@ -108,15 +150,29 @@ def calendar_hooks(db, *, client: Optional[CalendarClient] = None, calendar_id: 
         client = GHLCalendarClient.from_settings()
         contact_resolver = contact_resolver or ghl_contact_id
 
-    def find_slots(window_start: datetime, window_end: datetime, now: datetime) -> list[datetime]:
+    span = timedelta(minutes=SLOT_DURATION_MINUTES)
+
+    def bookable(window_start: datetime, window_end: datetime) -> list[datetime]:
+        """Slot starts in [window_start, window_end) that a booking of one slot length fits in."""
+        if isinstance(client, BookableSlotSource):
+            free = client.get_free_slots(calendar_id=calendar_id, start=window_start, end=window_end,
+                                         timezone_name=SLOT_TIMEZONE)
+            return sorted({slot for slot in free if window_start <= slot and slot + span <= window_end})
         busy = client.get_busy(calendar_id=calendar_id, start=window_start, end=window_end)
         return open_slots(busy, window_start, window_end)
 
+    def find_slots(window_start: datetime, window_end: datetime, now: datetime) -> list[datetime]:
+        return bookable(window_start, window_end)
+
+    def still_bookable(start: datetime) -> bool:
+        # The whole local day is read: a calendar's free-slot list is built per day, not per narrow range.
+        return start in bookable(start, _local_day_end(start))
+
     def book(request: BookingRequest) -> BookingOutcome:
         email = _booking_email(db, request)
-        if email and is_email_suppressed(db, email):
-            logger.info("[after-hours-calendar] id=%s not booked: the email address is suppressed",
-                        request.conversation_id)
+        if not _still_wanted(db, request, email):
+            logger.info("[after-hours-calendar] id=%s not booked: the lead can no longer be reached or the "
+                        "conversation was closed", request.conversation_id)
             return BookingOutcome(BOOKING_REFUSED)
         contact_id = contact_resolver(request, email) if contact_resolver else None
         if not (contact_id or email):
@@ -127,7 +183,7 @@ def calendar_hooks(db, *, client: Optional[CalendarClient] = None, calendar_id: 
         start, end = request.slot_start, request.slot_start + timedelta(minutes=SLOT_DURATION_MINUTES)
         title = APPOINTMENT_TITLE.format(name=request.first_name or "night inquiry")
         try:
-            if open_slots(client.get_busy(calendar_id=calendar_id, start=start, end=end), start, end) != [start]:
+            if not still_bookable(start):
                 return BookingOutcome(BOOKING_SLOT_TAKEN)
             event = client.create_event(calendar_id=calendar_id, start=start, end=end, summary=title,
                                         attendee_email=email or "", description="\n".join(request.answers),
@@ -137,6 +193,9 @@ def calendar_hooks(db, *, client: Optional[CalendarClient] = None, calendar_id: 
         except CalendarUnavailable as exc:  # the calendar answered no, or could not be read: nothing was booked
             logger.error("[after-hours-calendar] id=%s not booked: the calendar refused (%s)",
                          request.conversation_id, type(exc).__name__)
+            return BookingOutcome(BOOKING_REFUSED)
+        if not _still_wanted(db, request, email):
+            _cancel_unwanted(client, calendar_id, request, event.event_id)
             return BookingOutcome(BOOKING_REFUSED)
         _move_card_to_booked(request, email, title)
         return BookingOutcome(BOOKING_BOOKED, event.event_id)

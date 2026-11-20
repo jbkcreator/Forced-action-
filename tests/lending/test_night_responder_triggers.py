@@ -43,7 +43,6 @@ class _FakeDb:
 @pytest.fixture
 def opened(monkeypatch):
     calls = []
-    monkeypatch.setattr(reply_webhook, "has_text_consent", lambda db, phone: True)
     monkeypatch.setattr(reply_webhook, "open_conversation", lambda db, **kwargs: calls.append(kwargs) or 7)
     return calls
 
@@ -72,20 +71,40 @@ def test_no_conversation_for_a_text_in_hours_a_stop_no_phone_or_a_lendingflow_le
     assert opened == []
 
 
-def test_no_conversation_without_text_consent(opened, monkeypatch):
-    monkeypatch.setattr(reply_webhook, "has_text_consent", lambda db, phone: False)
-    assert not reply_webhook._open_for_inbound_text(_FakeDb(), _text(), NIGHT)
-    assert opened == []
+def test_the_text_opens_a_conversation_before_its_consent_webhook_has_arrived(opened):
+    # GHL reports the consent this text carries on its own webhook, which can come second: the conversation opens
+    # now and the responder holds the first question for the consent (test_after_hours_responder).
+    assert reply_webhook._open_for_inbound_text(_FakeDb(), _text(), NIGHT)
+    assert len(opened) == 1
 
 
-def test_a_failed_open_never_fails_the_reply(monkeypatch):
-    monkeypatch.setattr(reply_webhook, "has_text_consent", lambda db, phone: True)
+class _AdvanceDb(_FakeDb):
+    def __init__(self):
+        super().__init__()
+        self.commits = self.rollbacks = 0
+
+    def commit(self):
+        self.commits += 1
+
+    def rollback(self):
+        self.rollbacks += 1
+
+
+def test_a_failed_open_is_refused_so_ghl_redelivers_the_text(monkeypatch):
+    from src.lending.after_hours_conversation import OUTCOME_NO_CONVERSATION
 
     def broken(db, **kwargs):
         raise RuntimeError("table missing")
 
+    monkeypatch.setattr(reply_webhook, "conversations_enabled", lambda: True)
+    monkeypatch.setattr(reply_webhook, "record_reply", lambda db, **kwargs: OUTCOME_NO_CONVERSATION)
+    monkeypatch.setattr(reply_webhook, "in_reply_hours", lambda now: False)
     monkeypatch.setattr(reply_webhook, "open_conversation", broken)
-    assert reply_webhook._open_for_inbound_text(_FakeDb(), _text(), NIGHT) is False
+    db = _AdvanceDb()
+    # None: the endpoint answers 503 and GHL sends the text again; the message id keys the open, so the
+    # redelivery opens exactly one conversation.
+    assert reply_webhook._advance_after_hours_conversation(db, _text()) is None
+    assert (db.commits, db.rollbacks) == (0, 1)
 
 
 # ── website form ─────────────────────────────────────────────────────────────
@@ -184,7 +203,7 @@ class _Client:
 def test_open_conversations_are_tagged_and_finished_ones_untagged():
     db = _TagDb(to_tag=[{"id": 1, "phone": PHONE, "ghl_contact_id": None},
                         {"id": 2, "phone": None, "ghl_contact_id": "c-2"}],
-                to_untag=[{"id": 3, "ghl_contact_id": "c-3"}])
+                to_untag=[{"id": 3, "ghl_contact_id": "c-3", "still_needed": False}])
     client = _Client(found={PHONE: "c-1"})
     counts = sync_night_tags(db, client, NIGHT)
     assert counts == {"tagged": 2, "untagged": 1}
@@ -197,10 +216,21 @@ def test_open_conversations_are_tagged_and_finished_ones_untagged():
 def test_a_contact_not_in_ghl_or_a_failed_call_is_left_for_the_next_pass():
     db = _TagDb(to_tag=[{"id": 1, "phone": PHONE, "ghl_contact_id": None},
                         {"id": 2, "phone": None, "ghl_contact_id": "c-2"}],
-                to_untag=[{"id": 3, "ghl_contact_id": "c-3"}])
+                to_untag=[{"id": 3, "ghl_contact_id": "c-3", "still_needed": False}])
     counts = sync_night_tags(db, _Client(fail={"c-2", "c-3"}), NIGHT)
     assert counts == {"not_in_ghl": 1, "failed": 2}
     assert db.writes == [] and db.commits == 0
+
+
+def test_a_finished_conversation_leaves_the_tag_to_the_same_contacts_open_one():
+    # Pass order: the new conversation is tagged first, then the old one is cleaned up. The tag is the contact's,
+    # so removing it for the old one would leave the new one untagged and GHL Conversation AI answering too.
+    db = _TagDb(to_tag=[{"id": 5, "phone": PHONE, "ghl_contact_id": "c-1"}],
+                to_untag=[{"id": 4, "ghl_contact_id": "c-1", "still_needed": True}])
+    client = _Client()
+    assert sync_night_tags(db, client, NIGHT) == {"tagged": 1, "kept_for_open": 1}
+    assert client.calls == [("add", "c-1", GHL_TAG_NIGHT_CONVERSATION)]  # never removed
+    assert [row_id for _, row_id in db.writes] == [5, 4]  # the old row is settled without touching GHL
 
 
 def test_the_tag_sync_queries_run_on_postgres(lending_db):
@@ -227,3 +257,27 @@ def test_the_tag_sync_queries_run_on_postgres(lending_db):
     assert rows[open_id]["ghl_contact_id"] == "c-o" and rows[open_id]["ghl_tagged_at"] is not None
     assert rows[booked_id]["ghl_untagged_at"] is not None
     assert sync_night_tags(lending_db, _Client(), NIGHT) == {}
+
+
+def test_on_postgres_an_old_conversation_keeps_the_tag_while_the_contacts_new_one_is_open(lending_db):
+    from migrations.apply_lending_after_hours_conversations import apply_to
+
+    apply_to(lending_db.connection())
+    insert = text("""
+        INSERT INTO lending.after_hours_conversations (inquiry_key, source, channel, contact_key, phone, ghl_contact_id,
+                                                       state, expires_at, ghl_tagged_at)
+        VALUES (:key, 'test', 'sms', :contact_key, :phone, 'c-same', :state, :expires, :tagged) RETURNING id
+    """)
+    later = NIGHT + timedelta(hours=6)
+    lending_db.execute(insert, {"key": "TAG-TEST-old", "contact_key": "TAG-TEST-old", "phone": PHONE,
+                                "state": "booked", "expires": later, "tagged": NIGHT})
+    new_id = lending_db.execute(insert, {"key": "TAG-TEST-new", "contact_key": PHONE, "phone": PHONE,
+                                         "state": QUESTION_STATES[0], "expires": later, "tagged": None}).scalar()
+    client = _Client()
+    assert sync_night_tags(lending_db, client, NIGHT) == {"tagged": 1, "kept_for_open": 1}
+    assert client.calls == [("add", "c-same", GHL_TAG_NIGHT_CONVERSATION)]
+    # Once the new one finishes too, the tag comes off.
+    lending_db.execute(text("UPDATE lending.after_hours_conversations SET state = 'closed' WHERE id = :id"),
+                       {"id": new_id})
+    assert sync_night_tags(lending_db, client, NIGHT) == {"untagged": 1}
+    assert client.calls[-1] == ("remove", "c-same", GHL_TAG_NIGHT_CONVERSATION)

@@ -76,6 +76,9 @@ MORNING_END_HOUR = 12
 SLOT_DURATION_MINUTES = 30  # also the grid the slot starts sit on: 9:00, 9:30, ...
 
 MAX_SEND_ATTEMPTS = 3
+# A conversation opened by an inbound text waits this long for the text consent GHL reports on its own webhook
+# (it can arrive after the text itself) before the first question; with no consent by then it closes unsent.
+CONSENT_WAIT_MINUTES = 10
 # A send claimed this long ago with no recorded result crashed mid-send: it may or may not have gone out, so it is
 # recorded as unknown and never sent again (a second copy of a question is worse than a missing one).
 # It must outlast the slowest single step: a booking makes several GHL calls, each with its own retries and

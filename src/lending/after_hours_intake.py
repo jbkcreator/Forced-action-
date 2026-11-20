@@ -195,8 +195,19 @@ _PINS = text("""
 """)
 _DRAFTED = text("SELECT idempotency_key, action_id, status, COALESCE(error, '') LIKE :lane_prefix AS lane_blocked "
                 "FROM lending.pending_actions WHERE idempotency_key = ANY(:keys)")
-_NIGHT_RESPONDER_TEXTED = text("SELECT inquiry_key FROM lending.after_hours_conversations "
-                               "WHERE inquiry_key = ANY(:keys) AND prompted_state IS NOT NULL")
+# The voicemails whose caller the night responder has texted: the conversation that voicemail opened, or one that
+# was already open from the same number when it arrived (a second voicemail joins the open conversation, so its own
+# key never opens one).
+_NIGHT_RESPONDER_TEXTED = text("""
+    SELECT DISTINCT p.call_key
+      FROM unnest(CAST(:keys AS text[]), CAST(:phones AS text[]), CAST(:received AS timestamptz[]))
+               AS p(call_key, phone, received_at)
+      JOIN lending.after_hours_conversations c
+        ON c.prompted_state IS NOT NULL
+       AND (c.inquiry_key = p.call_key
+            OR (c.phone = p.phone AND c.opened_at <= p.received_at
+                AND COALESCE(c.closed_at, c.expires_at) >= p.received_at))
+""")
 
 
 def pins_to_call(db, now: datetime) -> list[PinnedCall]:
@@ -260,8 +271,9 @@ def draft_morning_replies(db, pins: list[PinnedCall], queue: DraftQueue, drafter
     keys = [pin.event.call_key for pin in pins]
     drafted = {key: (action_id, status, lane_blocked) for key, action_id, status, lane_blocked in
                db.execute(_DRAFTED, {"keys": keys, "lane_prefix": f"{LANE_BLOCK_PREFIX}%"}).all()}
-    texted = (set(db.execute(_NIGHT_RESPONDER_TEXTED, {"keys": keys}).scalars())
-              if conversations_enabled() else set())
+    texted = (set(db.execute(_NIGHT_RESPONDER_TEXTED, {
+        "keys": keys, "phones": [pin.event.phone for pin in pins],
+        "received": [pin.event.received_at for pin in pins]}).scalars()) if conversations_enabled() else set())
     names = names_by_phone(db, [pin.event.phone for pin in pins if pin.event.call_key not in drafted])
     replies = []
     for pin in pins:

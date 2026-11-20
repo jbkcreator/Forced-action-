@@ -12,7 +12,8 @@ this module never talks to a calendar itself. With no calendar passed in, or non
 A booking call with no clear result is never made a second time (``booking_unknown``).
 
 Checks before a send, in order: the conversation has not expired; the recipient still has consent (text) or is not
-suppressed (email); it is 8am-8pm for the recipient; for a text, the carrier has approved lending texts; and the
+suppressed (email), where a conversation an inbound text opened waits ``CONSENT_WAIT_MINUTES`` for that text's
+consent before it closes; it is 8am-8pm for the recipient; for a text, the carrier has approved lending texts; and the
 message carries no Backflip name, number or domain. A recipient outside the window, or a text before carrier
 approval, waits and is tried again on the next pass. The lending emergency halt stops the whole pass.
 
@@ -40,8 +41,9 @@ from config.lending_after_hours_conversation import (BOOKED, CHANNEL_EMAIL, CHAN
                                                      CLOSED_BLOCKED_LANE, CLOSED_BOOKING_REFUSED,
                                                      CLOSED_BOOKING_UNKNOWN, CLOSED_EXPIRED, CLOSED_NO_CONSENT,
                                                      CLOSED_NO_SLOTS, CLOSED_SEND_FAILED, CLOSED_SEND_REFUSED,
-                                                     CONVERSATION_TTL_HOURS, EMAIL_SUBJECT, MAX_SEND_ATTEMPTS, OFFERED_SLOT_COUNT,
-                                                     OPEN_STATES, SEND_BATCH_SIZE,
+                                                     CONSENT_WAIT_MINUTES, CONVERSATION_TTL_HOURS, EMAIL_SUBJECT,
+                                                     MAX_SEND_ATTEMPTS, OFFERED_SLOT_COUNT, OPEN_STATES,
+                                                     QUESTION_STATES, SEND_BATCH_SIZE, SOURCE_INBOUND_TEXT,
                                                      SENDABLE_STATES, SLOT_CHOICE, SLOT_CHOSEN, SLOT_OFFER,
                                                      SLOT_OFFER_AFTER_TAKEN, SLOT_OFFER_AGAIN, STALE_CLAIM_SECONDS,
                                                      TEMPLATE_VERSIONS)
@@ -61,13 +63,14 @@ SENT = "sent"
 SEND_UNKNOWN = "send_unknown"
 WAITING_HOURS = "waiting_hours"
 WAITING_CARRIER = "waiting_carrier"
+WAITING_CONSENT = "waiting_consent"
 NOT_CONFIGURED = "not_configured"
 RETRY_LATER = "retry_later"
 BOOKED_NOW = "booked"
 SLOT_TAKEN = "slot_taken"
 CLAIM_LOST = "claim_lost"
 # Outcomes that leave the step due: the conversation is not tried again in the same pass.
-_STILL_DUE = (WAITING_HOURS, WAITING_CARRIER, NOT_CONFIGURED, RETRY_LATER)
+_STILL_DUE = (WAITING_HOURS, WAITING_CARRIER, WAITING_CONSENT, NOT_CONFIGURED, RETRY_LATER)
 
 BOOKING_BOOKED = "booked"
 BOOKING_SLOT_TAKEN = "slot_taken"
@@ -118,6 +121,8 @@ class DueStep:
     offered_slots: list  # ISO slot starts, in the order they were numbered for the lead
     chosen_slot_start: Optional[datetime]
     offered_before: bool  # a slot offer has already gone out in this conversation
+    source: str
+    opened_at: datetime
     claimed_at: datetime
 
     @property
@@ -162,7 +167,7 @@ _CLAIM = text("""
      WHERE c.id = picked.id
     RETURNING c.id, c.channel, c.phone, c.email, c.first_name, c.state, c.send_attempts, c.ghl_contact_id,
               c.answers, c.offered_slots, c.chosen_slot_start,
-              c.sent_messages @> CAST(:slot_offer_receipt AS jsonb), c.sending_claimed_at
+              c.sent_messages @> CAST(:slot_offer_receipt AS jsonb), c.source, c.opened_at, c.sending_claimed_at
 """)
 # Every write below is the claim holder's: it changes nothing once the claim has been settled or taken over.
 _RELEASE = text("""
@@ -255,6 +260,13 @@ def _may_contact(db, item: DueStep) -> bool:
     return not is_email_suppressed(db, item.email or "")
 
 
+def _awaiting_consent(item: DueStep, now: datetime) -> bool:
+    """A conversation opened by an inbound text whose consent GHL has not reported yet: nothing has gone out and
+    the wait is not over (the consent webhook can arrive after the text's own)."""
+    return (item.source == SOURCE_INBOUND_TEXT and item.state == QUESTION_STATES[0]
+            and now < item.opened_at + timedelta(minutes=CONSENT_WAIT_MINUTES))
+
+
 def _waiting(item: DueStep, now: datetime, *, carrier_approved: bool, has_sender: bool) -> Optional[str]:
     """Why this message cannot go yet (it is tried again on the next pass), or None."""
     if not _window_open(item, now):
@@ -313,6 +325,9 @@ def _send_one(db, item: DueStep, *, text_sender: Optional[TextSender], email_sen
     """Check, send and record one due message; returns the outcome (the caller commits). ``started`` is set the
     moment the sender is about to be called: from then on a failure may have reached the recipient."""
     if not _may_contact(db, item):
+        if _awaiting_consent(item, now):
+            _write(db, _RELEASE, item, send_attempts=item.send_attempts)
+            return WAITING_CONSENT
         return _stop(db, item, CLOSED_NO_CONSENT, now)
     sender = text_sender if item.channel == CHANNEL_SMS else email_sender
     waiting = _waiting(item, now, carrier_approved=carrier_approved, has_sender=sender is not None)

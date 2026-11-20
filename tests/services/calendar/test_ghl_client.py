@@ -35,6 +35,30 @@ def _response(status_code=200, json_body=None, text=""):
     return resp
 
 
+class TestGetFreeSlots:
+    def test_reads_the_calendars_bookable_times_per_day_and_keeps_the_asked_range(self):
+        payload = {
+            "2026-06-15": {"slots": ["2026-06-15T13:00:00+00:00", "2026-06-15T14:00:00+00:00"]},
+            "2026-06-18": {"slots": ["2026-06-18T13:00:00+00:00"]},  # past END: dropped
+            "traceId": "t-1",                                         # not a day: ignored
+        }
+        with patch("requests.request", return_value=_response(json_body=payload)) as mock_req:
+            slots = _client().get_free_slots(calendar_id=CALENDAR_ID, start=START, end=END,
+                                             timezone_name="America/New_York")
+
+        assert slots == [datetime(2026, 6, 15, 13, tzinfo=timezone.utc), datetime(2026, 6, 15, 14, tzinfo=timezone.utc)]
+        args, kwargs = mock_req.call_args
+        assert args[1].endswith(f"/calendars/{CALENDAR_ID}/free-slots")
+        assert kwargs["params"] == {"startDate": int(START.timestamp() * 1000), "endDate": int(END.timestamp() * 1000),
+                                    "timezone": "America/New_York"}
+
+    def test_a_refused_read_raises_instead_of_reporting_no_slots(self):
+        with patch("requests.request", return_value=_response(status_code=400, text="bad")):
+            with pytest.raises(CalendarUnavailable):
+                _client().get_free_slots(calendar_id=CALENDAR_ID, start=START, end=END,
+                                         timezone_name="America/New_York")
+
+
 class TestGetBusy:
     def test_parses_events_as_busy_spans(self):
         client = _client()

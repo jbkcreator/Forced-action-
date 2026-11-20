@@ -81,6 +81,7 @@ def ghl_opt_out(
 @router.post("/ghl-text-consent")
 def ghl_text_consent(
     body: dict[str, Any],
+    background: BackgroundTasks,
     x_webhook_secret: Optional[str] = Header(default=None),
     db: Session = Depends(get_db),
 ) -> dict[str, Any]:
@@ -99,6 +100,9 @@ def ghl_text_consent(
         logger.error("[lending-ghl] consent webhook failed: %s", type(exc).__name__)
         report_webhook_failure(GHL_TEXT_CONSENT, body, exc)
         raise HTTPException(status_code=500, detail="Consent could not be recorded") from exc
+    if result.get("recorded") and conversations_enabled():
+        # A night conversation opened by this text may be holding its first question for this consent.
+        background.add_task(run_send_cycle_now)
     return result
 
 

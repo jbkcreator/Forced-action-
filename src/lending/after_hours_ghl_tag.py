@@ -2,7 +2,8 @@
 
 While a conversation is open, its GHL contact carries ``GHL_TAG_NIGHT_CONVERSATION``; the GHL Conversation AI
 workflow skips contacts with that tag (set in GHL, docs/lending/ghl-conversation-ai.md). The tag comes off once the
-conversation is booked, closed or expired. :func:`sync_night_tags` runs at the start of every night responder pass,
+conversation is booked, closed or expired, unless the same contact has another conversation still open: the tag is
+one per contact, so it stays for that one. :func:`sync_night_tags` runs at the start of every night responder pass,
 before its messages go out.
 
 A conversation with no GHL contact id is looked up by phone; one not found in GHL is tried again next pass. Each
@@ -83,11 +84,18 @@ _TO_TAG = text("""
        AND (ghl_contact_id IS NOT NULL OR phone IS NOT NULL)
      ORDER BY opened_at LIMIT :limit
 """)
+# The tag is per GHL contact, shared by all of that contact's conversations: a finished conversation whose contact
+# has another one still open keeps it (still_needed), and the open one takes over the tag.
 _TO_UNTAG = text("""
-    SELECT id, ghl_contact_id FROM lending.after_hours_conversations
-     WHERE ghl_tagged_at IS NOT NULL AND ghl_untagged_at IS NULL
-       AND (state <> ALL(:open_states) OR expires_at <= :now)
-     ORDER BY updated_at LIMIT :limit
+    SELECT c.id, c.ghl_contact_id,
+           EXISTS (SELECT 1 FROM lending.after_hours_conversations o
+                    WHERE o.id <> c.id AND o.state = ANY(:open_states) AND o.expires_at > :now
+                      AND (o.ghl_contact_id = c.ghl_contact_id OR (o.phone IS NOT NULL AND o.phone = c.phone)))
+               AS still_needed
+      FROM lending.after_hours_conversations c
+     WHERE c.ghl_tagged_at IS NOT NULL AND c.ghl_untagged_at IS NULL
+       AND (c.state <> ALL(:open_states) OR c.expires_at <= :now)
+     ORDER BY c.updated_at LIMIT :limit
 """)
 _MARK_TAGGED = text("""
     UPDATE lending.after_hours_conversations
@@ -100,7 +108,7 @@ _MARK_UNTAGGED = text("UPDATE lending.after_hours_conversations SET ghl_untagged
 def sync_night_tags(db, client: NightTagClient, now: datetime) -> dict[str, int]:
     """Tag the GHL contacts of open conversations and untag those of finished ones. Commits after each write, so
     a later failure never undoes a tag GHL already holds."""
-    counts = {"tagged": 0, "untagged": 0, "not_in_ghl": 0, "failed": 0}
+    counts = {"tagged": 0, "untagged": 0, "kept_for_open": 0, "not_in_ghl": 0, "failed": 0}
     params = {"open_states": list(OPEN_STATES), "now": now, "limit": TAG_SYNC_BATCH_SIZE}
     for row in db.execute(_TO_TAG, params).mappings().all():
         try:
@@ -117,6 +125,11 @@ def sync_night_tags(db, client: NightTagClient, now: datetime) -> dict[str, int]
         db.commit()
         counts["tagged"] += 1
     for row in db.execute(_TO_UNTAG, params).mappings().all():
+        if row["still_needed"]:
+            db.execute(_MARK_UNTAGGED, {"id": row["id"], "now": now})
+            db.commit()
+            counts["kept_for_open"] += 1
+            continue
         try:
             client.remove_tag(row["ghl_contact_id"], GHL_TAG_NIGHT_CONVERSATION)
         except GhlTagError as exc:

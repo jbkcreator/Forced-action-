@@ -9,10 +9,10 @@ import pytest
 from sqlalchemy import text
 
 from config.lending_after_hours_conversation import (BOOKED, CHANNEL_EMAIL, CHANNEL_SMS, CLOSED,
-                                                     CONVERSATION_TTL_HOURS, EMAIL_SUBJECT, MAX_SEND_ATTEMPTS,
-                                                     QUESTION_STATES, QUESTIONS, SLOT_CHOICE, SLOT_CHOSEN,
-                                                     SLOT_OFFER, SLOT_OFFER_AFTER_TAKEN, SLOT_OFFER_AGAIN,
-                                                     STALE_CLAIM_SECONDS)
+                                                     CONSENT_WAIT_MINUTES, CONVERSATION_TTL_HOURS, EMAIL_SUBJECT,
+                                                     MAX_SEND_ATTEMPTS, QUESTION_STATES, QUESTIONS, SLOT_CHOICE,
+                                                     SLOT_CHOSEN, SLOT_OFFER, SLOT_OFFER_AFTER_TAKEN,
+                                                     SLOT_OFFER_AGAIN, SOURCE_INBOUND_TEXT, STALE_CLAIM_SECONDS)
 from src.lending import after_hours_responder
 from src.lending.after_hours_conversation import (booked_message, next_morning_window, open_conversation,
                                                   question_message, record_reply, slot_label, slot_offer_message)
@@ -136,6 +136,63 @@ def test_no_text_once_consent_is_gone(db):
     assert _pass(db, sender) == {"no_consent": 1}
     row = _row(db, conversation_id)
     assert sender.sent == [] and (row["state"], row["closed_reason"]) == (CLOSED, "no_consent")
+
+
+def _open_by_inbound_text(db):
+    from src.lending.after_hours_conversation import inbound_text_inquiry_key
+
+    return _open(db, inquiry_key=inbound_text_inquiry_key("m-first"), source=SOURCE_INBOUND_TEXT)
+
+
+def test_a_text_whose_consent_webhook_comes_second_gets_the_first_question_once_the_consent_lands(db):
+    db.execute(text("DELETE FROM lending.text_consents WHERE phone = :p"), {"p": PHONE})
+    conversation_id, sender = _open_by_inbound_text(db), FakeSender()
+    assert _pass(db, sender) == {"waiting_consent": 1}
+    row = _row(db, conversation_id)
+    assert sender.sent == [] and (row["state"], row["sending_claimed_at"]) == (QUESTION_STATES[0], None)
+    db.execute(text("INSERT INTO lending.text_consents (phone, source) VALUES (:p, 'inbound_text')"), {"p": PHONE})
+    assert _pass(db, sender, now=DAY + timedelta(minutes=1)) == {"sent": 1}
+
+
+def test_a_text_whose_consent_webhook_came_first_gets_the_first_question_at_once(db):
+    _open_by_inbound_text(db)  # the db fixture already holds the consent
+    assert _pass(db, FakeSender()) == {"sent": 1}
+
+
+def test_a_text_whose_consent_never_lands_closes_unsent_after_the_wait(db):
+    db.execute(text("DELETE FROM lending.text_consents WHERE phone = :p"), {"p": PHONE})
+    conversation_id, sender = _open_by_inbound_text(db), FakeSender()
+    assert _pass(db, sender, now=DAY + timedelta(minutes=CONSENT_WAIT_MINUTES - 1)) == {"waiting_consent": 1}
+    assert _pass(db, sender, now=DAY + timedelta(minutes=CONSENT_WAIT_MINUTES)) == {"no_consent": 1}
+    assert sender.sent == [] and _row(db, conversation_id)["closed_reason"] == "no_consent"
+
+
+def test_only_a_conversation_opened_by_a_text_waits_for_consent(db):
+    # A voicemail or website conversation was opened because the consent was already on record: none now means
+    # it was withdrawn, so it closes at once (test_no_text_once_consent_is_gone).
+    db.execute(text("DELETE FROM lending.text_consents WHERE phone = :p"), {"p": PHONE})
+    _open(db)
+    assert _pass(db, FakeSender()) == {"no_consent": 1}
+
+
+def test_the_consent_webhook_starts_a_send_pass_for_a_waiting_text(db, enabled, monkeypatch,
+                                                                    night_responder_send_passes):
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+    from pydantic import SecretStr
+
+    from config.settings import get_settings
+    from src.api import lending_ghl_router
+    from src.api.deps import get_db
+
+    monkeypatch.setattr(get_settings(), "lending_ghl_webhook_secret", SecretStr("s"), raising=False)
+    app = FastAPI()
+    app.include_router(lending_ghl_router.router)
+    app.dependency_overrides[get_db] = lambda: db
+    response = TestClient(app).post("/webhooks/lending/ghl-text-consent", headers={"X-Webhook-Secret": "s"},
+                                    json={"source": "inbound_text", "phone": PHONE, "message": "Hi, I have a flip"})
+    assert response.status_code == 200 and response.json()["recorded"]
+    assert night_responder_send_passes == ["intake"]
 
 
 def test_a_message_carrying_a_backflip_name_is_held(db):
@@ -267,6 +324,45 @@ def test_a_caller_the_night_responder_texted_gets_no_morning_reply_draft(db, ena
     [reply] = draft_morning_replies(db, pins, NoDrafts(), lambda first_name, transcript: "hi")
     assert reply.action_id is None and reply.night_responder_texted
     assert "texted overnight by the night responder" in format_slack([reply])
+
+
+def test_a_second_voicemail_after_the_first_question_went_out_gets_no_morning_reply_draft(db, enabled):
+    from src.lending.after_hours_intake import draft_morning_replies, pins_to_call, record_intake
+
+    class NoDrafts:
+        def enqueue(self, **kwargs: Any) -> int:
+            raise AssertionError("no reply may be drafted")
+
+    db.execute(text("DELETE FROM lending.contacts WHERE phone = :p"), {"p": PHONE})
+    assert record_intake(db, VOICEMAIL, now=NIGHT)
+    assert _pass(db, FakeSender(), now=MORNING) == {"sent": 1}
+    later = MORNING + timedelta(minutes=20)
+    # The second voicemail joins the open conversation, so its own key never opens one; the list must still see
+    # that this caller is already answering the questions by text.
+    assert record_intake(db, {**VOICEMAIL, "call_id": "vm-2", "received_at": later.isoformat()}, now=later)
+    pins = pins_to_call(db, MORNING + timedelta(minutes=55))
+    [reply] = draft_morning_replies(db, pins, NoDrafts(), lambda first_name, transcript: "hi")
+    assert reply.pin.event.ref == "vm-2" and reply.night_responder_texted
+
+
+def test_a_voicemail_after_the_last_conversation_closed_gets_its_morning_reply_draft(db, enabled):
+    from src.lending.after_hours_intake import draft_morning_replies, pins_to_call, record_intake
+
+    class Drafts:
+        def enqueue(self, **kwargs: Any) -> int:
+            return 77
+
+    db.execute(text("DELETE FROM lending.contacts WHERE phone = :p"), {"p": PHONE})
+    assert record_intake(db, VOICEMAIL, now=NIGHT)
+    assert _pass(db, FakeSender(), now=MORNING) == {"sent": 1}
+    db.execute(text("UPDATE lending.after_hours_conversations SET state = 'closed', closed_at = :at "
+                    "WHERE contact_key = :p"), {"at": MORNING + timedelta(minutes=5), "p": PHONE})
+    later = MORNING + timedelta(minutes=20)
+    assert record_intake(db, {**VOICEMAIL, "call_id": "vm-3", "received_at": later.isoformat()}, now=later)
+    pins = pins_to_call(db, MORNING + timedelta(minutes=55))
+    [reply] = draft_morning_replies(db, pins, Drafts(), lambda first_name, transcript: "hi")
+    # vm-3 opened a new conversation of its own that has sent nothing yet: the caller is owed a reply.
+    assert reply.pin.event.ref == "vm-3" and not reply.night_responder_texted and reply.action_id == 77
 
 
 # --- after the third answer: slots on the next business morning, the booking, the confirmation ---

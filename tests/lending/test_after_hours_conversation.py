@@ -44,7 +44,7 @@ def test_a_long_answer_is_cut_and_a_blank_message_changes_nothing():
     assert (blank.outcome, blank.state, blank.answers) == ("ignored", QUESTION_STATES[1], ("a",))
 
 
-@pytest.mark.parametrize("state", [*QUESTION_STATES, SLOT_CHOICE])
+@pytest.mark.parametrize("state", [*QUESTION_STATES, SLOT_CHOICE, SLOT_CHOSEN])
 @pytest.mark.parametrize("message", ["STOP", "stop", "Unsubscribe", "please stop"])
 def test_a_stop_request_closes_the_conversation_from_any_waiting_state(state, message):
     turn = next_turn(state, ("a",), message, offered_slot_count=3)
@@ -164,6 +164,58 @@ def test_a_redelivered_message_is_applied_once(db):
     mark_prompted(db, conversation_id, QUESTION_STATES[1], now=NOW)
     assert _reply(db, "m-1", "Fix and flip") == "duplicate"
     assert _row(db, conversation_id)["answers"] == ["Fix and flip"]
+
+
+def _pick_and_book(db, conversation_id, message_id="m-pick"):
+    _answer_all(db, conversation_id)
+    mark_prompted(db, conversation_id, SLOT_CHOICE, now=NOW, offered_slots=SLOTS)
+    assert _reply(db, message_id, "2") == "slot_chosen"
+    db.execute(text("UPDATE lending.after_hours_conversations SET state = 'booked', closed_at = :now WHERE id = :id"),
+               {"now": NOW, "id": conversation_id})
+
+
+def test_a_pick_redelivered_after_the_booking_opens_nothing_and_answers_nothing(db):
+    first = _open(db)
+    _pick_and_book(db, first)
+    # The booked conversation no longer matches as open: without the receipt check the "2" would be taken for a
+    # new inquiry and reach the opener.
+    assert _reply(db, "m-pick", "2") == "duplicate"
+    second = _open(db, inquiry_key="after_hours:ghl_voicemail:vm-2")
+    mark_prompted(db, second, QUESTION_STATES[0], now=NOW)
+    # A newer conversation is waiting for its first answer: the old pick is still not its answer.
+    assert _reply(db, "m-pick", "2") == "duplicate"
+    assert _row(db, second)["answers"] == []
+    assert _reply(db, "m-new", "Rental") == "answered"
+
+
+def test_a_redelivered_text_that_opened_the_conversation_is_never_taken_as_its_first_answer(db):
+    from src.lending.after_hours_conversation import inbound_text_inquiry_key
+
+    conversation_id = _open(db, inquiry_key=inbound_text_inquiry_key("m-first"), source="inbound_text")
+    mark_prompted(db, conversation_id, QUESTION_STATES[0], now=NOW)
+    assert _reply(db, "m-first", "Hi, I have a flip in Tampa") == "duplicate"
+    assert _row(db, conversation_id)["answers"] == []
+
+
+def test_a_stop_counts_even_while_the_next_question_has_not_gone_out(db):
+    conversation_id = _open(db)  # the first question is still waiting to be sent
+    assert _reply(db, "m-stop", "STOP") == "opted_out"
+    assert (_row(db, conversation_id)["state"], _row(db, conversation_id)["closed_reason"]) == (CLOSED, CLOSED_OPTED_OUT)
+
+
+def test_a_stop_while_the_booking_is_pending_closes_it_and_releases_the_booking_claim(db):
+    conversation_id = _open(db)
+    _answer_all(db, conversation_id)
+    mark_prompted(db, conversation_id, SLOT_CHOICE, now=NOW, offered_slots=SLOTS)
+    assert _reply(db, "m-pick", "2") == "slot_chosen"
+    db.execute(text("UPDATE lending.after_hours_conversations SET sending_claimed_at = :now WHERE id = :id"),
+               {"now": NOW, "id": conversation_id})  # a booking pass is running
+    assert _reply(db, "m-stop", "STOP") == "opted_out"
+    row = _row(db, conversation_id)
+    assert (row["state"], row["closed_reason"], row["sending_claimed_at"]) == (CLOSED, CLOSED_OPTED_OUT, None)
+    assert row["chosen_slot_start"] == SLOTS[1]  # kept as the record of what was picked
+    [opt_out] = db.opt_outs
+    assert opt_out["phone"] == PHONE
 
 
 def test_three_answers_then_a_pick_store_the_chosen_slot(db):

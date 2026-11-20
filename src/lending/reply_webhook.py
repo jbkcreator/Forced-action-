@@ -18,10 +18,9 @@ from config.lending_after_hours_conversation import CHANNEL_SMS, SOURCE_INBOUND_
 from src.api.deps import get_db
 from src.api.lending_ghl_router import _verify_secret
 from src.lending.after_hours_conversation import (OUTCOME_ANSWERED, OUTCOME_NO_CONVERSATION, OUTCOME_REPROMPT,
-                                                  OUTCOME_SLOT_CHOSEN, conversations_enabled, open_conversation,
-                                                  record_reply)
+                                                  OUTCOME_SLOT_CHOSEN, conversations_enabled,
+                                                  inbound_text_inquiry_key, open_conversation, record_reply)
 from src.lending.after_hours_responder import run_send_cycle_now
-from src.lending.consent import has_text_consent
 from src.lending.instantly_replies import is_stop_request
 from src.lending.payload_shape import log_shape
 from src.lending.reply_guard import ReplyEvent, handle_reply_event, in_reply_hours, parse_event, slack_poster
@@ -35,29 +34,28 @@ _LENDINGFLOW_LEAD = text("SELECT EXISTS (SELECT 1 FROM lending.lendingflow_leads
 
 def _open_for_inbound_text(db: Session, event: ReplyEvent, now: datetime) -> bool:
     """An inbound text outside Josh's hours, from someone with no open after-hours conversation, starts one: they
-    texted first and are waiting for an answer. Same text-consent rule as the voicemail trigger. A LendingFlow lead
-    is left out (the intro text and the speed-to-lead queue already reach them), and so is a stop request."""
+    texted first and are waiting for an answer. A LendingFlow lead is left out (the intro text and the speed-to-lead
+    queue already reach them), and so is a stop request.
+
+    Text consent is not required here: GHL reports the consent this text carries on a separate webhook that can
+    arrive after this one. The responder holds the first question until the consent is recorded, for
+    ``CONSENT_WAIT_MINUTES``, and closes the conversation unsent if it never is. A failure raises, so GHL
+    redelivers the text; the inquiry key is the message id, so a redelivery never opens a second conversation."""
     if not event.phone or in_reply_hours(now) or is_stop_request(event.body):
         return False
-    try:
-        with db.begin_nested():  # a failure here never undoes the reply handling around it
-            if db.execute(_LENDINGFLOW_LEAD, {"p": event.phone}).scalar() or not has_text_consent(db, event.phone):
-                return False
-            return open_conversation(db, inquiry_key=f"after_hours:{SOURCE_INBOUND_TEXT}:{event.message_id}",
-                                     source=SOURCE_INBOUND_TEXT, channel=CHANNEL_SMS, phone=event.phone,
-                                     ghl_contact_id=event.contact_id, first_name=event.first_name,
-                                     now=now) is not None
-    except Exception as exc:  # class only: SQL errors embed bound parameters
-        logger.error("[reply-webhook] night conversation for message %s not opened (%s)", event.message_id,
-                     type(exc).__name__)
+    if db.execute(_LENDINGFLOW_LEAD, {"p": event.phone}).scalar():
         return False
+    return open_conversation(db, inquiry_key=inbound_text_inquiry_key(event.message_id), source=SOURCE_INBOUND_TEXT,
+                             channel=CHANNEL_SMS, phone=event.phone, ghl_contact_id=event.contact_id,
+                             first_name=event.first_name, now=now) is not None
 
 
 def _advance_after_hours_conversation(db: Session, event: ReplyEvent) -> Optional[bool]:
     """An inbound message from a lead in an open after-hours conversation is that conversation's next answer; an
     inbound text after hours from a lead with none starts one. True when it made a message or the booking due,
-    False when it changed nothing, None when it could not be saved: the caller still runs the handoff, then answers
-    with an error so GHL redelivers the message (an applied message is never applied twice)."""
+    False when it changed nothing, None when it could not be saved (an answer, or the opening of a conversation):
+    the caller still runs the handoff, then answers with an error so GHL redelivers the message (an applied message
+    is never applied twice)."""
     if event.direction != "inbound" or not conversations_enabled():
         return False
     try:

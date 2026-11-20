@@ -165,6 +165,37 @@ class GHLCalendarClient:
             if ev.get("appointmentStatus") not in ("cancelled", "showed_cancelled")
         ]
 
+    def get_free_slots(
+        self, *, calendar_id: str, start: datetime, end: datetime, timezone_name: str
+    ) -> list[datetime]:
+        """The start times this calendar accepts a booking at in [start, end).
+
+        Unlike ``get_busy`` (the gaps between events), this is GHL's own
+        bookable list, so the calendar's opening hours, buffers and booking
+        rules are already applied. Response shape (public reference, not yet
+        confirmed live): ``{"2026-11-23": {"slots": ["2026-11-23T09:00:00-05:00",
+        ...]}, "traceId": "..."}``; anything that is not a date entry with a
+        ``slots`` list is ignored.
+        """
+        resp = self._request(
+            "GET",
+            f"/calendars/{calendar_id}/free-slots",
+            params={
+                "startDate": _to_epoch_ms(start),
+                "endDate": _to_epoch_ms(end),
+                "timezone": timezone_name,
+            },
+        )
+        if not resp.ok:
+            raise CalendarUnavailable(
+                f"GHL free-slots failed for {calendar_id!r}: HTTP {resp.status_code}"
+            )
+        slots: list[datetime] = []
+        for day in (resp.json() or {}).values():
+            if isinstance(day, dict) and isinstance(day.get("slots"), list):
+                slots.extend(_parse_timestamp(value) for value in day["slots"])
+        return sorted(slot for slot in slots if start <= slot < end)
+
     def get_event(self, *, calendar_id: str, event_id: str) -> Optional[CalendarEvent]:
         resp = self._request("GET", f"/calendars/events/appointments/{event_id}")
         if resp.status_code == 404:
