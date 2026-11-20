@@ -50,6 +50,7 @@ from typing import Any, Mapping, Optional, Protocol
 from sqlalchemy import text
 
 from config.lending_compliance import REACHED_CODES, REACHED_GHL_STATUSES, REACHED_MIN_TALK_SECONDS
+from config.lending_after_hours_conversation import SOURCE_WEB_FORM
 from config.lending_followup import CALL_SOURCE_GHL
 from config.lending_speed_to_lead import (
     ACTIVE_CASCADE_MINUTES,
@@ -93,6 +94,7 @@ from config.lending_speed_to_lead import (
     SOURCE_WEB,
     SOURCES,
     TEXT_BY_LENDINGFLOW,
+    TEXT_BY_NIGHT_RESPONDER,
     TEXT_HELD,
     TEXT_NOT_ALLOWED,
     TEXT_OFF,
@@ -253,9 +255,25 @@ def voice_eligible(lead: Mapping[str, Any]) -> bool:
     return bool(lead["ai_call_consent"] and lead["ai_call_consent_text_matches"])
 
 
+_NIGHT_CONVERSATION = text("SELECT 1 FROM lending.after_hours_conversations WHERE inquiry_key = :key")
+
+
+def _night_responder_texts(db, lead_id: int) -> bool:
+    """Team decision Q8: a website lead the night responder is texting gets no second message. Its conversation is
+    saved with the lead, before this step, so such a lead is never tagged or held for the 8 AM release. Read only while
+    the night responder is on: its table exists only once its migration has run."""
+    from src.lending.after_hours_conversation import conversations_enabled
+
+    if not conversations_enabled():
+        return False
+    return db.execute(_NIGHT_CONVERSATION, {"key": f"after_hours:{SOURCE_WEB_FORM}:{lead_id}"}).first() is not None
+
+
 def _web_text(db, lead: Mapping[str, Any], tags: TagClient, *, halted: bool, now: datetime) -> tuple[str, Optional[datetime]]:
     if not intro_sms_on():
         return TEXT_OFF, None
+    if _night_responder_texts(db, lead["id"]):
+        return TEXT_BY_NIGHT_RESPONDER, None
     if now - lead["received_at"] > TEXT_LAST_CHANCE:
         return TEXT_TOO_LATE, None
     if halted or not lead["sms_consent"] or lead["suppressed"] or not has_text_consent(db, lead["phone"]):

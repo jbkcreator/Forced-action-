@@ -98,6 +98,7 @@ TEXT_NOT_ALLOWED = "not_allowed"   # no text consent, suppressed, or halted
 TEXT_TOO_LATE = "too_late"         # past TEXT_LAST_CHANCE
 TEXT_OFF = "off"                   # LENDING_INTRO_SMS_ENABLED is off
 TEXT_BY_LENDINGFLOW = "lendingflow_intro"  # LendingFlow's own T-09 intro text (lendingflow_leads.intro_sms_tagged_at)
+TEXT_BY_NIGHT_RESPONDER = "night_responder"  # the night responder's first question is this website lead's first text
 CALL_TAGGED = "tagged"
 CALL_BLOCKED = "blocked"           # call_block_reason says why (suppressed, DNC, outside hours, attempt cap, halt ...)
 CALL_OFF = "off"                   # LENDING_SPEED_TO_LEAD_ENABLED is off (a queued lead also ends here when it is switched off)

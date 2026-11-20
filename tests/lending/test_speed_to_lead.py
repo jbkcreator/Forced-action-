@@ -21,6 +21,7 @@ from config.lending_speed_to_lead import (
     GHL_TAG_SPEED_TO_LEAD,
     GHL_TAG_WEB_INTRO_READY,
     TEXT_BY_LENDINGFLOW,
+    TEXT_BY_NIGHT_RESPONDER,
     TEXT_HELD,
     TEXT_NOT_ALLOWED,
     TEXT_OFF,
@@ -64,7 +65,8 @@ class _Result:
 class FakeDb:
     """Answers start()'s statements: the lead, the claim, the queue lock, the "must wait" read and the record."""
 
-    def __init__(self, lead, *, claimed=True, busy=False, locked_elsewhere=False):
+    def __init__(self, lead, *, claimed=True, busy=False, locked_elsewhere=False, night_keys=()):
+        self.night_keys = set(night_keys)
         self.lead, self.claimed, self.busy, self.records, self.locks = lead, claimed, busy, [], 0
         self.locked_elsewhere = locked_elsewhere
         self.marks: list[dict] = []
@@ -73,6 +75,8 @@ class FakeDb:
         sql = str(statement)
         if "FROM lending.lendingflow_leads WHERE id" in sql or "FROM lending.web_leads WHERE id" in sql:
             return _Result(row=self.lead)
+        if "FROM lending.after_hours_conversations" in sql:
+            return _Result(row=(1,) if params["key"] in self.night_keys else None)
         if "pg_try_advisory_xact_lock" in sql:
             assert params == {"key": 7_302_020_811}
             self.locks += 1
@@ -348,6 +352,22 @@ def test_an_intro_text_outside_the_window_is_held(gates):
     gates.window = False
     outcome, tags, _ = run(web_lead())
     assert outcome.text_status == TEXT_HELD and ("add", "c-7", GHL_TAG_WEB_INTRO_READY) not in tags.calls
+
+
+def test_a_website_lead_the_night_responder_is_texting_gets_no_intro_text(gates, monkeypatch):
+    # Team decision Q8: the night responder's first question is the lead's first text, never a second message.
+    monkeypatch.setattr("src.lending.after_hours_conversation.conversations_enabled", lambda: True)
+    gates.window = False  # an 8 PM-8 AM lead: not held for the 8 AM release either
+    outcome, tags, db = run(web_lead(), night_keys={"after_hours:web_form:7"})
+    assert outcome.text_status == TEXT_BY_NIGHT_RESPONDER
+    assert not any(tag == GHL_TAG_WEB_INTRO_READY for _, _, tag in tags.calls)
+    assert db.records[0]["text_tagged_at"] is None
+
+
+def test_the_intro_text_still_goes_when_the_night_responder_has_no_conversation_for_the_lead(gates, monkeypatch):
+    monkeypatch.setattr("src.lending.after_hours_conversation.conversations_enabled", lambda: True)
+    outcome, tags, _ = run(web_lead(), night_keys={"after_hours:web_form:8"})
+    assert outcome.text_status == TEXT_TAGGED and ("add", "c-7", GHL_TAG_WEB_INTRO_READY) in tags.calls
 
 
 # ── once per lead, and never in the way of a delivery ────────────────────────

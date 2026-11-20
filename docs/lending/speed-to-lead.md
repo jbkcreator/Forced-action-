@@ -92,7 +92,9 @@ What happens next:
   `LENDING_SMS_CARRIER_APPROVED=true`: no text before the 10DLC approval is confirmed): the
   text box was ticked, `consent.has_text_consent` (consent row, no opt-out, not do-not-contact), not halted, and
   8am-8pm for the borrower. Outside the window the text is held; the web-lead sweep (every 5 minutes) sends it once the
-  window opens, for up to 24 hours. LendingFlow leads keep T-09's own rules.
+  window opens, for up to 24 hours. A lead the night responder (P2.3) opened a conversation for gets no intro text
+  (`night_responder`): its first question is the lead's first text (team decision Q8). LendingFlow leads keep T-09's
+  own rules.
 * **Call cascade** (`LENDING_SPEED_TO_LEAD_ENABLED`): `ghl_call_gate.blocked_reasons` allows the number (suppression,
   DNC result, already reached, attempt caps, the 8am-8pm calling window, emergency halt), the lead is not handled in
   GHL, and nothing has to go first (call queue above). Website leads also need the call-consent box, and get a fresh

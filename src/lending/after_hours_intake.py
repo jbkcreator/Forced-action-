@@ -13,6 +13,9 @@ text when there is none or the model's draft is unusable), frozen in ``lending.p
 minute sweep posts the card. A voicemail that already has a draft is not drafted again. One without consent is listed
 as call-only. Nothing is sent here; GHL's instant missed-call text is untouched.
 
+With ``LENDING_AFTER_HOURS_CONVERSATION_ENABLED`` on, a new voicemail from a caller with text consent also opens
+the night responder's conversation (``src/lending/after_hours_conversation.py``).
+
 Body fields (top level or under ``contact``): ``phone`` (required), ``first_name`` / ``name``, ``message`` /
 ``transcription`` / ``transcript``, ``received_at`` (ISO 8601), ``source`` (default ``ghl_voicemail``),
 ``call_id`` / ``message_id``.
@@ -28,10 +31,12 @@ from typing import Any, Callable, Mapping, Optional, Protocol
 
 from sqlalchemy import text
 
+from config.lending_after_hours_conversation import CHANNEL_SMS
 from config.lending_after_hours import (BUSINESS_DAYS, DEFAULT_SOURCE, DRAFT_FORBIDDEN, DRAFT_MAX_CHARS, DRAFT_PROMPT,
                                         DRAFT_TOOL_NAME, FALLBACK_REPLY, INTAKE_MARKER, MORNING_POST_ET, PIN_UNTIL_ET)
 from config.lending_reminders import TIMEZONE
 from packages.agent_core.lane_guard import LANE_BLOCK_PREFIX, LaneViolation
+from src.lending.after_hours_conversation import conversations_enabled, open_conversation
 from src.lending.consent import has_text_consent
 from src.lending.cora_tools import borrower_draft_problem
 from src.lending.ghl_consent_events import InvalidEvent
@@ -76,8 +81,9 @@ class PinnedCall:
 @dataclass(frozen=True)
 class MorningReply:
     pin: PinnedCall
-    action_id: Optional[int]  # None: no text consent, or blocked, call only
+    action_id: Optional[int]  # None: no reply draft (no text consent, blocked, or the night responder already texted)
     blocked: bool = False  # the Backflip check blocked the reply: no card will ever appear
+    night_responder_texted: bool = False
 
 
 class DraftQueue(Protocol):
@@ -166,7 +172,15 @@ def record_intake(db, body: Mapping[str, Any], *, now: Optional[datetime] = None
                                     "now": now}).rowcount
     if logged:
         db.execute(_PIN, {"id": contact_id, "now": now, "until": pin_until(now)})
+        _open_conversation_with_consent(db, event, now)
     return bool(logged)
+
+
+def _open_conversation_with_consent(db, event: IntakeEvent, now: datetime) -> None:
+    """A voicemail leaves a phone only, so the conversation is by text and needs the caller's text consent."""
+    if conversations_enabled() and has_text_consent(db, event.phone):
+        open_conversation(db, inquiry_key=event.call_key, source=event.source, channel=CHANNEL_SMS,
+                          phone=event.phone, first_name=event.first_name, now=now)
 
 
 _PINS = text("""
@@ -181,6 +195,19 @@ _PINS = text("""
 """)
 _DRAFTED = text("SELECT idempotency_key, action_id, status, COALESCE(error, '') LIKE :lane_prefix AS lane_blocked "
                 "FROM lending.pending_actions WHERE idempotency_key = ANY(:keys)")
+# The voicemails whose caller the night responder has texted: the conversation that voicemail opened, or one that
+# was already open from the same number when it arrived (a second voicemail joins the open conversation, so its own
+# key never opens one).
+_NIGHT_RESPONDER_TEXTED = text("""
+    SELECT DISTINCT p.call_key
+      FROM unnest(CAST(:keys AS text[]), CAST(:phones AS text[]), CAST(:received AS timestamptz[]))
+               AS p(call_key, phone, received_at)
+      JOIN lending.after_hours_conversations c
+        ON c.prompted_state IS NOT NULL
+       AND (c.inquiry_key = p.call_key
+            OR (c.phone = p.phone AND c.opened_at <= p.received_at
+                AND COALESCE(c.closed_at, c.expires_at) >= p.received_at))
+""")
 
 
 def pins_to_call(db, now: datetime) -> list[PinnedCall]:
@@ -239,10 +266,14 @@ def _queue_reply(queue: DraftQueue, pin: PinnedCall, drafter: Drafter, full_name
 
 def draft_morning_replies(db, pins: list[PinnedCall], queue: DraftQueue, drafter: Drafter) -> list[MorningReply]:
     """Queue a reply for Approve for each pin with text consent; a voicemail already drafted keeps its draft (no
-    second model call). The rest are call-only."""
+    second model call). A caller the night responder already texted gets no draft: a second message saying their
+    voicemail arrived would follow the questions they were sent overnight. The rest are call-only."""
+    keys = [pin.event.call_key for pin in pins]
     drafted = {key: (action_id, status, lane_blocked) for key, action_id, status, lane_blocked in
-               db.execute(_DRAFTED, {"keys": [pin.event.call_key for pin in pins],
-                                     "lane_prefix": f"{LANE_BLOCK_PREFIX}%"}).all()}
+               db.execute(_DRAFTED, {"keys": keys, "lane_prefix": f"{LANE_BLOCK_PREFIX}%"}).all()}
+    texted = (set(db.execute(_NIGHT_RESPONDER_TEXTED, {
+        "keys": keys, "phones": [pin.event.phone for pin in pins],
+        "received": [pin.event.received_at for pin in pins]}).scalars()) if conversations_enabled() else set())
     names = names_by_phone(db, [pin.event.phone for pin in pins if pin.event.call_key not in drafted])
     replies = []
     for pin in pins:
@@ -252,6 +283,8 @@ def draft_morning_replies(db, pins: list[PinnedCall], queue: DraftQueue, drafter
                 replies.append(MorningReply(pin, None, blocked=bool(lane_blocked)))
             else:
                 replies.append(MorningReply(pin, action_id))
+        elif pin.event.call_key in texted:
+            replies.append(MorningReply(pin, None, night_responder_texted=True))
         elif has_text_consent(db, pin.event.phone):
             try:
                 replies.append(MorningReply(pin, _queue_reply(queue, pin, drafter, names.get(pin.event.phone))))

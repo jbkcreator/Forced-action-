@@ -47,6 +47,8 @@ def _line(reply: MorningReply, names: Mapping[str, str]) -> str:
         status = "reply draft waiting for Approve"
     elif reply.blocked:
         status = "reply blocked by the Backflip check, no card: call back"
+    elif reply.night_responder_texted:
+        status = "texted overnight by the night responder"
     else:
         status = "no text consent, call only"
     # Full name from the lead record when known, else the name the caller gave; escaped (caller-supplied).
