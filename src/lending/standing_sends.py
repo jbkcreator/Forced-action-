@@ -522,7 +522,7 @@ _RETURN_ONE_FOR_APPROVAL = text("""
 """)
 
 
-def return_for_approval(engine: Engine, action_id: int) -> bool:
+def return_for_approval(engine: Engine, action_id: int, *, reason: str = "its wording is not approved wording") -> bool:
     """Send one automatically approved, still unsent action back for a person's approval (no decision, no card: the
     card retry posts a fresh "Approval needed" card). True when it was returned. The relay has already claimed the action
     ("sending") when its send check runs, so both states match; the relay's release of the claim then finds it pending
@@ -531,7 +531,7 @@ def return_for_approval(engine: Engine, action_id: int) -> bool:
         returned = conn.execute(_RETURN_ONE_FOR_APPROVAL, {"action_id": action_id,
                                                            "auto_actor": AUTO_GRADUATED_ACTOR}).first() is not None
     if returned:
-        logger.warning("[standing-sends] action %s sent back for approval (its wording is not approved wording)", action_id)
+        logger.warning("[standing-sends] action %s sent back for approval (%s)", action_id, reason)
     return returned
 
 

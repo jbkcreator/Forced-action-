@@ -23,6 +23,9 @@ Code: `src/tasks/lending_audience_export.py`; settings: `config/lending_audience
   - email: trimmed, lower-cased; Google file only: periods before `@gmail.com` / `@googlemail.com` removed
   - phone: E.164 with `+` for Google (`+18135550100`), digits without `+` for Meta (`18135550100`)
 - Each email and each phone appears once per file. Files are written owner-only (0600); the last 7 nights are kept.
+- Files are named by the Eastern date of the run. After both files are written, `audience_counts_{day}.json` (counts
+  only: rows per platform, contacts per source) marks the day finished. The nightly ledger export reads it for its
+  `audiences.csv`, so the ledger reports the staged files' counts, never a live count. Summaries are never pruned.
 - Logs carry counts only.
 
 ## 3. Switching it on
