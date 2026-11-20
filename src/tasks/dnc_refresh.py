@@ -80,10 +80,11 @@ def _submit_scrub_batch(phones: list[str], api_key: str) -> str:
     return str(queue_id)
 
 
-def _poll_queue(queue_id: str, api_key: str) -> list[dict]:
-    """Poll /dnc/queue/:id until pending=False, return CSV rows."""
+def _poll_queue(queue_id: str, api_key: str, max_attempts: int = 120) -> list[dict]:
+    """Poll /dnc/queue/:id until pending=False, return CSV rows. Raises after ``max_attempts`` polls
+    (_POLL_INTERVAL seconds apart)."""
     url = f"{_QUEUE_ENDPOINT}{queue_id}"
-    for attempt in range(120):
+    for attempt in range(max_attempts):
         resp = requests.get(url, headers=_headers(api_key), timeout=30)
         if not resp.ok:
             raise RuntimeError(f"Tracerfy DNC queue poll HTTP {resp.status_code}: {resp.text[:300]}")
@@ -99,7 +100,7 @@ def _poll_queue(queue_id: str, api_key: str) -> list[dict]:
             return list(csv.DictReader(io.StringIO(csv_resp.text)))
         logger.info("[DNCRefresh] queue=%s pending attempt=%d", queue_id, attempt + 1)
         time.sleep(_POLL_INTERVAL)
-    raise RuntimeError(f"Tracerfy DNC queue {queue_id} did not complete within 10 minutes")
+    raise RuntimeError(f"Tracerfy DNC queue {queue_id} did not complete within {max_attempts * _POLL_INTERVAL} seconds")
 
 
 # ---------------------------------------------------------------------------

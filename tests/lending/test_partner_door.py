@@ -33,6 +33,8 @@ from src.lending.models import LendingLoanFile, LendingPartner, LendingPartnerFi
 CONSENT = "I confirm I have the borrower's permission to share this information with Next Deal Lending."
 
 SQLITE_DDL = (
+    """CREATE TABLE lending.loan_file_status_events (id INTEGER PRIMARY KEY AUTOINCREMENT, loan_file_id INTEGER NOT NULL,
+        status TEXT NOT NULL, reason TEXT, at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP)""",
     """CREATE TABLE lending.partners (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, company TEXT,
         partner_type TEXT NOT NULL, phone TEXT, email TEXT, states TEXT, agreement_status TEXT NOT NULL DEFAULT 'pending',
         referral_terms TEXT, sms_consent BOOLEAN NOT NULL DEFAULT 0, active BOOLEAN NOT NULL DEFAULT 1, created_by TEXT,
@@ -931,3 +933,30 @@ def test_the_occupancy_answer_is_stored_and_never_blocks_the_form(answer, expect
     data = partners.SubmissionInput.model_validate(
         {k: v for k, v in {**FORM, "occupancy": answer}.items() if k != "consent"})
     assert data.occupancy == expected
+
+
+# ── status history for the nightly ledger export ─────────────────────────────
+
+def test_every_status_change_is_recorded_so_two_changes_in_one_day_are_both_kept(engine, session_factory, tmp_path) -> None:
+    _, token = _partner(session_factory)
+    file_id = _submit(session_factory, token)
+    morning = datetime(2026, 11, 18, 14, 0, tzinfo=timezone.utc)
+    with session_factory() as db:
+        partners.record_status_change(db, file_id, "approved", "sized", now=morning)
+        partners.record_status_change(db, file_id, "funded", None, now=morning + timedelta(hours=3))
+        partners.record_status_change(db, file_id, "funded", None, now=morning + timedelta(hours=4))  # no change: no event
+        db.commit()
+    events = _rows(engine, "loan_file_status_events")
+    assert [(e["status"], e["reason"]) for e in events] == [("received", None), ("approved", "sized"), ("funded", None)]
+    assert _rows(engine, "loan_files")[0]["status"] == "funded"  # the file itself holds only the latest
+
+
+def test_a_status_change_still_happens_when_the_history_table_is_missing(engine, session_factory, tmp_path) -> None:
+    _, token = _partner(session_factory)
+    file_id = _submit(session_factory, token)
+    with engine.begin() as conn:
+        conn.execute(text("DROP TABLE lending.loan_file_status_events"))
+    with session_factory() as db:
+        partners.record_status_change(db, file_id, "approved", None)
+        db.commit()
+    assert _rows(engine, "loan_files")[0]["status"] == "approved"

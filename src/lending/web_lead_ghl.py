@@ -33,6 +33,7 @@ from config.lending_web import (
     GHL_TAG_SMS_CONSENT_YES,
     GHL_TAG_WEB_LEAD,
 )
+from config.lending_lendingflow import INTRO_NAME_FALLBACK
 from config.settings import get_settings
 from src.lending.cold_leads import reconcile_warm_contact
 from src.lending.ghl_account import GhlAccount, ghl_headers, lending_ghl_account
@@ -81,6 +82,9 @@ def _custom_fields(lead: Mapping[str, Any]) -> list[dict[str, str]]:
         fields.append({"id": settings.lending_ghl_cf_loan_amount, "value": str(lead["loan_amount"])})
     if settings.lending_ghl_cf_credit_band and lead["credit_band"]:
         fields.append({"id": settings.lending_ghl_cf_credit_band, "value": lead["credit_band"]})
+    if settings.lending_ghl_cf_intro_name:  # P2.1 web intro text: first name or "there", as for LendingFlow
+        first = str(lead["name"] or "").strip().partition(" ")[0]
+        fields.append({"id": settings.lending_ghl_cf_intro_name, "value": first or INTRO_NAME_FALLBACK})
     if settings.lending_ghl_cf_property_address and lead["property_address"]:
         fields.append({"id": settings.lending_ghl_cf_property_address, "value": lead["property_address"]})
     return fields
@@ -109,6 +113,9 @@ def _note(lead: Mapping[str, Any]) -> str:
         + (" (number was already suppressed: no consent applied)" if lead["suppressed"] and lead["sms_consent"] else "") + ".",
         f"Call consent box: {'ticked' if lead['call_consent'] else 'not ticked'}"
         + (" (number was already suppressed: no consent applied)" if lead["suppressed"] and lead["call_consent"] else "") + ".",
+        f"AI call consent box: {'ticked' if lead.get('ai_call_consent') else 'not ticked'}"
+        + (" (number was already suppressed: no consent applied)" if lead["suppressed"] and lead.get("ai_call_consent")
+           else "") + ".",
         f"Deal Drop (weekly email) opt-in box: {'ticked' if lead['deal_drop_optin'] else 'not ticked'}.",
         f"Doing: {lead['deal_type'] or 'n/a'}. Projects finished, last 3 years: {lead['completed_projects_3y'] or 'n/a'}. "
         f"Property city: {lead['property_city'] or 'n/a'}.",

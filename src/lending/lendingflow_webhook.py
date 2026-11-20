@@ -18,6 +18,8 @@ from sqlalchemy.orm import Session
 from config.lending_lendingflow import MAX_BODY_BYTES
 from config.settings import get_settings
 from src.lending.db import get_lending_db
+from config.lending_speed_to_lead import SOURCE_LENDINGFLOW
+from src.lending import speed_to_lead
 from src.lending.lendingflow import ParseError, deliver_and_follow_up, parse_lendingflow, save_lead
 from src.lending.lendingflow_ghl import get_live_sink
 
@@ -39,7 +41,8 @@ def _verify_lendingflow_secret(received: Optional[str]) -> None:
 
 
 def _deliver_in_background(lead_id: int) -> None:
-    deliver_and_follow_up(get_live_sink(), lead_id=lead_id)
+    deliver_and_follow_up(get_live_sink(), lead_id=lead_id,
+                          after_delivery=speed_to_lead.live_step(SOURCE_LENDINGFLOW))
 
 
 @router.post("/lendingflow")

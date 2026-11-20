@@ -20,6 +20,7 @@ logger = logging.getLogger(__name__)
 
 DRIVE_SCOPE = "https://www.googleapis.com/auth/drive"
 _FIELDS = "files(id, name, size, createdTime)"
+_MAX_INBOX_PAGES = 10
 
 
 class DriveError(RuntimeError):
@@ -67,9 +68,20 @@ class GoogleDriveJobFolders:
         return result.get("files") or []
 
     def list_inbox(self, limit: int) -> list[DriveFile]:
+        """The oldest ``limit`` ``.json`` files. Other files are skipped, and listing continues past them, so a
+        pile of stray files never hides a job behind them."""
         query = f"'{self._inbox}' in parents and trashed = false and mimeType != 'application/vnd.google-apps.folder'"
-        files = [DriveFile(f["id"], f["name"], int(f.get("size") or 0), _parse_time(f["createdTime"]))
-                 for f in self._list(query, limit * 2) if f.get("name", "").lower().endswith(".json")]
+        files: list[DriveFile] = []
+        page_token: Optional[str] = None
+        for _ in range(_MAX_INBOX_PAGES):
+            result = self._run("list", self._files().list(
+                q=query, fields=f"nextPageToken, {_FIELDS}", orderBy="createdTime", pageSize=100,
+                pageToken=page_token, supportsAllDrives=True, includeItemsFromAllDrives=True))
+            files.extend(DriveFile(f["id"], f["name"], int(f.get("size") or 0), _parse_time(f["createdTime"]))
+                         for f in result.get("files") or [] if f.get("name", "").lower().endswith(".json"))
+            page_token = result.get("nextPageToken")
+            if len(files) >= limit or not page_token:
+                break
         return sorted(files, key=lambda f: f.created_time)[:limit]
 
     def read(self, file_id: str) -> bytes:
@@ -111,7 +123,8 @@ class FakeJobFolders:
         return file_id
 
     def list_inbox(self, limit: int) -> list[DriveFile]:
-        return sorted((entry[0] for entry in self.inbox.values()), key=lambda f: f.created_time)[:limit]
+        return sorted((entry[0] for entry in self.inbox.values() if entry[0].name.lower().endswith(".json")),
+                      key=lambda f: f.created_time)[:limit]
 
     def read(self, file_id: str) -> bytes:
         return self.inbox[file_id][1]
