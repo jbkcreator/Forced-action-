@@ -1,0 +1,23 @@
+{% extends "base.html" %}
+{% block title %}Next Deal Lending · Your documents{% endblock %}
+{% block content %}
+<h1>Your loan documents</h1>
+<p class="lead">Hi {{ first_name or "there" }}, upload each document below. PDF, JPG, PNG or HEIC, up to {{ max_upload_mb }} MB each.
+This page is just for you; please don't share the link.</p>
+{% if errors %}<div class="errors" role="alert">{% for error in errors %}<p>{{ error }}</p>{% endfor %}</div>{% endif %}
+{% for item in items %}
+<fieldset>
+  <legend>{{ item.label }}</legend>
+  {% if item.received_at %}
+  <p>✓ Received. You can upload a newer copy if needed.</p>
+  {% endif %}
+  <form method="post" action="/api/lending/docs/{{ token }}/upload" enctype="multipart/form-data">
+    <input type="hidden" name="item_code" value="{{ item.item_code }}">
+    <label for="doc-{{ item.item_code }}">Choose file</label>
+    <input id="doc-{{ item.item_code }}" type="file" name="document" accept=".pdf,.jpg,.jpeg,.png,.heic" required>
+    <button type="submit">Upload</button>
+  </form>
+</fieldset>
+{% endfor %}
+<p>{{ received }} of {{ items|length }} received. Questions? Call (656) 221-1100.</p>
+{% endblock %}

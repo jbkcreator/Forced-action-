@@ -182,6 +182,11 @@ def test_coras_own_draft_types_are_counted_but_never_graduate(template):
     assert tracker_line(row) == f"• {template}: drafted by Cora, always needs approval · 40 approved · 0% edited"
 
 
+@pytest.mark.parametrize("template", ["DOCS-REQUEST-SMS-v1", "DOCS-CHASE-D2-EMAIL-v1", "DOCS-CHASE-D8-SMS-v1"])
+def test_doc_chase_drafts_are_counted_but_never_graduate(template):
+    row = TemplateStats(template, 40, 0, 0, 0)
+    assert row.meets_rule is False and row.state == "approval_only"
+
 def test_coras_sms_and_email_drafts_carry_a_template_version():
     from src.lending.cora_tools import CoraToolkit
 
