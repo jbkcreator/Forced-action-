@@ -96,7 +96,7 @@ def test_the_file_is_created_owner_only_before_any_hash_is_written(fixed_contact
     (tmp_path / f"google_customer_match_{DAY}.partial").write_text("stale, maybe world-readable")
     export(None, tmp_path, day=DAY)
     assert [(path.endswith(".partial"), bool(flags & os.O_EXCL), mode) for path, flags, mode in opened] == [
-        (True, True, 0o600), (True, True, 0o600)]
+        (True, True, 0o600)] * 3  # both files and the counts summary
     assert not list(tmp_path.glob("*.partial"))  # the stale partial was replaced, not reused with its old mode
 
 
@@ -115,6 +115,45 @@ def test_a_failed_write_leaves_no_partial_file(fixed_contacts, tmp_path, monkeyp
     with pytest.raises(OSError):
         export(None, tmp_path, day=DAY)
     assert not list(tmp_path.glob("*.partial")) and not list(tmp_path.glob("*.csv"))
+
+
+def test_a_counts_only_summary_is_written_after_both_files(fixed_contacts, tmp_path):
+    import json
+
+    export(None, tmp_path, day=DAY)
+    summary = json.loads((tmp_path / f"audience_counts_{DAY}.json").read_text())
+    assert {k: summary[k] for k in ("day", "google_rows", "meta_rows", "contacts_by_source")} == {
+        "day": str(DAY), "google_rows": 2, "meta_rows": 2, "contacts_by_source": {"lendingflow": 1, "web": 1}}
+    raw = (tmp_path / f"audience_counts_{DAY}.json").read_text()
+    assert "@" not in raw and "813555" not in raw
+    assert export_task.read_summary(tmp_path, DAY).google_rows == 2
+
+
+def test_a_failed_file_write_leaves_no_summary(fixed_contacts, tmp_path, monkeypatch):
+    real_write = export_task._write
+
+    def fail_on_meta(path, headers, rows):
+        if path.name.startswith("meta_"):
+            raise OSError("disk full")
+        real_write(path, headers, rows)
+
+    monkeypatch.setattr(export_task, "_write", fail_on_meta)
+    with pytest.raises(OSError):
+        export(None, tmp_path, day=DAY)
+    assert export_task.read_summary(tmp_path, DAY) is None
+
+
+def test_the_default_day_is_the_eastern_date(fixed_contacts, tmp_path, monkeypatch):
+    from datetime import datetime as real_datetime, timezone
+
+    class Late(real_datetime):  # 02:30 UTC on the 19th is still the 18th in Eastern time
+        @classmethod
+        def now(cls, tz=None):
+            return real_datetime(2026, 11, 19, 2, 30, tzinfo=timezone.utc)
+
+    monkeypatch.setattr(export_task, "datetime", Late)
+    export(None, tmp_path)
+    assert (tmp_path / "audience_counts_2026-11-18.json").exists()
 
 
 def test_a_dry_run_writes_nothing(fixed_contacts, tmp_path):

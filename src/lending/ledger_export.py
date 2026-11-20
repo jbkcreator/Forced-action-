@@ -7,7 +7,8 @@ lead carries one), the internal ``contact_id`` and the last 4 digits of the phon
 * contacts, consents, scores, cohorts: full snapshot each night. ``cohorts.csv`` is one row per LendingFlow batch
   (``cohort_report.cohorts``), with no contact columns.
 * audiences: the retargeting audiences as daily counts only (rows per platform, contacts per source), never the
-  hashed files, which stay on our server (team decision Q33).
+  hashed files, which stay on our server (team decision Q33). Read from the audience export's summary for the same
+  Eastern date, so the counts match the staged files; no rows for a day whose audience export did not finish.
 * contacts carry the first-contact rank and time (``lending.first_contact_snapshots``).
 * consents include email-only opt-outs (matched to a website lead's contact by email, else keyless) and the boxes
   ticked on the website form.
@@ -29,6 +30,7 @@ from __future__ import annotations
 
 import csv
 import io
+import logging
 import re
 from dataclasses import dataclass, field
 from datetime import date, datetime, time, timedelta, timezone
@@ -39,6 +41,8 @@ from sqlalchemy import text
 
 from src.lending.borrower_score import facts_from_lendingflow_lead, facts_from_web_lead, score_borrower
 from src.services.phone_utils import normalize
+
+logger = logging.getLogger(__name__)
 
 ET = ZoneInfo("America/New_York")
 KEY_COLUMNS = ("ghl_contact_id", "contact_id", "phone_last4")
@@ -336,16 +340,29 @@ def collect(db, day: date) -> LedgerData:
         outcomes=_rows(db, _OUTCOMES, test, test_ghl, start=start, end=end),
         scores=[_score(lead) for lead in _rows(db, _SCORE_LEADS, test, test_ghl)],
         cohorts=_cohort_rows(db),
-        audiences=_audience_rows(db, day),
+        audiences=_audience_rows(day),
     )
 
 
-def _audience_rows(db, day: date) -> list[dict]:
-    """The retargeting audiences as counts only (team decision Q33): rows per platform and contacts per source, from
-    the same rules the nightly audience export uses. The hashed files themselves stay on our server."""
-    from src.tasks.lending_audience_export import export as audience_export
+def _audience_rows(day: date) -> list[dict]:
+    """The retargeting audiences as counts only (team decision Q33): rows per platform and contacts per source of the
+    audience files dated ``day``, read from the summary the audience export writes after both files (same Eastern date
+    convention). No rows when that day's export never finished or the export folder is not set, never a live count.
+    The hashed files themselves stay on our server."""
+    from pathlib import Path
 
-    counts = audience_export(db, None, day=day, dry_run=True)
+    from config.settings import get_settings
+    from src.tasks.lending_audience_export import read_summary
+
+    directory = get_settings().lending_audience_export_dir
+    try:
+        counts = read_summary(Path(directory), day) if directory else None
+    except (OSError, ValueError, KeyError, TypeError) as exc:  # an unreadable summary must not stop the whole ledger
+        logger.error("[ledger-export] audience summary for %s unreadable (%s); no audience rows", day,
+                     type(exc).__name__)
+        return []
+    if counts is None:
+        return []
     by_source = counts.contacts_by_source
     return [{"day": day.isoformat(), "platform": platform, "rows": rows,
              "lendingflow_contacts": by_source.get("lendingflow", 0), "web_contacts": by_source.get("web", 0)}

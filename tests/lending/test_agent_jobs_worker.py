@@ -506,6 +506,8 @@ def test_a_graduated_job_with_approved_wording_still_sends_automatically(h: Harn
     h.worker.run_once()
     action = h.queue.get(h.row()["action_id"])
     assert (action.status, action.decided_by) == (ActionStatus.APPROVED, "auto:graduated") and action.card_ts is None
+
+
 def _q14_q19_off(monkeypatch) -> None:
     from config.settings import get_settings
 
@@ -529,18 +531,20 @@ def test_a_graduated_cold_email_still_gets_a_card(h: Harness, monkeypatch) -> No
     _q14_q19_off(monkeypatch)
     from src.lending.agent_jobs.worker import may_send_without_card
 
-    assert not may_send_without_card("instantly_cold_email", CONTACT)
-    assert may_send_without_card("ghl_email", CONTACT)
+    assert not may_send_without_card("instantly_cold_email", {})
+    assert may_send_without_card("ghl_email", {})
 
 
 def test_cold_and_partner_messages_can_graduate_only_once_q14_and_q19_are_both_on(h: Harness, monkeypatch) -> None:
     from config.settings import get_settings
     from src.lending.agent_jobs import worker
 
-    partner = GhlContact("ghl-123", "+18135550142", "mark@example.com", frozenset(), frozenset({"ndl-partner"}))
+    partner = {"partner_contact": True}
     settings = get_settings()
     monkeypatch.setattr(settings, "lending_graduation_count_rejections", True, raising=False)
     monkeypatch.setattr(settings, "lending_graduated_approved_wording_only", False, raising=False)
-    assert not worker.may_send_without_card("instantly_cold_email", partner)  # one of the two is not enough
+    assert not worker.may_send_without_card("instantly_cold_email", {})  # one of the two is not enough
+    assert not worker.may_send_without_card("ghl_sms", partner)
     monkeypatch.setattr(settings, "lending_graduated_approved_wording_only", True, raising=False)
-    assert worker.may_send_without_card("instantly_cold_email", partner)
+    assert worker.may_send_without_card("instantly_cold_email", {})
+    assert worker.may_send_without_card("ghl_sms", partner)

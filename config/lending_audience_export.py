@@ -10,6 +10,8 @@ KEEP_NIGHTS = 7
 
 GOOGLE_FILE = "google_customer_match_{day}.csv"
 META_FILE = "meta_custom_audience_{day}.csv"
+# Counts-only summary written after both files; the ledger export reads it. Never pruned (it holds no contact data).
+SUMMARY_FILE = "audience_counts_{day}.json"
 
 # Column headers of each platform's contact-list upload template, holding SHA-256 hex values only.
 GOOGLE_HEADERS = ("Email", "Phone")

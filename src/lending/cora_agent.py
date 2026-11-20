@@ -47,7 +47,7 @@ from packages.agent_core.store import AgentStore
 from packages.agent_core.thread_history import build_history
 from packages.agent_core.tools import ToolContext, ToolRegistry
 from src.lending.agent_jobs.drive import google_job_folders
-from src.lending.agent_jobs.worker import JobQueueWorker, make_check
+from src.lending.agent_jobs.worker import JobQueueWorker, make_check, may_send_without_card
 from src.lending.attempt_log import lending_ghl_readers
 from src.lending.compliance import text_window_open
 from src.lending.consent import has_text_consent
@@ -223,7 +223,10 @@ def make_send_check(engine: Engine, *, carrier_approved: bool = False,
     8am-8pm window, and an email (GHL or Instantly) for the recipient's 8am-8pm window: these are deferrals, so an
     approved send stays approved and goes on a later sweep once they hold, or is blocked when the draft expires. An
     action approved automatically (P1.4 graduation) whose template has since been revoked is held too, and the next
-    sweep sends it back for a person's approval. With ``wording_ok`` (LENDING_GRADUATED_APPROVED_WORDING_ONLY) an
+    sweep sends it back for a person's approval. An automatically approved cold email or partner message goes back for
+    approval at once while LENDING_GRADUATION_COUNT_REJECTIONS (Q14) or LENDING_GRADUATED_APPROVED_WORDING_ONLY (Q19)
+    is off (team decision Q18), so one queued while both were on cannot send after either is turned off. With
+    ``wording_ok`` (LENDING_GRADUATED_APPROVED_WORDING_ONLY) an
     automatically approved action is re-checked against the approved wording too, so one queued before the switch was
     turned on cannot send wording nobody approved: it goes back for approval at once."""
 
@@ -244,6 +247,10 @@ def make_send_check(engine: Engine, *, carrier_approved: bool = False,
                 # P1.4: its template was revoked after the automatic approval. Held, never sent; the next sweep
                 # sends it back for a person's approval (standing_sends.return_ungraduated_auto_approvals).
                 return SendDeferred("its message type no longer auto-sends; going back for approval")
+        if action.decided_by == AUTO_GRADUATED_ACTOR and not may_send_without_card(action.channel, action.payload):
+            return_for_approval(engine, action.action_id,
+                                reason="a cold or partner message, and Q14 or Q19 is off")
+            return SendDeferred("cold and partner messages need a card while Q14 or Q19 is off; going back for approval")
         if (wording_ok is not None and action.decided_by == AUTO_GRADUATED_ACTOR
                 and not wording_ok(action.payload.get("template_version") or "", action.channel, action.payload,
                                    label_names(action.payload.get("contact_label")))):
