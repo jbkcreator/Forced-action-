@@ -49,6 +49,9 @@ class AgentJob(BaseModel):
     subject: Optional[str] = Field(default=None, min_length=1, max_length=200)
     task_due_at: Optional[AwareDatetime] = None
     task_assignee: Optional[str] = Field(default=None, max_length=64)
+    # The address a send_email job was filed for (the cold-email creator sets it). When set, the job is refused if the
+    # GHL contact's email no longer matches, so a later upsert on the same contact can never redirect it.
+    recipient_email: Optional[str] = Field(default=None, max_length=254)
 
     @model_validator(mode="after")
     def _consistent(self) -> "AgentJob":

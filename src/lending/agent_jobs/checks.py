@@ -133,6 +133,8 @@ def check_job(db, job: AgentJob, contact: Optional[GhlContact], now: datetime, *
         return _block("blocked_lane", "the job mentions a Backflip name, number or domain")
     if job.expires_at <= now:
         return _block("expired", "the job expired before Cora could act on it")
+    if job.recipient_email and (contact.email or "").strip().lower() != job.recipient_email.strip().lower():
+        return _block("error", "the GHL contact's email no longer matches the address this job was filed for")
     rail = rail_for(job, contact)
     is_message = job.type in MESSAGE_JOB_TYPES
     if is_message:

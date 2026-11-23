@@ -1227,6 +1227,10 @@ COUNTY_ID=hillsborough
 # Off until LENDING_FA_EXPORT_ENABLED=true + LENDING_FA_EXPORT_FOLDER_ID; GHL push LENDING_FA_EXPORT_GHL_ENABLED.
 30 9 * * * $PROJECT/scripts/cron/run.sh src.tasks.lending_fa_export
 
+# T1 cold-email creator: one send_email agent job per cold lead with a traced email, up to
+# LENDING_COLD_EMAIL_DAILY_CAP per ET day (08:00 EST). Off until LENDING_COLD_EMAIL_CREATOR_ENABLED=true.
+0 13 * * * $PROJECT/scripts/cron/run.sh src.tasks.lending_cold_email_creator
+
 # Lending call dispositions — retry Google Sheet / Slack #dial-tasks delivery for
 # calls whose first delivery failed or whose result was changed by the caller.
 */5 * * * * $PROJECT/scripts/cron/run.sh src.tasks.lending_disposition_delivery_retry

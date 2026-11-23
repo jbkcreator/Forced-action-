@@ -1104,6 +1104,10 @@ class AppSettings(BaseSettings):
 	lending_fa_export_enabled: bool = Field(default=False, env="LENDING_FA_EXPORT_ENABLED")
 	lending_fa_export_folder_id: str = Field(default="", env="LENDING_FA_EXPORT_FOLDER_ID")
 	lending_fa_export_ghl_enabled: bool = Field(default=False, env="LENDING_FA_EXPORT_GHL_ENABLED")
+	# T1 cold-email creator (src/tasks/lending_cold_email_creator.py): one send_email agent job per cold lead with an
+	# email. Daily cap = jobs filed per ET day; raise it as the sending domain warms up.
+	lending_cold_email_creator_enabled: bool = Field(default=False, env="LENDING_COLD_EMAIL_CREATOR_ENABLED")
+	lending_cold_email_daily_cap: int = Field(default=25, ge=0, env="LENDING_COLD_EMAIL_DAILY_CAP")
 	# Daily Florida real estate LLC export (src/tasks/sunbiz_re_llc_export.py): off until enabled with a Drive folder
 	# shared with the lending Drive service account. SFTP: the state's public data server (login published on
 	# dos.fl.gov Daily Data; kept in .env, not in code).

@@ -1,7 +1,8 @@
 """Cold leads: numbers we reached first from a list (loaded into the dialer), never inbound.
 
-Client rule: a cold lead never gets an email, and gets a text only after giving text consent on a
-call. A number counts as cold once it has been loaded into the dialer, unless it also came in
+Client rule: a cold lead never gets an email through GHL, and gets a text only after giving text consent on a
+call. The one exception is cold email through NDL's Instantly campaign (the ``ndl-cold`` rail in
+src/lending/agent_jobs/checks.py, filed by src/lending/cold_email_creator.py; ADR 0040). A number counts as cold once it has been loaded into the dialer, unless it also came in
 through LendingFlow or the website form (an inbound lead is warm).
 
 A cold lead that later comes in through the form or LendingFlow is warm again: the do-not-disturb the cold push
