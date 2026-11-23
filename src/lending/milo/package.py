@@ -46,6 +46,7 @@ class MiloPackage:
     arv: Decimal
     guarantors: tuple[Guarantor, ...]
     refinance: bool = False
+    geo_restriction: str = "na"
     entity_name: Optional[str] = None
     comps: Optional[dict] = None
     deal_facts: dict = field(default_factory=dict)
@@ -104,6 +105,7 @@ def package_from_dict(data: dict) -> MiloPackage:
         arv=_money(_required(data, "arv"), "arv"),
         guarantors=guarantors,
         refinance=bool(data.get("refinance", False)),
+        geo_restriction=str(data.get("geo_restriction") or "na"),
         entity_name=data.get("entity_name") or None,
         comps=data.get("comps") or None,
         deal_facts=dict(data.get("deal_facts") or {}),

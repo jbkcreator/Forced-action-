@@ -11,10 +11,11 @@ from typing import Optional
 from config.lending_milo import (
     MILO_FICO_BANDS,
     MILO_FICO_BANDS_CONFIRMED,
-    MILO_GEO_RESTRICTION_DEFAULT,
+    MILO_GEO_RESTRICTIONS,
     MILO_PRODUCTS,
     MILO_PROPERTY_TYPES,
     MILO_PROPERTY_TYPES_CONFIRMED,
+    MILO_STEP2_PRODUCTS,
     MILO_SUPPORTED_PRODUCTS,
 )
 from src.lending.milo.package import MiloPackage, PackageError
@@ -77,6 +78,8 @@ def map_package(package: MiloPackage) -> MiloApplication:
         raise PackageError(f"product {package.product!r} is not mapped yet")
     if package.property_type not in MILO_PROPERTY_TYPES:
         raise PackageError(f"property_type {package.property_type!r} has no Milo option")
+    if package.geo_restriction not in MILO_GEO_RESTRICTIONS:
+        raise PackageError(f"geo_restriction {package.geo_restriction!r} has no Milo option")
 
     flags: list[str] = []
     if not MILO_FICO_BANDS_CONFIRMED:
@@ -107,21 +110,21 @@ def map_package(package: MiloPackage) -> MiloApplication:
             "borrower_entity": package.entity_name or "",
         },
         step2_property={
-            "Product": MILO_PRODUCTS[package.product],
+            "Product": MILO_STEP2_PRODUCTS[package.product],
             "Property state": addr.state,
             "Refinance": "Yes" if package.refinance else "No",
             "Property Type": MILO_PROPERTY_TYPES[package.property_type],
-            "GEO Restrictions": MILO_GEO_RESTRICTION_DEFAULT,
+            "GEO Restrictions": MILO_GEO_RESTRICTIONS[package.geo_restriction],
             "Purchase Price": _whole(price),
             "Estimated Cost of Rehab": _whole(rehab),
             "After Repair Value (ARV)": _whole(arv),
         },
         step2_borrower={
-            "Est. FICO Score": fico_band(pricing_fico),
-            "Foreign National": "Yes" if any(g.foreign_national for g in package.guarantors) else "No",
-            "Currently Owned Rentals": str(lead.owned_rentals),
-            "Fix & Flip Exits (Last 24 Months)": str(lead.fix_flip_exits_24m),
-            "Ground-Up Exits (Last 24 Months)": str(lead.ground_up_exits_24m),
+            "Est. FICO": fico_band(pricing_fico),
+            "Foreign national": "Yes" if any(g.foreign_national for g in package.guarantors) else "No",
+            "Rentals owned": str(lead.owned_rentals),
+            "Flip exits (24 mo)": str(lead.fix_flip_exits_24m),
+            "Ground-up exits (24 mo)": str(lead.ground_up_exits_24m),
         },
         # What Milo calculates itself; compared after filling to prove the entry.
         checks={

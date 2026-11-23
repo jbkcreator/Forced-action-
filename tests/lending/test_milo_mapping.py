@@ -28,7 +28,7 @@ def test_fix_and_flip_maps_to_milo_step_fields_and_matches_milo_calculations():
     assert app.step1["state"] == "FL"
     assert app.step2_property["Purchase Price"] == "200,000"
     assert app.step2_property["Property Type"] == "1-4 Unit"
-    assert app.step2_borrower["Fix & Flip Exits (Last 24 Months)"] == "3"
+    assert app.step2_borrower["Flip exits (24 mo)"] == "3"
     # Milo showed 250,000 / 100,000 / 1.40 for these inputs.
     assert app.checks == {"Total Project Cost": "250,000", "Gross Profit": "100,000", "Viability Ratio": "1.40"}
 
@@ -38,14 +38,49 @@ def test_pricing_uses_lowest_fico_and_strongest_track_record():
         {"name": "A", "fico": 790, "fix_flip_exits_24m": 0},
         {"name": "B", "fico": 665, "fix_flip_exits_24m": 6},
     ])))
-    assert app.step2_borrower["Est. FICO Score"] == mapping.fico_band(665)
-    assert app.step2_borrower["Fix & Flip Exits (Last 24 Months)"] == "6"
+    assert app.step2_borrower["Est. FICO"] == mapping.fico_band(665)
+    assert app.step2_borrower["Flip exits (24 mo)"] == "6"
 
 
-def test_unconfirmed_lists_and_missing_comps_are_flagged():
+def test_confirmed_lists_are_not_flagged_and_missing_comps_is():
     flags = mapping.map_package(package_from_dict(_data())).flags
-    assert mapping.FLAG_FICO_BAND_UNCONFIRMED in flags
+    assert mapping.FLAG_FICO_BAND_UNCONFIRMED not in flags
+    assert mapping.FLAG_PROPERTY_TYPE_UNCONFIRMED not in flags
     assert mapping.FLAG_NO_COMPS in flags
+
+
+@pytest.mark.parametrize("fico,band", [
+    (850, "780+"), (780, "780+"), (779, "760-779"), (665, "660-679"), (659, "640-659"), (640, "640-659"),
+    (639, "620-639"), (600, "600-619"), (599, "<600"), (300, "<600"),
+])
+def test_fico_bands_match_milo_dropdown(fico, band):
+    assert mapping.fico_band(fico) == band
+
+
+@pytest.mark.parametrize("key,label", [
+    ("1_4_unit", "1-4 Unit"), ("5_plus_multifamily", "5+ MultiFamily"), ("mixed_use", "Mixed Use"),
+    ("commercial", "Commercial"), ("vacant_land", "Vacant Land (No Construction)"), ("other", "Other"),
+])
+def test_property_types_match_milo_dropdown(key, label):
+    app = mapping.map_package(package_from_dict(_data(property_type=key)))
+    assert app.step2_property["Property Type"] == label
+
+
+@pytest.mark.parametrize("key,label", [
+    (None, "N/A"), ("partial_rural", "Partial Rural"), ("rural", "Rural"),
+    ("restricted_city", "DETROIT, CHICAGO, BALTIMORE, PHILADELPHIA"),
+])
+def test_geo_restrictions_match_milo_dropdown(key, label):
+    app = mapping.map_package(package_from_dict(_data(geo_restriction=key)))
+    assert app.step2_property["GEO Restrictions"] == label
+
+
+def test_step2_uses_milo_dropdown_labels():
+    app = mapping.map_package(package_from_dict(_data(refinance=True)))
+    assert app.step2_property["Product"] == "Fix & Flip / Fix to Rent"
+    assert app.step2_property["Refinance"] == "Yes"
+    assert set(app.step2_borrower) == {"Est. FICO", "Foreign national", "Rentals owned", "Flip exits (24 mo)",
+                                       "Ground-up exits (24 mo)"}
 
 
 def test_arv_below_cost_is_flagged():
@@ -55,6 +90,7 @@ def test_arv_below_cost_is_flagged():
 @pytest.mark.parametrize("over", [
     {"product": "dscr"},
     {"property_type": "condo_tower"},
+    {"geo_restriction": "suburban"},
 ])
 def test_unmapped_product_or_property_type_is_refused(over):
     with pytest.raises(PackageError):
