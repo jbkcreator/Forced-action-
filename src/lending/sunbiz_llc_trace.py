@@ -5,9 +5,9 @@ a person registered agent. The state writes names ``LAST FIRST [MIDDLE]``; the l
 (``live_trace._split_name``), so the name is reordered here. A subject whose address is shared by more than
 MAX_LLCS_PER_ADDRESS of the day's LLCs is skipped (a formation service or agent, not that LLC's owner).
 
-shortcut: a surname of two words ("DE LA CRUZ") reads as last name "DE" and misses (a miss is free), and a second LLC
-formed by a person already looked up at the same building is skipped as already traced; upgrade when the pilot shows
-how many LLCs this loses.
+shortcut: a surname of two words ("DE LA CRUZ") reads as last name "DE" and misses (a miss is free), and the same person
+already looked up through PropertyRadar is paid for again here (2 cents) instead of reusing that result; upgrade when the
+pilot shows how often either happens.
 """
 from __future__ import annotations
 
@@ -41,6 +41,13 @@ class TraceLead:
 class Plan:
     leads: list[TraceLead]
     skipped: Counter  # no_person | shared_address
+
+
+def ledger_key(lead: TraceLead) -> str:
+    """The key this lookup is ledgered under: address + ZIP + person. PropertyRadar ledgers a plain address + ZIP, so a
+    lookup here never suppresses a different person's lookup there (or the other way round), and two people at one
+    address are each looked up."""
+    return f"{trace_key(lead.property_address, lead.zip)}|{lead.owner_name.upper()}"
 
 
 def trace_name(raw: str) -> str:

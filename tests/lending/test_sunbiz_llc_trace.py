@@ -4,6 +4,7 @@ from datetime import date
 import pytest
 
 from src.lending.sunbiz_llc_trace import plan, trace_name
+from src.services.skip_trace_ledger import trace_key
 from src.scrappers.sunbiz.daily_filings import Filing, Officer
 from src.tasks import sunbiz_llc_trace as task
 
@@ -64,8 +65,11 @@ class _Session:
 
 @pytest.fixture
 def traced(monkeypatch):
+    """The shared ledger as the database behaves: a key is 'traced' once a row with that target_address exists."""
     ledger_rows = []
-    monkeypatch.setattr(task, "already_traced", lambda session, source, keys: {})
+    monkeypatch.setattr(task, "already_traced",
+                        lambda session, source, keys: {k: {"normal"} for k in keys if any(
+                            e["target_address"] == k for e in ledger_rows)})
     monkeypatch.setattr("src.tasks.property_radar_lead_handoff._write_usage_ledger",
                         lambda session, entries: ledger_rows.extend(entries))
     return ledger_rows
@@ -80,6 +84,10 @@ def _two_llcs():
                  _filing("L2", officers=[_officer("ROE RICK", address="34 ELM ST")])])
 
 
+def _many(n):
+    return plan([_filing(f"L{i}", officers=[_officer(f"PERSON{i:03d} AL", address=f"{100 + i} OAK ST")]) for i in range(n)])
+
+
 def test_a_hit_is_stored_against_its_llc_and_ledgered(traced):
     session = _Session()
     counts = task.run(session, _two_llcs(), submit=_submit, cap_cents=100, dry_run=False)
@@ -89,11 +97,23 @@ def test_a_hit_is_stored_against_its_llc_and_ledgered(traced):
     assert len(traced) == 2 and all(e["cost_cents"] == 2 for e in traced)
 
 
-def test_the_cost_cap_stops_a_run_before_anything_is_submitted(traced):
-    session = _Session()
-    counts = task.run(session, _two_llcs(), submit=lambda rows: pytest.fail("spent past the cap"), cap_cents=2,
+def test_a_day_over_the_cap_is_looked_up_to_the_cap_not_skipped(traced):
+    counts = task.run(_Session(), _many(51), submit=_submit, cap_cents=100, dry_run=False)
+    assert counts["looked_up"] == 50 and counts["over_cap"] == 1
+
+
+def test_a_cap_below_one_lookup_submits_nothing(traced):
+    counts = task.run(_Session(), _two_llcs(), submit=lambda rows: pytest.fail("spent past the cap"), cap_cents=1,
                       dry_run=False)
-    assert counts["looked_up"] == 0 and counts["over_cap"] == 2 and not session.upserts
+    assert counts["looked_up"] == 0 and counts["over_cap"] == 2
+
+
+@pytest.mark.parametrize("cap", [0, -5])
+def test_a_zero_or_negative_cap_never_calls_the_vendor(traced, cap):
+    session = _Session()
+    counts = task.run(session, _two_llcs(), submit=lambda rows: pytest.fail("a zero cap spent money"), cap_cents=cap,
+                      dry_run=False)
+    assert counts["looked_up"] == 0 and counts["over_cap"] == 2 and not session.upserts and not traced
 
 
 def test_a_dry_run_counts_and_spends_nothing(traced):
@@ -102,3 +122,53 @@ def test_a_dry_run_counts_and_spends_nothing(traced):
                       dry_run=True)
     assert counts["would_look_up"] == 2 and counts["worst_case_cents"] == 4
     assert not session.upserts and not traced
+
+
+def test_two_people_at_one_address_are_each_looked_up_and_the_plain_address_is_never_ledgered(traced):
+    shared = plan([_filing("L1", officers=[_officer("DOE JANE", address="12 OAK ST")]),
+                   _filing("L2", officers=[_officer("ROE RICK", address="12 OAK ST")])])
+    counts = task.run(_Session(), shared, submit=_submit, cap_cents=100, dry_run=False)
+    assert counts["looked_up"] == 2
+    plain = trace_key("12 OAK ST", "33601")
+    assert plain not in {e["target_address"] for e in traced}
+    assert {e["target_address"] for e in traced} == {f"{plain}|DOE, JANE", f"{plain}|ROE, RICK"}
+
+
+def test_a_propertyradar_lookup_at_the_same_address_does_not_block_a_sunbiz_person(monkeypatch, traced):
+    plain = trace_key("12 OAK ST", "33601")  # what PropertyRadar ledgers for its own lead at this address
+    monkeypatch.setattr(task, "already_traced",
+                        lambda session, source, keys: {k: {"normal"} for k in keys if k == plain})
+    counts = task.run(_Session(), plan([_filing("L1", officers=[_officer("DOE JANE", address="12 OAK ST")])]),
+                      submit=_submit, cap_cents=100, dry_run=False)
+    assert counts["looked_up"] == 1
+
+
+def test_the_same_person_is_never_looked_up_twice_in_one_run_or_the_next(traced):
+    twice = plan([_filing("L1", officers=[_officer("DOE JANE", address="12 OAK ST")]),
+                  _filing("L2", officers=[_officer("DOE JANE", address="12 OAK ST")])])
+    counts = task.run(_Session(), twice, submit=_submit, cap_cents=100, dry_run=False)
+    assert counts["looked_up"] == 1 and counts["already_traced"] == 1
+    again = task.run(_Session(), twice, submit=lambda rows: pytest.fail("paid twice"), cap_cents=100, dry_run=False)
+    assert again["looked_up"] == 0 and again["already_traced"] == 2
+
+
+class _Source:
+    """A state server whose file for one day shows up later."""
+
+    def __init__(self):
+        self.available = {}
+
+    def fetch(self, day):
+        return self.available.get(day)
+
+
+def test_a_state_file_posted_after_the_run_is_looked_up_by_a_later_run(monkeypatch):
+    first_day, second_day = date(2026, 11, 20), date(2026, 11, 21)
+    filings = {b"day1": [_filing("L1", officers=[_officer("DOE JANE")])]}
+    monkeypatch.setattr(task, "parse_file", lambda data: (filings[data], 0))
+    monkeypatch.setattr(task, "real_estate_llcs", lambda fs, day: ((f, "HOMES") for f in fs))
+    source = _Source()
+    assert task.window_plan(source, first_day).leads == []  # the file is not there yet at the scheduled run
+    source.available[first_day] = b"day1"  # the state posts it later
+    assert [lead.radar_id for lead in task.window_plan(source, second_day).leads] == ["L1"]
+    assert task.window_plan(source, date(2026, 11, 25)).leads == []  # outside the catch-up window: no longer retried
