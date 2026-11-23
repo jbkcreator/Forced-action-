@@ -488,6 +488,10 @@ COUNTY_ID=hillsborough
 # No-op until SUNBIZ_RE_LLC_EXPORT_ENABLED=true. Docs: docs/sunbiz-re-llc-export.md
 0 11 * * * flock /tmp/sunbiz_re_llc_export.lock $PROJECT/scripts/cron/run.sh src.tasks.sunbiz_re_llc_export
 30 13 * * * flock -w 3000 /tmp/sunbiz_re_llc_export.lock $PROJECT/scripts/cron/run.sh src.tasks.sunbiz_re_llc_export --retry
+# Tracerfy lookup of one person per new LLC (T3), after the export: stores hits in lending.sunbiz_llc_contacts for cold email.
+# No-op until SUNBIZ_LLC_TRACE_ENABLED=true; spend capped per run by SUNBIZ_LLC_TRACE_MAX_COST_CENTS; never retried.
+# Check first, spending nothing: PYTHONPATH=. python -m src.tasks.sunbiz_llc_trace --dry-run
+0 12 * * * flock /tmp/sunbiz_llc_trace.lock $PROJECT/scripts/cron/run.sh src.tasks.sunbiz_llc_trace
 
 # Vera — Live-State Report — 07:47 AM UTC daily.
 # Prod-hash vs dev-HEAD drift, migration applied/not-applied status, cron

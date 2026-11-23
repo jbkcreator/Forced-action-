@@ -367,6 +367,9 @@ class AppSettings(BaseSettings):
 	# Hard cap per calendar month (UTC) across every state and campaign: a pull that would take
 	# the month's exports_consumed past it is refused. Default = the Solo plan's 10,000 credits.
 	property_radar_monthly_cap: int = Field(default=10000, env="PROPERTY_RADAR_MONTHLY_CAP")
+	# Day of the month (1-28, UTC) the PropertyRadar plan resets. The monthly cap counts exports from the latest such
+	# day; the default 1 is the calendar month.
+	property_radar_billing_day: int = Field(default=1, ge=1, le=28, env="PROPERTY_RADAR_BILLING_DAY")
 
 
 	# ── Mode-aware helpers ────────────────────────────────────────────────────
@@ -1113,6 +1116,10 @@ class AppSettings(BaseSettings):
 	# dos.fl.gov Daily Data; kept in .env, not in code).
 	sunbiz_re_llc_export_enabled: bool = Field(default=False, env="SUNBIZ_RE_LLC_EXPORT_ENABLED")
 	lending_sunbiz_llc_export_folder_id: str = Field(default="", env="LENDING_SUNBIZ_LLC_EXPORT_FOLDER_ID")
+	# Tracerfy lookup of a person at each new LLC, for cold email (src/tasks/sunbiz_llc_trace.py). Off until enabled. The cap is
+	# the most it may spend in one run, counted as if every lookup hit (2 cents each); 100 = 50 lookups, a pilot-sized day; 0 = no lookups.
+	sunbiz_llc_trace_enabled: bool = Field(default=False, env="SUNBIZ_LLC_TRACE_ENABLED")
+	sunbiz_llc_trace_max_cost_cents: int = Field(default=100, ge=0, env="SUNBIZ_LLC_TRACE_MAX_COST_CENTS")
 	sunbiz_sftp_host: str = Field(default="sftp.floridados.gov", env="SUNBIZ_SFTP_HOST")
 	sunbiz_sftp_username: str = Field(default="", env="SUNBIZ_SFTP_USERNAME")
 	sunbiz_sftp_password: Optional[SecretStr] = Field(default=None, env="SUNBIZ_SFTP_PASSWORD")

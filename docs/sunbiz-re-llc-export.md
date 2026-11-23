@@ -70,3 +70,25 @@ python -m src.tasks.sunbiz_re_llc_export                       # yesterday (ET)
 python -m src.tasks.sunbiz_re_llc_export --day 2026-11-15      # one day (backfill)
 python -m src.tasks.sunbiz_re_llc_export --day 2026-11-15 --dry-run
 ```
+
+## Contact lookup (T3)
+
+The state file has no phone or email, so `src/tasks/sunbiz_llc_trace.py` (cron 12:00 UTC, after the export) asks
+Tracerfy for one person per LLC: the first person-type officer, else a person registered agent
+(`src/lending/sunbiz_llc_trace.py`). The state writes names `LAST FIRST`, so the name is reordered for the lookup. An
+address shared by more than 2 of the day's LLCs is skipped (formation services and agents). Hits are stored in
+`lending.sunbiz_llc_contacts` (migration `migrations/apply_lending_sunbiz_llc_contacts.py`, run it before enabling);
+emails and phones are never written to the Drive CSV. Each run covers the day and the 3 days before it (newest first),
+so a state file posted late is still looked up and a lead the cost cap left over gets another try. LLCs that list the same person at the same address share one lookup and all get the contact. A batch Tracerfy accepted but
+returned nothing for (poll timeout) is ledgered as looked up, so the catch-up never pays for it twice. Every lookup goes
+through the shared Tracerfy ledger under address + ZIP + person, so it never blocks a PropertyRadar lookup at the same
+address and a person is never paid for twice (a hit costs 2 cents, a miss nothing; the same person already traced through
+PropertyRadar is looked up again here). `SUNBIZ_LLC_TRACE_MAX_COST_CENTS` limits a run, counted as if every lookup hit:
+batches are sized to it, so a day over the cap is looked up up to the cap, and `0` means no lookups. Off until
+`SUNBIZ_LLC_TRACE_ENABLED=true`.
+
+```bash
+python -m src.tasks.sunbiz_llc_trace --dry-run --day 2026-11-15   # counts the lookups and the worst-case cost; spends nothing
+python -m src.tasks.sunbiz_llc_trace                              # yesterday (ET), when enabled
+```
+

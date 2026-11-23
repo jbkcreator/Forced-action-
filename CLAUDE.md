@@ -27,6 +27,8 @@ python -m src.scrappers.foreclosures.foreclosure_engine
 
 # Daily Florida real estate LLC CSV to Drive: the state's public SFTP daily filings file (doc/cor/yyyymmddc.txt) -> active FL LLCs filed in the last 30 days named REI/Homes/Investments/Capital (src/scrappers/sunbiz/daily_filings.py, config/sunbiz_re_llc.py) -> Drive LENDING_SUNBIZ_LLC_EXPORT_FOLDER_ID/{date}/ via the lending Drive service account (cron 11:00 UTC + 13:30 UTC --retry, flock; also catches up 3 days a late file missed; off until SUNBIZ_RE_LLC_EXPORT_ENABLED; needs SUNBIZ_SFTP_USERNAME/PASSWORD; paramiko; docs/sunbiz-re-llc-export.md)
 python -m src.tasks.sunbiz_re_llc_export [--day YYYY-MM-DD] [--dry-run] [--retry]
+# T3: Tracerfy lookup of one person per new LLC (cron 12:00 UTC, after the export; off until SUNBIZ_LLC_TRACE_ENABLED, capped by SUNBIZ_LLC_TRACE_MAX_COST_CENTS, never retried by run.sh; hits in lending.sunbiz_llc_contacts, migration apply_lending_sunbiz_llc_contacts.py; --dry-run counts and spends nothing)
+python -m src.tasks.sunbiz_llc_trace [--day YYYY-MM-DD] [--dry-run]
 
 # Rescore all properties
 python -m src.services.cds_engine --rescore-all
@@ -112,6 +114,7 @@ python -m src.lending.ghl_call_gate [--dry-run | --clear]  # G5 (cron every minu
 python -m src.lending.ghl_list_scrub [--dry-run]  # D1/D4 (cron hourly, off until LENDING_GHL_LIST_SCRUB_ENABLED=true): Tracerfy scrub of listed non-LendingFlow numbers with no scrub or one 6+ days old, capped by LENDING_GHL_LIST_SCRUB_MAX_CREDITS
 # PropertyRadar daily target-lender maturity pull (separate cron, disabled until PROPERTY_RADAR_ENABLED=true — see scripts/cron/crontab.txt)
 python -m src.tasks.property_radar_maturity_pull --mode daily --state FL
+# PROPERTY_RADAR_BILLING_DAY (default 1, UTC): the day the PropertyRadar plan resets; PROPERTY_RADAR_MONTHLY_CAP counts exports from it
 # PropertyRadar nightly runner lines (FL + GA): maturity_target_lender (traced for the FA Max handoff) and cash_purchase / investor_portfolio (traced for the dialer only, config/property_radar_handoff.DIALER_TRACE_CAMPAIGNS; bridge stages them as list_2 / investor_portfolio_propertyradar -> Transaction ready). Linking covers every county with a FIPS code and FA parcels (src/services/property_radar/linking.linkable_counties)
 python -m src.tasks.lending_pr_dialer_autoload [--apply]  # 09:xx and 12:xx ET (cron 13,14,16,17:05 UTC; 12:xx loads numbers whose 8am local had not come): loads the pr_maturity records the bridge staged (loans coming due, cash purchases, investor portfolios) into BatchDialer, phones not already loaded only, dialer-load gates apply (free ones before a DNC credit is spent; a failed DNC check fails the run); Tracerfy DNC credits capped per ET day (LENDING_PR_DIALER_AUTOLOAD_MAX_SCRUB_CREDITS, counted across retries in data/pr_dialer_autoload/); GHL follows via ghl_load_sync; off until LENDING_PR_DIALER_AUTOLOAD_ENABLED
 PYTHONPATH=. python migrations/apply_enrichment_usage_trace_type.py  # enrichment_usage_logs.trace_type (the PropertyRadar trace code already writes it) (idempotent, RUN BEFORE the first live trace)

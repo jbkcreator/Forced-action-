@@ -60,7 +60,7 @@ import json
 import logging
 import sys
 from collections import Counter
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -88,12 +88,20 @@ logger = logging.getLogger(__name__)
 # Budget guard
 # ---------------------------------------------------------------------------
 
+def billing_window_start(now: datetime, billing_day: int) -> datetime:
+    """UTC midnight of the latest plan-reset day on or before ``now`` (billing_day 1 = the calendar month)."""
+    start = now.astimezone(timezone.utc).replace(day=billing_day, hour=0, minute=0, second=0, microsecond=0)
+    if start > now:
+        start = (start.replace(day=1) - timedelta(days=1)).replace(day=billing_day)
+    return start
+
+
 def _month_exports(session) -> int:
-    """Exports bought so far this calendar month (UTC), every state and campaign."""
+    """Exports bought since the plan last reset (PROPERTY_RADAR_BILLING_DAY, UTC), every state and campaign."""
+    since = billing_window_start(datetime.now(timezone.utc), settings.property_radar_billing_day)
     return int(session.execute(text(
-        "SELECT COALESCE(SUM(exports_consumed), 0) FROM property_radar_pull_runs "
-        "WHERE started_at >= date_trunc('month', now() AT TIME ZONE 'UTC') AT TIME ZONE 'UTC'"
-    )).scalar() or 0)
+        "SELECT COALESCE(SUM(exports_consumed), 0) FROM property_radar_pull_runs WHERE started_at >= :since"
+    ), {"since": since}).scalar() or 0)
 
 
 class BudgetRefused(RuntimeError):
