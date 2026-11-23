@@ -7,7 +7,14 @@ do-not-contact email. A lead with no phone is left out (the GHL upsert is by pho
 
 An address is emailed once: it is skipped when a cold email to it is already in ``lending.pending_actions`` (any
 status) or a job for it was already filed. The job row's ``drive_file_id`` is ``cold-email:<md5 of the email>``
-(unique), so a re-run never files a second job for the same address.
+(unique), so a re-run never files a second job for the same address. A phone is used once too (``file_name`` is
+``cold-email-creator:<md5 of the phone>``): the GHL upsert is by phone, so a second email on the same number would
+overwrite the first job's address. The job also carries ``recipient_email``, and the worker refuses a job whose GHL
+contact no longer has that address.
+
+A job the worker finished as "cold email rail not configured" does not count: the address and phone stay eligible and
+the next run files them again in place. The task also refuses to run while the Instantly rail is not configured, and
+only one run at a time holds the creator's advisory lock, so overlapping runs cannot exceed the daily cap.
 
 The GHL contact is resolved by an upsert by phone (email set, cold do-not-disturb as the cold push sets it) plus the
 tags ``NDL`` and ``ndl-cold``, which route the job to the Instantly rail. A number the dialer load already pushed to
@@ -39,7 +46,9 @@ from src.lending.pr_maturity_bridge import first_phone
 logger = logging.getLogger(__name__)
 
 CREATED_BY = "cold_email_creator"
-FILE_NAME = "cold-email-creator"
+PHONE_KEY_PREFIX = "cold-email-creator:"
+RAIL_NOT_CONFIGURED = "cold email rail not configured%"
+RUN_LOCK_KEY = 7_405_311_901  # pg advisory lock: one creator run at a time
 DRIVE_KEY_PREFIX = "cold-email:"
 JOB_TTL = timedelta(days=3)
 FETCH_PAGE = 500
@@ -114,6 +123,10 @@ def drive_key(email: str) -> str:
     return DRIVE_KEY_PREFIX + hashlib.md5(email.strip().lower().encode()).hexdigest()
 
 
+def phone_key(phone: str) -> str:
+    return PHONE_KEY_PREFIX + hashlib.md5(phone.encode()).hexdigest()
+
+
 def ghl_tags(lead: ColdLead) -> list[str]:
     tags = [fx.GHL_TAG_NDL, GHL_TAG_COLD_LEAD]
     if not lead.in_ghl:
@@ -126,6 +139,7 @@ def build_job(lead: ColdLead, contact_id: str, now: datetime) -> AgentJob:
         "job_id": str(uuid.uuid4()), "lane": "NDL", "created_by": CREATED_BY, "created_at": now,
         "type": "send_email", "ghl_contact_id": contact_id, "contact_label": "", "template_version": TEMPLATE_VERSION,
         "subject": SUBJECT, "body": BODY, "reason": f"T1 cold email (radar_id {lead.radar_id})",
+        "recipient_email": lead.email,
         "requires_approval": False, "not_before": None, "expires_at": now + JOB_TTL,
     })
 
@@ -162,7 +176,9 @@ _CANDIDATES = text("""
       FROM t LEFT JOIN rec ON rec.radar_id = t.radar_id
      WHERE NOT EXISTS (SELECT 1 FROM lending.pending_actions p
                         WHERE p.channel = :channel AND lower(p.recipient_email) = t.email)
-       AND NOT EXISTS (SELECT 1 FROM lending.agent_jobs j WHERE j.drive_file_id = :prefix || md5(t.email))
+       AND NOT EXISTS (SELECT 1 FROM lending.agent_jobs j WHERE j.drive_file_id = :prefix || md5(t.email)
+                          AND NOT (j.state = 'done' AND j.result_status = 'error'
+                                   AND j.result->>'reason' LIKE :not_configured))
      ORDER BY t.traced_at, t.radar_id
      LIMIT :limit OFFSET :offset
 """)
@@ -170,6 +186,12 @@ _CANDIDATES = text("""
 _IN_GHL = text("""
     SELECT DISTINCT phone FROM lending.dialer_load_records
      WHERE phone = ANY(CAST(:phones AS text[])) AND ghl_contact_id IS NOT NULL
+""")
+
+_PHONES_USED = text("""
+    SELECT file_name FROM lending.agent_jobs
+     WHERE file_name = ANY(CAST(:keys AS text[]))
+       AND NOT (state = 'done' AND result_status = 'error' AND result->>'reason' LIKE :not_configured)
 """)
 
 _FILED_SINCE = text("""
@@ -181,7 +203,13 @@ _INSERT_JOB = text("""
                                     ghl_contact_id, job, state, release_at, received_at, updated_at)
     VALUES (:job_id, :drive_file_id, :file_name, :created_by, 'send_email', :template_version, :ghl_contact_id,
             CAST(:job AS jsonb), 'held', :now, :now, :now)
-    ON CONFLICT DO NOTHING
+    ON CONFLICT (drive_file_id) DO UPDATE
+       SET job_id = EXCLUDED.job_id, file_name = EXCLUDED.file_name, ghl_contact_id = EXCLUDED.ghl_contact_id,
+           job = EXCLUDED.job, template_version = EXCLUDED.template_version, state = 'held', held_reason = NULL,
+           rail = NULL, action_id = NULL, result_status = NULL, result = NULL, result_written_at = NULL,
+           release_at = EXCLUDED.release_at, received_at = EXCLUDED.received_at, updated_at = EXCLUDED.updated_at
+     WHERE agent_jobs.state = 'done' AND agent_jobs.result_status = 'error'
+       AND agent_jobs.result->>'reason' LIKE :not_configured
 """)
 
 
@@ -199,7 +227,8 @@ def _candidate_page(session, offset: int) -> list[dict[str, Any]]:
     from config.lending_agent_jobs import COLD_EMAIL_CHANNEL
 
     return [dict(r) for r in session.execute(_CANDIDATES, {
-        "channel": COLD_EMAIL_CHANNEL, "prefix": DRIVE_KEY_PREFIX, "limit": FETCH_PAGE, "offset": offset,
+        "channel": COLD_EMAIL_CHANNEL, "prefix": DRIVE_KEY_PREFIX, "not_configured": RAIL_NOT_CONFIGURED,
+        "limit": FETCH_PAGE, "offset": offset,
     }).mappings()]
 
 
@@ -207,14 +236,17 @@ def _to_leads(session, rows: list[dict[str, Any]]) -> list[ColdLead]:
     with_phone = [(r, first_phone(list(r["phones"] or []))) for r in rows]
     phones = sorted({p for _, p in with_phone if p})
     in_ghl = set(session.execute(_IN_GHL, {"phones": phones}).scalars()) if phones else set()
+    used = set(session.execute(_PHONES_USED, {"keys": [phone_key(p) for p in phones],
+                                              "not_configured": RAIL_NOT_CONFIGURED}).scalars()) if phones else set()
     return [ColdLead(radar_id=r["radar_id"], email=r["email"], phone=p, state=r["state"], owner_name=r["owner_name"],
                      ownership_type=r["ownership_type"], in_ghl=p in in_ghl)
-            for r, p in with_phone if p]
+            for r, p in with_phone if p and phone_key(p) not in used]
 
 
 def eligible_leads(session, limit: int) -> list[ColdLead]:
     """Up to ``limit`` leads that pass every gate, read a page at a time (gates are batch reads per page)."""
     picked: list[ColdLead] = []
+    phones_taken: set[str] = set()
     offset = 0
     while len(picked) < limit:
         rows = _candidate_page(session, offset)
@@ -226,6 +258,9 @@ def eligible_leads(session, limit: int) -> list[ColdLead]:
         phone_gates = fx.contact_gates(session, gate_rows)
         blocked = fx.blocked_emails(session, gate_rows)
         for lead in gate_leads(leads, phone_gates, blocked):
+            if lead.phone in phones_taken:  # one email per number: the GHL upsert is by phone
+                continue
+            phones_taken.add(lead.phone)
             picked.append(lead)
             if len(picked) >= limit:
                 break
@@ -235,15 +270,29 @@ def eligible_leads(session, limit: int) -> list[ColdLead]:
 def file_job(session, lead: ColdLead, contact_id: str, now: datetime) -> bool:
     job = build_job(lead, contact_id, now)
     inserted = session.execute(_INSERT_JOB, {
-        "job_id": str(job.job_id), "drive_file_id": drive_key(lead.email), "file_name": FILE_NAME,
+        "job_id": str(job.job_id), "drive_file_id": drive_key(lead.email), "file_name": phone_key(lead.phone),
         "created_by": CREATED_BY, "template_version": TEMPLATE_VERSION, "ghl_contact_id": contact_id,
-        "job": json.dumps(job.model_dump(mode="json")), "now": now,
+        "job": json.dumps(job.model_dump(mode="json")), "now": now, "not_configured": RAIL_NOT_CONFIGURED,
     }).rowcount
     return bool(inserted)
 
 
+class RunInProgress(RuntimeError):
+    """Another creator run holds the advisory lock."""
+
+
 def run(session, *, sink: ContactSink, now: datetime, daily_cap: int, halted: Callable[[], bool]) -> RunResult:
-    """File today's jobs, up to what is left of the daily cap. Commits after each filed job."""
+    """File today's jobs, up to what is left of the daily cap, holding the creator's session advisory lock so two runs
+    never read the same remaining cap. Commits after each filed job."""
+    if not session.execute(text("SELECT pg_try_advisory_lock(:k)"), {"k": RUN_LOCK_KEY}).scalar():
+        raise RunInProgress("another cold-email creator run is in progress")
+    try:
+        return _run_locked(session, sink=sink, now=now, daily_cap=daily_cap, halted=halted)
+    finally:
+        session.execute(text("SELECT pg_advisory_unlock(:k)"), {"k": RUN_LOCK_KEY})
+
+
+def _run_locked(session, *, sink: ContactSink, now: datetime, daily_cap: int, halted: Callable[[], bool]) -> RunResult:
     result = RunResult(remaining_cap=remaining_cap(session, now, daily_cap))
     if result.remaining_cap == 0:
         logger.info("[cold-email] daily cap %d already reached", daily_cap)

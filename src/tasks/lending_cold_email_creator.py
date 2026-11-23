@@ -24,6 +24,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     from src.core.database import get_db_context
     from src.lending import cold_email_creator as creator
     from src.lending.global_halt import is_globally_halted
+    from src.lending.instantly_email import get_ndl_instantly_sender
 
     if not logging.getLogger().handlers:
         logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
@@ -42,12 +43,21 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         if not settings.lending_cold_email_creator_enabled:
             logger.info("[cold-email] LENDING_COLD_EMAIL_CREATOR_ENABLED is off; nothing filed")
             return EXIT_OK
+        if get_ndl_instantly_sender() is None:
+            # Checked before any GHL change or filed job: a job filed now would only fail as not configured.
+            logger.error("[cold-email] the Instantly rail is not configured (key, campaign or footer address); "
+                         "nothing filed")
+            return EXIT_REFUSED
         sink = creator.ghl_sink()
         if sink is None:
             logger.error("[cold-email] the Next Deal Lending GHL account is not configured")
             return EXIT_REFUSED
-        result = creator.run(session, sink=sink, now=now, daily_cap=settings.lending_cold_email_daily_cap,
-                             halted=is_globally_halted)
+        try:
+            result = creator.run(session, sink=sink, now=now, daily_cap=settings.lending_cold_email_daily_cap,
+                                 halted=is_globally_halted)
+        except creator.RunInProgress:
+            logger.warning("[cold-email] another run is in progress; nothing filed")
+            return EXIT_OK
     logger.info("[cold-email] filed=%d failed=%d halted=%s", result.filed, result.failed, result.halted)
     return EXIT_FAILED if result.failed else EXIT_OK
 

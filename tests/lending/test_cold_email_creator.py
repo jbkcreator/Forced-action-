@@ -175,3 +175,95 @@ def test_lead_at_limit_is_blocked_by_checks(db) -> None:
     _cold_email_action(db, EMAIL)
     job = creator.build_job(_lead(), "ghl-1", NOW)
     assert check_job(db, job, _contact(), NOW, text_window=_open).status == "blocked_cap"
+
+
+# -- review fixes: shared phone, rail not configured, overlapping runs ------------------------------------------
+
+
+class _SameContactSink(_Sink):
+    """GHL upserts by phone: two leads on one number come back as one contact."""
+
+    def push(self, record, tags):
+        self.pushed.append((record, tags))
+        return "ghl-same"
+
+
+def test_job_carries_the_address_it_was_filed_for() -> None:
+    assert creator.build_job(_lead(), "ghl-1", NOW).recipient_email == EMAIL
+
+
+def test_changed_contact_email_blocks_the_job(db) -> None:
+    job = creator.build_job(_lead(), "ghl-1", NOW)
+    verdict = check_job(db, job, _contact(email="other@example.com"), NOW, text_window=_open)
+    assert (verdict.status, "no longer matches" in verdict.reason) == ("error", True)
+
+
+def test_two_leads_sharing_a_phone_file_one_job(db) -> None:
+    _traced(db, "R1", ["first@example.com"], [PHONE])
+    _traced(db, "R2", ["second@example.com"], [PHONE])
+    sink = _SameContactSink()
+    first = creator.run(db, sink=sink, now=NOW, daily_cap=10, halted=lambda: False)
+    second = creator.run(db, sink=sink, now=NOW, daily_cap=10, halted=lambda: False)
+    assert (first.filed, second.filed, len(sink.pushed)) == (1, 0, 1)
+
+
+def _finish_as_not_configured(db, email: str) -> None:
+    db.execute(text("UPDATE lending.agent_jobs SET state = 'done', result_status = 'error', "
+                    "result = CAST(:r AS jsonb) WHERE drive_file_id = :k"),
+               {"r": json.dumps({"reason": "cold email rail not configured (Instantly key, campaign or footer address)"}),
+                "k": creator.drive_key(email)})
+
+
+def test_lead_stays_eligible_after_rail_not_configured_and_is_refiled(db) -> None:
+    _traced(db, "R1", [EMAIL], [PHONE])
+    assert creator.run(db, sink=_Sink(), now=NOW, daily_cap=10, halted=lambda: False).filed == 1
+    _finish_as_not_configured(db, EMAIL)
+    assert [lead.email for lead in creator.eligible_leads(db, 10)] == [EMAIL]
+    later = NOW + timedelta(days=1)
+    assert creator.run(db, sink=_Sink(), now=later, daily_cap=10, halted=lambda: False).filed == 1
+    row = db.execute(text("SELECT state, result_status FROM lending.agent_jobs WHERE drive_file_id = :k"),
+                     {"k": creator.drive_key(EMAIL)}).one()
+    assert (row.state, row.result_status) == ("held", None)
+
+
+def test_other_errors_still_count_as_emailed(db) -> None:
+    _traced(db, "R1", [EMAIL], [PHONE])
+    creator.run(db, sink=_Sink(), now=NOW, daily_cap=10, halted=lambda: False)
+    db.execute(text("UPDATE lending.agent_jobs SET state = 'done', result_status = 'error', "
+                    "result = '{\"reason\": \"contact not found in NDL GHL\"}'::jsonb WHERE drive_file_id = :k"),
+               {"k": creator.drive_key(EMAIL)})
+    assert creator.eligible_leads(db, 10) == []
+
+
+def test_overlapping_run_is_refused(db, monkeypatch) -> None:
+    _traced(db, "R1", [EMAIL], [PHONE])
+    other = db.get_bind().engine.connect()
+    try:
+        other.execute(text("SELECT pg_advisory_lock(:k)"), {"k": creator.RUN_LOCK_KEY})
+        with pytest.raises(creator.RunInProgress):
+            creator.run(db, sink=_Sink(), now=NOW, daily_cap=10, halted=lambda: False)
+    finally:
+        other.execute(text("SELECT pg_advisory_unlock(:k)"), {"k": creator.RUN_LOCK_KEY})
+        other.close()
+
+
+def test_task_refuses_while_instantly_is_not_configured(monkeypatch) -> None:
+    from src.tasks import lending_cold_email_creator as task
+
+    class _Settings:
+        lending_cold_email_creator_enabled = True
+        lending_cold_email_daily_cap = 25
+
+    class _Ctx:
+        def __enter__(self):
+            return object()
+
+        def __exit__(self, *exc):
+            return False
+
+    monkeypatch.setattr("config.settings.get_settings", lambda: _Settings())
+    monkeypatch.setattr("src.core.database.get_db_context", lambda: _Ctx())
+    monkeypatch.setattr("src.lending.instantly_email.get_ndl_instantly_sender", lambda: None)
+    monkeypatch.setattr(creator, "ghl_sink", lambda: pytest.fail("GHL must not be touched"))
+    monkeypatch.setattr(creator, "run", lambda *a, **k: pytest.fail("nothing may be filed"))
+    assert task.main([]) == task.EXIT_REFUSED
