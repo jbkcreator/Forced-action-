@@ -81,44 +81,67 @@ def _rounds(leads: Sequence[TraceLead]) -> list[list[TraceLead]]:
 
 def run(session, day_plan_: Plan, *, submit, cap_cents: int, dry_run: bool) -> dict[str, int]:
     """Look up (or, in a dry run, count) the plan's leads. Returns counts only: no names, addresses or contacts."""
+    from src.services.property_radar.live_trace import _ledger_entry
     from src.tasks.property_radar_lead_handoff import _write_usage_ledger
 
     leads = day_plan_.leads
     counts = {"llcs_with_a_person": len(leads), **{f"skipped_{k}": v for k, v in day_plan_.skipped.items()}}
-    ledgered = already_traced(session, "tracerfy", {ledger_key(lead) for lead in leads})
-    pending = [lead for lead in leads if not ledgered.get(ledger_key(lead))]
+    # One lookup per person and address: LLCs that list the same person there share it and all get the contacts.
+    groups: dict[str, list[TraceLead]] = {}
+    for lead in leads:
+        groups.setdefault(ledger_key(lead), []).append(lead)
+    reps = [members[0] for members in groups.values()]
+    members_of = {members[0].radar_id: members for members in groups.values()}
+    ledgered = already_traced(session, "tracerfy", set(groups))
+    pending = [lead for lead in reps if not ledgered.get(ledger_key(lead))]
     if dry_run:
         return {**counts, "would_look_up": len(pending), "worst_case_cents": len(pending) * CENTS_PER_HIT}
     if cap_cents <= 0:  # RunSpendCap reads 0 as "no limit": a zero cap must mean no lookups
         return {**counts, "looked_up": 0, "over_cap": len(pending)}
-    by_doc = {lead.radar_id: lead for lead in leads}
     cap = RunSpendCap(cap_cents)
-    batch_size = max(1, cap_cents // CENTS_PER_HIT)  # a batch is refused whole when its worst case passes the cap
     total = {"looked_up": 0, "with_contacts": 0, "already_traced": 0, "over_cap": 0, "no_result": 0}
 
     def write_contacts(contacts: dict[str, LeadContacts]) -> None:
-        if contacts:  # not committed here: the ledger write that follows commits both together
-            session.execute(_UPSERT, [{"doc": doc, "entity": by_doc[doc].entity_name[:200], "role": by_doc[doc].role,
-                                       "name": by_doc[doc].subject_name[:80], "phones": list(c.phones),
-                                       "emails": list(c.emails)} for doc, c in contacts.items()])
+        rows = [{"doc": member.radar_id, "entity": member.entity_name[:200], "role": member.role,
+                 "name": member.subject_name[:80], "phones": list(c.phones), "emails": list(c.emails)}
+                for rep_doc, c in contacts.items()
+                for member in members_of[rep_doc]]
+        if rows:  # not committed here: the ledger write that follows commits both together
+            session.execute(_UPSERT, rows)
 
-    for round_leads in _rounds(leads):
+    rounds = _rounds(reps)
+    for index, round_leads in enumerate(rounds):
+        # Size the batch to what is left: the tracer refuses a whole batch whose worst case passes the cap.
+        affordable = (cap_cents - cap.projected_cents) // CENTS_PER_HIT
+        if affordable < 1:
+            total["over_cap"] += sum(len(r) for r in rounds[index:])
+            break
         qualified = {trace_key(lead.property_address, lead.zip): ledger_key(lead) for lead in round_leads}
         ledgered = already_traced(session, "tracerfy", set(qualified.values()))  # re-read: earlier rounds just wrote
 
         def write_ledger(entries: list[dict]) -> None:
             _write_usage_ledger(session, [{**e, "target_address": qualified[e["target_address"]]} for e in entries])
 
+        def submit_ledgered(rows: list[dict]) -> list[dict]:
+            results = submit(rows)
+            if not results:
+                # shortcut: Tracerfy accepted the batch but no result came back (poll timeout or errors), so a hit may
+                # have been billed. Ledger it as looked up (no hit) so the catch-up window never pays for it again; a
+                # late result is lost. Upgrade when Tracerfy gives a way to fetch a queue's results later.
+                write_ledger([_ledger_entry(trace_key(r["address"], r["zip"]), False) for r in rows])
+            return results
+
         outcome = trace_staged_leads(
             round_leads, ledger={plain: ledgered[q] for plain, q in qualified.items() if ledgered.get(q)},
-            submit=submit, write_ledger=write_ledger, write_contacts=write_contacts, cap=cap, batch_size=batch_size)
+            submit=submit_ledgered, write_ledger=write_ledger, write_contacts=write_contacts, cap=cap,
+            batch_size=affordable)
         total["looked_up"] += outcome.submitted
         total["with_contacts"] += len(outcome.contacts)
         total["already_traced"] += outcome.skipped_already_traced
         total["over_cap"] += outcome.skipped_cap
         total["no_result"] += outcome.skipped_no_result
-        if outcome.skipped_cap or outcome.skipped_no_result:
-            break  # the cap is spent (or Tracerfy answered nothing): later rounds would only be refused too
+        if outcome.skipped_no_result:
+            break  # Tracerfy answered nothing: later rounds would get the same
     return {**counts, **total}
 
 

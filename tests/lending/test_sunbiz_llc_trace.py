@@ -143,13 +143,35 @@ def test_a_propertyradar_lookup_at_the_same_address_does_not_block_a_sunbiz_pers
     assert counts["looked_up"] == 1
 
 
-def test_the_same_person_is_never_looked_up_twice_in_one_run_or_the_next(traced):
+def test_two_llcs_with_the_same_person_share_one_lookup_and_both_get_the_contact(traced):
     twice = plan([_filing("L1", officers=[_officer("DOE JANE", address="12 OAK ST")]),
                   _filing("L2", officers=[_officer("DOE JANE", address="12 OAK ST")])])
-    counts = task.run(_Session(), twice, submit=_submit, cap_cents=100, dry_run=False)
-    assert counts["looked_up"] == 1 and counts["already_traced"] == 1
+    session = _Session()
+    counts = task.run(session, twice, submit=_submit, cap_cents=100, dry_run=False)
+    assert counts["looked_up"] == 1
+    assert {u["doc"] for u in session.upserts} == {"L1", "L2"}
     again = task.run(_Session(), twice, submit=lambda rows: pytest.fail("paid twice"), cap_cents=100, dry_run=False)
-    assert again["looked_up"] == 0 and again["already_traced"] == 2
+    assert again["looked_up"] == 0 and again["already_traced"] == 1
+
+
+def test_the_budget_left_after_a_round_is_spent_not_skipped(traced):
+    # 47 single addresses + two addresses with two people each: round 1 is 49 lookups, round 2 has two waiting and the
+    # cap covers one of them.
+    filings = [_filing(f"L{i}", officers=[_officer(f"PERSON{i:03d} AL", address=f"{100 + i} OAK ST")]) for i in range(47)]
+    for address in ("1 SHARED WAY", "2 SHARED WAY"):
+        for person in ("AAA ONE", "BBB TWO"):
+            filings.append(_filing(f"{address[0]}{person[0]}", officers=[_officer(person, address=address)]))
+    counts = task.run(_Session(), plan(filings), submit=_submit, cap_cents=100, dry_run=False)
+    assert counts["looked_up"] == 50 and counts["over_cap"] == 1
+
+
+def test_a_batch_that_returned_nothing_is_ledgered_so_a_later_run_does_not_pay_for_it_again(traced):
+    first = task.run(_Session(), _two_llcs(), submit=lambda rows: [], cap_cents=100, dry_run=False)
+    assert first["looked_up"] == 2 and first["no_result"] == 2 and first["with_contacts"] == 0
+    assert len(traced) == 2 and all(e["cost_cents"] == 0 and not e["success"] for e in traced)
+    later = task.run(_Session(), _two_llcs(), submit=lambda rows: pytest.fail("paid for the same batch again"),
+                     cap_cents=100, dry_run=False)
+    assert later["looked_up"] == 0 and later["already_traced"] == 2
 
 
 class _Source:

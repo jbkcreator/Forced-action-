@@ -79,7 +79,8 @@ Tracerfy for one person per LLC: the first person-type officer, else a person re
 address shared by more than 2 of the day's LLCs is skipped (formation services and agents). Hits are stored in
 `lending.sunbiz_llc_contacts` (migration `migrations/apply_lending_sunbiz_llc_contacts.py`, run it before enabling);
 emails and phones are never written to the Drive CSV. Each run covers the day and the 3 days before it (newest first),
-so a state file posted late is still looked up and a lead the cost cap left over gets another try. Every lookup goes
+so a state file posted late is still looked up and a lead the cost cap left over gets another try. LLCs that list the same person at the same address share one lookup and all get the contact. A batch Tracerfy accepted but
+returned nothing for (poll timeout) is ledgered as looked up, so the catch-up never pays for it twice. Every lookup goes
 through the shared Tracerfy ledger under address + ZIP + person, so it never blocks a PropertyRadar lookup at the same
 address and a person is never paid for twice (a hit costs 2 cents, a miss nothing; the same person already traced through
 PropertyRadar is looked up again here). `SUNBIZ_LLC_TRACE_MAX_COST_CENTS` limits a run, counted as if every lookup hit:

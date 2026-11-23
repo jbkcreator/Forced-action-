@@ -5,9 +5,10 @@ a person registered agent. The state writes names ``LAST FIRST [MIDDLE]``; the l
 (``live_trace._split_name``), so the name is reordered here. A subject whose address is shared by more than
 MAX_LLCS_PER_ADDRESS of the day's LLCs is skipped (a formation service or agent, not that LLC's owner).
 
-shortcut: a surname of two words ("DE LA CRUZ") reads as last name "DE" and misses (a miss is free), and the same person
-already looked up through PropertyRadar is paid for again here (2 cents) instead of reusing that result; upgrade when the
-pilot shows how often either happens.
+shortcut: a surname of two words ("DE LA CRUZ") reads as last name "DE" and misses (a miss is free); LLCs that list the same
+person at the same address on one run share one lookup, but a later LLC by a person already looked up on an earlier run
+gets no row of its own (the earlier LLC's row holds the contact), and a person already traced through PropertyRadar is
+paid for again here (2 cents). Upgrade when the pilot shows how often any of these happens.
 """
 from __future__ import annotations
 
