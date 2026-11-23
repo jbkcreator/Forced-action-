@@ -159,7 +159,8 @@ def test_halt_stops_filing(db) -> None:
 
 
 def test_opted_out_lead_is_blocked_by_checks(db) -> None:
-    db.execute(text("INSERT INTO email_opt_outs (email) VALUES (:e)"), {"e": EMAIL})
+    db.execute(text("INSERT INTO email_opt_outs (email, source, opted_out_at) VALUES (:e, 'unsubscribe_link', now())"),
+               {"e": EMAIL})
     job = creator.build_job(_lead(), "ghl-1", NOW)
     assert check_job(db, job, _contact(), NOW, text_window=_open).status == "blocked_consent"
 
