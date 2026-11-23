@@ -1984,3 +1984,23 @@ class LendingMiloCard(LendingBase):
     __table_args__ = (
         CheckConstraint("status IN ('open', 'confirmed', 'cancelled')", name="ck_lending_milo_cards_status"),
     )
+
+
+class LendingSunbizLlcContact(LendingBase):
+    """The person traced for one new Florida real estate LLC (src/tasks/sunbiz_llc_trace.py): who was looked up (an
+    officer or the registered agent) and the phones and emails Tracerfy found. Only LLCs with a hit have a row; a miss
+    is ledgered in enrichment_usage_logs, which keeps it from being paid for again. Read by the cold-email step."""
+
+    __tablename__ = "sunbiz_llc_contacts"
+
+    document_number: Mapped[str] = mapped_column(String(12), primary_key=True)
+    entity_name: Mapped[str] = mapped_column(String(200), nullable=False)
+    subject_role: Mapped[str] = mapped_column(String(10), nullable=False)  # officer | agent
+    subject_name: Mapped[str] = mapped_column(String(80), nullable=False)
+    phones: Mapped[list[str]] = mapped_column(ARRAY(String), nullable=False, server_default=text("'{}'"))
+    emails: Mapped[list[str]] = mapped_column(ARRAY(String), nullable=False, server_default=text("'{}'"))
+    traced_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_now, server_default=text("now()"))
+
+    __table_args__ = (
+        CheckConstraint("subject_role IN ('officer', 'agent')", name="ck_lending_sunbiz_llc_contacts_role"),
+    )

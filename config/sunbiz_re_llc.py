@@ -37,3 +37,9 @@ FILE_ENCODING = "latin-1"  # the state's ASCII export; latin-1 never fails on a 
 # Drive: one file per day in a dated subfolder of LENDING_SUNBIZ_LLC_EXPORT_FOLDER_ID (same layout as the ledger exports).
 EXPORT_FILE = "sunbiz_re_llcs_{day}.csv"
 OFFICER_SLOTS = 6
+
+# Contact lookup (src/lending/sunbiz_llc_trace.py). The state marks an officer or agent "P" (person) or "C" (company).
+PERSON_TYPE = "P"
+# Skip a lookup address that more than this many of the day's LLCs share: formation services and registered agents
+# put hundreds of LLCs at one address, and one person there is not each LLC's owner.
+MAX_LLCS_PER_ADDRESS = 2

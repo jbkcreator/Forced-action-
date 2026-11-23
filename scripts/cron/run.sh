@@ -25,8 +25,8 @@ if [[ "$1" == *"tax_delinquent_engine"* ]]; then
     TIMEOUT=7200                           # 2 hours for tax scraper
 fi
 
-# PropertyRadar runner: never retried. A retry after a purchase began would buy the same window again.
-if [[ "$1" == *"property_radar_runner"* ]]; then
+# PropertyRadar runner and the Sunbiz LLC lookup: never retried. A retry after a purchase began could pay again.
+if [[ "$1" == *"property_radar_runner"* || "$1" == *"sunbiz_llc_trace"* ]]; then
     MAX_ATTEMPTS=1
 fi
 
