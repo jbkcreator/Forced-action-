@@ -90,3 +90,16 @@ Answers: 200 `{loan_file_id, from_stage, to_stage, outcome}`; 400 not allowed; 4
 SELECT stage, count(*) FROM lending.loan_files GROUP BY 1;                 -- backfill
 SELECT count(*) FROM lending.loan_files WHERE borrower_id IS NULL;         -- files from before this item
 ```
+
+## GHL stage moves (v1 payment source)
+
+`POST /webhooks/lending/ghl-stage` hands each stage to `src/lending/ghl_stage_bridge.py`:
+
+* **Funded**: `transition(FUNDED)`.
+* **Paid**: on a FUNDED file, a payment event (`record_payment(mark_paid=True)`) that moves it to PAID; on any other
+  stage the move is refused.
+
+The file is found by the borrower's phone and must be the only open file with that number; otherwise nothing moves
+and Cora's inbox gets a `ghl_stage_unmatched` card. Each event is keyed `<opportunity id>:<stage>` (source
+`ghl_stage`), so a replayed webhook changes nothing. A refused move is stored as a `rejected` stage event with a card,
+and GHL still gets 200. The webhook needs the stage workflow to fire on "Funded" and "Paid" and to send `phone`.

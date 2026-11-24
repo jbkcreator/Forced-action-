@@ -33,6 +33,7 @@ from src.lending.after_hours_intake import record_intake
 from src.lending.after_hours_responder import run_send_cycle_now
 from src.lending.closing.blockers import current_stage, upsert_current_stage
 from src.lending.cora_inbox import add_to_inbox_safely
+from src.lending.ghl_stage_bridge import apply_stage
 from src.lending.ghl_disposition_match import (
     InvalidDispositionEvent,
     attach_pending,
@@ -150,6 +151,18 @@ def _record_current_stage(db: Session, opportunity_id: str, stage: str, phone: O
         logger.error("[lending-ghl] current stage not recorded (%s)", type(exc).__name__)
 
 
+def _apply_loan_stage(db: Session, opportunity_id: str, stage: str, phone: Optional[str]) -> None:
+    """R1 0.1: a Funded / Paid stage moves the loan file (``ghl_stage_bridge``), in a savepoint: a failure is logged
+    and never loses the scoreboard's stage event.  A refused move is stored and carded there; GHL still gets 200."""
+    try:
+        with db.begin_nested():
+            outcome = apply_stage(db, opportunity_id=opportunity_id, stage_name=stage, phone=phone)
+        if outcome:
+            logger.info("[lending-ghl] loan stage from GHL: %s", outcome)
+    except Exception as exc:
+        logger.error("[lending-ghl] loan stage not applied (%s)", type(exc).__name__)
+
+
 @router.post("/ghl-stage")
 def ghl_stage(
     body: dict[str, Any],
@@ -175,6 +188,7 @@ def ghl_stage(
              "phone": phone, "by": _resolved(body, "booked_by"), "raw": json.dumps(body)},
         ).rowcount
         _record_current_stage(db, opportunity_id, stage, phone, repeat=not inserted)
+        _apply_loan_stage(db, opportunity_id, stage, phone)
         db.commit()
     except Exception as exc:
         db.rollback()
