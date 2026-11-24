@@ -18,10 +18,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Generator, Optional
 
-from sqlalchemy import text
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker
 
 from config.settings import AppSettings, get_settings
-from src.lending.db import lending_session
+from config.lending_watchdog import DOORS, Door
 from src.lending.watchdog.collectors import (
     db_observations,
     door_observations,
@@ -42,6 +43,7 @@ from src.services.telnyx_sms import send_message
 
 logger = logging.getLogger(__name__)
 
+CONNECT_TIMEOUT_SECONDS = 5
 STATEMENT_TIMEOUT_MS = 5000
 
 
@@ -51,14 +53,31 @@ def load_config(settings: AppSettings) -> WatchdogConfig:
         units=units,
         health_url=settings.lending_watchdog_health_url,
         public_base_url=settings.lending_watchdog_public_base_url,
-        fail_polls=settings.lending_watchdog_fail_polls,
-        repeat_minutes=settings.lending_watchdog_repeat_minutes,
-        ghl_window_minutes=settings.lending_watchdog_ghl_window_minutes,
+        fail_polls=max(1, settings.lending_watchdog_fail_polls),
+        repeat_minutes=max(10, settings.lending_watchdog_repeat_minutes),
+        ghl_window_minutes=max(1, settings.lending_watchdog_ghl_window_minutes),
         ghl_min_calls=settings.lending_watchdog_ghl_min_calls,
-        card_age_minutes=settings.lending_watchdog_card_age_minutes,
-        reply_backlog=settings.lending_watchdog_reply_backlog,
-        open_failures=settings.lending_watchdog_open_failures,
+        card_age_minutes=max(1, settings.lending_watchdog_card_age_minutes),
+        reply_backlog=max(1, settings.lending_watchdog_reply_backlog),
+        open_failures=max(1, settings.lending_watchdog_open_failures),
     )
+
+
+def poll_seconds(settings: AppSettings) -> int:
+    return max(30, settings.lending_watchdog_poll_seconds)
+
+
+_warned_doors: set[str] = set()
+
+
+def selected_doors(settings: AppSettings) -> tuple[Door, ...]:
+    names = [n.strip() for n in settings.lending_watchdog_doors.split(",") if n.strip()]
+    known = {door.name: door for door in DOORS}
+    unknown = [n for n in names if n not in known and n not in _warned_doors]
+    if unknown:
+        _warned_doors.update(unknown)
+        logger.warning("[watchdog] LENDING_WATCHDOG_DOORS has unknown door names, ignored: %s", ", ".join(unknown))
+    return tuple(known[n] for n in dict.fromkeys(names) if n in known)
 
 
 def recipients(settings: AppSettings) -> list[str]:
@@ -97,12 +116,34 @@ def _slack(settings: AppSettings) -> Any:
     return MentioningSlack(_slack_client(), parse_user_ids(settings.lending_cora_approver_user_ids))
 
 
+_session_factory: Optional[sessionmaker] = None
+
+
+def _factory() -> sessionmaker:
+    global _session_factory
+    if _session_factory is None:
+        engine = create_engine(
+            str(get_settings().database_url),
+            pool_pre_ping=True,
+            connect_args={"connect_timeout": CONNECT_TIMEOUT_SECONDS, "options": f"-c statement_timeout={STATEMENT_TIMEOUT_MS}"},
+        )
+        _session_factory = sessionmaker(bind=engine, autoflush=False, expire_on_commit=False)
+    return _session_factory
+
+
 @contextmanager
 def _timed_session() -> Generator[Any, None, None]:
-    """lending_session with a short statement timeout, so a hung Postgres fails the check instead of the watchdog."""
-    with lending_session() as db:
-        db.execute(text(f"SET LOCAL statement_timeout = {STATEMENT_TIMEOUT_MS}"))
-        yield db
+    """The watchdog's own connection with connect and statement timeouts, so a hung Postgres fails the check
+    quickly instead of blocking the alerts already collected. Commits on exit, rolls back on error."""
+    session = _factory()()
+    try:
+        yield session
+        session.commit()
+    except Exception:
+        session.rollback()
+        raise
+    finally:
+        session.close()
 
 
 def _route(name: str, build: Callable[[], Any]) -> Any:
@@ -115,6 +156,27 @@ def _route(name: str, build: Callable[[], Any]) -> Any:
 
 
 _memory_state: Optional[dict[str, CheckState]] = None  # set only while the last save failed; wins over the file
+
+
+def setup_problems(settings: AppSettings) -> list[str]:
+    problems = []
+    if not recipients(settings):
+        problems.append("no SMS recipient (LENDING_ALARM_SMS_TO)")
+    if _route("GHL", _ghl_route) is None:
+        problems.append("no GHL SMS route (LENDING_GHL_* settings)")
+    if _route("Telnyx", lambda: telnyx_route(settings)) is None:
+        problems.append("no Telnyx fallback route (LENDING_WATCHDOG_TELNYX_FROM_NUMBER, TELNYX_SMS_API_KEY, TELNYX_MESSAGING_PROFILE_ID)")
+    if not (settings.lending_slack_bot_token and settings.lending_ops_channel):
+        problems.append("no Slack route (LENDING_SLACK_BOT_TOKEN, LENDING_OPS_CHANNEL)")
+    if not settings.lending_watchdog_public_base_url:
+        problems.append("door checks off (LENDING_WATCHDOG_PUBLIC_BASE_URL)")
+    return problems
+
+
+def log_setup_problems(settings: AppSettings) -> None:
+    problems = setup_problems(settings)
+    if problems:
+        logger.error("[watchdog] setup incomplete: %s", "; ".join(problems))
 
 
 def _persist(path: Path, state: dict[str, CheckState]) -> None:
@@ -150,8 +212,10 @@ def run_cycle(*, now: Optional[datetime] = None, dry_run: bool = False) -> list[
     observations = []
     if cfg.units:
         observations.extend(unit_observations(cfg.units))
-    observations.append(health_observation(cfg.health_url))
-    observations.extend(door_observations(cfg.public_base_url))
+    health = health_observation(cfg.health_url)
+    observations.append(health)
+    if health.ok:
+        observations.extend(door_observations(cfg.public_base_url, selected_doors(settings)))
     observations.extend(db_observations(_timed_session, now, cfg))
 
     path = Path(settings.lending_watchdog_state_path)
@@ -205,6 +269,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     signal.signal(signal.SIGINT, _on_signal)
     settings = get_settings()
     logger.info("[watchdog] starting (enabled=%s)", settings.lending_watchdog_enabled)
+    log_setup_problems(settings)
     while not _stop_event.is_set():
         try:
             run_cycle(dry_run=args.dry_run)
@@ -212,7 +277,7 @@ def main(argv: Optional[list[str]] = None) -> int:
             logger.error("[watchdog] cycle failed (%s); retrying next interval", type(exc).__name__)
         if args.once or args.dry_run:
             break
-        _wait(settings.lending_watchdog_poll_seconds)
+        _wait(poll_seconds(settings))
     return 0
 
 

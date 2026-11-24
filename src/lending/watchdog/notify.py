@@ -41,7 +41,42 @@ def format_sms(alert: Alert, now: Optional[datetime] = None) -> str:
     if len(body) <= SMS_MAX_CHARS:
         return body
     overflow = len(body) - SMS_MAX_CHARS
-    return _render(alert, now, alert.detail[: max(0, len(alert.detail) - overflow - 1)] + "…").rstrip()[:SMS_MAX_CHARS]
+    shortened = alert.detail[: max(0, len(alert.detail) - overflow - 3)] + "..."
+    return _render(alert, now, shortened).rstrip()[:SMS_MAX_CHARS]
+
+
+def _ascii(text: str) -> str:
+    return text.encode("ascii", "replace").decode("ascii")
+
+
+def _short_label(alert: Alert) -> str:
+    try:
+        return _ascii(_label(alert.key))
+    except Exception as exc:
+        logger.error("[watchdog] could not label alert %s: %s", alert.key, type(exc).__name__)
+        return _ascii(str(alert.key))
+
+
+def _segment(prefix: str, labels: Sequence[str], budget: int) -> str:
+    for shown in range(len(labels), 0, -1):
+        rest = len(labels) - shown
+        body = prefix + ", ".join(labels[:shown]) + (f" +{rest} more" if rest else "") + "."
+        if len(body) <= budget:
+            return body
+    return (prefix + labels[0] + ".")[:budget]
+
+
+def format_sms_digest(alerts: Sequence[Alert], now: Optional[datetime] = None) -> str:
+    """One text for a whole cycle: a single alert keeps its full wording, several are joined by label."""
+    now = now or datetime.now(timezone.utc)
+    if len(alerts) == 1:
+        return _safe(alerts[0], lambda: format_sms(alerts[0], now))
+    down = [_short_label(a) for a in alerts if a.kind != "recovered"]
+    recovered = [_short_label(a) for a in alerts if a.kind == "recovered"]
+    if not down:
+        return _segment("NDL watchdog recovered: ", recovered, SMS_MAX_CHARS)
+    tail = _segment(" Recovered: ", recovered, 60) if recovered else ""
+    return (_segment("NDL watchdog DOWN: ", down, SMS_MAX_CHARS - len(tail)) + tail)[:SMS_MAX_CHARS]
 
 
 def _fallback(alert: Alert) -> str:
@@ -121,11 +156,9 @@ def deliver(
         reached = post_slack_alert(format_slack(alerts, now), slack=slack, channel=channel)
     except Exception as exc:
         logger.error("[watchdog] Slack alert step failed: %s", type(exc).__name__)
-    for alert in alerts:
-        try:
-            body = _safe(alert, lambda alert=alert: format_sms(alert, now))
-            results = send_sms_alert(body, recipients or (), ghl=ghl, telnyx=telnyx)
-            reached = reached or any(route != "failed" for route in results.values())
-        except Exception as exc:
-            logger.error("[watchdog] SMS step failed for alert %s: %s", alert.key, type(exc).__name__)
+    try:
+        results = send_sms_alert(format_sms_digest(alerts, now), recipients or (), ghl=ghl, telnyx=telnyx)
+        reached = reached or any(route != "failed" for route in results.values())
+    except Exception as exc:
+        logger.error("[watchdog] SMS step failed: %s", type(exc).__name__)
     return reached

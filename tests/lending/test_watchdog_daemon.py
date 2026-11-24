@@ -46,7 +46,7 @@ def fakes(monkeypatch):
     ghl, slack = MagicMock(return_value="m1"), MagicMock()
     monkeypatch.setattr(daemon, "unit_observations", lambda units: [Observation("unit:fa-lending-cora", False, "inactive")])
     monkeypatch.setattr(daemon, "health_observation", lambda url: Observation("health:lending-api", True, "ok"))
-    monkeypatch.setattr(daemon, "door_observations", lambda base: [])
+    monkeypatch.setattr(daemon, "door_observations", lambda base, doors: [])
     monkeypatch.setattr(daemon, "db_observations", lambda factory, now, cfg: [Observation("database", True, "ok")])
     monkeypatch.setattr(daemon, "_ghl_route", lambda: ghl)
     monkeypatch.setattr(daemon, "_slack", lambda settings: slack)
@@ -124,16 +124,30 @@ def test_telnyx_route_ignores_telnyx_sms_enabled(monkeypatch):
     assert daemon.telnyx_route(settings) is None
 
 
-def test_session_sets_statement_timeout(monkeypatch):
-    executed = []
-    db = MagicMock()
-    db.execute.side_effect = lambda stmt, *a: executed.append(str(stmt))
-    inner = MagicMock()
-    inner.__enter__.return_value = db
-    monkeypatch.setattr(daemon, "lending_session", lambda: inner)
-    with daemon._timed_session() as session:
-        assert session is db
-    assert "statement_timeout" in executed[0]
+def test_session_factory_sets_connect_and_statement_timeouts(monkeypatch):
+    monkeypatch.setattr(daemon, "_session_factory", None)
+    engine = MagicMock()
+    create = MagicMock(return_value=engine)
+    monkeypatch.setattr(daemon, "create_engine", create)
+    daemon._factory()
+    assert create.call_args.kwargs["connect_args"] == {"connect_timeout": 5, "options": "-c statement_timeout=5000"}
+    monkeypatch.setattr(daemon, "_session_factory", None)
+
+
+def test_timed_session_commits_and_rolls_back(monkeypatch):
+    session = MagicMock()
+    monkeypatch.setattr(daemon, "_factory", lambda: lambda: session)
+    with daemon._timed_session() as db:
+        assert db is session
+    session.commit.assert_called_once()
+    session.close.assert_called_once()
+    session = MagicMock()
+    monkeypatch.setattr(daemon, "_factory", lambda: lambda: session)
+    with pytest.raises(ValueError):
+        with daemon._timed_session():
+            raise ValueError("x")
+    session.rollback.assert_called_once()
+    session.commit.assert_not_called()
 
 
 def test_cycle_exception_does_not_stop_loop(env, fakes, monkeypatch):
@@ -219,3 +233,126 @@ def test_route_construction_failure_does_not_lose_other_routes(env, fakes, monke
     assert len(daemon.run_cycle(now=NOW)) == 1
     survivor = slack.chat_postMessage if route == "_ghl_route" else ghl
     survivor.assert_called_once()
+
+
+def test_failing_health_drops_door_checks_for_the_cycle(env, fakes, monkeypatch):
+    monkeypatch.setattr(daemon, "health_observation", lambda url: Observation("health:lending-api", False, "HTTP 500"))
+    monkeypatch.setattr(daemon, "door_observations", lambda base, doors: pytest.fail("doors checked while health is down"))
+    monkeypatch.setenv("LENDING_WATCHDOG_PUBLIC_BASE_URL", "https://x.example")
+    get_settings.cache_clear()
+    keys = {a.key for a in daemon.run_cycle(now=NOW)}
+    assert "health:lending-api" in keys
+
+
+def test_selected_doors_default_and_unknown_warning(caplog):
+    daemon._warned_doors.clear()
+    settings = MagicMock(lending_watchdog_doors="ghl-stage, website ,nope")
+    with caplog.at_level(logging.WARNING):
+        doors = daemon.selected_doors(settings)
+        daemon.selected_doors(settings)
+    assert [d.name for d in doors] == ["ghl-stage", "website"]
+    assert caplog.text.count("unknown door names") == 1 and "nope" in caplog.text
+    full = MagicMock(lending_watchdog_doors="ghl-stage,ghl-disposition,lendingflow,instantly,website")
+    assert len(daemon.selected_doors(full)) == 5
+    assert daemon.selected_doors(MagicMock(lending_watchdog_doors="")) == ()
+
+
+def test_cycle_passes_only_selected_doors(env, fakes, monkeypatch):
+    seen = []
+    monkeypatch.setattr(daemon, "door_observations", lambda base, doors: seen.append([d.name for d in doors]) or [])
+    monkeypatch.setenv("LENDING_WATCHDOG_DOORS", "website")
+    get_settings.cache_clear()
+    daemon.run_cycle(now=NOW)
+    assert seen == [["website"]]
+
+
+def _configured(**overrides):
+    values = dict(
+        lending_alarm_sms_to="(813) 234-5678", lending_watchdog_backup_sms_to=None,
+        lending_slack_bot_token="xoxb", lending_ops_channel="C1", lending_watchdog_public_base_url="https://x.example",
+        lending_watchdog_telnyx_from_number="+18130001111", lending_watchdog_telnyx_messaging_profile_id="p",
+        telnyx_messaging_profile_id=None, telnyx_sms_api_key="k",
+    )
+    return MagicMock(**{**values, **overrides})
+
+
+def test_fully_configured_setup_logs_no_error(monkeypatch, caplog):
+    monkeypatch.setattr(daemon, "_ghl_route", lambda: (lambda to, body: "id"))
+    with caplog.at_level(logging.ERROR):
+        daemon.log_setup_problems(_configured())
+    assert caplog.text == ""
+
+
+@pytest.mark.parametrize("override,name", [
+    ({"lending_alarm_sms_to": None}, "LENDING_ALARM_SMS_TO"),
+    ({"lending_watchdog_telnyx_from_number": None}, "LENDING_WATCHDOG_TELNYX_FROM_NUMBER"),
+    ({"lending_slack_bot_token": None}, "LENDING_SLACK_BOT_TOKEN"),
+    ({"lending_ops_channel": ""}, "LENDING_OPS_CHANNEL"),
+    ({"lending_watchdog_public_base_url": ""}, "LENDING_WATCHDOG_PUBLIC_BASE_URL"),
+])
+def test_each_missing_setup_piece_is_named(monkeypatch, caplog, override, name):
+    monkeypatch.setattr(daemon, "_ghl_route", lambda: (lambda to, body: "id"))
+    with caplog.at_level(logging.ERROR):
+        daemon.log_setup_problems(_configured(**override))
+    assert caplog.text.count("setup incomplete") == 1 and name in caplog.text
+
+
+def test_missing_ghl_route_is_named(monkeypatch, caplog):
+    monkeypatch.setattr(daemon, "_ghl_route", lambda: None)
+    with caplog.at_level(logging.ERROR):
+        daemon.log_setup_problems(_configured())
+    assert "GHL SMS route" in caplog.text
+
+
+def test_main_logs_setup_problems_at_startup(env, fakes, monkeypatch):
+    logged = MagicMock()
+    monkeypatch.setattr(daemon, "log_setup_problems", logged)
+    monkeypatch.setattr(daemon.signal, "signal", lambda *a: None)
+    monkeypatch.setattr(daemon, "run_cycle", lambda **kw: [])
+    daemon.main(["--dry-run"])
+    logged.assert_called_once()
+
+
+def test_numeric_settings_are_clamped():
+    settings = MagicMock(
+        lending_watchdog_units="", lending_watchdog_health_url="", lending_watchdog_public_base_url="",
+        lending_watchdog_fail_polls=0, lending_watchdog_repeat_minutes=1, lending_watchdog_ghl_window_minutes=0,
+        lending_watchdog_ghl_min_calls=0, lending_watchdog_card_age_minutes=-5, lending_watchdog_reply_backlog=0,
+        lending_watchdog_open_failures=0, lending_watchdog_poll_seconds=1,
+    )
+    cfg = daemon.load_config(settings)
+    assert (cfg.fail_polls, cfg.repeat_minutes, cfg.ghl_window_minutes, cfg.card_age_minutes) == (1, 10, 1, 1)
+    assert (cfg.reply_backlog, cfg.open_failures, cfg.ghl_min_calls) == (1, 1, 0)
+    assert daemon.poll_seconds(settings) == 30
+
+
+def _seed_state(path, **entry):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({"unit:fa-lending-cora": entry}))
+
+
+def test_undelivered_still_down_keeps_previous_alert_time_and_retries(env, fakes):
+    ghl, slack = fakes
+    ghl.side_effect = RuntimeError("down")
+    slack.chat_postMessage.side_effect = RuntimeError("down")
+    old = "2026-11-24T12:00:00+00:00"
+    _seed_state(env, failures=5, open_since=old, last_alert_at=old)
+    assert [a.kind for a in daemon.run_cycle(now=NOW)] == ["still_down"]
+    assert json.loads(env.read_text())["unit:fa-lending-cora"]["last_alert_at"] == old
+    ghl.side_effect = None
+    assert [a.kind for a in daemon.run_cycle(now=NOW.replace(minute=2))] == ["still_down"]
+    assert json.loads(env.read_text())["unit:fa-lending-cora"]["last_alert_at"] != old
+
+
+def test_undelivered_recovery_keeps_open_alert_and_retries(env, fakes, monkeypatch):
+    ghl, slack = fakes
+    monkeypatch.setattr(daemon, "unit_observations", lambda units: [Observation("unit:fa-lending-cora", True, "active")])
+    ghl.side_effect = RuntimeError("down")
+    slack.chat_postMessage.side_effect = RuntimeError("down")
+    old = "2026-11-24T12:00:00+00:00"
+    _seed_state(env, failures=5, open_since=old, last_alert_at=old)
+    assert [a.kind for a in daemon.run_cycle(now=NOW)] == ["recovered"]
+    assert json.loads(env.read_text())["unit:fa-lending-cora"]["open_since"] == old
+    ghl.side_effect = None
+    assert [a.kind for a in daemon.run_cycle(now=NOW.replace(minute=2))] == ["recovered"]
+    assert json.loads(env.read_text())["unit:fa-lending-cora"]["open_since"] is None

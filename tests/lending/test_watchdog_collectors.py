@@ -219,9 +219,15 @@ def test_failure_decision_open_and_gave_up():
 class _FakeDb:
     def __init__(self):
         self.statements = []
+        self.savepoints = 0
 
     def execute(self, statement, params=None):
         self.statements.append(str(statement))
+
+    @contextmanager
+    def begin_nested(self):
+        self.savepoints += 1
+        yield
 
 
 def _factory(db):
@@ -232,7 +238,7 @@ def _factory(db):
 
 
 def test_db_checks_skipped_outside_business_hours(monkeypatch):
-    monkeypatch.setattr(collectors, "DB_CHECKS", (lambda *a: pytest.fail("ran outside business hours"),))
+    monkeypatch.setattr(collectors, "DB_CHECKS", (("x", lambda *a: pytest.fail("ran outside business hours")),))
     fake = _FakeDb()
     assert db_observations(_factory(fake), SATURDAY, _cfg()) == [Observation("database", True, "ok")]
     assert fake.statements == ["SELECT 1"]
@@ -240,8 +246,10 @@ def test_db_checks_skipped_outside_business_hours(monkeypatch):
 
 def test_db_checks_run_in_business_hours_and_none_is_dropped(monkeypatch):
     keep = Observation("x", True, "d")
-    monkeypatch.setattr(collectors, "DB_CHECKS", (lambda *a: keep, lambda *a: None))
-    assert db_observations(_factory(_FakeDb()), NOW, _cfg()) == [Observation("database", True, "ok"), keep]
+    monkeypatch.setattr(collectors, "DB_CHECKS", (("x", lambda *a: keep), ("y", lambda *a: None)))
+    fake = _FakeDb()
+    assert db_observations(_factory(fake), NOW, _cfg()) == [Observation("database", True, "ok"), keep]
+    assert fake.savepoints == 2
 
 
 def test_db_error_yields_single_database_observation():
@@ -251,16 +259,35 @@ def test_db_error_yields_single_database_observation():
     assert db_observations(broken, NOW, _cfg()) == [Observation("database", False, "OperationalError")]
 
 
-def test_db_check_error_yields_single_database_observation(monkeypatch):
+def test_select_one_failure_yields_single_database_observation(monkeypatch):
+    class Down(_FakeDb):
+        def execute(self, statement, params=None):
+            raise OperationalError("SELECT 1", {}, Exception("down"))
+
+    monkeypatch.setattr(collectors, "DB_CHECKS", (("x", lambda *a: pytest.fail("ran after SELECT 1 failed")),))
+    assert db_observations(_factory(Down()), NOW, _cfg()) == [Observation("database", False, "OperationalError")]
+
+
+def test_failing_check_is_reported_under_its_own_key_and_others_still_run(monkeypatch):
     def boom(*a):
         raise ValueError("bad row")
 
-    monkeypatch.setattr(collectors, "DB_CHECKS", (boom,))
-    assert db_observations(_factory(_FakeDb()), NOW, _cfg()) == [Observation("database", False, "ValueError")]
+    ok = Observation("failures", True, "0 open")
+    monkeypatch.setattr(collectors, "DB_CHECKS", (("cards", boom), ("failures", lambda *a: ok)))
+    assert db_observations(_factory(_FakeDb()), NOW, _cfg()) == [
+        Observation("database", True, "ok"),
+        Observation("cards", False, "ValueError"),
+        ok,
+    ]
 
 
 def test_db_checks_registry_lists_the_four_checks():
-    assert DB_CHECKS == (ghl_outcome_observation, card_observation, reply_observation, failure_observation)
+    assert DB_CHECKS == (
+        ("ghl_outcomes", ghl_outcome_observation),
+        ("cards", card_observation),
+        ("replies", reply_observation),
+        ("failures", failure_observation),
+    )
 
 
 # Queries against Postgres (skipped without TEST_DATABASE_URL).

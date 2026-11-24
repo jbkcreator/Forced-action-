@@ -1061,6 +1061,8 @@ class AppSettings(BaseSettings):
 		default="lending-api,fa-lending-cora,fa-lending-cdr-poller,fa-lending-uncalled-alarm-worker,"
 		"fa-lending-reminder-worker,fa-lending-transcript-worker,fa-lending-opt-out-poller,fa-lending-dialer-sweep",
 		env="LENDING_WATCHDOG_UNITS")  # comma-separated systemd units; empty = unit check off
+	lending_watchdog_doors: str = Field(
+		default="ghl-stage,ghl-disposition,lendingflow,instantly,website", env="LENDING_WATCHDOG_DOORS")  # comma-separated door names (config/lending_watchdog.py); remove a connector that is off on purpose
 	lending_watchdog_health_url: str = Field(default="http://127.0.0.1:8010/health", env="LENDING_WATCHDOG_HEALTH_URL")
 	lending_watchdog_state_path: str = Field(default="/var/lib/ndl-watchdog/state.json", env="LENDING_WATCHDOG_STATE_PATH")
 	# Uncalled-lead alarm working hours, Eastern, HH:MM 24h, Mon-Fri. No alarm or retry outside them; those leads go

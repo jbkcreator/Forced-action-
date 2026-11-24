@@ -99,11 +99,57 @@ def test_slack_post_success_and_failure():
     assert notify.post_slack_alert("t", slack=slack, channel="C1") is False
 
 
-def test_deliver_posts_once_and_texts_each_alert_per_recipient():
+def test_deliver_posts_once_and_sends_one_text_per_recipient():
     slack, ghl = MagicMock(), MagicMock(return_value="id")
     notify.deliver([alert(), alert(key="cards")], recipients=[PHONE, "+15557654321"], ghl=ghl, telnyx=None, slack=slack, channel="C1")
     assert slack.chat_postMessage.call_count == 1
-    assert ghl.call_count == 4
+    assert ghl.call_count == 2
+    body = ghl.call_args_list[0].args[1]
+    assert "Cora" in body and "Approval cards" in body
+
+
+def test_single_alert_text_keeps_full_wording():
+    ghl = MagicMock(return_value="id")
+    notify.deliver([alert()], recipients=[PHONE], ghl=ghl, telnyx=None, slack=None, channel="")
+    body = ghl.call_args.args[1]
+    assert body.startswith("NDL watchdog: Cora DOWN since ") and body.endswith(" ET. inactive")
+
+
+def test_digest_joins_labels_and_counts_the_rest():
+    keys = ["unit:lending-api", "health:lending-api", "door:ghl-stage", "door:ghl-disposition", "door:lendingflow",
+            "door:instantly", "door:website"]
+    body = notify.format_sms_digest([alert(key=k) for k in keys], now=NOW)
+    assert body.startswith("NDL watchdog DOWN: Lending API, Lending API health")
+    assert body.endswith("Website lead form.")
+    assert len(body) <= 160 and body.isascii()
+
+
+def test_digest_all_fit_lists_every_label():
+    body = notify.format_sms_digest([alert(key="cards"), alert(key="replies")], now=NOW)
+    assert body == "NDL watchdog DOWN: Approval cards, Reply backlog."
+
+
+def test_digest_mixed_has_separate_recovered_segment():
+    body = notify.format_sms_digest([alert(key="cards"), alert("recovered"), alert(key="replies", kind="still_down")], now=NOW)
+    assert body == "NDL watchdog DOWN: Approval cards, Reply backlog. Recovered: Cora."
+
+
+def test_digest_only_recovered():
+    body = notify.format_sms_digest([alert("recovered"), alert("recovered", key="cards")], now=NOW)
+    assert body == "NDL watchdog recovered: Cora, Approval cards."
+
+
+def test_digest_is_ascii_and_bounded_with_many_long_labels():
+    alerts = [alert(key=f"unit:fa-lending-very-long-service-name-{i}") for i in range(30)]
+    alerts += [alert("recovered", key=f"unit:caf\u00e9-{i}") for i in range(10)]
+    body = notify.format_sms_digest(alerts, now=NOW)
+    assert len(body) <= 160 and body.isascii()
+    assert "Recovered:" in body and " more" in body
+
+
+def test_truncated_sms_is_ascii_and_160_chars():
+    body = notify.format_sms(alert(detail="d" * 400), now=NOW)
+    assert len(body) == 160 and body.isascii() and body.endswith("...")
 
 
 def test_deliver_never_raises_when_everything_throws():
@@ -124,9 +170,8 @@ def test_deliver_isolates_a_bad_alert(bad):
     posted = slack.chat_postMessage.call_args.kwargs["text"]
     assert "Approval cards" in posted and "database" in posted
     bodies = [c.args[1] for c in ghl.call_args_list]
-    assert len(bodies) == 2
-    assert "NDL watchdog: database" in bodies[0]
-    assert "Approval cards" in bodies[1]
+    assert len(bodies) == 1
+    assert "Database" in bodies[0] and "Approval cards" in bodies[0]
 
 
 def test_deliver_slack_failure_does_not_stop_sms():

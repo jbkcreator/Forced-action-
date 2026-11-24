@@ -147,11 +147,11 @@ def failure_observation(db, now: datetime, cfg: WatchdogConfig) -> Observation:
     return _failure_decision(open_count, gave_up, cfg)
 
 
-DB_CHECKS: tuple[Callable[[Any, datetime, WatchdogConfig], Optional[Observation]], ...] = (
-    ghl_outcome_observation,
-    card_observation,
-    reply_observation,
-    failure_observation,
+DB_CHECKS: tuple[tuple[str, Callable[[Any, datetime, WatchdogConfig], Optional[Observation]]], ...] = (
+    ("ghl_outcomes", ghl_outcome_observation),
+    ("cards", card_observation),
+    ("replies", reply_observation),
+    ("failures", failure_observation),
 )
 
 
@@ -163,8 +163,16 @@ def db_observations(
             db.execute(text("SELECT 1"))
             observations = [Observation("database", True, "ok")]
             if is_business_time(now):
-                results = (check(db, now, cfg) for check in DB_CHECKS)
-                observations.extend(obs for obs in results if obs is not None)
+                for key, check in DB_CHECKS:
+                    try:
+                        with db.begin_nested():
+                            result = check(db, now, cfg)
+                    except Exception as exc:
+                        logger.warning("[watchdog] %s check failed (%s)", key, type(exc).__name__)
+                        observations.append(Observation(key, False, type(exc).__name__))
+                        continue
+                    if result is not None:
+                        observations.append(result)
             return observations
     except Exception as exc:
         logger.warning("[watchdog] database checks failed (%s)", type(exc).__name__)
