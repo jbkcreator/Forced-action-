@@ -21,7 +21,8 @@ def test_no_approvers_means_nobody_is_admin(monkeypatch):
 
 
 def test_constants_pinned():
-    assert set(rbac.DOCUMENT_TABLES) == {"doc_chase_uploads", "doc_view_links", "partner_file_uploads"}
+    assert set(rbac.DOCUMENT_TABLES) == {"doc_chase_uploads", "doc_view_links", "partner_file_uploads",
+                                         "staff_api_tokens", "doc_chase_links"}
     assert rbac.CALLER_DB_ROLE == "lending_caller"
     assert DOC_VIEW_LINK_TTL == timedelta(minutes=15) and STAFF_TOKEN_TTL == timedelta(days=90)
     assert DOC_VIEW_LINK_PATH == "/api/lending/docs/view/{token}"

@@ -17,6 +17,7 @@ from sqlalchemy.schema import CreateIndex
 
 from config.settings import get_settings
 from src.lending.models import LENDING_SCHEMA, LendingDocViewLink, LendingStaffApiToken
+from src.lending.security.rbac import revoke_from_caller_role
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
@@ -32,6 +33,8 @@ def apply_to(conn: Connection, schema: str = LENDING_SCHEMA) -> None:
         table: Table = model.__table__  # type: ignore[assignment]  # declarative tables are Table at runtime
         for index in sorted(table.indexes, key=lambda i: str(i.name or "")):
             translated.execute(CreateIndex(index, if_not_exists=True))
+    # Both tables hold token hashes: closed to callers at once when lending_caller already exists.
+    revoke_from_caller_role(conn, schema, tuple(model.__tablename__ for model in TABLES))
 
 
 def apply(engine: Engine | None = None, schema: str = LENDING_SCHEMA) -> None:

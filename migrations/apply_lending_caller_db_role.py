@@ -5,8 +5,10 @@ A NOLOGIN role that may read every ``lending`` table except the ones holding bor
 with ``SET LOCAL ROLE lending_caller`` (the staff API for a caller token, Cora's free-form SQL for a non-approver):
 even a missed check in code cannot read a document table.
 
-Run it as a role with CREATEROLE (the DB admin), naming the app's login, AFTER apply_lending_document_access.py
-(a table that does not exist yet cannot be revoked; re-running this later closes it):
+Run it as a Postgres SUPERUSER (or as the app's login when it has CREATEROLE and owns the lending tables), naming
+the app's login, after apply_lending_document_access.py. A non-owner's GRANT/REVOKE only warns and changes nothing,
+so the script ends by checking the result with has_table_privilege and fails loudly if a caller could still read a
+document table (including through a PUBLIC grant) or could not read a status table:
 
     PYTHONPATH=. python migrations/apply_lending_caller_db_role.py --app-role <DATABASE_URL user> [--dry-run]
 
@@ -49,9 +51,33 @@ def statements(conn: Connection, *, schema: str, role: str, app_role: str) -> li
     ]
 
 
+STATUS_TABLE = "doc_chase_items"  # a caller must still read document status
+
+
+class CallerRoleNotEffective(RuntimeError):
+    """The grants ran but the role's privileges are not what the wall needs."""
+
+
+def verify(conn: Connection, *, schema: str = LENDING_SCHEMA, role: str = CALLER_DB_ROLE) -> None:
+    def can_read(table: str) -> bool:
+        return bool(conn.execute(text("SELECT has_table_privilege(:r, :t, 'SELECT')"),
+                                 {"r": role, "t": f"{_q(schema)}.{_q(table)}"}).scalar())
+
+    def exists(table: str) -> bool:
+        return conn.execute(text("SELECT to_regclass(:t)"), {"t": f"{_q(schema)}.{_q(table)}"}).scalar() is not None
+
+    open_tables = [t for t in DOCUMENT_TABLES if exists(t) and can_read(t)]
+    if open_tables:
+        raise CallerRoleNotEffective(f"{role} can still read {', '.join(open_tables)} (a PUBLIC grant, or the "
+                                     "script did not run as the tables' owner or a superuser)")
+    if exists(STATUS_TABLE) and not can_read(STATUS_TABLE):
+        raise CallerRoleNotEffective(f"{role} cannot read {STATUS_TABLE}: the grants did not take effect")
+
+
 def apply_to(conn: Connection, *, schema: str = LENDING_SCHEMA, role: str = CALLER_DB_ROLE, app_role: str) -> None:
     for statement in statements(conn, schema=schema, role=role, app_role=app_role):
         conn.execute(text(statement))
+    verify(conn, schema=schema, role=role)
 
 
 def main() -> int:
@@ -75,10 +101,14 @@ def main() -> int:
         try:
             apply_to(conn, app_role=args.app_role)
             db.commit()
+        except CallerRoleNotEffective as exc:
+            db.rollback()
+            print(f"ERROR: {exc}; nothing was committed", file=sys.stderr)
+            return 1
         except DBAPIError as exc:
             db.rollback()
             if pg_error_code(exc) == INSUFFICIENT_PRIVILEGE:
-                print("ERROR: run this as a DB admin with CREATEROLE: --app-role <the app's login>", file=sys.stderr)
+                print("ERROR: run this as a Postgres superuser: --app-role <the app's login>", file=sys.stderr)
                 return 1
             raise
     print(f"{CALLER_DB_ROLE} ready: reads schema {LENDING_SCHEMA} except {', '.join(DOCUMENT_TABLES)}; "

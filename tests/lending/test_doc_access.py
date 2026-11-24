@@ -53,6 +53,13 @@ def test_search_ignores_leads_without_chase_and_wildcards(documents_db):
     assert find_document_borrowers(documents_db.db, "%").matches == ()
 
 
+def test_name_matches_word_starts_only(documents_db):
+    documents_db.add(5, "Joanne Smith", "+18135550155")
+    ann = documents_db.add(6, "Ann Lee", "+18135550166")
+    assert [m.lead_ref for m in find_document_borrowers(documents_db.db, "ann").matches] == [ann.lead_ref]
+    assert [m.display for m in find_document_borrowers(documents_db.db, "lee").matches] == ["Ann L. …0166"]
+
+
 def test_search_more_than_10_is_too_many(documents_db):
     for n in range(MAX_MATCHES + 1):
         documents_db.add(100 + n, f"Mark Person{n}", f"+1813555{1000 + n}", uploaded=())

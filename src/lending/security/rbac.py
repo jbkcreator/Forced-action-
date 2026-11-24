@@ -23,9 +23,10 @@ from packages.agent_core.config import parse_user_ids
 
 logger = logging.getLogger(__name__)
 
-# Tables in schema ``lending`` a caller may not read. A new table holding documents is added here and the role
-# migration is re-run.
-DOCUMENT_TABLES: tuple[str, ...] = ("doc_chase_uploads", "doc_view_links", "partner_file_uploads")
+# Tables in schema ``lending`` a caller may not read: stored documents and the hashes of the tokens that open or
+# upload them. A new such table is added here; its own migration revokes it (rbac.revoke_from_caller_role).
+DOCUMENT_TABLES: tuple[str, ...] = ("doc_chase_uploads", "doc_view_links", "partner_file_uploads",
+                                    "staff_api_tokens", "doc_chase_links")
 CALLER_DB_ROLE = "lending_caller"
 
 SLACK_ISSUER = "slack:"
@@ -74,6 +75,15 @@ def pg_error_code(exc: BaseException) -> Optional[str]:
 
 def _quote_ident(name: str) -> str:
     return '"' + name.replace('"', '""') + '"'
+
+
+def revoke_from_caller_role(conn, schema: str, tables: tuple[str, ...], role: str = CALLER_DB_ROLE) -> None:
+    """For a migration creating a document table: close it to ``role`` when that role already exists (otherwise the
+    role migration, run later, closes it)."""
+    if conn.execute(text("SELECT 1 FROM pg_roles WHERE rolname = :r"), {"r": role}).first() is None:
+        return
+    for table in tables:
+        conn.execute(text(f"REVOKE ALL ON {_quote_ident(schema)}.{_quote_ident(table)} FROM {_quote_ident(role)}"))
 
 
 def assume_caller_db_role(session, role: str = CALLER_DB_ROLE) -> None:

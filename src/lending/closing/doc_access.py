@@ -56,7 +56,8 @@ _SEARCH = text(_BORROWERS + """
      WHERE (CAST(:ref AS text) IS NOT NULL AND b.lead_ref = :ref)
         OR (CAST(:phone AS text) IS NOT NULL AND b.phone = :phone)
         OR (CAST(:last4 AS text) IS NOT NULL AND right(b.phone, 4) = :last4)
-        OR (CAST(:name AS text) IS NOT NULL AND (b.full_name ILIKE :name ESCAPE '\\' OR b.first_name ILIKE :name ESCAPE '\\'))
+        OR (CAST(:name AS text) IS NOT NULL AND ((' ' || b.full_name) ILIKE :name ESCAPE '\\'
+                                                 OR (' ' || b.first_name) ILIKE :name ESCAPE '\\'))
      ORDER BY b.accepted_at DESC, b.lead_ref
      LIMIT :limit
 """)
@@ -136,7 +137,8 @@ def _match(row: Any) -> BorrowerMatch:
 
 
 def _like(value: str) -> str:
-    return "%" + re.sub(r"([\\%_])", r"\\\1", value) + "%"
+    """Matches at the start of a word: "ann" finds "Ann Lee", never "Joanne"."""
+    return "% " + re.sub(r"([\\%_])", r"\\\1", value) + "%"
 
 
 def _search_params(query: str) -> dict[str, Optional[str]]:

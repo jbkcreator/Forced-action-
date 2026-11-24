@@ -43,6 +43,23 @@ def test_query_refuses_sql_naming_storage_columns():
             check_read_only_sql(sql)
 
 
+def test_query_refuses_role_switch_and_dynamic_sql():
+    """Review finding: set_config('role', session_user) inside a CTE would undo lending_caller, and query_to_xml
+    runs SQL held in a string that the table checks never see."""
+    attacks = (
+        "WITH r AS (SELECT set_config('role', session_user, true) AS x) "
+        "SELECT r.x, query_to_xml('select * from lending.doc_chase_uploads', true, false, '') FROM r",
+        "SELECT set_config('role', 'postgres', true)",
+        "SELECT SET_CONFIG ('role', session_user, true)",
+        "SELECT table_to_xml('lending.doc_chase_uploads', true, false, '')",
+        "SELECT cursor_to_xml('c', 1, true, false, '')",
+        "SELECT current_setting('role')",
+    )
+    for sql in attacks:
+        with pytest.raises(ToolInputError):
+            check_read_only_sql(sql)
+
+
 def test_caller_query_runs_under_caller_db_role(monkeypatch):
     roles = []
     toolkit = CoraToolkit(engine=None, memory=None)  # type: ignore[arg-type]

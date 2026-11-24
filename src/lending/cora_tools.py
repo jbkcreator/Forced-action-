@@ -95,7 +95,10 @@ _SQL_START = re.compile(r"^\s*(select|with)\b", re.IGNORECASE)
 _SQL_FORBIDDEN = re.compile(
     r"\b(insert|update|delete|merge|drop|alter|create|grant|revoke|truncate|copy|call|do|vacuum|analyze|"
     r"set|reset|lock|refresh|comment|listen|notify|prepare|execute|discard)\b"
-    r"|\bpg_\w+\s*\(|\bdblink\b|\blo_\w+\s*\(|\binto\b",
+    r"|\bpg_\w+\s*\(|\bdblink\b|\blo_\w+\s*\(|\binto\b"
+    # R1 0.2: set_config('role', ...) would switch a caller back from lending_caller, and the *_to_xml functions run
+    # a query held in a string, out of sight of the table and schema checks.
+    r"|\bset_config\s*\(|\bcurrent_setting\s*\(|\b\w*_to_xml\w*\s*\(",
     re.IGNORECASE,
 )
 _SQL_JOINED = re.compile(r"\bjoin\s+(?:lateral\s+)?([a-zA-Z_\"][\w\".]*)", re.IGNORECASE)

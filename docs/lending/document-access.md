@@ -20,6 +20,7 @@ In #cora (or any channel Cora answers in): *"Send me Mark Smith's bank statement
 
 - One match: Cora sends an **only-visible-to-you** message with a link that opens the newest upload for 15 minutes.
   Nobody else in the channel sees it and Slack does not keep it in the history. The thread only says it was sent.
+- Names match at the start of a word: "ann" finds Ann Lee, never Joanne.
 - Several matches (two Marks): no link is made. Cora lists them as `Mark S. …0101` / `Mark T. …4432`, with whether
   each uploaded that document, and asks which one. Answer "the 0101 one".
 - More than 10 matches: Cora asks for a last name or the last 4 digits.
@@ -68,25 +69,30 @@ Each token lasts 90 days; issue a new one before then. Never paste a token in Sl
 
 1. **API / Cora:** the role is checked when a link is asked for and again when it is opened.
 2. **Database:** a caller's work runs as the Postgres role `lending_caller` (`SET LOCAL ROLE`), which has no
-   privilege on `lending.doc_chase_uploads`, `lending.doc_view_links` or `lending.partner_file_uploads`
-   (`rbac.DOCUMENT_TABLES`). This covers every staff API request made with a caller token (set before the role
+   privilege on `lending.doc_chase_uploads`, `doc_view_links`, `partner_file_uploads`, `staff_api_tokens` or
+   `doc_chase_links` (`rbac.DOCUMENT_TABLES`: stored documents and the hashes of the tokens that open them). This covers every staff API request made with a caller token (set before the role
    check) and every free-form SQL lookup a non-admin asks Cora for. If the role is missing, those lookups are
    refused ("document access controls are not set up yet"), never run as the app's own login.
 
 Cora's SQL tool also refuses any query naming `stored_path` or `token_hash`, and blanks them in `SELECT *`, for
-admins too: Slack never shows where a file is stored.
+admins too: Slack never shows where a file is stored. It also refuses `set_config(...)`, `current_setting(...)` and
+the `*_to_xml(...)` functions, which could otherwise switch a caller back from `lending_caller` or run SQL hidden in
+a string.
 
 ## Setup (in order)
 
 1. `PYTHONPATH=. python migrations/apply_lending_document_access.py` (tables `doc_view_links`, `staff_api_tokens`).
-2. A **DB admin** (a login with CREATEROLE; the app's own login does not have it) runs
+2. A **Postgres superuser** (the app's own login has no CREATEROLE) runs
    `PYTHONPATH=. python migrations/apply_lending_caller_db_role.py --app-role <the DATABASE_URL user>`.
-   Run it after step 1 so the new table is closed to callers. `--dry-run` prints the statements.
+   `--dry-run` prints the statements. The script then checks the result (`has_table_privilege`): if a caller could
+   still read any document table (for example through a PUBLIC grant), or could not read document status, it stops
+   with an error and commits nothing.
 3. Deploy `lending-api` and `fa-lending-cora`. No new setting and no new Slack scope (`chat:write` covers the
    private message). Links need `LENDING_PARTNER_LINK_BASE_URL` (already set for the upload links).
 4. Issue Josh's and David's tokens.
 
-Adding a table that holds documents later: add it to `rbac.DOCUMENT_TABLES` and re-run step 2.
+Adding a table that holds documents or token hashes later: add it to `rbac.DOCUMENT_TABLES`, call
+`rbac.revoke_from_caller_role` in its migration (as `apply_lending_document_access.py` does), and re-run step 2.
 
 ## Outside this wall (decided)
 
