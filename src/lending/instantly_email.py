@@ -43,6 +43,7 @@ from config.lending_compliance import UNSUBSCRIBE_PATH
 from config.settings import get_settings
 from packages.agent_core.lane_guard import LaneViolation, lane_violation
 from src.lending.global_halt import is_globally_halted
+from src.lending.dispatch import circuit_breaker
 from src.lending.instantly_client import lending_instantly_account
 from src.services.email_unsubscribe import unsubscribe_url
 
@@ -55,9 +56,28 @@ _TIMEOUT = 15  # seconds
 
 Request = Callable[..., Any]
 
+_SEND_STEPS = frozenset({"lead lookup", "previous lead removal", "send"})  # API steps of one send (R1 0.4 breaker)
+
 
 class InstantlySendError(RuntimeError):
-    """The email was not handed to Instantly (or the outcome is unknown). Never holds an address."""
+    """The email was not handed to Instantly (or the outcome is unknown). Never holds an address.
+
+    ``ambiguous`` is True when Instantly may nonetheless have accepted it (a timeout or connection error, or HTTP
+    5xx on the send itself): the outcome is unknown and the send must never be repeated."""
+
+    def __init__(self, message: str, *, ambiguous: bool = False) -> None:
+        super().__init__(message)
+        self.ambiguous = ambiguous
+
+
+class InstantlySendPaused(InstantlySendError):
+    """Nothing was sent: the Instantly breaker is open (five failures in a row; a person must reopen it) or the
+    channel already sent its per-minute cap (``rate_limited``)."""
+
+    def __init__(self, cause: circuit_breaker.ChannelPaused) -> None:
+        super().__init__(str(cause))
+        self.channel = cause.channel
+        self.rate_limited = isinstance(cause, circuit_breaker.RateLimited)
 
 
 class InstantlyLaneBlock(InstantlySendError, LaneViolation):
@@ -131,14 +151,24 @@ class NdlInstantlySender:
                                      headers=_headers(self._account.api_key, has_body="json" in kwargs), **kwargs)
         except Exception as exc:  # class only: the message can carry request detail
             logger.warning("%s %s request error: %s", self._log_prefix, what, type(exc).__name__)
-            raise InstantlySendError(f"Instantly {what} request error ({type(exc).__name__})") from None
+            self._count_failure(what, type(exc).__name__)
+            raise InstantlySendError(f"Instantly {what} request error ({type(exc).__name__})",
+                                     ambiguous=what == "send") from None
         if response.status_code >= 400:
             logger.warning("%s %s failed: HTTP %s", self._log_prefix, what, response.status_code)
-            raise InstantlySendError(f"Instantly {what} failed: HTTP {response.status_code}")
+            self._count_failure(what, f"HTTP {response.status_code}")
+            raise InstantlySendError(f"Instantly {what} failed: HTTP {response.status_code}",
+                                     ambiguous=what == "send" and response.status_code >= 500)
         try:
             return response.json() or {}
         except ValueError:
             return {}
+
+    def _count_failure(self, what: str, error: str) -> None:
+        """R1 0.4: an API failure on a step of a send counts toward the Instantly breaker (a pause or resume of the
+        campaign does not)."""
+        if what in _SEND_STEPS:
+            circuit_breaker.record_failure(circuit_breaker.CHANNEL_INSTANTLY, error, ambiguous=what == "send")
 
     def _refuse_if_halted(self, what: str) -> None:
         if is_globally_halted():
@@ -174,6 +204,11 @@ class NdlInstantlySender:
             logger.error("%s SECURITY: email blocked by the Backflip check (footer included); nothing sent",
                          self._log_prefix)
             raise InstantlyLaneBlock("the email, with its footer, names Backflip; nothing sent")
+        try:
+            circuit_breaker.admit(circuit_breaker.CHANNEL_INSTANTLY)
+        except circuit_breaker.ChannelPaused as exc:
+            logger.warning("%s send refused: %s", self._log_prefix, exc.why)
+            raise InstantlySendPaused(exc) from None
         self._remove_previous_lead(email)
         self._refuse_if_halted("send")  # again: a halt can be set while the lookup runs
         result = self._call("send", "POST", "/api/v2/leads/add", json={
@@ -189,6 +224,7 @@ class NdlInstantlySender:
             raise InstantlySendError("Instantly reported no lead created")
         created = result.get("created_leads") or []
         lead_id = created[0].get("id") if created and isinstance(created[0], dict) else None
+        circuit_breaker.record_success(circuit_breaker.CHANNEL_INSTANTLY)
         logger.info("%s email handed to Instantly campaign %s", self._log_prefix, self._account.campaign_id)
         return str(lead_id) if lead_id else f"instantly:{self._account.campaign_id}"
 

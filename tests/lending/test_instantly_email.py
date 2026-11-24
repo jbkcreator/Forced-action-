@@ -253,3 +253,81 @@ def test_a_footer_block_is_a_lane_block_the_relay_stores_as_blocked_and_the_dige
         NdlInstantlySender(account, fake).send("m@example.com", "S", "clean body")
     assert isinstance(raised.value, InstantlySendError) and isinstance(raised.value, LaneViolation)
     assert fake.calls == []  # no request went to Instantly
+
+
+# ── R1 0.4: the Instantly channel breaker ─────────────────────────────────────
+
+@pytest.fixture
+def breaker(monkeypatch):
+    from src.lending.dispatch import circuit_breaker
+
+    seen = SimpleNamespace(admitted=[], failures=[], successes=[], refuse=None)
+
+    def admit(channel):
+        if seen.refuse is not None:
+            raise seen.refuse(channel, "test")
+        seen.admitted.append(channel)
+
+    monkeypatch.setattr(circuit_breaker, "admit", admit)
+    monkeypatch.setattr(circuit_breaker, "record_failure", lambda channel, error, *, ambiguous=False:
+                        seen.failures.append((channel, error, ambiguous)) or False)
+    monkeypatch.setattr(circuit_breaker, "record_success", lambda channel: seen.successes.append(channel))
+    return seen
+
+
+def test_a_good_cold_email_asks_the_breaker_and_resets_the_run(breaker) -> None:
+    NdlInstantlySender(ACCOUNT, FakeInstantly(_routes())).send("mark@example.com", "Hi", "Body")
+    assert breaker.admitted == ["instantly"] and breaker.successes == ["instantly"] and breaker.failures == []
+
+
+def test_a_paused_instantly_channel_refuses_before_any_request(breaker) -> None:
+    from src.lending.dispatch import circuit_breaker
+
+    breaker.refuse = circuit_breaker.RateLimited
+    fake = FakeInstantly(_routes())
+    with pytest.raises(instantly_email.InstantlySendPaused) as err:
+        NdlInstantlySender(ACCOUNT, fake).send("mark@example.com", "Hi", "Body")
+    assert err.value.rate_limited is True and err.value.ambiguous is False and fake.calls == []
+
+
+def test_a_5xx_on_the_send_counts_and_is_ambiguous(breaker) -> None:
+    routes = _routes()
+    routes[("POST", "/api/v2/leads/add")] = (503, {})
+    with pytest.raises(InstantlySendError) as err:
+        NdlInstantlySender(ACCOUNT, FakeInstantly(routes)).send("mark@example.com", "Hi", "Body")
+    assert err.value.ambiguous is True and breaker.failures == [("instantly", "HTTP 503", True)]
+
+
+def test_a_failed_lookup_counts_but_nothing_had_been_sent(breaker) -> None:
+    routes = _routes()
+    routes[("POST", "/api/v2/leads/list")] = (500, {})
+    with pytest.raises(InstantlySendError) as err:
+        NdlInstantlySender(ACCOUNT, FakeInstantly(routes)).send("mark@example.com", "Hi", "Body")
+    assert err.value.ambiguous is False and breaker.failures == [("instantly", "HTTP 500", False)]
+
+
+def test_a_recipient_the_provider_declines_is_not_a_channel_failure(breaker) -> None:
+    routes = _routes(added={"in_blocklist": True})
+    with pytest.raises(InstantlySendError):
+        NdlInstantlySender(ACCOUNT, FakeInstantly(routes)).send("mark@example.com", "Hi", "Body")
+    assert breaker.failures == [] and breaker.successes == []
+
+
+def test_pausing_the_campaign_does_not_count_toward_the_send_breaker(breaker) -> None:
+    routes = {("POST", f"/api/v2/campaigns/{ACCOUNT.campaign_id}/pause"): (500, {})}
+    NdlInstantlySender(ACCOUNT, FakeInstantly(routes)).pause_campaign()
+    assert breaker.failures == []
+
+
+def test_an_instantly_reply_is_counted_and_a_5xx_is_ambiguous(breaker, monkeypatch) -> None:
+    from src.lending import instantly_client
+
+    account = instantly_client.InstantlyAccount("k", "https://api.instantly.ai")
+    monkeypatch.setattr("src.lending.global_halt.is_globally_halted", lambda: False)
+    monkeypatch.setattr(instantly_client.requests, "post", lambda *a, **k: FakeResponse(502, {}))
+    with pytest.raises(instantly_client.InstantlyError) as err:
+        instantly_client.send_reply(account, eaccount="a@x.test", reply_to_uuid="u", subject="s", body="b")
+    assert err.value.ambiguous is True and breaker.failures == [("instantly", "InstantlyError", True)]
+    monkeypatch.setattr(instantly_client.requests, "post", lambda *a, **k: FakeResponse(200, {"id": "e1"}))
+    assert instantly_client.send_reply(account, eaccount="a@x.test", reply_to_uuid="u", subject="s", body="b") == "e1"
+    assert breaker.successes == ["instantly"]

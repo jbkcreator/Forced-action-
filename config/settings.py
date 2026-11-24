@@ -1015,6 +1015,10 @@ class AppSettings(BaseSettings):
 	lending_after_hours_calendar_id: Optional[str] = Field(default=None, env="LENDING_AFTER_HOURS_CALENDAR_ID")
 	# Carrier (10DLC) approval for lending texts Cora sends after Approve; until true an approved text waits (then blocks at expiry)
 	lending_sms_carrier_approved: bool = Field(default=False, env="LENDING_SMS_CARRIER_APPROVED")
+	# R1 0.4: per-minute send caps per channel (10DLC throughput for SMS), shared by every sender on that channel; approval cards keep 10 slots free for live replies
+	lending_sms_per_minute: int = Field(default=60, ge=1, env="LENDING_SMS_PER_MINUTE")
+	lending_email_per_minute: int = Field(default=30, ge=1, env="LENDING_EMAIL_PER_MINUTE")
+	lending_instantly_per_minute: int = Field(default=30, ge=1, env="LENDING_INSTANTLY_PER_MINUTE")
 	lending_ghl_cf_intro_name: Optional[str] = Field(default=None, env="LENDING_GHL_CF_INTRO_NAME")
 	# GHL contact custom field "lead_id": every LendingFlow push writes our lendingflow_leads.lead_uuid; unset = not written
 	lending_ghl_cf_lead_id: Optional[str] = Field(default=None, env="LENDING_GHL_CF_LEAD_ID")

@@ -133,6 +133,7 @@ class SlackSession:
         self._on_revision = on_revision
         self.bot_user_id = bot_user_id
         self._command_hook = command_hook
+        self._held_marked: set[int] = set()
         # Optional host hook for traffic this package does not own (a host's own buttons, forms and slash
         # commands). ``respond(request_type, payload) -> dict | None`` runs before the ack and may return the ack
         # payload (a form's validation errors); ``handle(request_type, payload) -> bool`` runs after the ack and
@@ -280,6 +281,9 @@ class SlackSession:
                     "yet. Nothing was sent.")
         if result.outcome is DispatchOutcome.FAILED:
             return ":warning: *Approved, send failed.* Nothing was retried; check the action before re-queuing."
+        if result.outcome is DispatchOutcome.HELD:
+            return (f":pause_button: *Approved, held for review*: {slack_safe(result.reason or 'needs a look')}. "
+                    "Nothing was sent and nothing will be retried. A reviewer can reopen it for a fresh approval.")
         if result.outcome is DispatchOutcome.DEFERRED:
             return (f":hourglass_flowing_sand: *Approved, waiting to send*: {slack_safe(result.reason or 'not yet')}. "
                     "It goes out automatically once allowed, unless the draft expires first; no need to redraft.")
@@ -294,6 +298,25 @@ class SlackSession:
                 self._chat.update(channel=action.card_channel, ts=action.card_ts, text=status_text,
                                   blocks=render_decided_card(action, status_text))
         return len(expired)
+
+    def mark_held_cards(self) -> int:
+        """Strip the buttons from the card of every held action and say why, once per action per process. A held
+        action is reopened by a person (a fresh card then asks for a new approval). Returns how many cards changed."""
+        changed = 0
+        for action_id in self._queue.held_ids():
+            if action_id in self._held_marked:
+                continue
+            self._held_marked.add(action_id)
+            action = self._queue.get(action_id)
+            if action is None or not (action.card_channel and action.card_ts):
+                continue
+            why = slack_safe((action.held_reason or "needs a look").replace("_", " "))
+            status_text = (f":pause_button: *Held for review* ({why}). Nothing was sent and nothing will be retried; "
+                           "a reviewer reopens it for a fresh approval.")
+            self._chat.update(channel=action.card_channel, ts=action.card_ts, text=status_text,
+                              blocks=render_decided_card(action, status_text))
+            changed += 1
+        return changed
 
     def _update_card(self, action_id: int, channel: str | None, ts: str | None, status_text: str) -> None:
         if not (channel and ts):

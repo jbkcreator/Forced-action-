@@ -8,7 +8,9 @@ Lifecycle of one row::
        ├──revise request──────────▶ revising ──reject──▶ rejected
        ├──reject──────────────────▶ rejected
        ├──expires_at passes (pending or revising)──▶ expired
-       └──lane deny list, at submit (no card)──▶ blocked
+       ├──lane deny list, at submit (no card)──▶ blocked
+       └──held (breaker open, recipient changed, consent revoked, outcome unknown): sending or approved ──▶ held
+            held ──reopen (a person)──▶ pending (fresh card, fresh expiry) | held ──reject──▶ rejected
 
 Every transition is a single conditional UPDATE, so a double click, a retried Slack payload or
 two relay processes can move a row at most once. ``sending`` is only ever left by the process
@@ -45,6 +47,7 @@ class ActionStatus(str, enum.Enum):
     FAILED = "failed"
     BLOCKED = "blocked"
     EXPIRED = "expired"
+    HELD = "held"  # held for a person's review: nothing was sent and nothing is retried
 
 
 _OPEN_STATUSES = (ActionStatus.PENDING, ActionStatus.REVISING)
@@ -75,6 +78,7 @@ class PendingAction:
     expires_at: datetime | None
     provider_ref: str | None
     error: str | None
+    held_reason: str | None = None
 
 
 def _load_json(raw: Any, default: Any) -> Any:
@@ -125,6 +129,7 @@ def _row_to_action(row: Mapping[str, Any]) -> PendingAction:
         expires_at=_load_datetime(row["expires_at"]),
         provider_ref=row["provider_ref"],
         error=row["error"],
+        held_reason=row["held_reason"] if "held_reason" in row.keys() else None,
     )
 
 
@@ -239,7 +244,7 @@ class PendingActionQueue:
                                 {"status": ActionStatus.APPROVED.value, "user_id": user_id}, require_unexpired=True)
 
     def reject(self, action_id: int, user_id: str) -> bool:
-        return self._transition(action_id, _OPEN_STATUSES,
+        return self._transition(action_id, (*_OPEN_STATUSES, ActionStatus.HELD),
                                 "status = :status, decided_by = :user_id, decided_at = :now",
                                 {"status": ActionStatus.REJECTED.value, "user_id": user_id})
 
@@ -342,6 +347,52 @@ class PendingActionQueue:
     def mark_blocked(self, action_id: int, reason: str) -> bool:
         """The send-time check refused it (opt-out, no consent). Nothing was sent."""
         return self._close_unsent(action_id, ActionStatus.BLOCKED, reason)
+
+    def mark_held(self, action_id: int, held_reason: str, detail: str = "") -> bool:
+        """Hold a claimed action for a person's review. Nothing was sent, or the outcome is unknown; either way it is
+        never retried. ``held_reason`` is a short code, ``detail`` free text (no contact details)."""
+        return self._transition(action_id, (ActionStatus.SENDING,),
+                                "status = :status, held_reason = :held_reason, error = :error",
+                                {"status": ActionStatus.HELD.value, "held_reason": held_reason,
+                                 "error": mask_long_digit_runs(detail)[:_ERROR_TEXT_LIMIT] or None})
+
+    def hold_approved(self, channels: tuple[str, ...], held_reason: str, detail: str = "") -> list[int]:
+        """Hold every approved, unclaimed action on ``channels`` at once (a tripped breaker). Returns their ids."""
+        if not channels:
+            return []
+        bind = {f"c_{i}": channel for i, channel in enumerate(channels)}
+        marks = ", ".join(f":c_{i}" for i in range(len(channels)))
+        with self._store.transaction() as conn:
+            rows = conn.execute(
+                text(f"UPDATE {self._table} SET status = :held, held_reason = :reason, error = :error, "
+                     f"updated_at = :now WHERE status = :approved AND channel IN ({marks}) RETURNING action_id"),
+                {**bind, "held": ActionStatus.HELD.value, "approved": ActionStatus.APPROVED.value,
+                 "reason": held_reason, "error": mask_long_digit_runs(detail)[:_ERROR_TEXT_LIMIT] or None,
+                 "now": self._clock()},
+            ).scalars().all()
+        return [int(action_id) for action_id in rows]
+
+    def reopen_held(self, action_id: int, ttl: timedelta | None = None) -> bool:
+        """A person reviewed a held action: back to pending with a fresh card and expiry. It needs a new approval,
+        and every send-time check runs again."""
+        now = self._clock()
+        current = self.get(action_id)
+        expires_at = _capped(now + (ttl or self._default_ttl), current) if current else now
+        return self._transition(action_id, (ActionStatus.HELD,),
+                                "status = :status, held_reason = NULL, error = NULL, card_channel = NULL, "
+                                "card_ts = NULL, decided_by = NULL, decided_at = NULL, expires_at = :expires_at",
+                                {"status": ActionStatus.PENDING.value, "expires_at": expires_at})
+
+    def held_ids(self, channels: tuple[str, ...] | None = None, limit: int = 200) -> list[int]:
+        """Held actions (optionally on ``channels``), oldest first."""
+        where, bind = "status = :held", {"held": ActionStatus.HELD.value, "limit": limit}
+        if channels:
+            bind.update({f"c_{i}": channel for i, channel in enumerate(channels)})
+            where += " AND channel IN (" + ", ".join(f":c_{i}" for i in range(len(channels))) + ")"
+        with self._store.transaction() as conn:
+            rows = conn.execute(text(f"SELECT action_id FROM {self._table} WHERE {where} "
+                                     "ORDER BY action_id LIMIT :limit"), bind).scalars().all()
+        return [int(action_id) for action_id in rows]
 
     def block_pending(self, action_id: int, reason: str) -> bool:
         """The send gate refused a new draft before its card was posted (lane deny list). Nothing was sent."""

@@ -11,7 +11,7 @@ from sqlalchemy import text
 from sqlalchemy.engine import Connection
 
 ACTION_STATUSES = ("pending", "revising", "approved", "rejected", "sending", "sent", "failed",
-                   "blocked", "expired")
+                   "blocked", "expired", "held")
 
 
 def _status_check() -> str:
@@ -71,6 +71,7 @@ def safeguard_statements(schema: str) -> list[str]:
         "idempotency_key varchar(128)",
         "expires_at timestamptz",
         "revised_by varchar(32)",
+        "held_reason varchar(32)",
     )
     return [
         *(f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS {column}" for column in added_columns),
