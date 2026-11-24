@@ -6,8 +6,7 @@ approved number or address may no longer be theirs. The card's ``contact_ref`` n
 record as it stands now:
 
 * the value changed, or the named lead no longer exists -> the send is held for review (never sent, never retried);
-* a ``contact_ref`` that is not one of ours to look up (an Instantly reply, a document chase) cannot be compared and
-  is allowed: the opt-out and consent checks still run on the frozen value.
+* a ``contact_ref`` that is not one of ours to look up cannot be compared; opt-out and consent checks still run.
 
 Consent revoked while queued is held the same way (``HOLD_CONSENT_REVOKED``), by the caller's send check.
 """
@@ -28,13 +27,15 @@ HOLD_LEAD_NOT_FOUND = "lead_not_found"
 HOLD_CONSENT_REVOKED = "consent_revoked"
 HOLD_UNCERTAIN_OUTCOME = "uncertain_outcome"
 
-_LEAD_REF = re.compile(r"^(web_lead|lendingflow_lead|contact):(\d+)$")
+_LEAD_REF = re.compile(r"^(web_lead|lendingflow_lead|contact|instantly_reply|doc_chase):(\d+)$")
 _GHL_REF = re.compile(r"^ghl:(\S+)$")
 
 _BY_LEAD = {
     "web_lead": text("SELECT phone, email FROM lending.web_leads WHERE id = :id"),
     "lendingflow_lead": text("SELECT phone, email FROM lending.lendingflow_leads WHERE id = :id"),
     "contact": text("SELECT phone, email FROM lending.contacts WHERE id = :id"),
+    "instantly_reply": text("SELECT NULL, lead_email FROM lending.instantly_replies WHERE id = :id"),
+    "doc_chase": text("SELECT phone, email FROM lending.doc_chases WHERE id = :id"),
 }
 _BY_GHL_CONTACT = text("""
     SELECT phone, email FROM lending.web_leads WHERE ghl_contact_id = :g

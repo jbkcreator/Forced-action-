@@ -476,7 +476,7 @@ def test_a_ghl_contact_with_no_lead_record_is_allowed_and_a_foreign_reference_is
     assert revalidate.changed_recipient(Conn([]), _action(contact_ref="ghl:abc"), sms_channels=SMS,
                                         email_channels=EMAIL) is None
     conn = Conn([("+18135559999", None)])
-    assert revalidate.changed_recipient(conn, _action(contact_ref="instantly_reply:5"), sms_channels=SMS,
+    assert revalidate.changed_recipient(conn, _action(contact_ref="external:5"), sms_channels=SMS,
                                         email_channels=EMAIL) is None and conn.queries == []
 
 
@@ -491,3 +491,8 @@ def test_a_ghl_contact_edited_in_our_records_holds_the_send():
     conn = Conn([("+18135559999", None), ("+18135558888", None)])
     assert revalidate.changed_recipient(conn, _action(contact_ref="ghl:abc"), sms_channels=SMS,
                                         email_channels=EMAIL) == "recipient_changed"
+
+def test_reply_and_chase_recipient_edits_hold_the_send():
+    for ref in ("instantly_reply:5", "doc_chase:5"):
+        action = _action(channel="ghl_email", contact_ref=ref)
+        assert revalidate.changed_recipient(Conn([(None, "new@example.com")]), action, sms_channels=SMS, email_channels=EMAIL) == "recipient_changed"

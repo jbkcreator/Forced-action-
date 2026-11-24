@@ -100,3 +100,23 @@ def test_approving_a_held_action_directly_is_refused(queue) -> None:
     action_id = _approved(queue)
     queue.hold_approved(("ghl_sms",), "breaker_open")
     assert queue.approve(action_id, APPROVER) is False  # it must be reopened first, so every check runs again
+
+def test_held_card_reports_uncertainty_and_retries_failed_updates(queue):
+    from packages.agent_core.chatport import FakeChatPort, PostResult
+    from packages.agent_core.slack_session import SlackSession
+    action_id = _approved(queue)
+    queue.attach_card(action_id, "C_APPROVALS", "1")
+    queue.claim_for_send(action_id)
+    queue.mark_held(action_id, "uncertain_outcome")
+    class FlakyChat(FakeChatPort):
+        def update(self, **kwargs):
+            if not hasattr(self, "attempted"):
+                self.attempted = True
+                return PostResult(ok=False)
+            return super().update(**kwargs)
+    session = SlackSession.__new__(SlackSession)
+    session._queue, session._chat, session._held_marked = queue, FlakyChat(), set()
+    session.mark_held_cards()
+    session.mark_held_cards()
+    assert len(session._chat.updates) == 1
+    assert "may have been sent" in session._chat.updates[0]["text"]

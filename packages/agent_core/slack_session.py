@@ -306,16 +306,18 @@ class SlackSession:
         for action_id in self._queue.held_ids():
             if action_id in self._held_marked:
                 continue
-            self._held_marked.add(action_id)
             action = self._queue.get(action_id)
             if action is None or not (action.card_channel and action.card_ts):
                 continue
             why = slack_safe((action.held_reason or "needs a look").replace("_", " "))
-            status_text = (f":pause_button: *Held for review* ({why}). Nothing was sent and nothing will be retried; "
-                           "a reviewer reopens it for a fresh approval.")
-            self._chat.update(channel=action.card_channel, ts=action.card_ts, text=status_text,
-                              blocks=render_decided_card(action, status_text))
-            changed += 1
+            outcome = "The message may have been sent" if action.held_reason == "uncertain_outcome" else "Nothing was sent"
+            status_text = (f":pause_button: *Held for review* ({why}). {outcome}; nothing will be retried. "
+                           "A reviewer reopens it for a fresh approval.")
+            result = self._chat.update(channel=action.card_channel, ts=action.card_ts, text=status_text,
+                                       blocks=render_decided_card(action, status_text))
+            if result.ok:
+                self._held_marked.add(action_id)
+                changed += 1
         return changed
 
     def _update_card(self, action_id: int, channel: str | None, ts: str | None, status_text: str) -> None:
