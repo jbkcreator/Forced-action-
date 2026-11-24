@@ -347,8 +347,15 @@ def _process(file_id: int, services: PipelineServices, session_factory: Callable
 
     fit: Optional[LenderFitResult] = None
     matrix: Matrix = ()
+    rule_version: Optional[int] = None
     try:
-        matrix = services.load_matrix()
+        # The rule version is read right before and after the rules are loaded; when a change lands in between, the
+        # version the evaluation used is unknown and is recorded as such (None), never as the newer one.
+        with session_factory() as db:
+            version_before = deal_ledger.rule_version_at(db)
+            matrix = services.load_matrix()
+            version_after = deal_ledger.rule_version_at(db)
+        rule_version = version_before if version_before == version_after else None
         fit = _score(services, file, matrix)
     except Exception as exc:
         logger.error("[partner-door] lender fit failed file=%s (%s)", file_id, type(exc).__name__)
@@ -369,6 +376,7 @@ def _process(file_id: int, services: PipelineServices, session_factory: Callable
         if fit is not None:
             deal_ledger.record_safely(
                 db, file_id, "quote_generated", actor=deal_ledger.system("partner_pipeline"), occurred_at=now,
+                rule_version=rule_version,
                 detail={"kind": "lender_fit", "fitting": [lender.lender_key for lender in fit.fitting],
                         "possible": len(fit.possible), "non_fitting": len(fit.non_fitting),
                         "missing_fields": fit.missing_fields},

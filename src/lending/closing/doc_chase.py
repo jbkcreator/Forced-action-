@@ -77,7 +77,9 @@ _MISSING = text("SELECT label FROM lending.doc_chase_items WHERE chase_id = :c A
 # Only an unambiguous match: a borrower with two deals in GHL is never guessed.
 _OPPORTUNITY = text("SELECT min(ghl_opportunity_id) FROM lending.ghl_opportunity_stage WHERE phone = :phone "
                     "HAVING count(*) = 1")
-_LOAN_FILE = text("SELECT id FROM lending.loan_files WHERE borrower_phone = :phone ORDER BY created_at DESC LIMIT 1")
+# The borrower's loan file, only when the phone names exactly one: with two deals the chase cannot tell which one it
+# is for, so it is tied to neither (and its quote is not put on the wrong deal's history).
+_LOAN_FILE = text("SELECT min(id) FROM lending.loan_files WHERE borrower_phone = :phone HAVING count(*) = 1")
 # P2.2 stores each quote's request and result in lending.instant_quotes; conditions[] carries {"code": ...}.
 _QUOTE_CONDITIONS = text("SELECT c ->> 'code' FROM lending.instant_quotes q, "
                          "jsonb_array_elements(COALESCE(q.result -> 'conditions', '[]'::jsonb)) c "

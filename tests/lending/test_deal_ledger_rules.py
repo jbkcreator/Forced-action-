@@ -203,3 +203,51 @@ def test_files_that_change_a_deal_call_the_ledger(path):
 def test_cora_sweep_runs_the_card_catch_up():
     source = (REPO / "src/lending/cora_agent.py").read_text(encoding="utf-8")
     assert "deal_ledger_sync=make_deal_ledger_step(engine)" in source and "services.deal_ledger_sync()" in source
+
+
+# ── PR #475 review fixes ───────────────────────────────────────────────────────
+
+@pytest.mark.parametrize("raw,source,expected", [
+    ("Josh\tSmith", "api", "human:Josh_Smith"),        # a tab no longer fails the ledger's actor check
+    ("human:", "api", "system:api"),                   # a reserved prefix with nothing after it
+    ("system:", "webhook", "system:webhook"),
+    ("slack:", "api", "system:api"),
+    ("human:Josh  Smith", "api", "human:Josh_Smith"),
+    ("slack:U0JOSH", "router", "human:U0JOSH"),
+    ("cora", "router", "cora"),
+])
+def test_loose_actor_labels_always_become_a_valid_ledger_actor(raw, source, expected):
+    actor = deal_ledger.tag_actor(raw, source=source)
+    assert actor == expected and deal_ledger._ACTOR.match(actor)
+
+
+@pytest.mark.parametrize("actor", ["human:", "system:", "Josh\tSmith", "  "])
+def test_the_stage_api_refuses_an_actor_that_names_nobody(actor):
+    from pydantic import ValidationError
+
+    from src.api.lending_loan_stage_router import StageIn
+
+    with pytest.raises(ValidationError):
+        StageIn(to_stage="FIT", actor=actor)
+    assert StageIn(to_stage="FIT", actor="Josh Smith").actor == "Josh Smith"
+
+
+def test_the_public_quote_api_cannot_attach_a_quote_to_a_loan_file():
+    """Review 1: quote credentials authorise quotes, not a loan's history."""
+    from src.api.lending_instant_quote_router import QuoteIn
+
+    assert "loan_file_id" not in QuoteIn.model_fields
+
+
+def test_a_document_chase_ties_itself_to_a_file_only_when_the_phone_names_one():
+    """Review 2: with two deals on one number the chase (and its quote) is tied to neither."""
+    from src.lending.closing import doc_chase
+
+    sql = str(doc_chase._LOAN_FILE)
+    assert "HAVING count(*) = 1" in sql and "ORDER BY created_at DESC" not in sql
+
+
+def test_each_card_decision_has_its_own_key():
+    """Review 3: an automatic approval returned to pending and the person's later decision are two events."""
+    source = (REPO / "src/lending/audit/deal_ledger.py").read_text(encoding="utf-8")
+    assert ":decided:{card['decided_at'].isoformat()}" in source

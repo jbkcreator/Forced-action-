@@ -60,10 +60,12 @@ def system(source: str) -> str:
 def tag_actor(actor: Optional[str], *, source: str) -> str:
     """The ledger actor for a caller's loose ``actor`` string: already tagged stays; ``slack:<id>`` is a person; a name
     given through the API or by hand is a person; anything else is the system source that did it."""
-    cleaned = (actor or "").strip().replace(" ", "_")
-    if cleaned == ACTOR_CORA or cleaned.startswith(("human:", "system:")):
+    cleaned = re.sub(r"\s+", "_", (actor or "").strip())
+    if _ACTOR.match(cleaned):
         return cleaned
-    if cleaned.startswith("slack:") and len(cleaned) > 6:
+    if cleaned in ("human:", "system:", "slack:"):  # a reserved prefix with nothing after it
+        cleaned = ""
+    if cleaned.startswith("slack:"):
         return human(cleaned[6:])
     if cleaned and source in _HUMAN_SOURCES:
         return human(cleaned)
@@ -231,7 +233,10 @@ def sync_card_events(db: Session, days: int = 3) -> int:
         if card["decided_at"] is not None and card["status"] in _APPROVED_STATES | {"rejected"}:
             actor, auto = _decider(card["decided_by"])
             kind = "card_rejected" if card["status"] == "rejected" else "card_approved"
-            events.append((kind, actor, {**base, "auto_approved": auto}, f"card:{card['action_id']}:decided", card["decided_at"]))
+            # Keyed by the decision's time: Standing Sends can send an automatic approval back to pending, and the
+            # person's later approval or rejection is a separate decision that must not be skipped as a duplicate.
+            events.append((kind, actor, {**base, "auto_approved": auto},
+                           f"card:{card['action_id']}:decided:{card['decided_at'].isoformat()}", card["decided_at"]))
         for event_type, actor, detail, key, at in events:
             if record(db, file_id, event_type, actor=actor, detail=detail, dedupe_key=key, occurred_at=at, **ref) is not None:
                 added += 1

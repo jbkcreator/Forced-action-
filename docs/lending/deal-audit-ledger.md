@@ -40,10 +40,10 @@ The table refuses UPDATE, DELETE and TRUNCATE (triggers), and a loan file that h
 * **Partner flow** (live before the ledger, so a ledger problem must not block a partner notice): the partner door
   creating a file, a status change by the router, and the lender-fit evaluation (`quote_generated`, `kind: lender_fit`)
   record through `record_safely`: a failure is logged and skipped.
-* **Quotes**: an instant quote made with a `loan_file_id` (the instant-quote API body or Cora's `instant_quote` tool)
-  is recorded in the same transaction as the quote. A quote made without one is recorded when it is tied to a file
-  (when a document chase starts with its `quote_id`), stamped with the time the quote was made and the rule version
-  then. A quote request carries no borrower, so a quote with no file named cannot be placed earlier.
+* **Quotes**: an instant quote made by Cora's `instant_quote` tool with a `loan_file_id` is recorded in the same
+  transaction as the quote. The public instant-quote API cannot name a loan file: its key authorises quotes, not a
+  loan's history. A quote is also recorded when a document chase starts with its `quote_id`, but only when the
+  borrower's phone names exactly one loan file; with two deals on one number it is put on neither.
 * **Cora's cards**: drafts, edits and approvals live in the agent tables, so Cora's minute sweep catches them up
   (`sync_card_events`, last 3 days, safe to repeat). Expect up to a minute of delay. A card is tied to a file by its
   `deal_ref` (`loan_file:<id>`, `doc_chase:<id>`) or else by the borrower's phone (only when exactly one file has that number); a
@@ -58,7 +58,7 @@ there as exempt with a reason). The partner-notice stamps (`notice_*`) are exemp
 
 ## Backfill
 
-The migration adds, once and idempotently, a `file_created` row per existing file and a `status_change` row per existing
+The migration adds, only while the ledger is still empty (so a re-run after deployment never duplicates live events), a `file_created` row per existing file and a `status_change` row per existing
 `loan_file_status_events` row, actor `system:backfill`, rule version NULL. Older card edits are not imported (they were
 never tied to a file).
 

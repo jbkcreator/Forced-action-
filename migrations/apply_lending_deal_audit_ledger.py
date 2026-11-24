@@ -70,8 +70,11 @@ def apply_to(conn: Connection, schema: str = LENDING_SCHEMA) -> None:
     conn.exec_driver_sql(f'CREATE TRIGGER deal_audit_events_no_truncate BEFORE TRUNCATE ON "{schema}".deal_audit_events '
                          f'FOR EACH STATEMENT EXECUTE FUNCTION "{schema}".deal_audit_events_append_only()')
 
-    conn.execute(text(_BACKFILL_FILES.format(s=schema)))
-    conn.execute(text(_BACKFILL_STATUS.format(s=schema)))
+    # Backfill once: only while the ledger is still empty. Live writers use their own keys, so a re-run after
+    # deployment would otherwise add a second copy of activity the live code already recorded.
+    if not conn.execute(text(f'SELECT EXISTS (SELECT 1 FROM "{schema}".deal_audit_events)')).scalar():
+        conn.execute(text(_BACKFILL_FILES.format(s=schema)))
+        conn.execute(text(_BACKFILL_STATUS.format(s=schema)))
 
 
 def apply(engine: Engine | None = None, schema: str = LENDING_SCHEMA) -> None:

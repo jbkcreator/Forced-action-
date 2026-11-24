@@ -353,3 +353,53 @@ def test_the_backfill_imports_old_files_and_status_changes_once(ledger_db):
     events = deal_ledger.lifecycle(db, old)
     assert [(e["event_type"], e["actor"]) for e in events] == [("file_created", "system:backfill"),
                                                                 ("status_change", "system:backfill"), ("status_change", "system:backfill")]
+
+
+# ── PR #475 review fixes ───────────────────────────────────────────────────────
+
+def test_a_rerun_of_the_migration_after_live_activity_adds_nothing(ledger_db):
+    """Review 5: the backfill runs only on an empty ledger, so a deployment retry never duplicates live events."""
+    db = ledger_db
+    file_id = _new_file(db)
+    sm.transition(db, file_id, LoanStage.FIT, source="api", actor="josh")
+    before = _count(db)
+    apply_ledger(db.info["conn"], db.info["schema"])
+    assert _count(db) == before
+
+
+def test_an_automatic_approval_returned_to_pending_and_then_rejected_keeps_both_decisions(ledger_db):
+    """Review 3."""
+    db = ledger_db
+    file_id = _new_file(db)
+    action = _card(db, deal_ref=f"loan_file:{file_id}", status="approved", decided_by=AUTO_GRADUATED_ACTOR, decided=True)
+    deal_ledger.sync_card_events(db)
+    db.execute(text("UPDATE lending.pending_actions SET status = 'rejected', decided_by = 'U0JOSH', "
+                    "decided_at = decided_at + interval '2 minutes', updated_at = now() WHERE action_id = :a"),
+               {"a": action})
+    deal_ledger.sync_card_events(db)
+    decisions = [(e["event_type"], e["actor"]) for e in deal_ledger.lifecycle(db, file_id)
+                 if e["event_type"] in ("card_approved", "card_rejected")]
+    assert decisions == [("card_approved", "system:standing_send"), ("card_rejected", "human:U0JOSH")]
+
+
+def test_a_partner_status_event_records_the_stage_and_closure_it_changed(ledger_db):
+    """Review 4."""
+    from src.lending import partners
+
+    db = ledger_db
+    file_id = _new_file(db)
+    partners.record_status_change(db, file_id, "routed")
+    partners.record_status_change(db, file_id, "declined", "credit_below_min")
+    changes = [e["diff"] for e in deal_ledger.lifecycle(db, file_id) if e["event_type"] == "status_change"]
+    assert changes[0]["stage"] == {"before": "INTAKE", "after": "SUBMITTED"}
+    assert changes[1]["closed"] == {"before": False, "after": True}
+    assert changes[1]["closed_reason"] == {"before": None, "after": "credit_below_min"}
+
+
+def test_a_document_chase_for_a_borrower_with_two_files_puts_the_quote_on_neither(ledger_db):
+    """Review 2."""
+    db = ledger_db
+    first, second = _new_file(db), _new_file(db, address="9 Elm St")
+    assert db.execute(text("SELECT min(id) FROM lending.loan_files WHERE borrower_phone = :p HAVING count(*) = 1"),
+                      {"p": "+18135550101"}).first() is None
+    assert "quote_generated" not in _types(db, first) + _types(db, second)
