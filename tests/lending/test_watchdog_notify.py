@@ -112,3 +112,25 @@ def test_deliver_never_raises_when_everything_throws():
     slack.chat_postMessage.side_effect = RuntimeError("boom")
     notify.deliver([alert()], recipients=[PHONE], ghl=boom, telnyx=boom, slack=slack, channel="C1")
     notify.deliver([alert()], recipients=None, ghl=boom, telnyx=boom, slack=slack, channel="C1")
+
+
+@pytest.mark.parametrize("bad", [
+    Alert("database", "bogus", "x", SINCE),
+    Alert("database", "recovered", "x", SINCE.replace(tzinfo=None)),
+])
+def test_deliver_isolates_a_bad_alert(bad):
+    slack, ghl = MagicMock(), MagicMock(return_value="id")
+    notify.deliver([bad, alert(key="cards")], recipients=[PHONE], ghl=ghl, telnyx=None, slack=slack, channel="C1")
+    posted = slack.chat_postMessage.call_args.kwargs["text"]
+    assert "Approval cards" in posted and "database" in posted
+    bodies = [c.args[1] for c in ghl.call_args_list]
+    assert len(bodies) == 2
+    assert "NDL watchdog: database" in bodies[0]
+    assert "Approval cards" in bodies[1]
+
+
+def test_deliver_slack_failure_does_not_stop_sms():
+    slack, ghl = MagicMock(), MagicMock(return_value="id")
+    slack.chat_postMessage.side_effect = RuntimeError("boom")
+    notify.deliver([alert()], recipients=[PHONE], ghl=ghl, telnyx=None, slack=slack, channel="C1")
+    assert ghl.call_count == 1

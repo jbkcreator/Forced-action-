@@ -44,9 +44,21 @@ def format_sms(alert: Alert, now: Optional[datetime] = None) -> str:
     return _render(alert, now, alert.detail[: max(0, len(alert.detail) - overflow - 1)] + "…").rstrip()[:SMS_MAX_CHARS]
 
 
+def _fallback(alert: Alert) -> str:
+    return f"NDL watchdog: {alert.key} {alert.kind}"
+
+
+def _safe(alert: Alert, render: Callable[[], str]) -> str:
+    try:
+        return render()
+    except Exception as exc:
+        logger.error("[watchdog] could not format alert %s: %s", alert.key, type(exc).__name__)
+        return _fallback(alert)
+
+
 def format_slack(alerts: Sequence[Alert], now: Optional[datetime] = None) -> str:
     now = now or datetime.now(timezone.utc)
-    return "\n".join(_render(a, now, a.detail).rstrip() for a in alerts)
+    return "\n".join(_safe(a, lambda a=a: _render(a, now, a.detail).rstrip()) for a in alerts)
 
 
 def _mask(phone: str) -> str:
@@ -102,10 +114,14 @@ def deliver(
 ) -> None:
     if not alerts:
         return
+    now = datetime.now(timezone.utc)
     try:
-        now = datetime.now(timezone.utc)
         post_slack_alert(format_slack(alerts, now), slack=slack, channel=channel)
-        for alert in alerts:
-            send_sms_alert(format_sms(alert, now), recipients or (), ghl=ghl, telnyx=telnyx)
     except Exception as exc:
-        logger.error("[watchdog] alert delivery failed: %s", type(exc).__name__)
+        logger.error("[watchdog] Slack alert step failed: %s", type(exc).__name__)
+    for alert in alerts:
+        try:
+            body = _safe(alert, lambda alert=alert: format_sms(alert, now))
+            send_sms_alert(body, recipients or (), ghl=ghl, telnyx=telnyx)
+        except Exception as exc:
+            logger.error("[watchdog] SMS step failed for alert %s: %s", alert.key, type(exc).__name__)
