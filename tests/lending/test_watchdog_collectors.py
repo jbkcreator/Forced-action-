@@ -319,7 +319,8 @@ def _ghl_call(db, started):
 
 def _ghl_outcome(db, received):
     db.execute(text(
-        "INSERT INTO lending.ghl_disposition_events (received_at, disposition_raw, code) VALUES (:r, 'x', 'no_answer')"),
+        "INSERT INTO lending.ghl_disposition_events (received_at, disposition_raw, code, raw_event) "
+        "VALUES (:r, 'x', 'no_answer', '{}')"),
         {"r": received})
 
 
