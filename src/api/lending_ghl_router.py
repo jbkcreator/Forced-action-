@@ -156,16 +156,19 @@ def _apply_loan_stage(db: Session, opportunity_id: str, stage: str, phone: Optio
     """R1 0.1: a Funded / Paid stage moves the loan file (``ghl_stage_bridge``), in a savepoint: a failure never loses
     the scoreboard's stage event, and the event is saved to ``lending.webhook_failures`` (with an ops alert) and
     replayed every 5 minutes until the file takes it, so GHL's 200 never hides a lost loan update. A refused move is
-    stored and carded by the state machine; GHL still gets 200."""
+    stored and carded by the state machine; GHL still gets 200. If the retry cannot be saved either, the error is
+    re-raised: the webhook rolls back and answers 500, so GHL delivers the event again (the stage insert is idempotent)."""
     try:
         with db.begin_nested():
             outcome = apply_stage(db, opportunity_id=opportunity_id, stage_name=stage, phone=phone)
         if outcome:
             logger.info("[lending-ghl] loan stage from GHL: %s", outcome)
     except Exception as exc:
-        logger.error("[lending-ghl] loan stage not applied (%s); saved for retry", type(exc).__name__)
-        report_webhook_failure(GHL_LOAN_STAGE, {"opportunity_id": opportunity_id, "stage_name": stage, "phone": phone},
-                               exc)
+        logger.error("[lending-ghl] loan stage not applied (%s); saving it for retry", type(exc).__name__)
+        saved = report_webhook_failure(GHL_LOAN_STAGE,
+                                       {"opportunity_id": opportunity_id, "stage_name": stage, "phone": phone}, exc)
+        if saved is None:  # not saved for retry either: fail the webhook so GHL delivers it again
+            raise
 
 
 @router.post("/ghl-stage")

@@ -50,7 +50,7 @@ SQLITE_DDL = (
         status_at TIMESTAMP NOT NULL, lender_fit TEXT, prequal_pdf_path TEXT, funded_at TIMESTAMP,
         notice_status TEXT, notice_emailed_at TIMESTAMP, notice_texted_at TIMESTAMP, notice_failed_at TIMESTAMP, is_test BOOLEAN NOT NULL DEFAULT 0,
         created_at TIMESTAMP NOT NULL, updated_at TIMESTAMP NOT NULL,
-        stage TEXT NOT NULL DEFAULT 'INTAKE', closed_reason TEXT, closed_at TIMESTAMP)""",
+        stage TEXT NOT NULL DEFAULT 'INTAKE', closed_reason TEXT, closed_at TIMESTAMP, ghl_opportunity_id TEXT)""",
     """CREATE TABLE lending.partner_submissions (id INTEGER PRIMARY KEY AUTOINCREMENT, file_id INTEGER NOT NULL UNIQUE,
         partner_id INTEGER NOT NULL, consent_checked BOOLEAN NOT NULL, consent_text TEXT NOT NULL,
         consented_at TIMESTAMP NOT NULL, ip_address TEXT, page_url TEXT, user_agent TEXT,
@@ -1012,3 +1012,16 @@ def test_a_status_the_state_machine_sets_queues_the_partner_notice(engine, sessi
         partners.record_status_change(db, file_id, "funded", "stage FUNDED")
     row = _rows(engine, "loan_files")[0]
     assert (row["notice_status"], row["notice_emailed_at"], row["stage"]) == ("funded", None, "FUNDED")
+
+
+def test_an_old_approve_click_never_turns_a_funded_file_back_to_approved(engine, session_factory) -> None:
+    """PR #473 review 2: a file funded through the loan state machine leaves no routing event, so R-1's own
+    already-funded check cannot see it; the shared status write refuses the step back instead."""
+    _, token = _partner(session_factory)
+    file_id = _submit(session_factory, token)
+    with session_factory() as db:
+        partners.record_status_change(db, file_id, "funded")
+        assert partners.record_status_change(db, file_id, "approved") is None
+        assert partners.record_status_change(db, file_id, "declined", "other") is None
+    row = _rows(engine, "loan_files")[0]
+    assert (row["status"], row["stage"], row["closed_at"]) == ("funded", "FUNDED", None)

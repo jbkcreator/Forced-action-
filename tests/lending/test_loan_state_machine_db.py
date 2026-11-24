@@ -336,29 +336,57 @@ def test_the_documented_migration_order_works_on_an_empty_schema():
         engine.dispose()
 
 
-def test_a_ghl_funded_sent_too_early_is_applied_when_the_deal_is_moved_again(sm_db):
+def _link(db, file_id, opportunity_id):
+    db.execute(text("UPDATE lending.loan_files SET ghl_opportunity_id = :o WHERE id = :id"),
+               {"o": opportunity_id, "id": file_id})
+
+
+def test_a_ghl_funded_sent_too_early_is_applied_when_the_deal_is_moved_again(sm_db, monkeypatch):
     """Review 6: the refused early event must not swallow the later valid one; a redelivery still changes nothing."""
-    from src.lending.ghl_stage_bridge import apply_stage
+    from src.lending import ghl_stage_bridge
 
+    monkeypatch.setattr(ghl_stage_bridge, "current_stage", lambda db, opp: ("Funded", None))
     file_id = sm.ingest_loan_file(sm_db, _loan(), actor="system:test").loan_file_id
+    _link(sm_db, file_id, "op1")
     _walk(sm_db, file_id, LoanStage.SUBMITTED)
-    assert apply_stage(sm_db, opportunity_id="op1", stage_name="Funded", phone="+18135550101") == "rejected"
+    assert ghl_stage_bridge.apply_stage(sm_db, opportunity_id="op1", stage_name="Funded") == "rejected"
     _walk(sm_db, file_id, LoanStage.CLOSING)
-    assert apply_stage(sm_db, opportunity_id="op1", stage_name="Funded", phone="+18135550101") == "applied"
+    assert ghl_stage_bridge.apply_stage(sm_db, opportunity_id="op1", stage_name="Funded") == "applied"
     assert _stage(sm_db, file_id) == "FUNDED"
-    assert apply_stage(sm_db, opportunity_id="op1", stage_name="Funded", phone="+18135550101") in ("noop", "duplicate")
+    assert ghl_stage_bridge.apply_stage(sm_db, opportunity_id="op1", stage_name="Funded") in ("noop", "duplicate")
 
 
-def test_a_borrower_with_a_second_closed_file_is_not_guessed(sm_db):
-    """Review 1."""
-    from src.lending.ghl_stage_bridge import apply_stage
+def test_a_deal_only_in_ghl_never_moves_the_borrowers_other_loan(sm_db, monkeypatch):
+    """Review 1: same phone, but the deal is not linked to this file."""
+    from src.lending import ghl_stage_bridge
 
+    monkeypatch.setattr(ghl_stage_bridge, "current_stage", lambda db, opp: ("Funded", None))
+    file_id = sm.ingest_loan_file(sm_db, _loan(), actor="system:test").loan_file_id
+    _link(sm_db, file_id, "op-this-loan")
+    _walk(sm_db, file_id, LoanStage.CLOSING)
+    assert ghl_stage_bridge.apply_stage(sm_db, opportunity_id="op-other-deal", stage_name="Funded",
+                                        phone="+18135550101") == "unlinked"
+    assert _stage(sm_db, file_id) == "CLOSING"
+
+
+def test_one_ghl_deal_links_to_one_loan_file(sm_db):
     first = sm.ingest_loan_file(sm_db, _loan(), actor="system:test").loan_file_id
     second = sm.ingest_loan_file(sm_db, _loan(address="9 Elm St"), actor="system:test").loan_file_id
-    sm.close_file(sm_db, second, DeclineReason.OTHER, actor="josh")
-    _walk(sm_db, first, LoanStage.CLOSING)
-    assert apply_stage(sm_db, opportunity_id="op2", stage_name="Funded", phone="+18135550101") == "unmatched"
-    assert _stage(sm_db, first) == "CLOSING"
+    _link(sm_db, first, "op3")
+    with pytest.raises(IntegrityError):
+        with sm_db.begin_nested():
+            _link(sm_db, second, "op3")
+
+
+def test_a_funded_loan_never_goes_back_to_approved(sm_db):
+    """Review 2: an old Approve button after a GHL funding changes nothing."""
+    from src.lending import partners
+
+    file_id = sm.ingest_loan_file(sm_db, _loan(), actor="system:test").loan_file_id
+    _walk(sm_db, file_id, LoanStage.FUNDED)
+    assert partners.record_status_change(sm_db, file_id, "approved") is None
+    row = sm_db.execute(text("SELECT status, stage FROM lending.loan_files WHERE id = :id"), {"id": file_id}).one()
+    assert (row.status, row.stage) == ("funded", "FUNDED")
 
 
 def test_a_router_decline_closes_the_file_so_a_later_stage_move_is_refused(sm_db):

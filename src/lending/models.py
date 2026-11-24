@@ -1368,6 +1368,8 @@ class LendingLoanFile(LendingBase):
     entity_id: Mapped[Optional[int]] = mapped_column(BigInteger, ForeignKey("lending.entities.id"))
     payoff_balance: Mapped[Optional[int]] = mapped_column(BigInteger)  # unknown stays NULL, never 0
     outstanding_balance: Mapped[Optional[int]] = mapped_column(BigInteger)  # payoff_balance minus payments; NULL while payoff is unknown
+    # The GHL deal this file is, linked by a person (ghl_stage_bridge --link). Only a linked file takes GHL Funded/Paid.
+    ghl_opportunity_id: Mapped[Optional[str]] = mapped_column(String(100))
     schema_version: Mapped[int] = mapped_column(SmallInteger, nullable=False, default=1, server_default=text("1"))
 
     __table_args__ = (
@@ -1382,6 +1384,8 @@ class LendingLoanFile(LendingBase):
         Index("idx_lending_loan_files_partner", "partner_id", "created_at"),
         Index("idx_lending_loan_files_status", "status", "status_at"),
         Index("idx_lending_loan_files_borrower_phone", "borrower_phone"),  # Slack name lookup by phone
+        Index("uq_lending_loan_files_ghl_opportunity", "ghl_opportunity_id", unique=True,
+              postgresql_where=text("ghl_opportunity_id IS NOT NULL")),
     )
 
 

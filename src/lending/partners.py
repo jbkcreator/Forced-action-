@@ -398,6 +398,7 @@ STAGE_FOR_STATUS: dict[str, LoanStage] = {
     "held": LoanStage.FIT, "routed": LoanStage.SUBMITTED, "approved": LoanStage.ACCEPTED, "funded": LoanStage.FUNDED,
 }
 _DECLINE_CODES = frozenset(code.value for code in DeclineReason)
+_FUNDED_STAGES = frozenset({LoanStage.FUNDED.value, LoanStage.PAID.value})
 _STAGE_RANK = {stage.value: rank for rank, stage in enumerate(LoanStage)}
 STATUS_STAGE_SOURCE = "partner_status"
 
@@ -452,6 +453,11 @@ def record_status_change(db, file_id: int, status: str, reason: Optional[str] = 
     now = now or _utcnow()
     clipped = (reason or None) and reason[:200]
     before = db.execute(_READ_STAGE, {"id": file_id}).scalar_one_or_none()
+    if before in _FUNDED_STAGES and status != "funded":
+        # A funded loan never reads as approved, routed or declined again (an old Approve button, a late route): the
+        # stage cannot go back, so neither may the status the partner sees.
+        logger.warning("[partners] file %s is %s; status %s refused, nothing changed", file_id, before, status)
+        return None
     new_stage = stage_after_status(before, status)
     changed = db.execute(_STATUS_UPDATE, {
         "status": status, "reason": clipped, "now": now, "id": file_id, "notify": status in PARTNER_NOTIFY_STATUSES,

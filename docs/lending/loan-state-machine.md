@@ -99,7 +99,29 @@ SELECT count(*) FROM lending.loan_files WHERE borrower_id IS NULL;         -- fi
 * **Paid**: on a FUNDED file, a payment event (`record_payment(mark_paid=True)`) that moves it to PAID; on any other
   stage the move is refused.
 
-The file is found by the borrower's phone and must be the only open file with that number; otherwise nothing moves
-and Cora's inbox gets a `ghl_stage_unmatched` card. Each event is keyed `<opportunity id>:<stage>` (source
-`ghl_stage`), so a replayed webhook changes nothing. A refused move is stored as a `rejected` stage event with a card,
-and GHL still gets 200. The webhook needs the stage workflow to fire on "Funded" and "Paid" and to send `phone`.
+**Which file:** only the loan file linked to the GHL deal (`loan_files.ghl_opportunity_id`, one file per deal). The
+borrower's phone is never used: a borrower can have deals in GHL that have no file here. An unlinked deal moves nothing
+and Cora's inbox gets a `ghl_stage_unlinked` card with the command to link it:
+
+```
+python -m src.lending.ghl_stage_bridge --link <loan file id> <GHL opportunity id>
+```
+
+Linking applies the deal's current GHL stage at once.
+
+**Stale events:** an event applies only while it is still the deal's current GHL stage (the webhook records the current
+stage first). A late copy of Funded that arrives after the deal moved to Lost is skipped.
+
+**Replays:** each event is keyed `<opportunity>:<stage>@<file stage>` (source `ghl_stage`): a redelivery changes
+nothing, and a move refused because it came too early applies when the deal is moved again after the file caught up.
+
+**Failures:** a loan update that fails is saved to `lending.webhook_failures` and retried every 5 minutes; if it cannot
+even be saved, the webhook answers 500 so GHL sends it again. A refused move is stored as a `rejected` stage event with
+a card, and GHL gets 200. The stage workflow must fire on "Funded" and "Paid".
+
+## Partner status and the stage
+
+`partners.record_status_change` is the one write for a status change, from the router and the state machine alike: it
+sets the status, queues the partner notice, moves the stage forward (never back) and closes the file on `declined`
+(a later re-route reopens it). Once a file is FUNDED or PAID, any status other than `funded` is refused, so an old
+Approve button cannot make a funded loan read Approved.

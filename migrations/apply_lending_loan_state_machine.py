@@ -48,7 +48,7 @@ TABLES = (LendingBorrowerProfile, LendingProperty, LendingEntity, LendingLenderS
 # statement with its model add these back (tests/lending/test_partner_door.py).
 ADDED_COLUMNS: dict[str, frozenset[str]] = {
     "loan_files": frozenset({"stage", "closed_reason", "closed_at", "borrower_id", "property_id", "entity_id",
-                             "payoff_balance", "outstanding_balance", "schema_version"}),
+                             "payoff_balance", "outstanding_balance", "schema_version", "ghl_opportunity_id"}),
     "partner_submissions": frozenset({"schema_version"}),
     "text_consents": frozenset({"loan_file_id", "schema_version"}),
 }
@@ -117,7 +117,11 @@ def apply_to(conn: Connection, schema: str = LENDING_SCHEMA) -> None:
         f'ADD COLUMN IF NOT EXISTS entity_id bigint REFERENCES "{schema}".entities(id), '
         "ADD COLUMN IF NOT EXISTS payoff_balance bigint, "
         "ADD COLUMN IF NOT EXISTS outstanding_balance bigint, "
-        "ADD COLUMN IF NOT EXISTS schema_version smallint NOT NULL DEFAULT 1"))
+        "ADD COLUMN IF NOT EXISTS schema_version smallint NOT NULL DEFAULT 1, "
+        "ADD COLUMN IF NOT EXISTS ghl_opportunity_id varchar(100)"))
+    conn.execute(text(
+        f'CREATE UNIQUE INDEX IF NOT EXISTS uq_lending_loan_files_ghl_opportunity ON "{schema}".loan_files '
+        "(ghl_opportunity_id) WHERE ghl_opportunity_id IS NOT NULL"))
     # A check constraint has no IF NOT EXISTS: drop and re-add so a changed value list reaches an existing table.
     for name, expr in (
         ("ck_lending_loan_files_stage", f"stage IN ({_STAGES})"),
