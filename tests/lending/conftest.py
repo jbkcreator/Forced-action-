@@ -307,7 +307,46 @@ def caller_role_db(closing_db):
         with closing_db.begin_nested():
             apply_caller_role(closing_db.connection(), schema=closing_db.info["schema"], role=role, app_role=app_role)
     except DBAPIError as exc:
-        if getattr(exc.orig, "pgcode", None) == "42501":
+        from src.lending.security.rbac import INSUFFICIENT_PRIVILEGE, pg_error_code
+        if pg_error_code(exc) == INSUFFICIENT_PRIVILEGE:
             pytest.skip("the test database login needs CREATEROLE")
         raise
     return closing_db, role
+
+
+@pytest.fixture
+def documents_db(closing_db, monkeypatch, tmp_path):
+    """R1 0.2: closing_db with the minimal lead tables the borrower search joins, uploads stored under tmp_path,
+    Josh (U_JOSH) as the only approver, and ``add(lead_id, full_name, phone, uploaded=(...))`` to seed a borrower
+    with a Central Lending chase and real uploads. Everything lives in the rolled-back throwaway schema."""
+    from datetime import datetime, timezone
+
+    from config.settings import get_settings
+    from src.lending.closing.doc_chase import record_upload, start_chase
+    from src.lending.closing.drafts import Recipient
+    from src.lending.partners import Upload
+
+    schema = closing_db.info["schema"]
+    closing_db.execute(text(f'CREATE TABLE "{schema}".web_leads (id BIGINT PRIMARY KEY, name VARCHAR(160))'))
+    closing_db.execute(text(f'CREATE TABLE "{schema}".lendingflow_leads (id BIGINT PRIMARY KEY, '
+                            "first_name VARCHAR(80), last_name VARCHAR(80))"))
+    settings = get_settings()
+    monkeypatch.setattr(settings, "lending_partner_link_base_url", "https://api.example.com", raising=False)
+    monkeypatch.setattr(settings, "lending_doc_upload_dir", str(tmp_path), raising=False)
+    monkeypatch.setattr(settings, "lending_doc_chase_sms_links_enabled", True, raising=False)
+    monkeypatch.setattr(settings, "lending_cora_approver_user_ids", "U_JOSH", raising=False)
+    monkeypatch.setattr("src.lending.closing.doc_chase.add_to_inbox_safely", lambda db, **event: None)
+
+    def add(lead_id: int, full_name: str, phone: str, uploaded=("bank_statements",), *, at=None):
+        at = at or datetime(2026, 11, 20, 15, 0, tzinfo=timezone.utc)
+        closing_db.execute(text("INSERT INTO lending.web_leads (id, name) VALUES (:id, :name)"),
+                           {"id": lead_id, "name": full_name})
+        chase_id = start_chase(closing_db, Recipient(full_name.split()[0], phone, None, None),
+                               lead_ref=f"web_lead:{lead_id}", accepted_by="slack:U_JOSH", now=at).chase_id
+        chase = {"id": chase_id, "first_name": full_name.split()[0], "phone": phone}
+        uploads = {code: record_upload(closing_db, chase, code, Upload(f"{code}.pdf", "application/pdf",
+                                                                        b"%PDF-1.4 " + code.encode()),
+                                       upload_dir=str(tmp_path), now=at) for code in uploaded}
+        return SimpleNamespace(lead_ref=f"web_lead:{lead_id}", chase_id=chase_id, paths=uploads)
+
+    return SimpleNamespace(db=closing_db, add=add, tmp_path=tmp_path)

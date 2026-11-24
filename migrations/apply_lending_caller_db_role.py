@@ -24,10 +24,9 @@ from sqlalchemy import text
 from sqlalchemy.engine import Connection, make_url
 from sqlalchemy.exc import DBAPIError
 
-from src.lending.security.rbac import CALLER_DB_ROLE, DOCUMENT_TABLES
+from src.lending.security.rbac import CALLER_DB_ROLE, DOCUMENT_TABLES, INSUFFICIENT_PRIVILEGE, pg_error_code
 
 LENDING_SCHEMA = "lending"
-INSUFFICIENT_PRIVILEGE = "42501"
 
 
 def _q(name: str) -> str:
@@ -78,7 +77,7 @@ def main() -> int:
             db.commit()
         except DBAPIError as exc:
             db.rollback()
-            if getattr(exc.orig, "pgcode", None) == INSUFFICIENT_PRIVILEGE:
+            if pg_error_code(exc) == INSUFFICIENT_PRIVILEGE:
                 print("ERROR: run this as a DB admin with CREATEROLE: --app-role <the app's login>", file=sys.stderr)
                 return 1
             raise

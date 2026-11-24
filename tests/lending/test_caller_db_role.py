@@ -19,7 +19,7 @@ def test_caller_role_cannot_read_document_tables(caller_role_db):
         with db.begin_nested():
             rbac.assume_caller_db_role(db, role)
             db.execute(text("SELECT count(*) FROM lending.doc_chase_uploads"))
-    assert caught.value.orig.pgcode == "42501"
+    assert rbac.pg_error_code(caught.value) == rbac.INSUFFICIENT_PRIVILEGE
 
 
 def test_caller_role_can_read_status_tables(caller_role_db):

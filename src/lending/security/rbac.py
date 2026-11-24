@@ -14,6 +14,7 @@ from __future__ import annotations
 import logging
 from datetime import datetime
 from enum import Enum
+from typing import Optional
 
 from sqlalchemy import text
 
@@ -60,6 +61,15 @@ def role_of_issuer(db, issued_to: str, now: datetime) -> Role:
         token = token_by_id(db, int(issued_to[len(TOKEN_ISSUER):]), now)
         return token.role if token is not None else Role.CALLER
     return Role.CALLER
+
+
+INSUFFICIENT_PRIVILEGE = "42501"
+
+
+def pg_error_code(exc: BaseException) -> Optional[str]:
+    """The SQLSTATE of a database error, whichever driver raised it (psycopg 3 ``sqlstate``, psycopg2 ``pgcode``)."""
+    orig = getattr(exc, "orig", exc)
+    return getattr(orig, "sqlstate", None) or getattr(orig, "pgcode", None)
 
 
 def _quote_ident(name: str) -> str:
