@@ -26,6 +26,7 @@ class Harness:
     def __init__(self, config: AgentCoreConfig, queue: PendingActionQueue, halt: HaltSwitch, relay: Relay,
                  fail_handler: bool = False) -> None:
         self.chat = FakeChatPort(default_channel="C_CORA")
+        self.queue = queue
         self.messages: list[InboundMessage] = []
         self.revisions: list[tuple[PendingAction, InboundMessage]] = []
         self.fail_handler = fail_handler
@@ -45,10 +46,16 @@ class Harness:
             "type": "message", "channel_type": "im", "channel": "D_JOSH", "user": user, "text": message_text, "ts": ts}})
 
     def click(self, user: str, action_id_value: str, button: str = "agent_core_approve",
-              envelope_id: str = "env-1") -> None:
+              envelope_id: str = "env-1", card_ts: str = "555.5") -> None:
+        """A click on the action's card (``card_ts``). A click only counts on the action's current card (R1 0.4), so an
+        action that has no card yet is given this one first, as Cora's card post would have."""
+        if action_id_value.isdigit():
+            action = self.queue.get(int(action_id_value))
+            if action is not None and action.card_ts is None:
+                self.queue.attach_card(int(action_id_value), "C_CORA", card_ts)
         self.session.handle_request("interactive", {
             "type": "block_actions", "user": {"id": user}, "channel": {"id": "C_CORA"},
-            "message": {"ts": "555.5"}, "actions": [{"action_id": button, "value": action_id_value}],
+            "message": {"ts": card_ts}, "actions": [{"action_id": button, "value": action_id_value}],
         }, envelope_id)
 
 

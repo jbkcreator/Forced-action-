@@ -269,6 +269,7 @@ def breaker(monkeypatch):
         seen.admitted.append(channel)
 
     monkeypatch.setattr(circuit_breaker, "admit", admit)
+    monkeypatch.setattr(circuit_breaker, "recheck", lambda channel: None)
     monkeypatch.setattr(circuit_breaker, "record_failure", lambda channel, error, *, ambiguous=False:
                         seen.failures.append((channel, error, ambiguous)) or False)
     monkeypatch.setattr(circuit_breaker, "record_success", lambda channel: seen.successes.append(channel))

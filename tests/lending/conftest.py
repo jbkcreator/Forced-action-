@@ -77,6 +77,7 @@ def _breaker_off_the_database(request, monkeypatch):
     from src.lending.dispatch import circuit_breaker
 
     monkeypatch.setattr(circuit_breaker, "admit", lambda channel: None)
+    monkeypatch.setattr(circuit_breaker, "recheck", lambda channel: None)
     monkeypatch.setattr(circuit_breaker, "record_success", lambda channel: None)
     monkeypatch.setattr(circuit_breaker, "record_failure", lambda channel, error, *, ambiguous=False: False)
 
