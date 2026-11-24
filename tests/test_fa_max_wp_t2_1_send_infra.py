@@ -53,6 +53,7 @@ _ALLOWED_RAW_VENDOR_CALLERS = {
     "src/services/relay/channels_sms.py",   # the one FA Max relay dispatcher
     "src/services/owner_alert.py",          # pre-existing, non-FA-Max feature
     "src/tasks/sold_out_reactivation.py",   # pre-existing, non-FA-Max feature
+    "src/lending/watchdog/daemon.py",       # internal ops alert must survive GHL down
 }
 
 _FORBIDDEN_CALLS = {"send_message"}

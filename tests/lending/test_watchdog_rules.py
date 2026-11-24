@@ -123,3 +123,9 @@ def test_bad_field_state_starts_fresh(tmp_path):
     assert load_state(p) == {}
     p.write_text('["a"]')
     assert load_state(p) == {}
+
+
+def test_naive_timestamp_state_starts_fresh(tmp_path):
+    p = tmp_path / "s.json"
+    p.write_text('{"cards": {"failures": 1, "open_since": "2026-11-24T15:00:00", "last_alert_at": null}}')
+    assert load_state(p) == {}

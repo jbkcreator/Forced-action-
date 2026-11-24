@@ -97,15 +97,22 @@ def _encode(state: CheckState) -> dict:
     }
 
 
+def _decode_time(value: Optional[str]) -> Optional[datetime]:
+    if not value:
+        return None
+    moment = datetime.fromisoformat(value)
+    if moment.tzinfo is None:
+        raise ValueError("timestamp must be timezone-aware")
+    return moment
+
+
 def _decode(raw: dict) -> CheckState:
     failures = raw["failures"]
     if not isinstance(failures, int) or isinstance(failures, bool):
         raise ValueError("failures must be an integer")
-    return CheckState(
-        failures=failures,
-        open_since=datetime.fromisoformat(raw["open_since"]) if raw["open_since"] else None,
-        last_alert_at=datetime.fromisoformat(raw["last_alert_at"]) if raw["last_alert_at"] else None,
-    )
+    open_since = _decode_time(raw["open_since"])
+    last_alert_at = _decode_time(raw["last_alert_at"])
+    return CheckState(failures=failures, open_since=open_since, last_alert_at=last_alert_at)
 
 
 def load_state(path: Path) -> dict[str, CheckState]:
