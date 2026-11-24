@@ -17,6 +17,7 @@ borrower consent.
 """
 from __future__ import annotations
 
+import hashlib
 import logging
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -36,6 +37,7 @@ from config.lending_partners import (
     PRODUCTS,
     SOURCE_PARTNER,
 )
+from src.lending import deal_ledger
 from src.lending.contracts import BorrowerProfile, LenderFitResult, LoanRequest
 from src.lending.partners import Partner, StatusChange, partner_by_id, record_status_change
 from src.lending.prequal import TEMPLATE, FitLimits, PrequalLead, build_context
@@ -364,6 +366,13 @@ def _process(file_id: int, services: PipelineServices, session_factory: Callable
                  "WHERE id = :id"),
             {"fit": fit.model_dump_json() if fit is not None else None, "pdf": pdf_path, "now": now, "id": file_id},
         )
+        if fit is not None:
+            deal_ledger.record_safely(
+                db, file_id, "quote_generated", actor=deal_ledger.system("partner_pipeline"), occurred_at=now,
+                detail={"kind": "lender_fit", "fitting": [lender.lender_key for lender in fit.fitting],
+                        "possible": len(fit.possible), "non_fitting": len(fit.non_fitting),
+                        "missing_fields": fit.missing_fields},
+                dedupe_key=f"lender_fit:{file_id}:{hashlib.sha1(fit.model_dump_json().encode()).hexdigest()[:16]}")
         db.commit()  # keep the score and PDF even if routing fails below
         try:
             route_file(db, file_id, now=now)

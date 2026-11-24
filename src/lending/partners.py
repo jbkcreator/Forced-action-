@@ -50,6 +50,7 @@ from config.lending_partners import (
 )
 from src.lending.contracts import DeclineReason, LoanStage
 from src.services.phone_utils import normalize
+from src.lending import deal_ledger
 
 logger = logging.getLogger(__name__)
 
@@ -345,6 +346,8 @@ def save_submission(db, partner: Partner, data: SubmissionInput, uploads: Sequen
          "notes": data.notes, "occupancy": data.occupancy, "now": now},
     ).scalar_one())
     _record_status_event(db, file_id, "received", None, now)
+    deal_ledger.record_safely(db, file_id, "file_created", actor=deal_ledger.system("partner_door"), occurred_at=now,
+                              detail={"source": SOURCE_PARTNER, "partner_id": partner.id, "product": data.product})
     db.execute(
         text("INSERT INTO lending.partner_submissions (file_id, partner_id, consent_checked, consent_text, "
              "consented_at, ip_address, page_url, user_agent, created_at) VALUES (:file_id, :partner_id, :checked, "
@@ -438,7 +441,7 @@ def _record_stage_event(db, file_id: int, before: str, after: str, reason: str) 
 
 
 def record_status_change(db, file_id: int, status: str, reason: Optional[str] = None,
-                         now: Optional[datetime] = None) -> Optional[StatusChange]:
+                         now: Optional[datetime] = None, *, record_ledger: bool = True) -> Optional[StatusChange]:
     """Move a file to ``status``: the one lifecycle write every status change goes through (R-1's route, decline,
     approval and funding, and the loan state machine). In one statement it sets the status, the partner notice fields
     (``notice_status`` and the delivery stamps the retry sweep reads), the loan ``stage`` (forward only) and the
@@ -458,6 +461,7 @@ def record_status_change(db, file_id: int, status: str, reason: Optional[str] = 
         # stage cannot go back, so neither may the status the partner sees.
         logger.warning("[partners] file %s is %s; status %s refused, nothing changed", file_id, before, status)
         return None
+    prior_status = db.execute(text("SELECT status FROM lending.loan_files WHERE id = :id"), {"id": file_id}).scalar()
     new_stage = stage_after_status(before, status)
     changed = db.execute(_STATUS_UPDATE, {
         "status": status, "reason": clipped, "now": now, "id": file_id, "notify": status in PARTNER_NOTIFY_STATUSES,
@@ -467,6 +471,10 @@ def record_status_change(db, file_id: int, status: str, reason: Optional[str] = 
         _record_status_event(db, file_id, status, reason, now)
         if new_stage is not None:
             _record_stage_event(db, file_id, before, new_stage, clipped or f"status {status}")
+        if record_ledger:
+            deal_ledger.record_safely(db, file_id, "status_change", actor=deal_ledger.system("router"), occurred_at=now,
+                                      diff=deal_ledger.diff_fields({"status": prior_status}, {"status": status}),
+                                      detail={"reason": reason})
     if not changed or status not in PARTNER_NOTIFY_STATUSES:
         return None
     row = db.execute(

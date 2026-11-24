@@ -1407,6 +1407,34 @@ class LendingLoanFileStatusEvent(LendingBase):
     )
 
 
+class LendingDealAuditEvent(LendingBase):
+    """R1 0.8: one row per thing that happened to a deal, append-only (triggers refuse UPDATE, DELETE and TRUNCATE).
+    ``actor`` is ``cora``, ``human:<slack id or name>`` or ``system:<source>``; ``rule_version`` is the lender rule
+    snapshot in force (``lender_rule_snapshots.version_no``); ``diff`` is ``{field: {before, after}}`` for the
+    fields that changed.  ``dedupe_key`` makes a catch-up pass (card events) idempotent."""
+
+    __tablename__ = "deal_audit_events"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    loan_file_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("lending.loan_files.id"), nullable=False)
+    event_type: Mapped[str] = mapped_column(String(32), nullable=False)
+    actor: Mapped[str] = mapped_column(String(100), nullable=False)
+    rule_version: Mapped[Optional[int]] = mapped_column(Integer)
+    diff: Mapped[Any] = mapped_column(JSONB, nullable=False, default=dict, server_default=text("'{}'::jsonb"))
+    detail: Mapped[Any] = mapped_column(JSONB, nullable=False, default=dict, server_default=text("'{}'::jsonb"))
+    ref_table: Mapped[Optional[str]] = mapped_column(String(40))
+    ref_id: Mapped[Optional[str]] = mapped_column(String(64))
+    dedupe_key: Mapped[Optional[str]] = mapped_column(String(160))
+    occurred_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_now, server_default=text("now()"))
+    schema_version: Mapped[int] = mapped_column(SmallInteger, nullable=False, default=1, server_default=text("1"))
+
+    __table_args__ = (
+        CheckConstraint("actor ~ '^(cora|human:[^ ]+|system:[^ ]+)$'", name="ck_lending_deal_audit_events_actor"),
+        Index("idx_lending_deal_audit_events_file", "loan_file_id", "occurred_at", "id"),
+        Index("uq_lending_deal_audit_events_dedupe", "dedupe_key", unique=True, postgresql_where=text("dedupe_key IS NOT NULL")),
+    )
+
+
 class LendingLenderRuleSnapshot(LendingBase):
     """R1 0.7: the full lender rule set after every change, append-only (a trigger refuses UPDATE and DELETE).
     ``version_no`` is the rule version other records name (the audit ledger).  A rollback copies an old snapshot back
