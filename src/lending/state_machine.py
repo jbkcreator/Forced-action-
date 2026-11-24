@@ -36,6 +36,7 @@ from src.lending.contracts import (
     PropertySchema,
 )
 from src.lending.cora_inbox import add_to_inbox_safely
+from src.lending.partners import record_status_change
 from src.services.phone_utils import normalize as normalize_phone
 
 logger = logging.getLogger(__name__)
@@ -196,12 +197,12 @@ def transition(db: Session, loan_file_id: int, to_stage: LoanStage | str, *, sou
 
     new_status = STATUS_FOR_STAGE[target]
     db.execute(
-        text("UPDATE lending.loan_files SET stage = :stage, status = :status, status_at = now(), updated_at = now(), "
+        text("UPDATE lending.loan_files SET stage = :stage, updated_at = now(), "
              "funded_at = CASE WHEN :stage = 'FUNDED' THEN COALESCE(funded_at, now()) ELSE funded_at END WHERE id = :id"),
-        {"stage": target.value, "status": new_status, "id": loan_file_id})
+        {"stage": target.value, "id": loan_file_id})
     if new_status != row.status:
-        db.execute(text("INSERT INTO lending.loan_file_status_events (loan_file_id, status, reason) VALUES (:id, :status, :reason)"),
-                   {"id": loan_file_id, "status": new_status, "reason": (reason or f"stage {target.value}")[:200]})
+        # The shared lifecycle write: status, its history and the partner notice (queued for the retry sweep).
+        record_status_change(db, loan_file_id, new_status, reason or f"stage {target.value}")
     return TransitionResult(loan_file_id, current, target, OUTCOME_APPLIED)
 
 
@@ -234,12 +235,10 @@ def close_file(db: Session, loan_file_id: int, reason: DeclineReason | str, *, a
          "reason": f"closed: {code.value}"}).scalar_one_or_none()
     if event_id is None:
         return False
-    db.execute(
-        text("UPDATE lending.loan_files SET closed_reason = :reason, closed_at = now(), status = :status, status_at = now(), "
-             "updated_at = now() WHERE id = :id"),
-        {"reason": code.value, "status": CLOSED_STATUS, "id": loan_file_id})
-    db.execute(text("INSERT INTO lending.loan_file_status_events (loan_file_id, status, reason) VALUES (:id, :status, :reason)"),
-               {"id": loan_file_id, "status": CLOSED_STATUS, "reason": code.value})
+    db.execute(text("UPDATE lending.loan_files SET closed_reason = :reason, closed_at = now(), updated_at = now() "
+                    "WHERE id = :id AND closed_at IS NULL"), {"reason": code.value, "id": loan_file_id})
+    # The shared lifecycle write records the status and queues the partner's "declined" notice.
+    record_status_change(db, loan_file_id, CLOSED_STATUS, code.value)
     return True
 
 

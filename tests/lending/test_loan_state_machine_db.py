@@ -307,3 +307,80 @@ def test_the_migration_is_idempotent_and_relaxes_the_not_null_columns(legacy_db)
     assert legacy_db.execute(text(f'SELECT id, stage, closed_reason FROM "{schema}".loan_files ORDER BY id')).all() == before
     legacy_db.execute(text(f'INSERT INTO "{schema}".loan_files (source, borrower_first_name, borrower_last_name, product) '
                            "VALUES ('web', 'N', 'Null', 'flip')"))  # loan_amount and property_state omitted: now allowed
+
+
+# ── PR #473 review fixes ───────────────────────────────────────────────────────
+
+def test_the_documented_migration_order_works_on_an_empty_schema():
+    """Review 3: text_consents is created from the model (the PR 319 migration) before loan_files exists; the foreign
+    key arrives with the state-machine migration, after the partner door has created loan_files."""
+    from migrations.apply_lending_partner_door import apply_to as apply_partner_door
+
+    schema = f"r101e_{uuid.uuid4().hex[:9]}"
+    engine, conn, tx = _connect(schema)
+    try:
+        translated = conn.execution_options(schema_translate_map={LENDING_SCHEMA: schema})
+        LendingTextConsent.__table__.create(translated)          # the PR 319 migration's step
+        apply_partner_door(conn, schema)
+        apply_to(conn, schema)
+        apply_to(conn, schema)                                    # re-run finds the key and adds no second one
+        keys = conn.execute(text(
+            "SELECT count(*) FROM pg_constraint WHERE conrelid = CAST(:t AS regclass) AND contype = 'f'"),
+            {"t": f'"{schema}".text_consents'}).scalar_one()
+        assert keys == 1
+    finally:
+        tx.rollback()
+        conn.close()
+        engine.dispose()
+
+
+def test_a_ghl_funded_sent_too_early_is_applied_when_the_deal_is_moved_again(sm_db):
+    """Review 6: the refused early event must not swallow the later valid one; a redelivery still changes nothing."""
+    from src.lending.ghl_stage_bridge import apply_stage
+
+    file_id = sm.ingest_loan_file(sm_db, _loan(), actor="system:test").loan_file_id
+    _walk(sm_db, file_id, LoanStage.SUBMITTED)
+    assert apply_stage(sm_db, opportunity_id="op1", stage_name="Funded", phone="+18135550101") == "rejected"
+    _walk(sm_db, file_id, LoanStage.CLOSING)
+    assert apply_stage(sm_db, opportunity_id="op1", stage_name="Funded", phone="+18135550101") == "applied"
+    assert _stage(sm_db, file_id) == "FUNDED"
+    assert apply_stage(sm_db, opportunity_id="op1", stage_name="Funded", phone="+18135550101") in ("noop", "duplicate")
+
+
+def test_a_borrower_with_a_second_closed_file_is_not_guessed(sm_db):
+    """Review 1."""
+    from src.lending.ghl_stage_bridge import apply_stage
+
+    first = sm.ingest_loan_file(sm_db, _loan(), actor="system:test").loan_file_id
+    second = sm.ingest_loan_file(sm_db, _loan(address="9 Elm St"), actor="system:test").loan_file_id
+    sm.close_file(sm_db, second, DeclineReason.OTHER, actor="josh")
+    _walk(sm_db, first, LoanStage.CLOSING)
+    assert apply_stage(sm_db, opportunity_id="op2", stage_name="Funded", phone="+18135550101") == "unmatched"
+    assert _stage(sm_db, first) == "CLOSING"
+
+
+def test_a_router_decline_closes_the_file_so_a_later_stage_move_is_refused(sm_db):
+    """Review 2: the router's status write keeps stage and closure in step."""
+    from src.lending import partners
+
+    file_id = sm.ingest_loan_file(sm_db, _loan(), actor="system:test").loan_file_id
+    partners.record_status_change(sm_db, file_id, "routed")
+    assert _stage(sm_db, file_id) == "SUBMITTED"
+    assert _count(sm_db, "loan_stage_events", f"loan_file_id = {file_id} AND source = 'partner_status'") == 1
+    partners.record_status_change(sm_db, file_id, "declined", "credit_below_min")
+    closed = sm_db.execute(text("SELECT closed_reason, closed_at FROM lending.loan_files WHERE id = :id"),
+                           {"id": file_id}).one()
+    assert closed.closed_reason == "credit_below_min" and closed.closed_at is not None
+    with pytest.raises(sm.IllegalStageTransitionError):
+        sm.transition(sm_db, file_id, LoanStage.ACCEPTED, source="api", actor="josh")
+
+
+def test_a_funding_move_queues_the_partner_funded_notice(sm_db):
+    """Review 4."""
+    file_id = sm.ingest_loan_file(sm_db, _loan(), actor="system:test").loan_file_id
+    _walk(sm_db, file_id, LoanStage.CLOSING)
+    sm_db.execute(text("UPDATE lending.loan_files SET notice_emailed_at = now() WHERE id = :id"), {"id": file_id})
+    sm.transition(sm_db, file_id, LoanStage.FUNDED, source="api", actor="josh")
+    row = sm_db.execute(text("SELECT status, notice_status, notice_emailed_at FROM lending.loan_files WHERE id = :id"),
+                        {"id": file_id}).one()
+    assert (row.status, row.notice_status, row.notice_emailed_at) == ("funded", "funded", None)

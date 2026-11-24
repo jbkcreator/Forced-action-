@@ -83,6 +83,22 @@ UPDATE "{s}".loan_files f
 """
 
 
+_CONSENT_FK = """
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint c
+          JOIN pg_attribute a ON a.attrelid = c.conrelid AND a.attnum = ANY (c.conkey)
+         WHERE c.conrelid = '"{s}".text_consents'::regclass AND c.contype = 'f' AND a.attname = 'loan_file_id'
+    ) THEN
+        ALTER TABLE "{s}".text_consents
+            ADD CONSTRAINT fk_text_consents_loan_file FOREIGN KEY (loan_file_id) REFERENCES "{s}".loan_files (id);
+    END IF;
+END
+$$
+"""
+
+
 def apply_to(conn: Connection, schema: str = LENDING_SCHEMA) -> None:
     translated = conn.execution_options(schema_translate_map={LENDING_SCHEMA: schema})
     # loan_files must exist first: run after apply_lending_partner_door.py.
@@ -123,8 +139,11 @@ def apply_to(conn: Connection, schema: str = LENDING_SCHEMA) -> None:
 
     conn.execute(text(
         f'ALTER TABLE "{schema}".text_consents '
-        f'ADD COLUMN IF NOT EXISTS loan_file_id bigint REFERENCES "{schema}".loan_files(id), '
+        "ADD COLUMN IF NOT EXISTS loan_file_id bigint, "
         "ADD COLUMN IF NOT EXISTS schema_version smallint NOT NULL DEFAULT 1"))
+    # The foreign key is added here, once loan_files exists (the model carries none: an older migration builds
+    # text_consents from it before loan_files may exist). Named, so a re-run finds it; any FK on the column counts.
+    conn.execute(text(_CONSENT_FK.format(s=schema)))
     conn.execute(text(f'ALTER TABLE "{schema}".partner_submissions ADD COLUMN IF NOT EXISTS schema_version smallint NOT NULL DEFAULT 1'))
 
     conn.execute(text(_BACKFILL_STAGE.format(s=schema)))

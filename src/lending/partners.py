@@ -48,6 +48,7 @@ from config.lending_partners import (
     TOKEN_BYTES,
     UPLOAD_TYPES,
 )
+from src.lending.contracts import DeclineReason, LoanStage
 from src.services.phone_utils import normalize
 
 logger = logging.getLogger(__name__)
@@ -389,9 +390,58 @@ class StatusChange:
     borrower_last_name: str
 
 
+# R1 0.1: the loan stage a partner status means. A status only ever moves the stage forward (the router can skip a
+# step: a held file routed straight to a lender); "declined" closes the file and keeps its stage; any later
+# non-declined status (a re-route) reopens it. The status UPDATE re-checks the row it changes; the stage is worked out
+# in Python so the same statement runs on SQLite (the partner tests) and PostgreSQL.
+STAGE_FOR_STATUS: dict[str, LoanStage] = {
+    "held": LoanStage.FIT, "routed": LoanStage.SUBMITTED, "approved": LoanStage.ACCEPTED, "funded": LoanStage.FUNDED,
+}
+_DECLINE_CODES = frozenset(code.value for code in DeclineReason)
+_STAGE_RANK = {stage.value: rank for rank, stage in enumerate(LoanStage)}
+STATUS_STAGE_SOURCE = "partner_status"
+
+_READ_STAGE = text("SELECT stage FROM lending.loan_files WHERE id = :id")
+_STATUS_UPDATE = text(
+    "UPDATE lending.loan_files SET status = :status, status_reason = :reason, status_at = :now, "
+    "funded_at = CASE WHEN :status = 'funded' AND (status <> 'funded' OR funded_at IS NULL) THEN :now "
+    "ELSE funded_at END, updated_at = :now, "
+    "notice_status = CASE WHEN :notify THEN :status ELSE NULL END, notice_emailed_at = NULL, "
+    "notice_texted_at = NULL, notice_failed_at = NULL, stage = COALESCE(:stage, stage), "
+    "closed_at = CASE WHEN :status = 'declined' THEN COALESCE(closed_at, :now) ELSE NULL END, "
+    "closed_reason = CASE WHEN :status = 'declined' THEN COALESCE(closed_reason, :closed_reason) ELSE NULL END "
+    "WHERE id = :id AND (status <> :status OR COALESCE(status_reason, '') <> COALESCE(:reason, ''))"
+)
+_STAGE_EVENT = text(
+    "INSERT INTO lending.loan_stage_events (loan_file_id, source, from_stage, to_stage, actor, outcome, reason) "
+    "VALUES (:file, :source, :from_stage, :to_stage, :actor, 'applied', :reason)"
+)
+
+
+def stage_after_status(current: Optional[str], status: str) -> Optional[str]:
+    """The stage a file is at once it gets ``status``: forward only, never back. None = leave it. Pure."""
+    target = STAGE_FOR_STATUS.get(status)
+    if target is None or current not in _STAGE_RANK:
+        return None
+    return target.value if _STAGE_RANK[target.value] > _STAGE_RANK[current] else None
+
+
+def _record_stage_event(db, file_id: int, before: str, after: str, reason: str) -> None:
+    """The stage move in ``loan_stage_events``, in a savepoint like the status history (logged, never undoes it)."""
+    try:
+        with db.begin_nested():
+            db.execute(_STAGE_EVENT, {"file": file_id, "source": STATUS_STAGE_SOURCE, "from_stage": before,
+                                      "to_stage": after, "actor": f"system:{STATUS_STAGE_SOURCE}", "reason": reason})
+    except Exception as exc:  # class only
+        logger.error("[partners] stage event for file %s not recorded (%s)", file_id, type(exc).__name__)
+
+
 def record_status_change(db, file_id: int, status: str, reason: Optional[str] = None,
                          now: Optional[datetime] = None) -> Optional[StatusChange]:
-    """Move a file to ``status``. The router (R-1) calls this on every route, decline, approval and funding.
+    """Move a file to ``status``: the one lifecycle write every status change goes through (R-1's route, decline,
+    approval and funding, and the loan state machine). In one statement it sets the status, the partner notice fields
+    (``notice_status`` and the delivery stamps the retry sweep reads), the loan ``stage`` (forward only) and the
+    closure; a stage it moved is recorded in ``loan_stage_events`` and the status in ``loan_file_status_events``.
 
     Returns a :class:`StatusChange` when the partner should be told; None when nothing changed or the
     status is internal. The caller commits. The router and the CLI call ``partner_pipeline.change_status``
@@ -400,19 +450,18 @@ def record_status_change(db, file_id: int, status: str, reason: Optional[str] = 
     if status not in FILE_STATUSES:
         raise ValueError(f"status must be one of {FILE_STATUSES}")
     now = now or _utcnow()
-    result = db.execute(
-        text("UPDATE lending.loan_files SET status = :status, status_reason = :reason, status_at = :now, "
-             "funded_at = CASE WHEN :status = 'funded' AND (status <> 'funded' OR funded_at IS NULL) THEN :now "
-             "ELSE funded_at END, updated_at = :now, "
-             "notice_status = CASE WHEN :notify THEN :status ELSE NULL END, notice_emailed_at = NULL, "
-             "notice_texted_at = NULL, notice_failed_at = NULL "
-             "WHERE id = :id AND (status <> :status OR COALESCE(status_reason, '') <> COALESCE(:reason, ''))"),
-        {"status": status, "reason": (reason or None) and reason[:200], "now": now, "id": file_id,
-         "notify": status in PARTNER_NOTIFY_STATUSES},
-    )
-    if result.rowcount == 1:
+    clipped = (reason or None) and reason[:200]
+    before = db.execute(_READ_STAGE, {"id": file_id}).scalar_one_or_none()
+    new_stage = stage_after_status(before, status)
+    changed = db.execute(_STATUS_UPDATE, {
+        "status": status, "reason": clipped, "now": now, "id": file_id, "notify": status in PARTNER_NOTIFY_STATUSES,
+        "stage": new_stage, "closed_reason": reason if reason in _DECLINE_CODES else DeclineReason.OTHER.value,
+    }).rowcount == 1
+    if changed:
         _record_status_event(db, file_id, status, reason, now)
-    if result.rowcount != 1 or status not in PARTNER_NOTIFY_STATUSES:
+        if new_stage is not None:
+            _record_stage_event(db, file_id, before, new_stage, clipped or f"status {status}")
+    if not changed or status not in PARTNER_NOTIFY_STATUSES:
         return None
     row = db.execute(
         text("SELECT partner_id, property_address, borrower_last_name FROM lending.loan_files "

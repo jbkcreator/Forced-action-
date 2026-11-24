@@ -360,7 +360,9 @@ class LendingTextConsent(LendingBase):
     captured_by: Mapped[Optional[str]] = mapped_column(String(200))  # caller name for on_call_yes
     captured_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_now, server_default=text("now()"))
     revoked_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
-    loan_file_id: Mapped[Optional[int]] = mapped_column(BigInteger, ForeignKey("lending.loan_files.id"))  # R1 0.1: ConsentRecord link
+    # R1 0.1: ConsentRecord link. No ForeignKey here: apply_lending_pr319_client_feedback.py creates this table from the
+    # model, possibly before loan_files exists; apply_lending_loan_state_machine.py adds fk_text_consents_loan_file.
+    loan_file_id: Mapped[Optional[int]] = mapped_column(BigInteger)
     schema_version: Mapped[int] = mapped_column(SmallInteger, nullable=False, default=1, server_default=text("1"))
 
     __table_args__ = (Index("uq_lending_text_consents_phone_source", "phone", "source", unique=True),)
