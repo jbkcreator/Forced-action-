@@ -72,3 +72,9 @@ def test_no_file_or_several_files_for_the_phone_moves_nothing_and_cards_josh(cal
 
 def test_no_phone_is_unmatched(calls):
     assert bridge.apply_stage(_Db([(1, "CLOSING")]), opportunity_id="o1", stage_name="Funded", phone=None) == "unmatched"
+
+
+def test_every_stage_the_bridge_maps_counts_as_closed_for_the_scoreboard_and_document_chase():
+    from config.lending_closing import CLOSED_STAGE_KEYS
+
+    assert set(bridge.GHL_STAGE_TO_LOAN_STAGE) <= CLOSED_STAGE_KEYS
