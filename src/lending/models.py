@@ -1774,6 +1774,41 @@ class LendingDocChaseUpload(LendingBase):
     __table_args__ = (Index("idx_lending_doc_chase_uploads_chase", "chase_id"),)
 
 
+class LendingDocViewLink(LendingBase):
+    """R1 0.2: a 15-minute link an admin was given to view or download one upload. Only the token's SHA-256 is
+    stored. ``issued_to`` (``slack:<user id>`` or ``token:<staff token id>``) is re-checked when the link is opened,
+    so it stops working as soon as that person or token is no longer admin."""
+
+    __tablename__ = "doc_view_links"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    token_hash: Mapped[str] = mapped_column(String(64), nullable=False, unique=True)
+    upload_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("lending.doc_chase_uploads.id"), nullable=False)
+    issued_to: Mapped[str] = mapped_column(String(40), nullable=False)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_now, server_default=text("now()"))
+
+    __table_args__ = (Index("idx_lending_doc_view_links_upload", "upload_id"),)
+
+
+class LendingStaffApiToken(LendingBase):
+    """R1 0.2: a person's token for the staff document API. Only its SHA-256 is stored; the raw token is shown once
+    when issued (``python -m src.lending.security.staff_tokens``). Valid until ``expires_at`` (90 days) or revoked."""
+
+    __tablename__ = "staff_api_tokens"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    name: Mapped[str] = mapped_column(String(80), nullable=False)
+    role: Mapped[str] = mapped_column(String(10), nullable=False)
+    token_hash: Mapped[str] = mapped_column(String(64), nullable=False, unique=True)
+    created_by: Mapped[str] = mapped_column(String(80), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_now, server_default=text("now()"))
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    revoked_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+
+    __table_args__ = (CheckConstraint("role IN ('admin', 'caller')", name="ck_lending_staff_api_tokens_role"),)
+
+
 class LendingDocChaseTouch(LendingBase):
     """P2.4: one chase step (day 0 / 2 / 5 / 8) taken for a chase; ``action_id`` is NULL when no channel was usable."""
 

@@ -1,0 +1,91 @@
+"""R1 0.2: the ``lending_caller`` Postgres role, the database layer of the Backflip Wall.
+
+A NOLOGIN role that may read every ``lending`` table except the ones holding borrower documents
+(``src.lending.security.rbac.DOCUMENT_TABLES``). The app's login is made a member, so a caller's work runs as it
+with ``SET LOCAL ROLE lending_caller`` (the staff API for a caller token, Cora's free-form SQL for a non-approver):
+even a missed check in code cannot read a document table.
+
+Run it as a role with CREATEROLE (the DB admin), naming the app's login, AFTER apply_lending_document_access.py
+(a table that does not exist yet cannot be revoked; re-running this later closes it):
+
+    PYTHONPATH=. python migrations/apply_lending_caller_db_role.py --app-role <DATABASE_URL user> [--dry-run]
+
+Idempotent: the role is created only if absent; GRANT / REVOKE / ALTER DEFAULT PRIVILEGES are re-runnable. Like the
+Vera role, new lending tables are granted to the role automatically (default privileges for the app login).
+"""
+from __future__ import annotations
+
+import argparse
+import sys
+
+sys.path.insert(0, ".")
+
+from sqlalchemy import text
+from sqlalchemy.engine import Connection, make_url
+from sqlalchemy.exc import DBAPIError
+
+from src.lending.security.rbac import CALLER_DB_ROLE, DOCUMENT_TABLES
+
+LENDING_SCHEMA = "lending"
+INSUFFICIENT_PRIVILEGE = "42501"
+
+
+def _q(name: str) -> str:
+    return '"' + name.replace('"', '""') + '"'
+
+
+def statements(conn: Connection, *, schema: str, role: str, app_role: str) -> list[str]:
+    """Every statement, in order. Only document tables that exist are revoked."""
+    existing = [t for t in DOCUMENT_TABLES
+                if conn.execute(text("SELECT to_regclass(:name)"), {"name": f"{_q(schema)}.{_q(t)}"}).scalar()]
+    create = (f"DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = '{role.replace(chr(39), '')}') "
+              f"THEN CREATE ROLE {_q(role)} NOLOGIN; END IF; END $$")
+    return [
+        create,
+        f"GRANT USAGE ON SCHEMA {_q(schema)} TO {_q(role)}",
+        f"GRANT SELECT ON ALL TABLES IN SCHEMA {_q(schema)} TO {_q(role)}",
+        *[f"REVOKE ALL ON {_q(schema)}.{_q(t)} FROM {_q(role)}" for t in existing],
+        f"ALTER DEFAULT PRIVILEGES FOR ROLE {_q(app_role)} IN SCHEMA {_q(schema)} GRANT SELECT ON TABLES TO {_q(role)}",
+        f"GRANT {_q(role)} TO {_q(app_role)}",
+    ]
+
+
+def apply_to(conn: Connection, *, schema: str = LENDING_SCHEMA, role: str = CALLER_DB_ROLE, app_role: str) -> None:
+    for statement in statements(conn, schema=schema, role=role, app_role=app_role):
+        conn.execute(text(statement))
+
+
+def main() -> int:
+    from config.settings import get_settings
+    from src.core.database import get_db_context
+
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument("--app-role", default=make_url(str(get_settings().database_url)).username,
+                        help="the login the lending apps connect as (default: the DATABASE_URL user)")
+    parser.add_argument("--dry-run", action="store_true")
+    args = parser.parse_args()
+    if not args.app_role:
+        print("ERROR: no --app-role and DATABASE_URL has no user", file=sys.stderr)
+        return 1
+    with get_db_context() as db:
+        conn = db.connection()
+        if args.dry_run:
+            for statement in statements(conn, schema=LENDING_SCHEMA, role=CALLER_DB_ROLE, app_role=args.app_role):
+                print(statement)
+            return 0
+        try:
+            apply_to(conn, app_role=args.app_role)
+            db.commit()
+        except DBAPIError as exc:
+            db.rollback()
+            if getattr(exc.orig, "pgcode", None) == INSUFFICIENT_PRIVILEGE:
+                print("ERROR: run this as a DB admin with CREATEROLE: --app-role <the app's login>", file=sys.stderr)
+                return 1
+            raise
+    print(f"{CALLER_DB_ROLE} ready: reads schema {LENDING_SCHEMA} except {', '.join(DOCUMENT_TABLES)}; "
+          f"{args.app_role} may SET ROLE to it")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -280,6 +280,8 @@ def closing_db():
         return statement.replace(f"{LENDING_SCHEMA}.", f"{schema}."), parameters
 
     apply_doc_chase(conn, schema)
+    from migrations.apply_lending_document_access import apply_to as apply_document_access
+    apply_document_access(conn, schema)
     session = Session(bind=conn, join_transaction_mode="create_savepoint")
     session.info["schema"] = schema
     yield session
@@ -287,3 +289,25 @@ def closing_db():
     tx.rollback()
     conn.close()
     engine.dispose()
+
+
+@pytest.fixture
+def caller_role_db(closing_db):
+    """R1 0.2: closing_db plus a uniquely named ``lending_caller``-style role over its throwaway schema. Created
+    inside the rolled-back transaction (roles are transactional), so it never outlives the test."""
+    import uuid
+
+    from sqlalchemy.exc import DBAPIError
+
+    from migrations.apply_lending_caller_db_role import apply_to as apply_caller_role
+
+    role = f"lending_caller_t{uuid.uuid4().hex[:8]}"
+    app_role = closing_db.execute(text("SELECT session_user")).scalar()
+    try:
+        with closing_db.begin_nested():
+            apply_caller_role(closing_db.connection(), schema=closing_db.info["schema"], role=role, app_role=app_role)
+    except DBAPIError as exc:
+        if getattr(exc.orig, "pgcode", None) == "42501":
+            pytest.skip("the test database login needs CREATEROLE")
+        raise
+    return closing_db, role
