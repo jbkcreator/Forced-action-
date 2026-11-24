@@ -19,3 +19,28 @@ DOORS: tuple[Door, ...] = (
     Door("instantly", "POST", "/webhooks/lending/instantly", frozenset({403})),
     Door("website", "GET", "/api/lending/web-leads", frozenset({405})),
 )
+
+
+ALERT_LABELS: dict[str, str] = {
+    "unit:fa-lending-cora": "Cora",
+    "unit:lending-api": "Lending API",
+    "health:lending-api": "Lending API health",
+    "database": "Database",
+    "door:ghl-stage": "GHL stage webhook",
+    "door:ghl-disposition": "GHL outcome webhook",
+    "door:lendingflow": "LendingFlow webhook",
+    "door:instantly": "Instantly webhook",
+    "door:website": "Website lead form",
+    "ghl_outcomes": "GHL call outcomes",
+    "cards": "Approval cards",
+    "replies": "Reply backlog",
+    "failures": "Webhook failures",
+}
+
+ALERT_TEMPLATES: dict[str, str] = {
+    "down": "NDL watchdog: {label} DOWN since {since} ET. {detail}",
+    "still_down": "NDL watchdog: {label} STILL DOWN since {since} ET. {detail}",
+    "recovered": "NDL watchdog: {label} recovered after {minutes} min.",
+}
+
+SMS_MAX_CHARS = 160
