@@ -11,8 +11,9 @@ from __future__ import annotations
 import argparse
 import logging
 import signal
-import time
+import threading
 from contextlib import contextmanager
+from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Generator, Optional
@@ -30,6 +31,7 @@ from src.lending.watchdog.collectors import (
 from src.lending.watchdog.notify import deliver
 from src.lending.watchdog.rules import (
     Alert,
+    CheckState,
     WatchdogConfig,
     evaluate,
     load_state,
@@ -103,17 +105,45 @@ def _timed_session() -> Generator[Any, None, None]:
         yield db
 
 
-def _persist(path: Path, state: dict) -> None:
+def _route(name: str, build: Callable[[], Any]) -> Any:
+    """A route that cannot be built is skipped, so one bad setting never silences the other routes."""
+    try:
+        return build()
+    except Exception as exc:
+        logger.error("[watchdog] %s route unavailable (%s)", name, type(exc).__name__)
+        return None
+
+
+_memory_state: Optional[dict[str, CheckState]] = None  # set only while the last save failed; wins over the file
+
+
+def _persist(path: Path, state: dict[str, CheckState]) -> None:
+    global _memory_state
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         save_state(path, state)
+        _memory_state = None
     except OSError as exc:
+        _memory_state = state
         logger.error("[watchdog] state not saved (%s)", type(exc).__name__)
+
+
+def _hold_undelivered(
+    alerts: list[Alert], old: dict[str, CheckState], new: dict[str, CheckState]
+) -> dict[str, CheckState]:
+    """No channel got the message, so keep the failure count but forget that we alerted: the next poll alerts again."""
+    held = dict(new)
+    for alert in alerts:
+        if alert.kind == "down":
+            held[alert.key] = replace(new[alert.key], open_since=None, last_alert_at=None)
+        elif alert.key in old:
+            held[alert.key] = old[alert.key]
+    return held
 
 
 def run_cycle(*, now: Optional[datetime] = None, dry_run: bool = False) -> list[Alert]:
     settings = get_settings()
-    if not settings.lending_watchdog_enabled:
+    if not settings.lending_watchdog_enabled and not dry_run:
         return []
     now = now or datetime.now(timezone.utc)
     cfg = load_config(settings)
@@ -125,8 +155,9 @@ def run_cycle(*, now: Optional[datetime] = None, dry_run: bool = False) -> list[
     observations.extend(db_observations(_timed_session, now, cfg))
 
     path = Path(settings.lending_watchdog_state_path)
+    old_state = _memory_state if _memory_state is not None else load_state(path)
     alerts, new_state = evaluate(
-        observations, load_state(path), now,
+        observations, old_state, now,
         fail_polls=cfg.fail_polls, repeat_minutes=cfg.repeat_minutes,
     )
     failing = sum(1 for o in observations if not o.ok)
@@ -135,44 +166,53 @@ def run_cycle(*, now: Optional[datetime] = None, dry_run: bool = False) -> list[
         for alert in alerts:
             logger.info("[watchdog] dry run, would send %s %s: %s", alert.kind, alert.key, alert.detail)
         return alerts
-    deliver(
+    delivered = deliver(
         alerts,
         recipients=recipients(settings),
-        ghl=_ghl_route(),
-        telnyx=telnyx_route(settings),
-        slack=_slack(settings),
+        ghl=_route("GHL", _ghl_route),
+        telnyx=_route("Telnyx", lambda: telnyx_route(settings)),
+        slack=_route("Slack", lambda: _slack(settings)),
         channel=settings.lending_ops_channel,
     )
+    if not delivered:
+        logger.error("[watchdog] %d alerts not delivered by any channel; will retry next poll", len(alerts))
+        new_state = _hold_undelivered(alerts, old_state, new_state)
     _persist(path, new_state)
     return alerts
 
 
-_running = True
+_stop_event = threading.Event()
 
 
-def _stop(signum, _frame) -> None:
-    global _running
-    logger.info("[watchdog] signal %s received, stopping after this cycle", signum)
-    _running = False
+def _on_signal(signum, _frame) -> None:
+    logger.info("[watchdog] signal %s received, stopping", signum)
+    _stop_event.set()
+
+
+def _wait(seconds: float) -> None:
+    _stop_event.wait(seconds)
 
 
 def main(argv: Optional[list[str]] = None) -> int:
+    if not logging.getLogger().handlers:
+        logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
     parser = argparse.ArgumentParser(description="NDL external watchdog")
     parser.add_argument("--once", action="store_true", help="run a single cycle and exit")
-    parser.add_argument("--dry-run", action="store_true", help="one cycle; send and save nothing")
+    parser.add_argument("--dry-run", action="store_true", help="one cycle; send and save nothing (works while disabled)")
     args = parser.parse_args(argv)
-    signal.signal(signal.SIGTERM, _stop)
-    signal.signal(signal.SIGINT, _stop)
+    _stop_event.clear()
+    signal.signal(signal.SIGTERM, _on_signal)
+    signal.signal(signal.SIGINT, _on_signal)
     settings = get_settings()
     logger.info("[watchdog] starting (enabled=%s)", settings.lending_watchdog_enabled)
-    while _running:
+    while not _stop_event.is_set():
         try:
             run_cycle(dry_run=args.dry_run)
         except Exception as exc:  # class only: details can carry numbers
             logger.error("[watchdog] cycle failed (%s); retrying next interval", type(exc).__name__)
         if args.once or args.dry_run:
             break
-        time.sleep(settings.lending_watchdog_poll_seconds)
+        _wait(settings.lending_watchdog_poll_seconds)
     return 0
 
 

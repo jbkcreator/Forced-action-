@@ -27,7 +27,7 @@ Recipients: `LENDING_ALARM_SMS_TO` plus optional `LENDING_WATCHDOG_BACKUP_SMS_TO
 1. Set `LENDING_WATCHDOG_PUBLIC_BASE_URL` to the public lending domain (`https://...`, no trailing path). Confirm the website door through nginx once before relying on it: `GET /api/lending/web-leads` must return 405 from the public domain. If nginx answers differently, the door will alarm falsely.
 2. Set `LENDING_WATCHDOG_BACKUP_SMS_TO` if there is a second phone.
 3. Set up Telnyx (below).
-4. Run `python -m src.lending.watchdog.daemon --once --dry-run`. It logs `[watchdog] N checks, M failing, K alerts` and what it would send, and sends and saves nothing. Any failing check means a setting (unit list, base URL) is wrong.
+4. Run `python -m src.lending.watchdog.daemon --once --dry-run` (works while the flag is still off). It logs `[watchdog] N checks, M failing, K alerts` and what it would send, and sends and saves nothing. Any failing check means a setting (unit list, base URL) is wrong.
 5. Set `LENDING_WATCHDOG_ENABLED=true` and `systemctl restart ndl-watchdog`. `deploy.sh` installs and restarts the unit (warn-only); it is safe to install while the flag is off.
 
 ## Telnyx fallback number

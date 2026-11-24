@@ -134,3 +134,14 @@ def test_deliver_slack_failure_does_not_stop_sms():
     slack.chat_postMessage.side_effect = RuntimeError("boom")
     notify.deliver([alert()], recipients=[PHONE], ghl=ghl, telnyx=None, slack=slack, channel="C1")
     assert ghl.call_count == 1
+
+
+def test_deliver_reports_whether_any_route_succeeded():
+    boom = MagicMock(side_effect=GhlSmsError("down"))
+    slack_down = MagicMock()
+    slack_down.chat_postMessage.side_effect = RuntimeError("x")
+    kwargs = dict(recipients=[PHONE], telnyx=None, channel="C1")
+    assert notify.deliver([alert()], ghl=boom, slack=slack_down, **kwargs) is False
+    assert notify.deliver([alert()], ghl=MagicMock(return_value="m"), slack=slack_down, **kwargs) is True
+    assert notify.deliver([alert()], ghl=boom, slack=MagicMock(), **kwargs) is True
+    assert notify.deliver([], ghl=boom, slack=slack_down, **kwargs) is True

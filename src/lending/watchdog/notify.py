@@ -111,17 +111,21 @@ def deliver(
     telnyx: Optional[Callable[[str, str], dict]],
     slack: Any,
     channel: str,
-) -> None:
+) -> bool:
+    """True when nothing needed sending or at least one channel (Slack post or any SMS route) got a message out."""
     if not alerts:
-        return
+        return True
     now = datetime.now(timezone.utc)
+    reached = False
     try:
-        post_slack_alert(format_slack(alerts, now), slack=slack, channel=channel)
+        reached = post_slack_alert(format_slack(alerts, now), slack=slack, channel=channel)
     except Exception as exc:
         logger.error("[watchdog] Slack alert step failed: %s", type(exc).__name__)
     for alert in alerts:
         try:
             body = _safe(alert, lambda alert=alert: format_sms(alert, now))
-            send_sms_alert(body, recipients or (), ghl=ghl, telnyx=telnyx)
+            results = send_sms_alert(body, recipients or (), ghl=ghl, telnyx=telnyx)
+            reached = reached or any(route != "failed" for route in results.values())
         except Exception as exc:
             logger.error("[watchdog] SMS step failed for alert %s: %s", alert.key, type(exc).__name__)
+    return reached

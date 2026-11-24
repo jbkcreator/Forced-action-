@@ -1,4 +1,6 @@
 import json
+import logging
+import time
 from datetime import datetime, timezone
 from unittest.mock import MagicMock
 
@@ -10,6 +12,15 @@ from src.lending.watchdog.rules import Observation
 
 NOW = datetime(2026, 11, 24, 15, 0, tzinfo=timezone.utc)
 JOSH = "+18132345678"
+
+
+@pytest.fixture(autouse=True)
+def reset_daemon_state():
+    daemon._memory_state = None
+    daemon._stop_event.clear()
+    yield
+    daemon._memory_state = None
+    daemon._stop_event.clear()
 
 
 @pytest.fixture
@@ -132,12 +143,79 @@ def test_cycle_exception_does_not_stop_loop(env, fakes, monkeypatch):
         calls.append(1)
         if len(calls) == 1:
             raise RuntimeError("boom")
-        daemon._running = False
+        daemon._stop_event.set()
         return []
 
     monkeypatch.setattr(daemon, "run_cycle", run_cycle)
-    monkeypatch.setattr(daemon.time, "sleep", lambda s: None)
     monkeypatch.setattr(daemon.signal, "signal", lambda *a: None)
-    daemon._running = True
+    monkeypatch.setattr(daemon, "_wait", lambda seconds: None)
     assert daemon.main([]) == 0
     assert len(calls) == 2
+
+
+def test_signal_wakes_the_wait(monkeypatch):
+    daemon._stop_event.clear()
+    daemon._on_signal(15, None)
+    assert daemon._stop_event.is_set()
+    start = time.monotonic()
+    daemon._wait(30)
+    assert time.monotonic() - start < 1
+    daemon._stop_event.clear()
+
+
+def test_main_configures_logging_when_no_handlers(env, fakes, monkeypatch):
+    root = logging.getLogger()
+    monkeypatch.setattr(root, "handlers", [])
+    configured = MagicMock()
+    monkeypatch.setattr(daemon.logging, "basicConfig", configured)
+    monkeypatch.setattr(daemon.signal, "signal", lambda *a: None)
+    monkeypatch.setattr(daemon, "run_cycle", lambda **kw: [])
+    daemon.main(["--once"])
+    configured.assert_called_once()
+    assert configured.call_args.kwargs["level"] == logging.INFO
+
+
+def test_dry_run_works_while_disabled(env, fakes, monkeypatch):
+    monkeypatch.setenv("LENDING_WATCHDOG_ENABLED", "false")
+    get_settings.cache_clear()
+    assert len(daemon.run_cycle(now=NOW, dry_run=True)) == 1
+    fakes[0].assert_not_called()
+
+
+def test_undelivered_down_alert_is_retried_next_poll(env, fakes):
+    ghl, slack = fakes
+    ghl.side_effect = RuntimeError("ghl down")
+    slack.chat_postMessage.side_effect = RuntimeError("slack down")
+    assert len(daemon.run_cycle(now=NOW)) == 1
+    saved = json.loads(env.read_text())["unit:fa-lending-cora"]
+    assert saved["open_since"] is None and saved["last_alert_at"] is None
+    ghl.side_effect = None
+    again = daemon.run_cycle(now=NOW.replace(minute=2))
+    assert [a.kind for a in again] == ["down"]
+    assert json.loads(env.read_text())["unit:fa-lending-cora"]["open_since"] is not None
+
+
+def test_failed_state_save_does_not_resend_down_every_cycle(env, fakes, monkeypatch):
+    ghl, _ = fakes
+    real_save = daemon.save_state
+    monkeypatch.setattr(daemon, "save_state", lambda path, state: (_ for _ in ()).throw(OSError("ro")))
+    assert len(daemon.run_cycle(now=NOW)) == 1
+    assert daemon.run_cycle(now=NOW.replace(minute=2)) == []
+    assert ghl.call_count == 1
+    monkeypatch.setattr(daemon, "save_state", real_save)
+    daemon.run_cycle(now=NOW.replace(minute=4))
+    assert daemon._memory_state is None
+    assert "unit:fa-lending-cora" in json.loads(env.read_text())
+
+
+@pytest.mark.parametrize("route", ["_ghl_route", "_slack"])
+def test_route_construction_failure_does_not_lose_other_routes(env, fakes, monkeypatch, route):
+    ghl, slack = fakes
+
+    def boom(*args):
+        raise RuntimeError("bad config")
+
+    monkeypatch.setattr(daemon, route, boom)
+    assert len(daemon.run_cycle(now=NOW)) == 1
+    survivor = slack.chat_postMessage if route == "_ghl_route" else ghl
+    survivor.assert_called_once()
