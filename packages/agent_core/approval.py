@@ -113,13 +113,14 @@ def parse_action_id(raw: str | None) -> int | None:
 
 
 def apply_click(queue: PendingActionQueue, action: ApprovalAction, action_id: int, user_id: str,
-                approver_user_ids: Set[str]) -> ClickOutcome:
-    """Apply one button click. ``dispatch`` tells the caller to hand the action to the relay."""
+                approver_user_ids: Set[str], card_ts: str | None = None) -> ClickOutcome:
+    """Apply one button click. ``dispatch`` tells the caller to hand the action to the relay. ``card_ts`` is the clicked
+    card's message ts: a click counts only on the action's current card (a reopened action has a new one)."""
     if not is_approver(approver_user_ids, user_id):
         return ClickOutcome(accepted=False, status_text="Only an approver can decide this action.")
 
     if action is ApprovalAction.APPROVE:
-        if queue.approve(action_id, user_id):
+        if queue.approve(action_id, user_id, card_ts=card_ts):
             return ClickOutcome(accepted=True, status_text=f":white_check_mark: *Approved* by <@{user_id}>, sending…",
                                 dispatch=True)
         current = queue.get(action_id)
@@ -128,11 +129,11 @@ def apply_click(queue: PendingActionQueue, action: ApprovalAction, action_id: in
         return ClickOutcome(accepted=False, status_text="Already decided; nothing changed.")
 
     if action is ApprovalAction.REJECT:
-        if queue.reject(action_id, user_id):
+        if queue.reject(action_id, user_id, card_ts=card_ts):
             return ClickOutcome(accepted=True, status_text=f":x: *Rejected* by <@{user_id}>. Nothing was sent.")
         return ClickOutcome(accepted=False, status_text="Already decided; nothing changed.")
 
-    if queue.request_revision(action_id, user_id):
+    if queue.request_revision(action_id, user_id, card_ts=card_ts):
         return ClickOutcome(
             accepted=True,
             status_text=(f":pencil2: *Revising* for <@{user_id}>: reply with the change you want. "

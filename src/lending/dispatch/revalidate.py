@@ -8,24 +8,28 @@ record as it stands now:
 * the value changed, or the named lead no longer exists -> the send is held for review (never sent, never retried);
 * a ``contact_ref`` that is not one of ours to look up cannot be compared; opt-out and consent checks still run.
 
+A ``ghl:<contact id>`` card (agent jobs draft from the GHL contact) is checked against the GHL contact itself, read at
+dispatch through ``ghl_reader``: a changed phone/email or a deleted contact holds the send; a failed read defers it to
+the next sweep (never sends unchecked). Only without a reader (GHL not configured) does it fall back to our lead records.
+
 Consent revoked while queued is held the same way (``HOLD_CONSENT_REVOKED``), by the caller's send check.
 """
 from __future__ import annotations
 
 import re
-from collections.abc import Collection
-from typing import Optional
+from collections.abc import Callable, Collection
+from typing import Any, Optional
 
 from sqlalchemy import text
 
 from packages.agent_core.pending_actions import PendingAction
-from packages.agent_core.relay import SendHold
+from packages.agent_core.relay import HELD_UNCERTAIN_OUTCOME, SendDeferred, SendHold
 from src.services.phone_utils import normalize
 
 HOLD_RECIPIENT_CHANGED = "recipient_changed"
 HOLD_LEAD_NOT_FOUND = "lead_not_found"
 HOLD_CONSENT_REVOKED = "consent_revoked"
-HOLD_UNCERTAIN_OUTCOME = "uncertain_outcome"
+HOLD_UNCERTAIN_OUTCOME = HELD_UNCERTAIN_OUTCOME
 
 _LEAD_REF = re.compile(r"^(web_lead|lendingflow_lead|contact|instantly_reply|doc_chase):(\d+)$")
 _GHL_REF = re.compile(r"^ghl:(\S+)$")
@@ -60,10 +64,13 @@ def recipient_still_matches(card_phone: Optional[str], card_email: Optional[str]
     return False
 
 
+GhlReader = Callable[[str], Any]  # contact id -> an object with .phone / .email, or None when GHL has no such contact
+
+
 def changed_recipient(conn, action: PendingAction, *, sms_channels: Collection[str],
-                      email_channels: Collection[str]) -> Optional[SendHold]:
-    """A ``SendHold`` when the recipient was edited (or the lead is gone) since approval, else None. Only text and
-    email channels have a recipient to compare."""
+                      email_channels: Collection[str], ghl_reader: Optional[GhlReader] = None) -> Optional[str]:
+    """A ``SendHold`` when the recipient was edited (or the lead is gone) since approval, a ``SendDeferred`` when the GHL
+    contact could not be read, else None. Only text and email channels have a recipient to compare."""
     uses_phone, uses_email = action.channel in sms_channels, action.channel in email_channels
     ref = action.contact_ref or ""
     if not (uses_phone or uses_email) or not ref:
@@ -73,6 +80,14 @@ def changed_recipient(conn, action: PendingAction, *, sms_channels: Collection[s
         rows = conn.execute(_BY_LEAD[lead.group(1)], {"id": int(lead.group(2))}).all()
         if not rows:
             return SendHold(HOLD_LEAD_NOT_FOUND)
+    elif ghl and ghl_reader is not None:
+        try:
+            contact = ghl_reader(ghl.group(1))
+        except Exception as exc:  # class only: the message can carry request detail
+            return SendDeferred(f"the GHL contact could not be read ({type(exc).__name__}); trying again")
+        if contact is None:
+            return SendHold(HOLD_LEAD_NOT_FOUND)
+        rows = [(contact.phone, contact.email)]
     elif ghl:
         rows = conn.execute(_BY_GHL_CONTACT, {"g": ghl.group(1)}).all()
         if not rows:

@@ -116,6 +116,16 @@ class GhlSmsSender:
             logger.warning("%s send refused: %s", self._log_prefix, exc.why)
             raise GhlChannelPaused(exc) from None
 
+    def _recheck(self) -> None:
+        """The breaker again, right before the final send request (it may have tripped during the upsert)."""
+        if self._internal_alert:
+            return
+        try:
+            circuit_breaker.recheck(self._breaker_channel)
+        except circuit_breaker.ChannelPaused as exc:
+            logger.warning("%s send refused before the request: %s", self._log_prefix, exc.why)
+            raise GhlChannelPaused(exc) from None
+
     def _count_failure(self, error: str, *, ambiguous: bool) -> None:
         if not self._internal_alert:
             circuit_breaker.record_failure(self._breaker_channel, error, ambiguous=ambiguous)
@@ -199,6 +209,7 @@ class GhlSmsSender:
                                 decision.lift_dnd)
         if deadline is not None and datetime.now(timezone.utc) > deadline:
             raise GhlSmsError("deadline passed before send")
+        self._recheck()
         sent = self._post(self._http(), "/conversations/messages",
                           {"type": "SMS", "contactId": contact_id, "message": body, "fromNumber": self._from},
                           "message send", version="2021-04-15", is_send=True)  # conversations endpoints use this version

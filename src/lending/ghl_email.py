@@ -77,6 +77,7 @@ class GhlEmailSender(GhlSmsSender):
                          "emailFrom": email_from}
         if bcc:
             message["emailBcc"] = bcc
+        self._recheck()
         sent = self._post(self._http(), "/conversations/messages", message, "email send", version="2021-04-15",
                           is_send=True)
         message_id = sent.get("messageId") or sent.get("emailMessageId") or sent.get("id")

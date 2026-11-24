@@ -193,6 +193,22 @@ def admit(channel: str) -> None:
         raise RateLimited(channel, f"over {limit} a minute; the next minute opens more")
 
 
+def recheck(channel: str) -> None:
+    """Raise ``ChannelPaused`` when the breaker opened since ``admit`` (another worker recorded the fifth failure while
+    this send was preparing). Takes no rate-limit slot. Called right before the final provider request."""
+    paused: Optional[str] = None
+    try:
+        with lending_session() as db:
+            row = db.execute(_STATE, {"c": channel}).first()
+            if row is None or row.state == STATE_OPEN:
+                paused = "tripped while this send was being prepared"
+    except Exception as exc:  # class only: SQL errors embed bound parameters
+        logger.error("[channel-breaker] %s state unreadable on recheck (%s); send refused", channel, type(exc).__name__)
+        paused = "breaker state could not be read"
+    if paused is not None:
+        raise ChannelPaused(channel, paused)
+
+
 def record_success(channel: str) -> None:
     """A send went through: the run of failures starts over. Never raises."""
     try:

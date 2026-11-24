@@ -28,6 +28,10 @@ class SendDeferred(str):
     a later sweep tries again, until the action's expiry, when it is blocked."""
 
 
+# The held reason for a send whose outcome is unknown (timeout, 5xx, no message id): it may have gone out.
+HELD_UNCERTAIN_OUTCOME = "uncertain_outcome"
+
+
 class SendHold(str):
     """A send-check reason meaning "a person must look": the action is held (``held_reason`` = the string's value),
     nothing is sent, and it is never retried. A reviewer reopens it, which asks for a fresh approval."""

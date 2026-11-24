@@ -120,3 +120,41 @@ def test_held_card_reports_uncertainty_and_retries_failed_updates(queue):
     session.mark_held_cards()
     assert len(session._chat.updates) == 1
     assert "may have been sent" in session._chat.updates[0]["text"]
+
+
+# ── PR #476 review fixes ───────────────────────────────────────────────────────
+
+def test_an_old_card_click_cannot_approve_a_reopened_action(queue, halt: HaltSwitch) -> None:
+    """Review 1: the reopened action gets a new card; a delayed click on the old one moves nothing."""
+    from packages.agent_core.approval import ApprovalAction, apply_click
+
+    action_id = enqueue_sms(queue)
+    queue.attach_card(action_id, "C_APPROVALS", "1700.1")
+    queue.approve(action_id, APPROVER, card_ts="1700.1")
+    queue.hold_approved(("ghl_sms",), "breaker_open")
+    queue.reopen_held(action_id)
+    old = apply_click(queue, ApprovalAction.APPROVE, action_id, APPROVER, {APPROVER}, card_ts="1700.1")
+    assert old.accepted is False and queue.get(action_id).status is ActionStatus.PENDING  # before the new card
+    queue.attach_card(action_id, "C_APPROVALS", "1800.2")
+    assert apply_click(queue, ApprovalAction.APPROVE, action_id, APPROVER, {APPROVER}, card_ts="1700.1").accepted is False
+    assert apply_click(queue, ApprovalAction.REJECT, action_id, APPROVER, {APPROVER}, card_ts="1700.1").accepted is False
+    new = apply_click(queue, ApprovalAction.APPROVE, action_id, APPROVER, {APPROVER}, card_ts="1800.2")
+    assert new.accepted is True and queue.get(action_id).status is ActionStatus.APPROVED
+
+
+def test_an_uncertain_send_says_it_may_have_gone_out_right_after_the_click_too() -> None:
+    """Review 6: the immediate answer and the sweep's card text are the same, and warn against reopening."""
+    from packages.agent_core.slack_session import held_text
+
+    uncertain = held_text("uncertain_outcome", approved=True)
+    assert "may have been sent" in uncertain and "Nothing was sent" not in uncertain
+    assert "Do not reopen" in uncertain
+    assert "Nothing was sent" in held_text("breaker_open", approved=True)
+
+
+def test_the_card_sweep_reads_the_newest_holds_first(queue) -> None:
+    """Review 7: a new hold is always within the limit, however many older ones wait."""
+    ids = [_approved(queue, f"m{i}") for i in range(4)]
+    queue.hold_approved(("ghl_sms",), "breaker_open")
+    assert queue.held_ids(limit=2, newest_first=True) == [ids[3], ids[2]]
+    assert queue.held_ids(limit=2) == [ids[0], ids[1]]

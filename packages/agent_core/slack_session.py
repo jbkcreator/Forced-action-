@@ -30,7 +30,7 @@ from .config import AgentCoreConfig
 from .halt import AgentHalted, HaltSwitch
 from .pending_actions import PendingAction, PendingActionQueue
 from .redaction import slack_safe
-from .relay import DispatchOutcome, Relay
+from .relay import DispatchOutcome, Relay, HELD_UNCERTAIN_OUTCOME
 
 logger = logging.getLogger(__name__)
 
@@ -255,7 +255,7 @@ class SlackSession:
         channel = (payload.get("channel") or {}).get("id")
         ts = (payload.get("message") or {}).get("ts")
 
-        outcome = apply_click(self._queue, button, action_id, user_id, self._config.approver_user_ids)
+        outcome = apply_click(self._queue, button, action_id, user_id, self._config.approver_user_ids, card_ts=ts)
         logger.info("%s session: %s on action %s by %s accepted=%s", self._config.agent_name,
                     button.value, action_id, user_id, outcome.accepted)
         if not outcome.accepted:
@@ -282,8 +282,7 @@ class SlackSession:
         if result.outcome is DispatchOutcome.FAILED:
             return ":warning: *Approved, send failed.* Nothing was retried; check the action before re-queuing."
         if result.outcome is DispatchOutcome.HELD:
-            return (f":pause_button: *Approved, held for review*: {slack_safe(result.reason or 'needs a look')}. "
-                    "Nothing was sent and nothing will be retried. A reviewer can reopen it for a fresh approval.")
+            return held_text(result.reason, approved=True)
         if result.outcome is DispatchOutcome.DEFERRED:
             return (f":hourglass_flowing_sand: *Approved, waiting to send*: {slack_safe(result.reason or 'not yet')}. "
                     "It goes out automatically once allowed, unless the draft expires first; no need to redraft.")
@@ -303,16 +302,13 @@ class SlackSession:
         """Strip the buttons from the card of every held action and say why, once per action per process. A held
         action is reopened by a person (a fresh card then asks for a new approval). Returns how many cards changed."""
         changed = 0
-        for action_id in self._queue.held_ids():
+        for action_id in self._queue.held_ids(newest_first=True):
             if action_id in self._held_marked:
                 continue
             action = self._queue.get(action_id)
             if action is None or not (action.card_channel and action.card_ts):
                 continue
-            why = slack_safe((action.held_reason or "needs a look").replace("_", " "))
-            outcome = "The message may have been sent" if action.held_reason == "uncertain_outcome" else "Nothing was sent"
-            status_text = (f":pause_button: *Held for review* ({why}). {outcome}; nothing will be retried. "
-                           "A reviewer reopens it for a fresh approval.")
+            status_text = held_text(action.held_reason)
             result = self._chat.update(channel=action.card_channel, ts=action.card_ts, text=status_text,
                                        blocks=render_decided_card(action, status_text))
             if result.ok:
@@ -327,6 +323,17 @@ class SlackSession:
         if action is None:
             return
         self._chat.update(channel=channel, ts=ts, text=status_text, blocks=render_decided_card(action, status_text))
+
+
+def held_text(held_reason: str | None, *, approved: bool = False) -> str:
+    """The card text for a held action, the same right after the click and after the sweep. An uncertain send may have
+    reached the recipient: the card says so and warns against reopening it, which would send it a second time."""
+    why = slack_safe((held_reason or "needs a look").replace("_", " "))
+    head = ":pause_button: *Approved, held for review*" if approved else ":pause_button: *Held for review*"
+    if held_reason == HELD_UNCERTAIN_OUTCOME:
+        return (f"{head} ({why}). The message *may have been sent*: check the conversation before doing anything. "
+                "Do not reopen it unless you are sure it did not go out; nothing will be retried.")
+    return f"{head} ({why}). Nothing was sent and nothing will be retried. A reviewer reopens it for a fresh approval."
 
 
 def run_socket_mode(session: SlackSession, *, app_token: str, web_client: Any,

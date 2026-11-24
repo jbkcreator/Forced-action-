@@ -496,3 +496,89 @@ def test_reply_and_chase_recipient_edits_hold_the_send():
     for ref in ("instantly_reply:5", "doc_chase:5"):
         action = _action(channel="ghl_email", contact_ref=ref)
         assert revalidate.changed_recipient(Conn([(None, "new@example.com")]), action, sms_channels=SMS, email_channels=EMAIL) == "recipient_changed"
+
+
+# ── PR #476 review fixes ───────────────────────────────────────────────────────
+
+def _ghl_action(**fields):
+    return _action(contact_ref="ghl:abc", **fields)
+
+
+def test_a_ghl_card_is_checked_against_the_ghl_contact_itself():
+    """Review 2: agent jobs draft from GHL, so the send check reads GHL, not our intake records."""
+    reader = lambda contact_id: SimpleNamespace(phone="+18135559999", email="sam@example.com")
+    conn = Conn([(PHONE, "sam@example.com")])  # our records still carry the old number: not consulted
+    hold = revalidate.changed_recipient(conn, _ghl_action(), sms_channels=SMS, email_channels=EMAIL, ghl_reader=reader)
+    assert hold == "recipient_changed" and conn.queries == []
+    same = lambda contact_id: SimpleNamespace(phone=PHONE, email="sam@example.com")
+    assert revalidate.changed_recipient(Conn([]), _ghl_action(), sms_channels=SMS, email_channels=EMAIL,
+                                        ghl_reader=same) is None
+
+
+def test_a_deleted_ghl_contact_holds_and_a_failed_read_defers():
+    from packages.agent_core.relay import SendDeferred
+
+    gone = revalidate.changed_recipient(Conn([]), _ghl_action(), sms_channels=SMS, email_channels=EMAIL,
+                                        ghl_reader=lambda contact_id: None)
+    assert gone == "lead_not_found" and isinstance(gone, SendHold)
+
+    def down(contact_id):
+        raise RuntimeError("GHL 503")
+
+    later = revalidate.changed_recipient(Conn([]), _ghl_action(), sms_channels=SMS, email_channels=EMAIL,
+                                         ghl_reader=down)
+    assert isinstance(later, SendDeferred)
+
+
+def test_the_breaker_is_checked_again_before_the_final_send_request(breaker, monkeypatch):
+    """Review 3: another worker can trip the breaker while this one upserts the contact."""
+    def tripped(channel):
+        raise cb.ChannelPaused(channel, "tripped while this send was being prepared")
+
+    monkeypatch.setattr(cb, "recheck", tripped)
+    sender = _sms(*GOOD)
+    with pytest.raises(GhlChannelPaused):
+        sender(PHONE, "hi", None)
+    assert [url.rsplit("/", 1)[-1] for _, url in sender._http().calls] == ["upsert"]  # the message send never went
+
+
+def test_the_recheck_takes_no_rate_limit_slot(monkeypatch):
+    db = _session(monkeypatch, _admit_handler(state="closed"))
+    cb.recheck(cb.CHANNEL_SMS)
+    assert cb._TAKE_SLOT not in db.statements()
+    _session(monkeypatch, _admit_handler(state="open"))
+    with pytest.raises(cb.ChannelPaused):
+        cb.recheck(cb.CHANNEL_SMS)
+
+
+def test_a_paused_channel_puts_a_missed_call_text_back_to_pending_not_failed(monkeypatch):
+    """Review 4: the text is retried on the next poll while still inside its 60 s window."""
+    from datetime import datetime, timezone
+
+    from src.lending import text_back
+
+    recorded = []
+    monkeypatch.setattr(text_back, "_decide", lambda db, item, **kw: "send")
+    monkeypatch.setattr(text_back, "_render", lambda item, number, booking_link: ("k", "body"))
+    monkeypatch.setattr(text_back, "_record", lambda db, event_id, status, *a: recorded.append(status))
+
+    def paused(*a, **k):
+        raise GhlChannelPaused(cb.RateLimited(cb.CHANNEL_SMS, "over the cap"))
+
+    item = SimpleNamespace(event_id=1, phone=PHONE, borrower_name="Sam", ended_at=datetime.now(timezone.utc))
+    out = text_back._decide_and_send(None, item, sender=paused, enabled=True, number="+18135550100",
+                                     now=datetime.now(timezone.utc), started=[False])
+    assert out == "deferred_channel_paused" and recorded == ["pending"]
+
+
+def test_an_instantly_reply_without_an_id_is_unconfirmed_and_never_resets_the_run(breaker, monkeypatch):
+    """Review 5."""
+    from src.lending import instantly_client
+
+    account = instantly_client.InstantlyAccount("k", "https://api.instantly.ai")
+    monkeypatch.setattr("src.lending.global_halt.is_globally_halted", lambda: False)
+    monkeypatch.setattr(instantly_client.requests, "post", lambda *a, **k: Resp(200, {}))
+    with pytest.raises(instantly_client.InstantlyError) as err:
+        instantly_client.send_reply(account, eaccount="a@x.test", reply_to_uuid="u", subject="s", body="b")
+    assert err.value.ambiguous is True and breaker.successes == []
+    assert breaker.failures == [(cb.CHANNEL_INSTANTLY, "no_reply_id", True)]

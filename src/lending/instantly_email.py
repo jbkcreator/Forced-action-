@@ -211,6 +211,11 @@ class NdlInstantlySender:
             raise InstantlySendPaused(exc) from None
         self._remove_previous_lead(email)
         self._refuse_if_halted("send")  # again: a halt can be set while the lookup runs
+        try:
+            circuit_breaker.recheck(circuit_breaker.CHANNEL_INSTANTLY)  # it may have tripped during the lookup
+        except circuit_breaker.ChannelPaused as exc:
+            logger.warning("%s send refused before the request: %s", self._log_prefix, exc.why)
+            raise InstantlySendPaused(exc) from None
         result = self._call("send", "POST", "/api/v2/leads/add", json={
             "campaign_id": self._account.campaign_id,
             "leads": [{"email": email, "custom_variables": {"ra_subject": subject,

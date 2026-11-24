@@ -231,10 +231,17 @@ def email_window_open(phone: Optional[str], *, now: Optional[datetime] = None) -
     return CALL_WINDOW_START <= local < CALL_WINDOW_END
 
 
+def _ghl_contact_reader() -> Optional[revalidate.GhlReader]:
+    """R1 0.4: the scoped GHL contact read the send check uses for ``ghl:`` cards; None while GHL is not configured."""
+    crm = get_crm_writer()
+    return crm.read_contact if crm is not None else None
+
+
 def make_send_check(engine: Engine, *, carrier_approved: bool = False,
                     text_window: Callable[[str], bool] = text_window_open,
                     email_window: Callable[[Optional[str]], bool] = email_window_open,
-                    wording_ok: Optional[Callable[..., bool]] = None) -> SendCheck:
+                    wording_ok: Optional[Callable[..., bool]] = None,
+                    ghl_reader: Optional[revalidate.GhlReader] = None) -> SendCheck:
     """Lending rule run by the relay right before a send. Returns a reason to block, or None.
 
     A text also waits for the carrier (10DLC) approval (LENDING_SMS_CARRIER_APPROVED) and for the borrower's
@@ -262,7 +269,7 @@ def make_send_check(engine: Engine, *, carrier_approved: bool = False,
             if action.channel in INSTANTLY_CHANNELS and conn.execute(_EMAIL_OPTED_OUT, {"e": email}).scalar():
                 return "recipient is suppressed or marked do-not-contact"
             changed = revalidate.changed_recipient(conn, action, sms_channels=SMS_CHANNELS,
-                                                   email_channels=EMAIL_CHANNELS)
+                                                   email_channels=EMAIL_CHANNELS, ghl_reader=ghl_reader)
             if changed is not None:
                 return changed  # R1 0.4: the lead's phone/email was edited after approval; held, never sent
             if action.channel in SMS_CHANNELS and not (phone and has_text_consent(conn, phone)):
@@ -720,7 +727,8 @@ def build_live_services(settings: AppSettings) -> Optional[CoraServices]:
                              bot_user_id, messages_client=messages_client, send_check=make_send_check(
                                  engine, carrier_approved=settings.lending_sms_carrier_approved,
                                  wording_ok=make_wording_ok(engine)
-                                 if settings.lending_graduated_approved_wording_only else None),
+                                 if settings.lending_graduated_approved_wording_only else None,
+                                 ghl_reader=_ghl_contact_reader()),
                              toolkit_factory=toolkit_factory, inbox_context=make_inbox_context(engine),
                              executors=build_egress_executors(), extension=RoutingSlack(web),
                              record_edits=True)

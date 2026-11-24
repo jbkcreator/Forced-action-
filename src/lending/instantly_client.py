@@ -100,9 +100,12 @@ def send_reply(account: InstantlyAccount, *, eaccount: str, reply_to_uuid: str, 
     except InstantlyError as exc:
         circuit_breaker.record_failure(circuit_breaker.CHANNEL_INSTANTLY, type(exc).__name__, ambiguous=exc.ambiguous)
         raise
-    circuit_breaker.record_success(circuit_breaker.CHANNEL_INSTANTLY)
     email_id = result.get("id")
-    return str(email_id) if email_id else None
+    if not email_id:  # Instantly's reply response carries the email id; without it the send is unconfirmed
+        circuit_breaker.record_failure(circuit_breaker.CHANNEL_INSTANTLY, "no_reply_id", ambiguous=True)
+        raise InstantlyError("/api/v2/emails/reply returned no email id", ambiguous=True)
+    circuit_breaker.record_success(circuit_breaker.CHANNEL_INSTANTLY)
+    return str(email_id)
 
 
 def block_address(account: InstantlyAccount, email: str) -> bool:
