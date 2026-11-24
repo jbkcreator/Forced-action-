@@ -174,3 +174,24 @@ def test_the_current_version_is_the_newest_snapshot(rules_db):
     _set(rules_db, 0.9)
     assert store.current_rule_version(rules_db) == 2
     assert [s["version_no"] for s in store.list_snapshots(rules_db)] == [2, 1]
+
+def test_rollback_and_import_preserve_seeded_json_null(rules_db):
+    from migrations.apply_lending_lender_rule_values import apply_to as seed_rules
+
+    seed_rules(rules_db.connection(), rules_db.info["schema"])
+    version = store.current_rule_version(rules_db)
+    exported = json.loads(json.dumps(store.get_snapshot(rules_db, version)))
+    assert any(row["value"] is None for row in exported)
+    _set(rules_db, 680, field="credit_floor")
+    store.rollback_to(rules_db, version, actor="test")
+    assert store.current_rules(rules_db) and any(row["value"] is None for row in store.current_rules(rules_db))
+    rules_db.execute(text("DELETE FROM lending.lender_rule_values"))
+    store.replace_rules(rules_db, exported, actor="test", reason="import")
+    assert any(row["value"] is None for row in store.current_rules(rules_db))
+
+def test_manual_writes_acquire_advisory_lock_before_statement(rules_db):
+    trigger = rules_db.execute(text("SELECT pg_get_triggerdef(oid) FROM pg_trigger "
+                                    "WHERE tgrelid = CAST(:table AS regclass) "
+                                    "AND tgname = 'lender_rule_values_lock'"),
+                               {"table": f'{rules_db.info["schema"]}.lender_rule_values'}).scalar_one()
+    assert "BEFORE INSERT OR DELETE OR UPDATE" in trigger and "FOR EACH STATEMENT" in trigger

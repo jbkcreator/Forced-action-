@@ -235,3 +235,34 @@ def test_the_newest_dump_is_found_and_an_empty_folder_is_refused(tmp_path):
     assert verify_backup_restore.latest_dump(tmp_path, "distress_db") == dump
     with pytest.raises(SystemExit):
         verify_backup_restore.latest_dump(tmp_path / "empty", "distress_db")
+
+def test_restore_verifier_ends_existence_transaction_before_probes(monkeypatch):
+    from sqlalchemy import create_engine, event
+    engine = create_engine("sqlite://")
+    @event.listens_for(engine, "connect")
+    def attach(dbapi_connection, _record):
+        dbapi_connection.create_function("to_regclass", 1, lambda _: "present")
+        dbapi_connection.execute("ATTACH DATABASE ':memory:' AS lending")
+        dbapi_connection.execute("CREATE TABLE lending.lender_rule_snapshots (reason text)")
+        dbapi_connection.execute("INSERT INTO lending.lender_rule_snapshots VALUES ('x')")
+    monkeypatch.setattr(verify_backup_restore, "create_engine", lambda _: engine)
+    assert verify_backup_restore.append_only_holds(make_url("sqlite://")) is False
+
+def test_staging_template_contains_required_startup_keys():
+    from pathlib import Path
+    from dotenv import dotenv_values
+    values = dotenv_values(Path("config/staging.env.example"))
+    assert {"ANTHROPIC_API_KEY", "FIRECRAWL_API_KEY", "COURT_LISTENER_API_KEY"} <= values.keys()
+
+
+def test_restore_verifier_does_not_treat_unexpected_sql_error_as_protection(monkeypatch):
+    from sqlalchemy import create_engine, event
+    from sqlalchemy.exc import DBAPIError
+    engine = create_engine("sqlite://")
+    @event.listens_for(engine, "connect")
+    def attach(dbapi_connection, _record):
+        dbapi_connection.create_function("to_regclass", 1, lambda _: "present")
+        dbapi_connection.execute("ATTACH DATABASE ':memory:' AS lending")
+    monkeypatch.setattr(verify_backup_restore, "create_engine", lambda _: engine)
+    with pytest.raises(DBAPIError):
+        verify_backup_restore.append_only_holds(make_url("sqlite://"))

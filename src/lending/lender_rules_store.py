@@ -338,9 +338,10 @@ _DELETE_NOT_IN = text("""
 """)
 _UPSERT_ALL = text("""
     INSERT INTO lending.lender_rule_values (lender_key, field, value, status, note, updated_by, effective_from)
-    SELECT x.lender_key, x.field, x.value, x.status, x.note, :actor, x.effective_from
-      FROM jsonb_to_recordset(CAST(:rules AS jsonb))
-           AS x(lender_key text, field text, value jsonb, status text, note text, updated_by text, effective_from date)
+    SELECT x.lender_key, x.field, item -> 'value', x.status, x.note, :actor, x.effective_from
+      FROM jsonb_array_elements(CAST(:rules AS jsonb)) AS item
+      CROSS JOIN LATERAL jsonb_to_record(item)
+           AS x(lender_key text, field text, status text, note text, updated_by text, effective_from date)
     ON CONFLICT (lender_key, field) DO UPDATE
        SET value = EXCLUDED.value, status = EXCLUDED.status, note = EXCLUDED.note,
            updated_by = EXCLUDED.updated_by, updated_at = now(), effective_from = EXCLUDED.effective_from

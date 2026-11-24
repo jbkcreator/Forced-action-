@@ -101,7 +101,7 @@ The same operations over HTTP, with `X-Admin-Token`: `GET /api/lending/lender-ru
 
 `scripts/pg_backup.py` (cron 03:20 UTC) writes `/var/backups/postgres/<database>_<UTC timestamp>.dump` (pg_dump custom
 format, seven days kept, the newest never deleted) and a `.counts.json` beside it with the row counts of the audit tables.
-Before this item the server had no database backup of its own; the provider's disk backups are the off-server copy.
+Configure cron MAILTO and a working local mail transport to receive failure notices; check delivery during setup. The provider's disk backups are the off-server copy.
 
 `scripts/verify_backup_restore.py --scratch-url postgresql://USER:PASSWORD@HOST/restore_check_test` restores the newest
 dump into a scratch database (its name must contain `test` and it must not be the app database) and checks that the dump
@@ -112,7 +112,7 @@ problem. The weekly cron line for it is commented out in `scripts/cron/crontab.t
 ## Staging mirror (R1 0.7)
 
 `config/staging.env.example` lists the settings that make a staging host a mirror of production that cannot reach a
-real borrower, lender or the production database. To copy production's rules to staging:
+real borrower, lender or the production database. Supply the three required API keys from the team secret manager, using staging-owned credentials. To copy production's rules to staging:
 
 ```
 # on production

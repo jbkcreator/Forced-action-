@@ -66,6 +66,15 @@ END
 $fn$ LANGUAGE plpgsql
 """
 
+_LOCK_FUNCTION = """
+CREATE OR REPLACE FUNCTION "{s}".lock_lender_rule_values() RETURNS trigger AS $fn$
+BEGIN
+    PERFORM pg_advisory_xact_lock({key});
+    RETURN NULL;
+END
+$fn$ LANGUAGE plpgsql
+"""
+
 _APPEND_ONLY_FUNCTION = """
 CREATE OR REPLACE FUNCTION "{s}".lender_rule_snapshots_append_only() RETURNS trigger AS $fn$
 BEGIN
@@ -82,12 +91,16 @@ def apply_to(conn: Connection, schema: str = LENDING_SCHEMA) -> None:
     for index in table.indexes:
         translated.execute(CreateIndex(index, if_not_exists=True))
 
-    for ddl in (_WRITE_FUNCTION, _TRIGGER_FUNCTION, _APPEND_ONLY_FUNCTION):
+    for ddl in (_WRITE_FUNCTION, _TRIGGER_FUNCTION, _LOCK_FUNCTION, _APPEND_ONLY_FUNCTION):
         conn.exec_driver_sql(ddl.format(s=schema, key=SNAPSHOT_LOCK_KEY))
     conn.exec_driver_sql(f'DROP TRIGGER IF EXISTS lender_rule_snapshots_append_only ON "{schema}".lender_rule_snapshots')
     conn.exec_driver_sql(
         f'CREATE TRIGGER lender_rule_snapshots_append_only BEFORE UPDATE OR DELETE ON "{schema}".lender_rule_snapshots '
         f'FOR EACH ROW EXECUTE FUNCTION "{schema}".lender_rule_snapshots_append_only()')
+    conn.exec_driver_sql(f'DROP TRIGGER IF EXISTS lender_rule_values_lock ON "{schema}".lender_rule_values')
+    conn.exec_driver_sql(
+        f'CREATE TRIGGER lender_rule_values_lock BEFORE INSERT OR UPDATE OR DELETE ON "{schema}".lender_rule_values '
+        f'FOR EACH STATEMENT EXECUTE FUNCTION "{schema}".lock_lender_rule_values()')
     conn.exec_driver_sql(
         f'DROP TRIGGER IF EXISTS lender_rule_values_snapshot ON "{schema}".lender_rule_values')
     conn.exec_driver_sql(

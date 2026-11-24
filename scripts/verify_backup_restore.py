@@ -25,6 +25,7 @@ from typing import Optional, Sequence
 
 from sqlalchemy import create_engine, text
 from sqlalchemy.engine import URL, make_url
+from sqlalchemy.exc import DBAPIError
 
 from config.settings import get_settings
 from scripts.pg_backup import DEFAULT_DEST, audit_counts, pg_env
@@ -69,14 +70,18 @@ def append_only_holds(scratch: URL) -> bool:
         with engine.connect() as conn:
             if conn.execute(text("SELECT to_regclass('lending.lender_rule_snapshots')")).scalar() is None:
                 return True  # not installed yet: nothing to check
+            conn.rollback()  # the existence query starts a transaction
             for statement in ("UPDATE lending.lender_rule_snapshots SET reason = reason",
                               "DELETE FROM lending.lender_rule_snapshots"):
                 tx = conn.begin()
                 try:
                     conn.execute(text(statement))
                     return False
-                except Exception:
-                    pass
+                except DBAPIError as exc:
+                    original = exc.orig
+                    if ((getattr(original, "pgcode", None) or getattr(original, "sqlstate", None)) != "P0001" or
+                            "lender_rule_snapshots is append-only" not in str(original)):
+                        raise
                 finally:
                     tx.rollback()
     finally:
