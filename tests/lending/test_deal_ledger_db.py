@@ -16,7 +16,8 @@ from sqlalchemy.orm import Session
 from config.lending_standing_sends import AUTO_GRADUATED_ACTOR
 from migrations.apply_lending_deal_audit_ledger import apply_to as apply_ledger
 from migrations.apply_lending_lender_rule_snapshots import apply_to as apply_snapshots
-from src.lending import deal_ledger, state_machine as sm
+from src.lending import state_machine as sm
+from src.lending.audit import deal_ledger
 from src.lending import lender_rules_store as rules
 from src.lending.contracts import BorrowerRecord, DeclineReason, LoanFile, LoanStage, PropertySchema
 from src.lending.models import (
@@ -272,6 +273,14 @@ def test_card_events_are_caught_up_once_and_only_for_cards_that_belong_to_a_file
     assert deal_ledger.sync_card_events(db) == 2
     assert deal_ledger.sync_card_events(db) == 0
     assert _types(db, file_id) == ["file_created", "cora_draft", "cora_draft"]
+
+
+def test_a_card_is_not_guessed_onto_one_of_several_files_with_the_same_phone(ledger_db):
+    db = ledger_db
+    first, second = _new_file(db), _new_file(db, address="9 Elm St")
+    _card(db, phone="+18135550101", secs=10)
+    assert deal_ledger.sync_card_events(db) == 0
+    assert "cora_draft" not in _types(db, first) + _types(db, second)
 
 
 def test_a_card_is_found_through_its_document_chase(ledger_db):

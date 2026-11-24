@@ -20,6 +20,7 @@ class QuoteRecord:
     rules_fired: list[str]
     unconfirmed: bool
     api_key_label: str
+    loan_file_id: Optional[int] = None  # R1 0.8: the file the quote is for; ledgered with the quote when given
 
 
 def _json_safe(value: Any) -> Any:
@@ -32,8 +33,9 @@ def _json_safe(value: Any) -> Any:
     return value
 
 
-def audit_record(request: Any, result: Any, caller_label: str) -> QuoteRecord:
-    """The audit row for one quote: the request and result as JSON, and who asked (an API key bucket, or "cora")."""
+def audit_record(request: Any, result: Any, caller_label: str, loan_file_id: Optional[int] = None) -> QuoteRecord:
+    """The audit row for one quote: the request and result as JSON, who asked (an API key bucket, or "cora"), and
+    the loan file it is for, when the caller knows it."""
     return QuoteRecord(
         status=result.status,
         reason=result.reason,
@@ -42,6 +44,7 @@ def audit_record(request: Any, result: Any, caller_label: str) -> QuoteRecord:
         rules_fired=list(result.rules_fired),
         unconfirmed=result.unconfirmed,
         api_key_label=caller_label,
+        loan_file_id=loan_file_id,
     )
 
 
@@ -52,7 +55,9 @@ class QuoteStore(Protocol):
 
 
 class SqlQuoteStore:
-    """Commits each record in its own transaction before returning, so no quote leaves unaudited."""
+    """Commits each record in its own transaction before returning, so no quote leaves unaudited.  A quote for a
+    loan file is recorded in that file's deal ledger in the same transaction (R1 0.8; a ledger problem is logged and
+    never withholds the quote)."""
 
     def save(self, record: QuoteRecord) -> str:
         with lending_session() as db:
@@ -76,4 +81,9 @@ class SqlQuoteStore:
                     "api_key_label": record.api_key_label,
                 },
             ).scalar_one()
+            if record.loan_file_id is not None:
+                from src.lending.audit import deal_ledger
+
+                actor = deal_ledger.ACTOR_CORA if record.api_key_label == "cora" else deal_ledger.system("instant_quote")
+                deal_ledger.record_quote(db, record.loan_file_id, str(quote_id), actor=actor)
         return str(quote_id)

@@ -1,14 +1,14 @@
 # Deal audit ledger (Release 1, item 0.8)
 
 `lending.deal_audit_events` is an append-only record of everything that happens to a loan file. Code:
-`src/lending/deal_ledger.py`; migration: `migrations/apply_lending_deal_audit_ledger.py`; endpoint:
+`src/lending/audit/deal_ledger.py`; migration: `migrations/apply_lending_deal_audit_ledger.py`; endpoint:
 `src/api/lending_deal_ledger_router.py`.
 
 ## Read a file's whole life
 
 ```
-python -m src.lending.deal_ledger --loan-file 12            # one line per event, oldest first
-python -m src.lending.deal_ledger --loan-file 12 --json
+python -m src.lending.audit.deal_ledger --loan-file 12            # one line per event, oldest first
+python -m src.lending.audit.deal_ledger --loan-file 12 --json
 GET /api/lending/loan-files/12/lifecycle                      # X-Admin-Token
 ```
 
@@ -40,11 +40,13 @@ The table refuses UPDATE, DELETE and TRUNCATE (triggers), and a loan file that h
 * **Partner flow** (live before the ledger, so a ledger problem must not block a partner notice): the partner door
   creating a file, a status change by the router, and the lender-fit evaluation (`quote_generated`, `kind: lender_fit`)
   record through `record_safely`: a failure is logged and skipped.
-* **Quotes**: an instant quote is recorded when it is tied to a file (when a document chase starts with a `quote_id`),
-  stamped with the time the quote was made and the rule version then.
+* **Quotes**: an instant quote made with a `loan_file_id` (the instant-quote API body or Cora's `instant_quote` tool)
+  is recorded in the same transaction as the quote. A quote made without one is recorded when it is tied to a file
+  (when a document chase starts with its `quote_id`), stamped with the time the quote was made and the rule version
+  then. A quote request carries no borrower, so a quote with no file named cannot be placed earlier.
 * **Cora's cards**: drafts, edits and approvals live in the agent tables, so Cora's minute sweep catches them up
   (`sync_card_events`, last 3 days, safe to repeat). Expect up to a minute of delay. A card is tied to a file by its
-  `deal_ref` (`loan_file:<id>`, `doc_chase:<id>`) or else by the borrower's phone (the newest file for that number); a
+  `deal_ref` (`loan_file:<id>`, `doc_chase:<id>`) or else by the borrower's phone (only when exactly one file has that number); a
   card about nobody in the pipeline is not recorded. A card approved by a graduated template shows as
   `system:standing_send`.
 

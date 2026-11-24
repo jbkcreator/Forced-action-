@@ -27,7 +27,7 @@ from config.lending_closing import (
     UPLOAD_LINK_PATH,
 )
 from packages.agent_core.send_gate import SendGate
-from src.lending import deal_ledger
+from src.lending.audit import deal_ledger
 from src.lending.closing.drafts import Recipient, chase_draft, submit_draft
 from src.lending.closing.rules import build_checklist, due_chase_day
 from src.lending.cora_inbox import add_to_inbox_safely

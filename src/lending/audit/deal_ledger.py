@@ -14,10 +14,10 @@ Two ways in:
 * A catch-up pass (``sync_card_events``) for Cora's cards, run by her minute sweep: drafts, approvals and edits live in
   ``packages/agent_core``'s own tables, which cannot call into ``src``.  Each event has a ``dedupe_key``, so the pass can
   run any number of times.  A card is tied to a loan file through its ``deal_ref`` (``loan_file:<id>`` or
-  ``doc_chase:<id>``) or, failing that, the borrower's phone (the newest file for that number); a card about nothing in
+  ``doc_chase:<id>``) or, failing that, the borrower's phone (only when exactly one file has that number); a card about nothing in
   the pipeline is not ledgered.
 
-    python -m src.lending.deal_ledger --loan-file 12 [--json]
+    python -m src.lending.audit.deal_ledger --loan-file 12 [--json]
 """
 from __future__ import annotations
 
@@ -193,8 +193,8 @@ resolved AS (
         CASE WHEN c.deal_ref ~ '^loan_file:[0-9]+$' THEN substr(c.deal_ref, 11)::bigint END,
         (SELECT d.loan_file_id FROM lending.doc_chases d
           WHERE c.deal_ref ~ '^doc_chase:[0-9]+$' AND d.id = substr(c.deal_ref, 11)::bigint),
-        (SELECT f.id FROM lending.loan_files f WHERE f.borrower_phone = c.recipient_phone
-          ORDER BY f.created_at DESC LIMIT 1)) AS loan_file_id
+        (SELECT min(f.id) FROM lending.loan_files f WHERE f.borrower_phone = c.recipient_phone
+          HAVING count(*) = 1)) AS loan_file_id
       FROM cards c
 )
 """

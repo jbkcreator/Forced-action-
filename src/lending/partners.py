@@ -50,7 +50,7 @@ from config.lending_partners import (
 )
 from src.lending.contracts import DeclineReason, LoanStage
 from src.services.phone_utils import normalize
-from src.lending import deal_ledger
+from src.lending.audit import deal_ledger
 
 logger = logging.getLogger(__name__)
 

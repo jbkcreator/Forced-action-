@@ -37,7 +37,7 @@ from config.lending_partners import (
     PRODUCTS,
     SOURCE_PARTNER,
 )
-from src.lending import deal_ledger
+from src.lending.audit import deal_ledger
 from src.lending.contracts import BorrowerProfile, LenderFitResult, LoanRequest
 from src.lending.partners import Partner, StatusChange, partner_by_id, record_status_change
 from src.lending.prequal import TEMPLATE, FitLimits, PrequalLead, build_context

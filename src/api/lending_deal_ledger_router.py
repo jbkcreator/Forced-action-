@@ -14,7 +14,7 @@ from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from src.api.lending_loan_stage_router import require_admin_token
-from src.lending import deal_ledger
+from src.lending.audit import deal_ledger
 from src.lending.db import get_lending_db
 
 logger = logging.getLogger(__name__)

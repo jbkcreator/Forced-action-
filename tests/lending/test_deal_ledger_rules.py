@@ -12,7 +12,8 @@ from pydantic import SecretStr
 
 from config.lending_standing_sends import AUTO_GRADUATED_ACTOR
 from src.api import lending_deal_ledger_router as ledger_router
-from src.lending import deal_ledger, state_machine
+from src.lending import state_machine
+from src.lending.audit import deal_ledger
 
 REPO = Path(__file__).resolve().parents[2]
 
@@ -188,7 +189,7 @@ def _writers() -> dict[str, int]:
 def test_every_path_that_writes_a_loan_file_is_classified():
     assert _writers() == LOAN_FILE_WRITES, (
         "a statement that writes lending.loan_files was added or removed: record a deal_ledger event for it "
-        "(src/lending/deal_ledger.py) or classify it in LOAN_FILE_WRITES with a reason")
+        "(src/lending/audit/deal_ledger.py) or classify it in LOAN_FILE_WRITES with a reason")
 
 
 @pytest.mark.parametrize("path", MUST_REFERENCE_THE_LEDGER)

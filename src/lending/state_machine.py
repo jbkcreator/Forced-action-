@@ -26,7 +26,7 @@ from typing import Any, Mapping, Optional
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
-from src.lending import deal_ledger
+from src.lending.audit import deal_ledger
 from src.lending.contracts import (
     LOAN_STAGE_ORDER,
     BorrowerRecord,

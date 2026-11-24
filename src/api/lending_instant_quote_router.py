@@ -49,6 +49,7 @@ class QuoteIn(BaseModel):
     rehab: Decimal = Field(ge=0, le=MAX_DEAL_AMOUNT)
     arv: Decimal = Field(gt=0, le=MAX_DEAL_AMOUNT)
     existing_debt: Optional[Decimal] = Field(default=None, ge=0, le=MAX_DEAL_AMOUNT)
+    loan_file_id: Optional[int] = Field(default=None, ge=1)  # R1 0.8: ledger the quote on this loan file
 
 
 
@@ -146,7 +147,7 @@ def instant_quote(
     quote_request = _to_request(body)
     result = quote(quote_request, new_construction_exit_rule=get_settings().lending_instant_quote_exit_rule_enabled)
     try:
-        quote_id = store.save(audit_record(quote_request, result, key_bucket))
+        quote_id = store.save(audit_record(quote_request, result, key_bucket, body.loan_file_id))
     except Exception as exc:
         logger.error("[instant-quote] audit write failed, quote withheld: %s state=%s purpose=%s status=%s key=%s",
                      type(exc).__name__, quote_request.state, quote_request.purpose, result.status, key_bucket)

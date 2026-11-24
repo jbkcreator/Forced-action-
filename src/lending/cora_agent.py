@@ -46,7 +46,7 @@ from packages.agent_core.slack_session import InboundMessage, SlackSession, run_
 from packages.agent_core.store import AgentStore
 from packages.agent_core.thread_history import build_history
 from packages.agent_core.tools import ToolContext, ToolRegistry
-from src.lending import deal_ledger
+from src.lending.audit import deal_ledger
 from src.lending.agent_jobs.drive import google_job_folders
 from src.lending.agent_jobs.worker import JobQueueWorker, make_check, may_send_without_card
 from src.lending.attempt_log import lending_ghl_readers
