@@ -314,6 +314,7 @@ def test_the_migration_is_idempotent_and_relaxes_the_not_null_columns(legacy_db)
 def test_the_documented_migration_order_works_on_an_empty_schema():
     """Review 3: text_consents is created from the model (the PR 319 migration) before loan_files exists; the foreign
     key arrives with the state-machine migration, after the partner door has created loan_files."""
+    from migrations.apply_lending_loan_file_status_events import apply_to as apply_status_events
     from migrations.apply_lending_partner_door import apply_to as apply_partner_door
 
     schema = f"r101e_{uuid.uuid4().hex[:9]}"
@@ -322,6 +323,7 @@ def test_the_documented_migration_order_works_on_an_empty_schema():
         translated = conn.execution_options(schema_translate_map={LENDING_SCHEMA: schema})
         LendingTextConsent.__table__.create(translated)          # the PR 319 migration's step
         apply_partner_door(conn, schema)
+        apply_status_events(conn, schema)                         # documented: after the partner door
         apply_to(conn, schema)
         apply_to(conn, schema)                                    # re-run finds the key and adds no second one
         keys = conn.execute(text(
