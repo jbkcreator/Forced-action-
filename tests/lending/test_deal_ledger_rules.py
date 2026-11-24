@@ -173,8 +173,11 @@ LOAN_FILE_WRITES = {
     # 3: lender_fit + PDF path (quote_generated); the other two stamp partner-notice delivery times (notice_*), which is
     # delivery bookkeeping, not a change to the deal.
     "src/lending/partner_pipeline.py": 3,
+    # 1: a person links the file to its GHL deal (field_update, dedupe key per file and deal).
+    "src/lending/ghl_stage_bridge.py": 1,
 }
-MUST_REFERENCE_THE_LEDGER = ("src/lending/state_machine.py", "src/lending/partners.py", "src/lending/partner_pipeline.py")
+MUST_REFERENCE_THE_LEDGER = ("src/lending/state_machine.py", "src/lending/partners.py", "src/lending/partner_pipeline.py",
+                             "src/lending/ghl_stage_bridge.py")
 
 
 def _writers() -> dict[str, int]:
