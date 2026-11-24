@@ -32,7 +32,6 @@ All times UTC. Add to the app-user's crontab on the production server (`crontab 
 # Load validator — 8:30 AM daily (after scoring; alerts on zero-record or anomalous scrapers)
 30 8 * * *     cd /opt/forced-action && python -m src.tasks.load_validator   >> /var/log/fa-load-validator.log 2>&1
 
-# DB backup — daily 1 AM UTC (before scrapers), weekly on Sunday
-0 1 * * *      cd /opt/forced-action && python scripts/backup_db.py          >> /var/log/fa-backup.log 2>&1
-0 1 * * 0      cd /opt/forced-action && python scripts/backup_db.py --weekly >> /var/log/fa-backup.log 2>&1
+# DB backup — daily 03:20 UTC (before scrapers); scripts/backup_db.py no longer exists, see scripts/pg_backup.py
+20 3 * * *     cd /opt/forced-action && PYTHONPATH=. python scripts/pg_backup.py >> /var/log/fa-backup.log 2>&1
 ```
