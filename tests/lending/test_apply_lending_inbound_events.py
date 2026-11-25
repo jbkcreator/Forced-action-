@@ -40,6 +40,8 @@ def test_the_sql_store_saves_once_per_key_and_marks_rows(lending_db):
     with store.transaction() as tx:
         assert tx.lock(event_id).status == "processed"
     other = store.insert_raw("test_source", "key-2", {"b": 1})
-    store.mark_failed(other, None, "DatabaseDown")  # not saved to the DLQ: stays received for reclaim
+    with store.transaction() as tx:
+        assert tx.lock(other).status == "received"
+        tx.mark_failed(other, None, "DatabaseDown")  # without a DLQ row, leave it available for reclaim
     with store.transaction() as tx:
         assert tx.lock(other).status == "received"
