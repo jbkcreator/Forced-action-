@@ -50,6 +50,7 @@ Reporter = Callable[[str, dict[str, Any], BaseException], Optional[int]]  # webh
 HANDLER_MODULES: tuple[str, ...] = (
     "src.lending.instantly_webhook",
     "src.lending.booking_webhook",
+    "src.lending.inbound.ghl_stage",
     "src.lending.inbound.lendingflow",
     "src.lending.reply_webhook",
 )
