@@ -26,6 +26,7 @@ from src.lending.db import lending_session
 logger = logging.getLogger(__name__)
 
 DEFAULT_LIST_LIMIT = 50
+REPLAY_BATCH_SIZE = 50
 
 _COLUMNS = ("id, endpoint, payload, ghl_contact_id, attempts, last_error, created_at, gave_up_at, resolved_at "
             "FROM lending.webhook_failures")
@@ -33,7 +34,7 @@ _LIST = text(f"SELECT {_COLUMNS} ORDER BY id DESC LIMIT :limit")
 _SHOW = text(f"SELECT {_COLUMNS} WHERE id = :id")
 _ONE = text(f"SELECT {_COLUMNS} WHERE id = :id FOR UPDATE")
 # Open or given up, not resolved; a row the sweep is replaying right now is skipped, not waited for.
-_OF_ENDPOINT = text(f"SELECT {_COLUMNS} WHERE endpoint = :endpoint AND resolved_at IS NULL ORDER BY id "
+_OF_ENDPOINT = text(f"SELECT {_COLUMNS} WHERE endpoint = :endpoint AND resolved_at IS NULL AND id > :after ORDER BY id LIMIT :limit "
                     "FOR UPDATE SKIP LOCKED")
 _REOPEN = text("UPDATE lending.webhook_failures SET gave_up_at = NULL WHERE id = :id")
 
@@ -102,10 +103,17 @@ def replay_id(db, failure_id: int) -> bool:
 
 def replay_endpoint(db, endpoint: str) -> bool:
     """Replay each open or given-up failure of ``endpoint`` once; True only when every one succeeded."""
-    rows = db.execute(_OF_ENDPOINT, {"endpoint": endpoint}).all()
-    results = [_replay(db, row) for row in rows]
-    logger.info("[dlq] %s: %d replayed, %d still failing", endpoint, results.count(True), results.count(False))
-    return all(results)
+    after = succeeded = failed = 0
+    while rows := db.execute(_OF_ENDPOINT, {"endpoint": endpoint, "after": after, "limit": REPLAY_BATCH_SIZE}).all():
+        for row in rows:
+            if _replay(db, row):
+                succeeded += 1
+            else:
+                failed += 1
+        after = rows[-1].id
+        db.commit()
+    logger.info("[dlq] %s: %d replayed, %d still failing", endpoint, succeeded, failed)
+    return failed == 0
 
 
 def main(argv: Optional[list[str]] = None, *, session_factory: Callable = lending_session) -> int:

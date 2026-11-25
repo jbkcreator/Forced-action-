@@ -96,8 +96,14 @@ def _resend_hint(endpoint: str) -> str:
 def save_failure(endpoint: str, body: dict[str, Any], error: str) -> int:
     """Store the payload for replay on a connection of its own (the request's transaction has failed)."""
     with lending_session() as db:
-        return int(db.execute(_INSERT, {"endpoint": endpoint, "payload": json.dumps(body),
-                                        "contact": contact_id_of(body), "error": error}).scalar_one())
+        return insert_failure(db, endpoint, body, error)
+
+
+def insert_failure(db, endpoint: str, body: dict[str, Any], error: str) -> int:
+    """Insert a retry row in the caller's transaction."""
+    return int(db.execute(_INSERT, {"endpoint": endpoint, "payload": json.dumps(body),
+                                    "contact": contact_id_of(body), "error": error}).scalar_one())
+
 
 
 def report_webhook_failure(endpoint: str, body: dict[str, Any], error: BaseException, *,

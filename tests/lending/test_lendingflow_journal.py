@@ -72,10 +72,17 @@ def store(monkeypatch):
 def reported(monkeypatch):
     saved: list[tuple[str, dict, str]] = []
 
-    def report(endpoint, body, error):
+    def insert(db, endpoint, body, error):
+        saved.append((endpoint, body, error))
+        return 900 + len(saved)
+
+    def report(endpoint, body, error, *, save=None):
+        if save is not None:
+            return save()
         saved.append((endpoint, body, type(error).__name__))
         return 900 + len(saved)
 
+    monkeypatch.setattr(webhook_failures, "insert_failure", insert)
     monkeypatch.setattr(webhook_failures, "report_webhook_failure", report)
     return saved
 
@@ -195,35 +202,6 @@ class _NullDb:
 
 
 # ---- reconcile replay (T8) ---------------------------------------------------------------------------------------
-
-def test_replay_creates_a_missing_lead_once(store, leads, reported):
-    assert lf_inbound.replay_lendingflow_body(_payload()) == "created"
-    assert lf_inbound.replay_lendingflow_body(_payload()) == "duplicate"
-    assert len(leads.leads) == 1
-
-
-def test_replay_of_a_lead_the_webhook_already_stored_is_a_duplicate(client, store, leads, reported):
-    _post(client)
-    assert lf_inbound.replay_lendingflow_body(_payload()) == "duplicate"
-    assert len(leads.leads) == 1
-
-
-def test_replay_of_a_lead_stored_before_the_journal_is_a_duplicate(store, leads, reported):
-    leads.leads.append(("LF-1", "older-hash"))  # stored by the direct path: no journal row
-    assert lf_inbound.replay_lendingflow_body(_payload()) == "duplicate"
-    assert len(leads.leads) == 1
-
-
-def test_replay_of_an_unparseable_body_saves_nothing(store, leads, reported):
-    assert lf_inbound.replay_lendingflow_body({"lead_id": "LF-9"}) == "invalid"
-    assert store.rows == {} and leads.leads == []
-
-
-def test_replay_failure_is_saved_for_retry(store, leads, reported):
-    leads.error = DatabaseDown()
-    assert lf_inbound.replay_lendingflow_body(_payload()) == "failed"
-    assert len(reported) == 1
-
 
 # ---- D6 optional HMAC --------------------------------------------------------------------------------------------
 

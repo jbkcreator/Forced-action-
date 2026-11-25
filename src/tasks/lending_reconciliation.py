@@ -4,8 +4,7 @@
 
 One job, a list of source slots. A slot finds the events of the trailing window that never reached us
 (``find_missing(since)`` -> payloads) and heals each one through the normal journal handler (``heal(payload)``,
-raises when the event was not healed). Slots: GHL stage (this module) and LendingFlow leads from the nginx edge log
-(``src.lending.inbound.lendingflow_edge_log``).
+raises when the event was not healed). The GHL stage slot fetches records directly from GHL.
 
 Cron fires at 06:00 and 07:00 UTC; only the run that is 2:xx ET acts (``--force`` for any time). Off until
 ``LENDING_RECONCILE_ENABLED``. One post to ``LENDING_OPS_CHANNEL`` only when something was healed or failed; a failure
@@ -218,10 +217,7 @@ def _pipeline_ids() -> list[str]:
 
 
 def default_slots() -> list[Slot]:
-    from src.lending.inbound.lendingflow_edge_log import LendingFlowEdgeLogSlot
-
-    return [GhlStageSlot(lending_ghl_account(), _pipeline_ids()),
-            LendingFlowEdgeLogSlot(get_settings().lending_lendingflow_body_log)]
+    return [GhlStageSlot(lending_ghl_account(), _pipeline_ids())]
 
 
 # ---- job -------------------------------------------------------------------------------------------------------

@@ -63,10 +63,17 @@ def dlq(monkeypatch):
     """What the journal hands to webhook_failures when a handler fails: (source, payload, error class)."""
     saved: list[tuple[str, dict, str]] = []
 
-    def report(source, payload, exc):
+    def insert(db, source, payload, exc):
+        saved.append((source, payload, exc))
+        return len(saved)
+
+    def report(source, payload, exc, *, save=None):
+        if save is not None:
+            return save()
         saved.append((source, payload, type(exc).__name__))
         return len(saved)
 
+    monkeypatch.setattr(webhook_failures, "insert_failure", insert)
     monkeypatch.setattr(webhook_failures, "report_webhook_failure", report)
     return saved
 

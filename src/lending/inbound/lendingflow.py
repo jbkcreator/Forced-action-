@@ -3,7 +3,6 @@
 The endpoint (``src/lending/lendingflow_webhook.py``) keeps its 401 / 413 / 400 checks, then calls ``ingest_lead``:
 the raw body is saved first, ``save_lead`` runs in the journal's transaction, and a failure goes to
 ``webhook_failures`` (retried every 5 minutes through the same handler) while the endpoint still answers 200.
-``replay_lendingflow_body`` is the same path for the 2 AM reconcile (T8): it never creates a second lead.
 
 Dedup key = ``vendor_lead_id|dedupe_hash`` (a lead without a LendingFlow id already carries the hash in its id).
 An exact re-send is a journal duplicate; a re-send that changed the phone/email or the lead id gets its own row and
@@ -11,20 +10,17 @@ reaches ``save_lead``, which records it against the existing lead and raises the
 """
 from __future__ import annotations
 
-import logging
 from typing import Any, Literal
 
 from config.lending_lendingflow import is_missing_lead_id
 from src.lending.inbound import journal
-from src.lending.lendingflow import ParsedLendingFlowLead, ParseError, SaveResult, dedupe_hash, parse_lendingflow, save_lead
-
-logger = logging.getLogger(__name__)
+from src.lending.lendingflow import ParsedLendingFlowLead, SaveResult, dedupe_hash, parse_lendingflow, save_lead
 
 SOURCE = "lendingflow_lead"
 LABEL = "LendingFlow lead"
-RESEND_HINT = "replay it from the LendingFlow nginx edge log or ask LendingFlow to resend the lead"
+RESEND_HINT = "ask LendingFlow to resend the lead"
 
-ReplayOutcome = Literal["created", "duplicate", "failed", "invalid"]
+ReplayOutcome = Literal["created", "duplicate", "failed"]
 
 
 def dedup_key(parsed: ParsedLendingFlowLead) -> str:
@@ -50,16 +46,3 @@ def outcome_of(result: journal.IngestResult) -> ReplayOutcome:
     if result.outcome == "processed":
         return "created" if result.value.created else "duplicate"
     return result.outcome
-
-
-def replay_lendingflow_body(raw: dict[str, Any]) -> ReplayOutcome:
-    """Reconcile entry point: one logged LendingFlow body through the live path. ``invalid`` = does not parse
-    (nothing saved); ``failed`` = saved to the DLQ for the 5-minute retry. Raises when the raw save fails.
-    GHL delivery of a created lead is left to ``lending_lendingflow_sweep``."""
-    try:
-        parsed = parse_lendingflow(raw)
-    except ParseError as exc:
-        logger.warning("[lendingflow] replay skipped: %s", exc)
-        return "invalid"
-    return outcome_of(ingest_lead(parsed, raw))
-

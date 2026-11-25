@@ -5,7 +5,7 @@ No database: the journal store is an in-memory fake with the same contract as th
 """
 from __future__ import annotations
 
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from types import SimpleNamespace
 
 import pytest
@@ -19,7 +19,7 @@ RAW = {"contact_id": "ghl-c-42", "phone": "+18135559301", "message": "hello"}
 class MemoryTx:
     def __init__(self, store: "MemoryStore"):
         self.store = store
-        self.db = SimpleNamespace(name="fake-db")
+        self.db = SimpleNamespace(name="fake-db", begin_nested=nullcontext)
         self.processed: list[int] = []
 
     def lock(self, event_id: int, *, skip_locked: bool = False):
@@ -27,6 +27,9 @@ class MemoryTx:
             return None
         row = self.store.rows[event_id]
         return SimpleNamespace(id=row.id, source=row.source, status=row.status, raw=dict(row.raw))
+
+    def mark_failed(self, event_id, failure_id, error_class):
+        self.store.mark_failed(event_id, failure_id, error_class)
 
     def mark_processed(self, event_id: int) -> None:
         self.processed.append(event_id)

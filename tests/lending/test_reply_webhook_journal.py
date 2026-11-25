@@ -94,7 +94,7 @@ class FakeStore:
     @contextmanager
     def transaction(self):
         processed = []
-        tx = SimpleNamespace(db=self.db, mark_processed=processed.append,
+        tx = SimpleNamespace(db=self.db, mark_processed=processed.append, mark_failed=self.mark_failed,
                              lock=lambda event_id, skip_locked=False: self.rows[event_id])
         try:
             yield tx
@@ -140,10 +140,17 @@ def saved(monkeypatch):
     """webhook_failures rows the journal saved: (endpoint, body, error class)."""
     rows: list[tuple[str, dict, str]] = []
 
-    def report(endpoint, body, error):
+    def insert(db, endpoint, body, error):
+        rows.append((endpoint, body, error))
+        return len(rows)
+
+    def report(endpoint, body, error, *, save=None):
+        if save is not None:
+            return save()
         rows.append((endpoint, body, type(error).__name__))
         return len(rows)
 
+    monkeypatch.setattr(webhook_failures, "insert_failure", insert)
     monkeypatch.setattr(webhook_failures, "report_webhook_failure", report)
     return rows
 
@@ -223,7 +230,11 @@ def test_a_failed_handoff_keeps_the_after_hours_answer(client, poster, saved, se
 
 def test_a_handoff_that_cannot_be_saved_retries_the_whole_message(client, poster, store, monkeypatch):
     poster.error = RuntimeError("slack down")
-    monkeypatch.setattr(webhook_failures, "report_webhook_failure", lambda endpoint, body, error: None)
+    monkeypatch.setattr(webhook_failures, "report_webhook_failure", lambda endpoint, body, error, **kwargs: None)
+    def fail_insert(*args):
+        raise ConnectionError("db down")
+
+    monkeypatch.setattr(webhook_failures, "insert_failure", fail_insert)
     response = post(client, RATE_QUESTION)
     assert response.status_code == 200 and response.json() == {"status": "failed"}
     assert [r.status for r in store.rows.values()] == ["received"]  # the 5-minute reclaim runs it again

@@ -39,6 +39,9 @@ class FakeTable:
     def begin_nested(self):
         yield
 
+    def commit(self):
+        pass
+
     def execute(self, statement, params=None):
         sql, params = " ".join(str(statement).split()), dict(params or {})
         if sql.startswith("SELECT"):
@@ -47,6 +50,8 @@ class FakeTable:
                 rows = [r for r in rows if r.id == params["id"]]
             if "endpoint = :endpoint" in sql:
                 rows = [r for r in rows if r.endpoint == params["endpoint"] and r.resolved_at is None]
+            if "after" in params:
+                rows = [r for r in rows if r.id > params["after"]][:params["limit"]]
             return SimpleNamespace(all=lambda: rows, first=lambda: rows[0] if rows else None)
         row = self.rows[params["id"]]
         if "SET resolved_at = now()" in sql:
@@ -118,6 +123,7 @@ def test_replay_all_runs_every_open_or_given_up_failure_of_one_endpoint(monkeypa
 
 
 def test_replay_all_exits_non_zero_when_any_replay_fails(monkeypatch, caplog):
+    monkeypatch.setattr(dlq_handler, "REPLAY_BATCH_SIZE", 1)
     calls: list[int] = []
 
     def first_fails(db, body):

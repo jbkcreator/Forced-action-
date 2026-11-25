@@ -111,6 +111,8 @@ class JournalTx(Protocol):
 
     def mark_processed(self, event_id: int) -> None: ...
 
+    def mark_failed(self, event_id: int, failure_id: Optional[int], error_class: str) -> None: ...
+
 
 class JournalStore(Protocol):
     def insert_raw(self, source: str, dedup_key: str, raw: dict[str, Any]) -> Optional[int]: ...
@@ -118,8 +120,6 @@ class JournalStore(Protocol):
     def find_id(self, source: str, dedup_key: str) -> int: ...
 
     def transaction(self) -> Any: ...  # context manager yielding a JournalTx; commits on a clean exit
-
-    def mark_failed(self, event_id: int, failure_id: Optional[int], error_class: str) -> None: ...
 
     def stuck_ids(self, *, older_than_seconds: int, max_attempts: int, limit: int) -> list[int]: ...
 
@@ -166,6 +166,9 @@ class _SqlTx:
     def mark_processed(self, event_id: int) -> None:
         self.db.execute(_PROCESSED, {"id": event_id})
 
+    def mark_failed(self, event_id: int, failure_id: Optional[int], error_class: str) -> None:
+        self.db.execute(_FAILED, {"id": event_id, "failure_id": failure_id, "error": error_class})
+
 
 class SqlJournalStore:
     """``lending.inbound_events`` through the lending database; every call is its own transaction."""
@@ -187,10 +190,6 @@ class SqlJournalStore:
     def transaction(self) -> Iterator[_SqlTx]:
         with self._session() as db:
             yield _SqlTx(db)
-
-    def mark_failed(self, event_id: int, failure_id: Optional[int], error_class: str) -> None:
-        with self._session() as db:
-            db.execute(_FAILED, {"id": event_id, "failure_id": failure_id, "error": error_class})
 
     def stuck_ids(self, *, older_than_seconds: int, max_attempts: int, limit: int) -> list[int]:
         with self._session() as db:
@@ -228,7 +227,6 @@ def ingest(source: str, dedup_key: str, raw: dict[str, Any], *, rerun_duplicates
     body could not be saved (the endpoint answers 5xx so the sender delivers it again)."""
     _handler_for(source)  # an unregistered source is a programming error: fail before saving anything
     store = store or SqlJournalStore()
-    report = report or webhook_failures.report_webhook_failure  # looked up per call so tests can patch it
     key = _normalize_key(dedup_key)
     try:
         event_id = store.insert_raw(source, key, raw)
@@ -244,35 +242,37 @@ def ingest(source: str, dedup_key: str, raw: dict[str, Any], *, rerun_duplicates
 
 
 def _process(store: JournalStore, event_id: int, *, rerun: bool, skip_locked: bool,
-             report: Reporter) -> IngestResult:
-    """Lock the row, run its handler and mark it processed in one transaction. A row already processed (or
-    failed and owned by the retry), or held by another worker when ``skip_locked``, is a duplicate."""
-    source, raw = "", {}
-    try:
-        with store.transaction() as tx:
-            row = tx.lock(event_id, skip_locked=skip_locked)
-            if row is None or (row.status != "received" and not rerun):
-                return IngestResult(event_id=event_id, outcome="duplicate")
-            source, raw = row.source, row.raw
-            value = _handler_for(source)(tx.db, raw)
+             report: Optional[Reporter]) -> IngestResult:
+    """Keep the journal lock through either success or the durable retry handoff."""
+    failure = None
+    failure_id = None
+    with store.transaction() as tx:
+        row = tx.lock(event_id, skip_locked=skip_locked)
+        if row is None or row.status == "failed" or (row.status != "received" and not rerun):
+            return IngestResult(event_id=event_id, outcome="duplicate")
+        try:
+            with tx.db.begin_nested():
+                value = _handler_for(row.source)(tx.db, row.raw)
+        except Exception as exc:
+            failure = exc
+            if report is not None:
+                failure_id = report(row.source, row.raw, exc)
+            else:
+                try:
+                    with tx.db.begin_nested():
+                        failure_id = webhook_failures.insert_failure(tx.db, row.source, row.raw, type(exc).__name__)
+                except Exception as save_exc:
+                    logger.error("[lending-inbound] %s #%s retry insert failed: %s",
+                                 row.source, event_id, type(save_exc).__name__)
+            tx.mark_failed(event_id, failure_id, type(exc).__name__)
+        else:
             tx.mark_processed(event_id)
-    except Exception as exc:  # class only
-        return _record_failure(store, source, event_id, raw, exc, report)
-    logger.info("[lending-inbound] %s #%s processed", source, event_id)
+    if failure is not None:
+        if report is None:
+            webhook_failures.report_webhook_failure(row.source, row.raw, failure, save=lambda *_: failure_id)
+        return IngestResult(event_id=event_id, outcome="failed", failure_id=failure_id)
+    logger.info("[lending-inbound] %s #%s processed", row.source, event_id)
     return IngestResult(event_id=event_id, outcome="processed", value=value)
-
-
-def _record_failure(store: JournalStore, source: str, event_id: int, raw: dict[str, Any], exc: BaseException,
-                    report: Reporter) -> IngestResult:
-    error = type(exc).__name__
-    logger.error("[lending-inbound] %s #%s handler failed: %s", source, event_id, error)
-    failure_id = report(source, raw, exc) if raw else None
-    try:
-        store.mark_failed(event_id, failure_id, error)
-    except Exception as mark_exc:  # the row stays 'received'; reclaim_stuck runs it again
-        logger.error("[lending-inbound] %s #%s could not be marked failed: %s", source, event_id,
-                     type(mark_exc).__name__)
-    return IngestResult(event_id=event_id, outcome="failed", failure_id=failure_id)
 
 
 @dataclass
@@ -287,7 +287,6 @@ def reclaim_stuck(*, store: Optional[JournalStore] = None,
     """Run each row still ``received`` after STUCK_AFTER_SECONDS (its worker died between save and process)
     once through the normal path. A row another worker holds is skipped (FOR UPDATE SKIP LOCKED)."""
     store = store or SqlJournalStore()
-    report = report or webhook_failures.report_webhook_failure
     result = ReclaimResult()
     for event_id in store.stuck_ids(older_than_seconds=STUCK_AFTER_SECONDS,
                                     max_attempts=webhook_failures.MAX_RETRY_ATTEMPTS, limit=RECLAIM_BATCH_SIZE):
