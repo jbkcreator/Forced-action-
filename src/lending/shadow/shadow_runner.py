@@ -24,6 +24,7 @@ No SendGate, PendingActionQueue or write session other than the shadow store is 
 from __future__ import annotations
 
 import argparse
+import difflib
 import json
 import logging
 from collections.abc import Callable
@@ -123,14 +124,6 @@ _LAST_MESSAGE_TIME = text("""
       AND created_at < :before
 """)
 
-_DEAL_OUTCOME = text("""
-    SELECT stage, closed_at, closed_reason
-    FROM lending.loan_files
-    WHERE id = CAST(split_part(:deal_ref, ':', 2) AS bigint)
-      AND deal_ref LIKE 'loan_file:%'
-""")
-
-
 # ── Feature extraction ───────────────────────────────────────────────────────
 
 def _build_features(card: Any, db: Session, now: datetime) -> CardFeatures:
@@ -228,7 +221,7 @@ def _derive_actual(card_row: Any) -> Optional[str]:
     if status == "rejected":
         return "reject"
 
-    if status in ("approved", "sent", "sending", "sent", "failed"):
+    if status in ("approved", "sent", "sending", "failed"):
         revisions = card_row.get("revisions") or []
         if isinstance(revisions, str):
             try:
@@ -266,9 +259,6 @@ def _edit_distance(revisions: Any, final_body: str) -> Optional[float]:
         first_body = revisions[0].get("payload", {}).get("body", "") or ""
     if not first_body and not final_body:
         return None
-    # Simple character-based normalised edit distance (no Levenshtein library required)
-    # Uses SequenceMatcher ratio for a cheap approximation
-    import difflib
     ratio = difflib.SequenceMatcher(None, first_body, final_body).ratio()
     return round(1.0 - ratio, 4)
 
@@ -356,7 +346,23 @@ class ShadowRunnerStep:
             for row in open_rows:
                 actual = _derive_actual(row)
                 if actual is None:
-                    continue  # not decided yet
+                    # Cards permanently stuck or past the 14-day window never get a real decision.
+                    # Write 'no_decision' so miss-rate stays accurate instead of leaving actual=NULL.
+                    card_age_days = (now - row["created_at"]).days if row.get("created_at") else None
+                    permanently_terminal = row["status"] in ("expired", "held", "blocked")
+                    past_window = card_age_days is not None and card_age_days > SHADOW_WINDOW_DAYS
+                    if permanently_terminal or past_window:
+                        store.fill_actual(
+                            db,
+                            subject_ref=row["subject_ref"],
+                            actual="no_decision",
+                            decided_at=None,
+                            decision_seconds=None,
+                            edit_distance=None,
+                            send_result=None,
+                        )
+                        result.filled += 1
+                    continue  # not decided yet (or just wrote no_decision)
 
                 payload = row["payload"] if isinstance(row["payload"], dict) else json.loads(row["payload"])
                 body = payload.get("body", "") or ""

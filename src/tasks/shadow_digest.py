@@ -17,8 +17,7 @@ Volume note (from 0.9-GRILL-DECISIONS.md): ~1.5 cards/day at pre-launch, so n wi
 """
 from __future__ import annotations
 
-import math
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Optional, Sequence
 
 MATCH_N_THRESHOLD = 20   # D15: show match % and kappa only once this many decisions exist
@@ -132,15 +131,17 @@ def build_shadow_section(
     baseline_rows: Sequence[dict],
     day_number: int,
     shadow_sent_count: int,
+    yesterday_rows: Optional[Sequence[dict]] = None,
 ) -> str:
     """Return the Slack-ready text section for one shadow class.
 
     Args:
         class_name:        The shadow class being reported (e.g. "auto-send-judge-v1").
-        class_rows:        All shadow_decisions rows for this class since start.
+        class_rows:        All shadow_decisions rows for this class since start (cumulative).
         baseline_rows:     All shadow_decisions rows for the baseline class (same period).
         day_number:        Days since the class was started (1-based).
         shadow_sent_count: Count of pending_actions requested_by LIKE 'shadow:%'.  Must be 0.
+        yesterday_rows:    Optional subset of class_rows scored/decided yesterday (D15).
     """
     if day_number <= SHADOW_WINDOW_DAYS:
         header = f"*Shadow mode — {class_name}* (day {day_number}/{SHADOW_WINDOW_DAYS})"
@@ -150,10 +151,6 @@ def build_shadow_section(
     n_scored = len(class_rows)
     n_decided = sum(1 for r in class_rows if r.get("actual") not in (None, "no_decision"))
     n_no_decision = sum(1 for r in class_rows if r.get("actual") == "no_decision")
-
-    # Yesterday's row subset (all rows in class_rows that have decided_at set to yesterday)
-    # (caller passes all rows since start; "yesterday" is computed from decided_at)
-    # For the section, we report cumulative stats (spec D15).
 
     risky = _risky_misses(class_rows)
     risky_rate = _risky_miss_rate(class_rows)
@@ -165,7 +162,13 @@ def build_shadow_section(
 
     lines: list[str] = [header, ""]
 
-    # Counts
+    # Yesterday's counts (D15)
+    if yesterday_rows is not None:
+        y_scored = len(yesterday_rows)
+        y_decided = sum(1 for r in yesterday_rows if r.get("actual") not in (None, "no_decision"))
+        lines.append(f"Yesterday: scored {y_scored}  |  decided {y_decided}")
+
+    # Cumulative counts
     lines.append(f"Scored: {n_scored}  |  Decided: {n_decided}  |  No decision yet: {n_no_decision}")
 
     # Risky-miss rate (headline)

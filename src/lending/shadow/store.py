@@ -35,6 +35,7 @@ shadow_sent_count(db) → int
 """
 from __future__ import annotations
 
+import json
 import logging
 from datetime import datetime
 from typing import Any, Optional
@@ -148,7 +149,6 @@ def insert_decision(
     proposed: dict[str, Any],
 ) -> Optional[int]:
     """Insert-if-absent.  Returns the new row id, or None when the row already existed."""
-    import json as _json
     row = db.execute(
         _INSERT_DECISION,
         {
@@ -156,10 +156,10 @@ def insert_decision(
             "class_version": class_version,
             "subject_kind": subject_kind,
             "subject_ref": subject_ref,
-            "inputs": _json.dumps(inputs),
+            "inputs": json.dumps(inputs),
             "rule_version": rule_version,
             "confidence": confidence,
-            "proposed": _json.dumps(proposed),
+            "proposed": json.dumps(proposed),
         },
     ).mappings().first()
     return row["id"] if row else None
