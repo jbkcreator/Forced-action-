@@ -1,0 +1,5 @@
+# R1 0.5 D13: http-level log format for the LendingFlow edge log. Copy to /etc/nginx/conf.d/lendingflow-body-log.conf
+# (conf.d is included inside the http block). One JSON object per line; $request_body is JSON-escaped (nginx >= 1.11.8).
+# The body holds a borrower's phone and email: the file is root-only and kept 7 days
+# (deploy/logrotate/lendingflow-body-log.example). Read by src/lending/inbound/lendingflow_edge_log.py.
+log_format lendingflow_body escape=json '{"t":"$time_iso8601","status":"$status","body":"$request_body"}';

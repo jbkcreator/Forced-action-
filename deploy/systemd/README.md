@@ -65,6 +65,22 @@ and a retrying `curl` of `http://127.0.0.1:8010/health` (after the restart). The
 before deploying this change**: `fa-api` no longer serves `/webhooks/lending/*`, and a dropped GHL opt-out is a do-not-contact compliance gap.
 Rollback: remove the nginx block and deploy the previous `fa-api`.
 
+### LendingFlow edge log (R1 0.5, one-time manual step)
+
+The 2 AM reconcile (`src.tasks.lending_reconciliation`) replays LendingFlow leads that reached nginx but were never
+stored (lending-api or the database down, a killed worker, a 5xx). nginx must log their bodies:
+
+```bash
+sudo cp deploy/nginx/lendingflow-body-log.conf.example /etc/nginx/conf.d/lendingflow-body-log.conf
+# add the "location = /api/lending/lendingflow" block from deploy/nginx/lending-api.conf.example above "location /api/lending/"
+sudo cp deploy/logrotate/lendingflow-body-log.example /etc/logrotate.d/lendingflow-body-log
+sudo touch /var/log/nginx/lendingflow_body.log && sudo chmod 600 /var/log/nginx/lendingflow_body.log
+sudo nginx -t && sudo systemctl reload nginx
+# .env: LENDING_LENDINGFLOW_BODY_LOG=/var/log/nginx/lendingflow_body.log
+```
+
+The file holds borrower phone numbers and emails: root-only, 7 days. It never holds the webhook secret (no headers).
+
 ## Prerequisites the units assume
 
 - `/root/Forced-action-/` — the checked-out repo
