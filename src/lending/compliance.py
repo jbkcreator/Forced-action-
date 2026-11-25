@@ -13,6 +13,7 @@ owns the transaction.
 from __future__ import annotations
 
 import hashlib
+from enum import Enum
 from collections import defaultdict
 import json
 from dataclasses import dataclass, replace
@@ -1559,9 +1560,10 @@ def reconcile_suppression(db, source_schema: str = "public", target_schema: str 
 SMS_LINE_TYPE_ALLOWED = "mobile"
 LINE_TYPE_UNKNOWN_RETRY_DAYS = 30
 LineTypeLookup = Callable[[str], dict]
+_UNKNOWN = "unknown"
 
 
-class SmsBlock:
+class SmsBlock(str, Enum):
     LANDLINE = "landline"
     NOT_MOBILE = "line_type_not_mobile"
     UNKNOWN = "line_type_unknown"
@@ -1581,7 +1583,7 @@ def _stored_line_type(db, phone: str) -> tuple[Optional[str], Optional[datetime]
 
 
 def _lookups_today(db, now: datetime) -> int:
-    day_start = now.astimezone(ZoneInfo("America/New_York")).replace(hour=0, minute=0, second=0, microsecond=0)
+    day_start = now.astimezone(ZoneInfo(DEFAULT_TZ)).replace(hour=0, minute=0, second=0, microsecond=0)
     return db.execute(
         text("SELECT count(*) FROM lending.contacts WHERE line_type_source = 'telnyx' AND line_type_checked_at >= :d"),
         {"d": day_start},
@@ -1611,7 +1613,7 @@ def _telnyx_line_type(db, phone: str, now: datetime, lookup: Optional[LineTypeLo
     if lookup is None:
         from src.services.telnyx_lookup import lookup_phone as lookup
     try:
-        line_type = (lookup(phone).get("type") or "unknown").lower()
+        line_type = (lookup(phone).get("type") or _UNKNOWN).lower()
     except Exception as exc:  # class only: the message can carry the number
         logger.warning("[lending-sms-gate] Telnyx line-type lookup failed (%s); number not texted", type(exc).__name__)
         return None
@@ -1620,7 +1622,7 @@ def _telnyx_line_type(db, phone: str, now: datetime, lookup: Optional[LineTypeLo
 
 
 def sms_block_reason(db, phone: str, *, now: Optional[datetime] = None,
-                     lookup: Optional[LineTypeLookup] = None) -> Optional[str]:
+                     lookup: Optional[LineTypeLookup] = None) -> Optional[SmsBlock]:
     """None when ``phone`` may be texted (a mobile number), else why not (``SmsBlock``). May spend one Telnyx lookup
     and write it to ``lending.contacts``; does not commit."""
     normalized = normalize_phone(phone)
@@ -1628,15 +1630,15 @@ def sms_block_reason(db, phone: str, *, now: Optional[datetime] = None,
         return SmsBlock.UNKNOWN
     now = now or datetime.now(timezone.utc)
     line_type, checked_at = _stored_line_type(db, normalized)
-    retry_unknown = line_type == "unknown" and (
+    retry_unknown = line_type == _UNKNOWN and (
         checked_at is None or checked_at < now - timedelta(days=LINE_TYPE_UNKNOWN_RETRY_DAYS))
     if line_type is None or retry_unknown:
         line_type = _telnyx_line_type(db, normalized, now, lookup) or line_type
     if line_type == SMS_LINE_TYPE_ALLOWED:
         return None
-    if line_type == "landline":
+    if line_type == SmsBlock.LANDLINE.value:
         return SmsBlock.LANDLINE
-    return SmsBlock.NOT_MOBILE if line_type and line_type != "unknown" else SmsBlock.UNKNOWN
+    return SmsBlock.NOT_MOBILE if line_type and line_type != _UNKNOWN else SmsBlock.UNKNOWN
 
 
 def sms_eligible(db, phone: str, **kwargs) -> bool:

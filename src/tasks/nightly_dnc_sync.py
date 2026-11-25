@@ -7,8 +7,8 @@ Instantly block-list sweep). This run is the backstop that makes every platform'
    Instantly block list we do not hold yet become internal opt-outs (``propagate_opt_out``). BatchDialer has no
    do-not-call list API; its opt-outs arrive as DNC_REQUEST call results through the CDR poller.
 2. Push: what our ledger shows as not yet done is pushed again: GHL do-not-disturb (``sync_ghl_dnd``, until it stops
-   making progress), pending BatchDialer removals, and every suppressed address missing from (or failed on) the
-   Instantly block-list queue.
+   making progress), pending BatchDialer removals, and every opted-out address missing from the Instantly block-list
+   queue (opt-outs only).
 
 Only ever adds suppression, never removes it. Each step runs in its own transaction, so one platform being down does
 not stop the others; any failure posts to the ops notice channel. National DNC is not re-checked here (weekly scrub).
@@ -25,7 +25,9 @@ from typing import Any, Optional
 
 from sqlalchemy import text
 
-from config.lending_compliance import OptOutChannel
+from src.utils.http_helpers import requests_get_with_retry
+
+from config.lending_compliance import OptOutChannel, SuppressionReason
 
 logger = logging.getLogger(__name__)
 
@@ -37,6 +39,7 @@ GHL_DND_MAX_ROUNDS = 50
 FetchEntries = Callable[[], Iterator[dict[str, Any]]]
 SessionFactory = Callable[[], Any]
 
+_OPT_OUT = SuppressionReason.OPT_OUT.value
 _KNOWN_EMAILS = text(
     "SELECT lower(email) FROM lending.suppression_list WHERE lower(email) = ANY(:emails) "
     "UNION SELECT lower(email) FROM lending.instantly_block_queue WHERE lower(email) = ANY(:emails)"
@@ -44,13 +47,9 @@ _KNOWN_EMAILS = text(
 _QUEUE_MISSING = text("""
     INSERT INTO lending.instantly_block_queue (email)
     SELECT DISTINCT lower(s.email) FROM lending.suppression_list s
-     WHERE s.email IS NOT NULL AND trim(s.email) <> ''
+     WHERE s.reason = :opt_out AND s.email IS NOT NULL AND trim(s.email) <> ''
        AND NOT EXISTS (SELECT 1 FROM lending.instantly_block_queue q WHERE q.email = lower(s.email))
     ON CONFLICT (email) DO NOTHING
-""")
-_REARM_FAILED = text("""
-    UPDATE lending.instantly_block_queue SET status = 'pending', attempts = 0, next_attempt_at = now(), last_error = NULL
-     WHERE status = 'failed'
 """)
 
 
@@ -86,11 +85,9 @@ def pull_instantly(db, entries: Iterator[dict[str, Any]]) -> int:
 
 
 def push_instantly(db) -> int:
-    """Queue every suppressed address the Instantly block-list queue lacks, and retry the ones that failed. Cora's
-    minute sweep sends them. Does not commit."""
-    queued = db.execute(_QUEUE_MISSING).rowcount or 0
-    rearmed = db.execute(_REARM_FAILED).rowcount or 0
-    return queued + rearmed
+    """Queue every opted-out address the Instantly block-list queue lacks; Cora's minute sweep sends them. A row that
+    already failed stays failed (its inbox item asks for a manual add). Does not commit."""
+    return db.execute(_QUEUE_MISSING, {"opt_out": _OPT_OUT}).rowcount or 0
 
 
 def push_ghl(db_factory: SessionFactory, ghl_dnd: Optional[Callable[[str], bool]] = None) -> int:
@@ -110,8 +107,6 @@ def push_ghl(db_factory: SessionFactory, ghl_dnd: Optional[Callable[[str], bool]
 def _instantly_entries() -> Iterator[dict[str, Any]]:
     """NDL's Instantly block list, page by page. UNVERIFIED against a live call: shape per the public v2 reference
     (GET /api/v2/block-lists-entries -> items[{id, bl_value, is_domain}], next_starting_after)."""
-    import requests
-
     from src.lending.instantly_client import TIMEOUT_SECONDS, lending_instantly_account
 
     account = lending_instantly_account()
@@ -122,8 +117,9 @@ def _instantly_entries() -> Iterator[dict[str, Any]]:
         params: dict[str, Any] = {"limit": INSTANTLY_PAGE_SIZE}
         if cursor:
             params["starting_after"] = cursor
-        response = requests.get(f"{account.base_url}/api/v2/block-lists-entries", params=params,
-                                headers={"Authorization": f"Bearer {account.api_key}"}, timeout=TIMEOUT_SECONDS)
+        response = requests_get_with_retry(f"{account.base_url}/api/v2/block-lists-entries", max_retries=3, params=params,
+                                           headers={"Authorization": f"Bearer {account.api_key}"},
+                                           timeout=TIMEOUT_SECONDS)
         response.raise_for_status()
         payload = response.json() or {}
         yield from payload.get("items") or []
@@ -140,12 +136,13 @@ def _step(report: SyncReport, name: str, run: Callable[[], int]) -> None:
         report.failures.append(name)
 
 
-def run_sync(db_factory: SessionFactory, *, fetch_ghl_dnd_page=None, fetch_instantly: Optional[FetchEntries] = None,
-             ghl_dnd: Optional[Callable[[str], bool]] = None, dialer_remover=None) -> SyncReport:
+def run_sync(db_factory: SessionFactory, *, fetch_ghl_dnd_page: Optional[Callable[[int], list[dict[str, Any]]]] = None,
+             fetch_instantly: Optional[FetchEntries] = None, ghl_dnd: Optional[Callable[[str], bool]] = None,
+             dialer_remover: Optional[Callable[..., None]] = None) -> SyncReport:
     """Pull, then push; each step in its own committed transaction. Fakes replace every platform in tests."""
     from src.lending import compliance
     from src.lending.ghl_account import lending_ghl_account
-    from src.lending.ghl_dnd_backstop import _ghl_fetch_dnd_page, run_backstop
+    from src.lending.ghl_dnd_backstop import fetch_ghl_dnd_page as live_ghl_page, run_backstop
     from src.lending.instantly_client import lending_instantly_account
 
     report = SyncReport()
@@ -157,7 +154,7 @@ def run_sync(db_factory: SessionFactory, *, fetch_ghl_dnd_page=None, fetch_insta
         return run
 
     if fetch_ghl_dnd_page is not None or lending_ghl_account() is not None:
-        _step(report, "ghl_pulled", in_tx(lambda db: run_backstop(db, fetch_dnd_page=fetch_ghl_dnd_page or _ghl_fetch_dnd_page)))
+        _step(report, "ghl_pulled", in_tx(lambda db: run_backstop(db, fetch_dnd_page=fetch_ghl_dnd_page or live_ghl_page)))
     if fetch_instantly is not None or lending_instantly_account() is not None:
         _step(report, "instantly_pulled", in_tx(lambda db: pull_instantly(db, (fetch_instantly or _instantly_entries)())))
     _step(report, "ghl_pushed", lambda: push_ghl(db_factory, ghl_dnd))
