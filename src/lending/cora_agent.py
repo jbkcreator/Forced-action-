@@ -147,6 +147,7 @@ class CoraServices(NamedTuple):
     block_list: Optional[Callable[[], Any]] = None  # P1.3: sends queued opt-out addresses to Instantly's block list
     backflip_alerts: Optional[Callable[[], int]] = None  # queues each new Backflip block for the inbox digest
     deal_ledger_sync: Optional[Callable[[], int]] = None  # R1 0.8: records card drafts, edits and approvals in the deal audit ledger
+    shadow_runner: Optional[Callable[[], Any]] = None  # R1 0.9: scores new cards for shadow classes and fills in outcomes
 
 
 def lending_channel_ids(settings: AppSettings) -> dict[str, str]:
@@ -629,6 +630,14 @@ def run_sweep(services: CoraServices) -> None:
             services.deal_ledger_sync()
         except Exception as exc:  # class only; the events are found again next sweep (each has a dedupe key)
             logger.error("[cora] deal ledger catch-up failed (%s); retrying next sweep", type(exc).__name__)
+    if services.shadow_runner is not None:
+        try:
+            result_sr = services.shadow_runner()
+            if result_sr and (result_sr.scored or result_sr.filled or result_sr.day14_alerts):
+                logger.info("[cora] shadow runner scored=%s filled=%s day14=%s",
+                            result_sr.scored, result_sr.filled, result_sr.day14_alerts)
+        except Exception as exc:  # class only; rows without a prediction are retried next sweep
+            logger.error("[cora] shadow runner failed (%s); retrying next sweep", type(exc).__name__)
     if services.block_list is not None:
         try:
             services.block_list()
@@ -752,6 +761,7 @@ def build_live_services(settings: AppSettings) -> Optional[CoraServices]:
                              agent_jobs=worker.run_once if worker is not None else None,
                              standing_sends=make_standing_sends_step(engine),
                              deal_ledger_sync=make_deal_ledger_step(engine),
+                             shadow_runner=make_shadow_runner_step(engine),
                              closing_blockers=closing_blockers, doc_chase=doc_chase,
                              block_list=BlockListSweep(engine),
                              after_hours_responder=run_send_cycle)
@@ -835,6 +845,12 @@ def make_standing_sends_step(engine: Engine) -> Callable[[], Any]:
     """P1.4 sweep step: record any card edit the revise handler missed, then graduate templates that meet the rule.
     Incremental (only drafts decided or revised since the last run), with a full pass at start and once a day."""
     return StandingSendsStep(engine)
+
+
+def make_shadow_runner_step(engine: Engine) -> Callable[[], Any]:
+    """R1 0.9 sweep step: score new cards for active shadow classes, fill in outcomes for older rows."""
+    from src.lending.shadow.shadow_runner import ShadowRunnerStep
+    return ShadowRunnerStep(engine)
 
 
 def make_instantly_replies(engine: Engine, store: AgentStore, config: AgentCoreConfig, messages_client: MessagesClient,
