@@ -35,8 +35,9 @@ class ToolContext:
     user_id: str
     is_approver: bool
     channel: str
-    thread_ts: str
+    thread_ts: str  # the conversation: the thread's parent, or the request itself when it was posted at top level
     tool_use_id: str
+    in_thread: bool = False  # the request was a reply inside an existing thread (thread_ts is then a live thread)
 
 
 @dataclass(frozen=True)

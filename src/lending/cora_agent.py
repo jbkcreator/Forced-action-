@@ -146,7 +146,37 @@ class CoraServices(NamedTuple):
     doc_chase: Optional[Callable[[], int]] = None  # P2.4: queues due document requests and reminders
     block_list: Optional[Callable[[], Any]] = None  # P1.3: sends queued opt-out addresses to Instantly's block list
     backflip_alerts: Optional[Callable[[], int]] = None  # queues each new Backflip block for the inbox digest
+    doc_link_revocation: Optional[Callable[[], int]] = None  # R1 0.2: revokes former approvers' document links
     deal_ledger_sync: Optional[Callable[[], int]] = None  # R1 0.8: records card drafts, edits and approvals in the deal audit ledger
+
+
+def make_doc_link_revocation(engine: Engine, approver_ids: frozenset[str]) -> Callable[[], int]:
+    """R1 0.2: each sweep, revoke the live document links of Slack users no longer in Cora's approver list. Cora
+    holds the current list (restarted when it changes), so lending-api never relies on its own cached copy."""
+    from src.lending.closing.doc_access import revoke_links_of_removed_approvers
+
+    def step() -> int:
+        with Session(engine) as session, session.begin():
+            return revoke_links_of_removed_approvers(session, approver_ids, datetime.now(timezone.utc))
+
+    return step
+
+
+def revoke_document_links_at_start(settings: AppSettings, approver_ids: frozenset[str]) -> int:
+    """R1 0.2: revoke former approvers' document links before anything else at start. Runs before the settings check
+    on purpose: removing the only approver leaves the list empty, so Cora refuses to start and never sweeps, and an
+    empty list here revokes every live Slack-issued link. A database failure is logged and never blocks the start;
+    the sweep retries every minute once Cora runs."""
+    if not settings.database_url:
+        return 0
+    engine = create_engine(str(settings.database_url), pool_pre_ping=True, connect_args={"connect_timeout": 10})
+    try:
+        return make_doc_link_revocation(engine, approver_ids)()
+    except Exception as exc:  # class only: SQL errors embed bound parameters
+        logger.error("[cora] document link revocation at start failed (%s)", type(exc).__name__)
+        return 0
+    finally:
+        engine.dispose()
 
 
 def lending_channel_ids(settings: AppSettings) -> dict[str, str]:
@@ -470,7 +500,8 @@ class CoraConversation:
 
     def _context(self, message: InboundMessage, tool_use_id: str) -> ToolContext:
         return ToolContext(user_id=message.user_id, is_approver=message.user_id in self._config.approver_user_ids,
-                           channel=message.channel, thread_ts=message.conversation_ts, tool_use_id=tool_use_id)
+                           channel=message.channel, thread_ts=message.conversation_ts, tool_use_id=tool_use_id,
+                           in_thread=message.thread_ts is not None)
 
     def _conversation_so_far(self, message: InboundMessage) -> list[dict[str, Any]]:
         """Inside a thread: that thread. Top level: only the channel's last few messages from the past hour.
@@ -588,6 +619,11 @@ def run_sweep(services: CoraServices) -> None:
     expired = services.session.expire_stale_actions()
     if expired:
         logger.info("[cora] expired %s stale draft(s)", expired)
+    if services.doc_link_revocation is not None:
+        try:
+            services.doc_link_revocation()
+        except Exception as exc:  # class only: SQL errors embed bound parameters; retried next sweep
+            logger.error("[cora] document link revocation failed (%s); retrying next sweep", type(exc).__name__)
     if services.instantly_replies is not None:
         try:
             replies = services.instantly_replies()
@@ -754,7 +790,8 @@ def build_live_services(settings: AppSettings) -> Optional[CoraServices]:
                              deal_ledger_sync=make_deal_ledger_step(engine),
                              closing_blockers=closing_blockers, doc_chase=doc_chase,
                              block_list=BlockListSweep(engine),
-                             after_hours_responder=run_send_cycle)
+                             after_hours_responder=run_send_cycle,
+                             doc_link_revocation=make_doc_link_revocation(engine, config.approver_user_ids))
 
 
 def build_closing_steps(settings: AppSettings, *, engine: Engine, chat: ChatPort, gate: SendGate,
@@ -890,6 +927,7 @@ def main(stop: Optional[threading.Event] = None) -> int:
         signal.signal(signum, lambda *_: stop.set())
     settings = get_settings()
     config = build_config(settings)
+    revoke_document_links_at_start(settings, config.approver_user_ids)
     missing = missing_settings(config)
     if missing:
         logger.error("[cora] not starting; missing settings: %s", ", ".join(missing))
