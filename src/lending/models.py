@@ -37,6 +37,7 @@ from config.lending_after_hours_conversation import (CHANNELS as CONVERSATION_CH
                                                      STATES as CONVERSATION_STATES)
 from config.lending_cohorts import REPLACEMENT_REQUESTED, REPLACEMENT_STATUSES
 from config.lending_text_back import SLOT_HOLDING_SQL
+from src.lending.contracts import DeclineReason, LoanStage
 
 LENDING_SCHEMA = "lending"
 
@@ -359,6 +360,10 @@ class LendingTextConsent(LendingBase):
     captured_by: Mapped[Optional[str]] = mapped_column(String(200))  # caller name for on_call_yes
     captured_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_now, server_default=text("now()"))
     revoked_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    # R1 0.1: ConsentRecord link. No ForeignKey here: apply_lending_pr319_client_feedback.py creates this table from the
+    # model, possibly before loan_files exists; apply_lending_loan_state_machine.py adds fk_text_consents_loan_file.
+    loan_file_id: Mapped[Optional[int]] = mapped_column(BigInteger)
+    schema_version: Mapped[int] = mapped_column(SmallInteger, nullable=False, default=1, server_default=text("1"))
 
     __table_args__ = (Index("uq_lending_text_consents_phone_source", "phone", "source", unique=True),)
 
@@ -1329,10 +1334,10 @@ class LendingLoanFile(LendingBase):
     borrower_email: Mapped[Optional[str]] = mapped_column(String(255))  # lower-cased
     product: Mapped[str] = mapped_column(String(20), nullable=False)  # flip / ground_up / dscr / other
     is_test: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default=text("false"))  # test traffic: left out of reports and caps, never out of suppression or consent
-    loan_amount: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    loan_amount: Mapped[Optional[int]] = mapped_column(BigInteger)  # R1 0.1: unknown stays NULL, never 0
     property_address: Mapped[Optional[str]] = mapped_column(String(200))
     property_city: Mapped[Optional[str]] = mapped_column(String(80))
-    property_state: Mapped[str] = mapped_column(String(2), nullable=False)  # USPS code
+    property_state: Mapped[Optional[str]] = mapped_column(String(2))  # USPS code; R1 0.1: unknown stays NULL
     property_zip: Mapped[Optional[str]] = mapped_column(String(10))
     purchase_price: Mapped[Optional[int]] = mapped_column(BigInteger)
     rehab_budget: Mapped[Optional[int]] = mapped_column(BigInteger)  # rehab or build budget
@@ -1354,13 +1359,33 @@ class LendingLoanFile(LendingBase):
     notice_failed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))  # retries gave up; Slack alerted
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_now, server_default=text("now()"))
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_now, server_default=text("now()"))
+    # R1 0.1: the 8-stage lifecycle is the source of truth; ``status`` above is derived from it (state_machine.STATUS_FOR_STAGE).
+    stage: Mapped[str] = mapped_column(String(24), nullable=False, default=LoanStage.INTAKE.value, server_default=text("'INTAKE'"))
+    closed_reason: Mapped[Optional[str]] = mapped_column(String(40))  # a DeclineReason code; the stage freezes where the deal died
+    closed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    borrower_id: Mapped[Optional[int]] = mapped_column(BigInteger, ForeignKey("lending.borrower_profiles.id"))
+    property_id: Mapped[Optional[int]] = mapped_column(BigInteger, ForeignKey("lending.properties.id"))
+    entity_id: Mapped[Optional[int]] = mapped_column(BigInteger, ForeignKey("lending.entities.id"))
+    payoff_balance: Mapped[Optional[int]] = mapped_column(BigInteger)  # unknown stays NULL, never 0
+    outstanding_balance: Mapped[Optional[int]] = mapped_column(BigInteger)  # payoff_balance minus payments; NULL while payoff is unknown
+    # The GHL deal this file is, linked by a person (ghl_stage_bridge --link). Only a linked file takes GHL Funded/Paid.
+    ghl_opportunity_id: Mapped[Optional[str]] = mapped_column(String(100))
+    schema_version: Mapped[int] = mapped_column(SmallInteger, nullable=False, default=1, server_default=text("1"))
 
     __table_args__ = (
         CheckConstraint("status IN ('received', 'held', 'routed', 'declined', 'approved', 'funded')",
                         name="ck_lending_loan_files_status"),
+        CheckConstraint("stage IN (" + ", ".join(f"'{x.value}'" for x in LoanStage) + ")", name="ck_lending_loan_files_stage"),
+        CheckConstraint("closed_reason IS NULL OR closed_reason IN (" + ", ".join(f"'{x.value}'" for x in DeclineReason) + ")",
+                        name="ck_lending_loan_files_closed_reason"),
+        CheckConstraint("(closed_reason IS NULL) = (closed_at IS NULL)", name="ck_lending_loan_files_closed_pair"),
+        Index("uq_lending_loan_files_borrower_property", "borrower_id", "property_id", unique=True,
+              postgresql_where=text("borrower_id IS NOT NULL AND property_id IS NOT NULL")),
         Index("idx_lending_loan_files_partner", "partner_id", "created_at"),
         Index("idx_lending_loan_files_status", "status", "status_at"),
         Index("idx_lending_loan_files_borrower_phone", "borrower_phone"),  # Slack name lookup by phone
+        Index("uq_lending_loan_files_ghl_opportunity", "ghl_opportunity_id", unique=True,
+              postgresql_where=text("ghl_opportunity_id IS NOT NULL")),
     )
 
 
@@ -1379,6 +1404,123 @@ class LendingLoanFileStatusEvent(LendingBase):
     __table_args__ = (
         Index("ix_lending_loan_file_status_events_at", "at"),
         Index("ix_lending_loan_file_status_events_file", "loan_file_id", "at"),
+    )
+
+
+class LendingBorrowerProfile(LendingBase):
+    """R1 0.1: one borrower.  Matched on normalized phone, then email (``state_machine.ingest_loan_file``)."""
+
+    __tablename__ = "borrower_profiles"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    first_name: Mapped[str] = mapped_column(String(80), nullable=False)
+    last_name: Mapped[str] = mapped_column(String(80), nullable=False)
+    phone: Mapped[Optional[str]] = mapped_column(String(20))  # phone_utils.normalize
+    email: Mapped[Optional[str]] = mapped_column(String(255))  # lower-cased
+    credit_band: Mapped[Optional[str]] = mapped_column(String(20))
+    schema_version: Mapped[int] = mapped_column(SmallInteger, nullable=False, default=1, server_default=text("1"))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_now, server_default=text("now()"))
+
+    __table_args__ = (
+        Index("uq_lending_borrower_profiles_phone", "phone", unique=True, postgresql_where=text("phone IS NOT NULL")),
+        Index("uq_lending_borrower_profiles_email", "email", unique=True, postgresql_where=text("email IS NOT NULL")),
+    )
+
+
+class LendingProperty(LendingBase):
+    """R1 0.1: one property, unique on its normalized address."""
+
+    __tablename__ = "properties"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    address_norm: Mapped[str] = mapped_column(String(300), nullable=False)
+    address: Mapped[str] = mapped_column(String(200), nullable=False)
+    city: Mapped[Optional[str]] = mapped_column(String(80))
+    state: Mapped[Optional[str]] = mapped_column(String(2))
+    zip_code: Mapped[Optional[str]] = mapped_column(String(10))
+    schema_version: Mapped[int] = mapped_column(SmallInteger, nullable=False, default=1, server_default=text("1"))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_now, server_default=text("now()"))
+
+    __table_args__ = (Index("uq_lending_properties_address_norm", "address_norm", unique=True),)
+
+
+class LendingEntity(LendingBase):
+    """R1 0.1: the borrowing LLC, unique on its normalized name.  Sunbiz standing arrives with item 1.8."""
+
+    __tablename__ = "entities"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    name_norm: Mapped[str] = mapped_column(String(200), nullable=False)
+    name: Mapped[str] = mapped_column(String(200), nullable=False)
+    state: Mapped[Optional[str]] = mapped_column(String(2))
+    sunbiz_status: Mapped[Optional[str]] = mapped_column(String(40))
+    schema_version: Mapped[int] = mapped_column(SmallInteger, nullable=False, default=1, server_default=text("1"))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_now, server_default=text("now()"))
+
+    __table_args__ = (Index("uq_lending_entities_name_norm", "name_norm", unique=True),)
+
+
+class LendingLenderSubmission(LendingBase):
+    """R1 0.1: one attempt to place a file with a lender.  A re-submit to the same lender is a new attempt_no."""
+
+    __tablename__ = "lender_submissions"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    loan_file_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("lending.loan_files.id"), nullable=False)
+    lender_key: Mapped[str] = mapped_column(String(60), nullable=False)
+    attempt_no: Mapped[int] = mapped_column(Integer, nullable=False)
+    status: Mapped[str] = mapped_column(String(20), nullable=False, default="submitted", server_default=text("'submitted'"))
+    schema_version: Mapped[int] = mapped_column(SmallInteger, nullable=False, default=1, server_default=text("1"))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_now, server_default=text("now()"))
+
+    __table_args__ = (
+        Index("uq_lending_lender_submissions_attempt", "loan_file_id", "lender_key", "attempt_no", unique=True),
+        Index("idx_lending_lender_submissions_file", "loan_file_id"),
+    )
+
+
+class LendingLoanStageEvent(LendingBase):
+    """R1 0.1: every stage event a file receives.  ``(source, source_event_id)`` is unique, so replaying an event
+    (a GHL retry, a duplicate notification) finds its row and changes nothing.  ``outcome``: applied / noop / rejected."""
+
+    __tablename__ = "loan_stage_events"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    loan_file_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("lending.loan_files.id"), nullable=False)
+    source: Mapped[str] = mapped_column(String(40), nullable=False)
+    source_event_id: Mapped[Optional[str]] = mapped_column(String(120))
+    from_stage: Mapped[Optional[str]] = mapped_column(String(24))
+    to_stage: Mapped[str] = mapped_column(String(24), nullable=False)
+    actor: Mapped[str] = mapped_column(String(80), nullable=False)
+    outcome: Mapped[str] = mapped_column(String(10), nullable=False)
+    reason: Mapped[Optional[str]] = mapped_column(String(200))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_now, server_default=text("now()"))
+
+    __table_args__ = (
+        CheckConstraint("outcome IN ('applied', 'noop', 'rejected')", name="ck_lending_loan_stage_events_outcome"),
+        Index("uq_lending_loan_stage_events_source_event", "source", "source_event_id", unique=True,
+              postgresql_where=text("source_event_id IS NOT NULL")),
+        Index("idx_lending_loan_stage_events_file", "loan_file_id", "created_at"),
+        Index("idx_lending_loan_stage_events_rejected", "created_at", postgresql_where=text("outcome = 'rejected'")),
+    )
+
+
+class LendingLoanPayment(LendingBase):
+    """R1 0.1: a payment or payoff on a file.  ``(source, payment_id)`` is unique: a duplicate notification inserts
+    nothing and recalculates no balance.  ``amount`` is NULL when the notice carries none (a GHL "Paid" move)."""
+
+    __tablename__ = "loan_payments"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    loan_file_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("lending.loan_files.id"), nullable=False)
+    source: Mapped[str] = mapped_column(String(40), nullable=False)
+    payment_id: Mapped[str] = mapped_column(String(120), nullable=False)
+    amount: Mapped[Optional[int]] = mapped_column(BigInteger)
+    received_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_now, server_default=text("now()"))
+
+    __table_args__ = (
+        Index("uq_lending_loan_payments_source_payment", "source", "payment_id", unique=True),
+        Index("idx_lending_loan_payments_file", "loan_file_id"),
     )
 
 
@@ -1440,6 +1582,7 @@ class LendingPartnerSubmission(LendingBase):
     borrower_notified: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default=text("false"))
     borrower_consent_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))  # live first contact logged
     confirm_failed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))  # confirmation gave up; Slack alerted
+    schema_version: Mapped[int] = mapped_column(SmallInteger, nullable=False, default=1, server_default=text("1"))  # R1 0.1
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_now, server_default=text("now()"))
 
 

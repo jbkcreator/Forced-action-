@@ -27,6 +27,7 @@ from sqlalchemy import text
 from src.lending.after_hours_intake import record_intake
 from src.lending.cora_inbox import add_to_inbox_in_own_session
 from src.lending.db import lending_session
+from src.lending.ghl_stage_bridge import apply_stage_payload
 from src.lending.ghl_consent_events import (
     InvalidEvent,
     contact_id_of,
@@ -41,13 +42,15 @@ logger = logging.getLogger(__name__)
 GHL_OPT_OUT = "ghl_opt_out"
 GHL_TEXT_CONSENT = "ghl_text_consent"
 AFTER_HOURS_INTAKE = "after_hours_intake"
+GHL_LOAN_STAGE = "ghl_loan_stage"  # R1 0.1: a GHL Funded / Paid move the loan file did not take
 ENDPOINT_HANDLERS: dict[str, Callable[[Any, dict[str, Any]], Any]] = {
+    GHL_LOAN_STAGE: apply_stage_payload,  # the replay key carries the file's stage, so it applies once
     GHL_OPT_OUT: record_ghl_opt_out,
     GHL_TEXT_CONSENT: record_inbound_consent,
     AFTER_HOURS_INTAKE: record_intake,  # a replay keeps the original call id, so it never pins twice
 }
 ENDPOINT_LABELS = {GHL_OPT_OUT: "opt-out (DND changed)", GHL_TEXT_CONSENT: "inbound text / consent",
-                   AFTER_HOURS_INTAKE: "after-hours voicemail"}
+                   AFTER_HOURS_INTAKE: "after-hours voicemail", GHL_LOAN_STAGE: "loan stage (Funded / Paid)"}
 MAX_RETRY_ATTEMPTS = 5
 RETRY_BATCH_SIZE = 50
 

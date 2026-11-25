@@ -11,7 +11,7 @@ from datetime import time, timedelta
 # Deals on the 7 AM card. New lead / Booked / Held / No show are leads (other alerts cover them).
 ACTIVE_STAGE_KEYS = frozenset({"application", "ready to fund", "submitted to lender"})
 # A document chase on a deal in one of these stops.
-CLOSED_STAGE_KEYS = frozenset({"funded", "lost", "nurture"})
+CLOSED_STAGE_KEYS = frozenset({"funded", "paid", "lost", "nurture"})  # "Paid": after Funded (R1 0.1)
 STUCK_AFTER = timedelta(days=3)  # brief: "stuck for more than 3 days"
 # GHL's stage webhook body carries no event time. A stage event repeated (same deal, same stage) within this long
 # of its first delivery is a redelivery and never moves the deal; a later repeat is a real move (a revived deal).

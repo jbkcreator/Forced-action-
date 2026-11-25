@@ -27,6 +27,7 @@ from src.lending.enrichment.webhook import router as lending_enrichment_router
 from src.api.lending_partner_router import router as lending_partner_router
 from src.api.lending_doc_upload_router import UploadTokenLogFilter, router as lending_doc_upload_router
 from src.api.lending_instant_quote_router import router as lending_instant_quote_router
+from src.api.lending_loan_stage_router import router as lending_loan_stage_router
 
 app = FastAPI(title="Lending API", docs_url=None, redoc_url=None)
 # Borrower upload links carry their token in the path: the access logs record it redacted.
@@ -56,6 +57,7 @@ lendingflow_events.subscribe(alert_josh)
 app.include_router(lending_partner_router)
 app.include_router(lending_doc_upload_router)
 app.include_router(lending_instant_quote_router)
+app.include_router(lending_loan_stage_router)
 
 
 @app.get("/health")
