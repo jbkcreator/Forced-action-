@@ -21,6 +21,7 @@ from src.lending.after_hours_conversation import (OUTCOME_ANSWERED, OUTCOME_NO_C
                                                   OUTCOME_SLOT_CHOSEN, conversations_enabled,
                                                   inbound_text_inquiry_key, open_conversation, record_reply)
 from src.lending.after_hours_responder import run_send_cycle_now
+from src.lending.inbound import journal
 from src.lending.instantly_replies import is_stop_request
 from src.lending.payload_shape import log_shape
 from src.lending.reply_guard import ReplyEvent, handle_reply_event, in_reply_hours, parse_event, slack_poster
@@ -50,6 +51,18 @@ def _open_for_inbound_text(db: Session, event: ReplyEvent, now: datetime) -> boo
                              first_name=event.first_name, now=now) is not None
 
 
+def _apply_after_hours(db: Session, event: ReplyEvent) -> bool:
+    """Apply an inbound message to its open after-hours conversation, or open one for an inbound text after hours.
+    True when it made a message or the booking due. Does not commit; raises when it cannot be saved."""
+    if event.direction != "inbound" or not conversations_enabled():
+        return False
+    now = datetime.now(timezone.utc)
+    outcome = record_reply(db, message_id=event.message_id, body=event.body, phone=event.phone,
+                           ghl_contact_id=event.contact_id, now=now)
+    opened = outcome == OUTCOME_NO_CONVERSATION and _open_for_inbound_text(db, event, now)
+    return opened or outcome in (OUTCOME_ANSWERED, OUTCOME_REPROMPT, OUTCOME_SLOT_CHOSEN)
+
+
 def _advance_after_hours_conversation(db: Session, event: ReplyEvent) -> Optional[bool]:
     """An inbound message from a lead in an open after-hours conversation is that conversation's next answer; an
     inbound text after hours from a lead with none starts one. True when it made a message or the booking due,
@@ -59,17 +72,60 @@ def _advance_after_hours_conversation(db: Session, event: ReplyEvent) -> Optiona
     if event.direction != "inbound" or not conversations_enabled():
         return False
     try:
-        now = datetime.now(timezone.utc)
-        outcome = record_reply(db, message_id=event.message_id, body=event.body, phone=event.phone,
-                               ghl_contact_id=event.contact_id, now=now)
-        opened = outcome == OUTCOME_NO_CONVERSATION and _open_for_inbound_text(db, event, now)
+        advanced = _apply_after_hours(db, event)
         db.commit()
-        return opened or outcome in (OUTCOME_ANSWERED, OUTCOME_REPROMPT, OUTCOME_SLOT_CHOSEN)
+        return advanced
     except Exception as exc:  # class only: the message text can carry personal details
         logger.error("[reply-webhook] after-hours conversation for message %s failed (%s)", event.message_id,
                      type(exc).__name__)
         db.rollback()
         return None
+
+
+# ---- inbound journal (R1 0.5, LENDING_INBOUND_JOURNAL_ENABLED) --------------------------------------------------
+
+JOURNAL_SOURCE = "ghl_reply"
+
+
+class ReplyHandoffNotConfigured(RuntimeError):
+    """A handoff is due but the replies channel or bot token is unset: saved for the 5-minute retry."""
+
+
+def handle_ghl_reply(db: Session, raw: dict[str, Any]) -> dict[str, Any]:
+    """The journal / replay handler: after-hours answer + Slack handoff in the caller's transaction (never commits).
+    Idempotent on the message id: an applied answer and a posted handoff are never applied twice. Raises when the
+    answer cannot be saved, the post fails or the channel is unset, so the whole message is retried."""
+    event = parse_event(raw)
+    if event is None:
+        return {"status": "ignored", "advanced": False}
+    advanced = _apply_after_hours(db, event)
+    outcome = handle_reply_event(db, event, poster=slack_poster(), commit=False)
+    if outcome == "not_configured":
+        raise ReplyHandoffNotConfigured("reply handoff channel is not configured")
+    return {"status": outcome, "advanced": advanced}
+
+
+journal.register_source(JOURNAL_SOURCE, handle_ghl_reply, label="GHL reply (handoff / after-hours answer)")
+
+
+def _journal_body(body: dict[str, Any], event: ReplyEvent) -> dict[str, Any]:
+    """The body as saved: a message without a GHL id keeps the fallback id it got now (it depends on the time),
+    so a replay later is still the same message."""
+    if body.get("messageId"):
+        return body
+    return {**body, "messageId": event.message_id}
+
+
+def _ghl_reply_via_journal(body: dict[str, Any], event: ReplyEvent, background: BackgroundTasks) -> dict[str, Any]:
+    try:
+        result = journal.ingest(JOURNAL_SOURCE, event.message_id, _journal_body(body, event))
+    except Exception:  # the journal logged the class; the body never reaches the log
+        raise HTTPException(status_code=503, detail="The reply could not be saved; it will be retried") from None
+    if result.outcome != "processed":
+        return {"status": result.outcome}
+    if result.value["advanced"]:
+        background.add_task(run_send_cycle_now)  # the next question, right after the response
+    return {"status": result.value["status"]}
 
 
 @router.post("/ghl-reply")
@@ -84,6 +140,8 @@ def ghl_reply(
     event = parse_event(body)
     if event is None:
         return {"status": "ignored", "reason": "no_message"}
+    if journal.journal_enabled():
+        return _ghl_reply_via_journal(body, event, background)
     advanced = _advance_after_hours_conversation(db, event)
     if advanced:
         background.add_task(run_send_cycle_now)  # the next question, right after the response
