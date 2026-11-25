@@ -68,6 +68,21 @@ def _src_logs_reach_caplog():
 
 
 @pytest.fixture(autouse=True)
+def _breaker_off_the_database(request, monkeypatch):
+    """R1 0.4: every GHL and Instantly send asks the channel breaker (a table in the shared database) first, and an
+    unreadable breaker refuses the send. Sender tests never touch it: admit lets everything through and nothing is
+    recorded. The breaker's own tests (test_channel_breaker_*) reach the real functions."""
+    if request.module.__name__.rsplit(".", 1)[-1].startswith("test_channel_breaker"):
+        return
+    from src.lending.dispatch import circuit_breaker
+
+    monkeypatch.setattr(circuit_breaker, "admit", lambda channel: None)
+    monkeypatch.setattr(circuit_breaker, "recheck", lambda channel: None)
+    monkeypatch.setattr(circuit_breaker, "record_success", lambda channel: None)
+    monkeypatch.setattr(circuit_breaker, "record_failure", lambda channel, error, *, ambiguous=False: False)
+
+
+@pytest.fixture(autouse=True)
 def _no_live_ghl(monkeypatch):
     """The shared DB holds real opt-outs: a test poll must never write them to the real GHL
     account. Tests that cover the GHL sync pass their own ``ghl_dnd``."""

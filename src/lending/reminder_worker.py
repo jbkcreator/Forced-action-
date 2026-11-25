@@ -51,7 +51,7 @@ from src.lending.compliance import phone_hash
 from src.lending.consent import has_text_consent
 from src.lending.db import lending_session
 from src.lending.ghl_email import get_email_sender
-from src.lending.ghl_sms import GhlSmsError, get_sender, texting_number
+from src.lending.ghl_sms import GhlChannelPaused, GhlSmsError, get_sender, texting_number
 
 logger = logging.getLogger(__name__)
 
@@ -209,6 +209,9 @@ def _send_text(db, row: Mapping[str, Any], *, now: datetime, sender: Optional[Te
     started[0] = True
     try:
         message_id = sender(row["contact_phone"], body, row["first_name"], deadline=slot)
+    except GhlChannelPaused:  # R1 0.4: nothing reached GHL; try again shortly, the slot deadline still applies
+        _requeue(db, row, now + timedelta(seconds=RETRY_DELAY_SECONDS), "channel_paused", count_attempt=False)
+        return "deferred_channel_paused"
     except GhlSmsError as exc:
         if exc.ambiguous:
             _record(db, rid, "send_unknown", "ambiguous_send_error", CHANNEL_TEXT)
@@ -238,6 +241,9 @@ def _send_email(db, row: Mapping[str, Any], *, now: datetime, sender: Optional[E
     try:
         message_id = sender(row["contact_email"], subject, body, phone=row["contact_phone"],
                             first_name=row["first_name"], deadline=row["slot_start_utc"])
+    except GhlChannelPaused:  # R1 0.4: nothing reached GHL; try again shortly
+        _requeue(db, row, now + timedelta(seconds=RETRY_DELAY_SECONDS), "channel_paused", count_attempt=False)
+        return "deferred_channel_paused"
     except GhlSmsError as exc:
         if exc.ambiguous:
             _record(db, rid, "send_unknown", "ambiguous_send_error", CHANNEL_EMAIL)

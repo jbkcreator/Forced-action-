@@ -17,6 +17,7 @@ borrower consent.
 """
 from __future__ import annotations
 
+import hashlib
 import logging
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -36,6 +37,7 @@ from config.lending_partners import (
     PRODUCTS,
     SOURCE_PARTNER,
 )
+from src.lending.audit import deal_ledger
 from src.lending.contracts import BorrowerProfile, LenderFitResult, LoanRequest
 from src.lending.partners import Partner, StatusChange, partner_by_id, record_status_change
 from src.lending.prequal import TEMPLATE, FitLimits, PrequalLead, build_context
@@ -53,7 +55,7 @@ Matrix = Sequence[LenderRules]
 FitEvaluator = Callable[[BorrowerProfile, LoanRequest, Matrix], LenderFitResult]
 FitLimitsLookup = Callable[[LenderFitResult, Matrix], list[FitLimits]]  # fitting lenders -> their loan-amount limits
 ContactCheck = Callable[[str], bool]  # phone -> True when the text window is open
-MatrixLoader = Callable[[], Matrix]
+MatrixLoader = Callable[[], tuple[Matrix, Optional[int]]]
 LetterSender = Callable[["Partner", dict, bytes], None]  # emails the pre-qual PDF to the partner  # the lender rules in force (config, or the DB table when LENDING_RULES_FROM_DB)
 
 _STATUS_WORDING = {
@@ -118,7 +120,7 @@ def live_services() -> PipelineServices:
     from src.lending.ghl_sms import get_sender
     from src.lending.lender_fit import evaluate_lender_fit
     from src.lending.compliance import text_window_open
-    from src.lending.lender_rules_store import current_matrix
+    from src.lending.lender_rules_store import current_matrix_with_version
     from src.lending.pdf.render import NON_BINDING_PREQUAL_WATERMARK, render_pdf
 
     from src.lending.partner_ghl import get_partner_letter_sink
@@ -143,7 +145,7 @@ def live_services() -> PipelineServices:
         render_pdf=lambda template, context: render_pdf(template, context, watermark=NON_BINDING_PREQUAL_WATERMARK),
         evaluate_fit=lambda borrower, loan, matrix: evaluate_lender_fit(borrower, loan, matrix=tuple(matrix)),
         fit_limits=fit_limits_from_result,
-        load_matrix=current_matrix,
+        load_matrix=current_matrix_with_version,
         opt_outs=_opt_outs,
         text_window_open=lambda phone: text_window_open(phone),
         upload_dir=settings.lending_partner_upload_dir,
@@ -345,8 +347,9 @@ def _process(file_id: int, services: PipelineServices, session_factory: Callable
 
     fit: Optional[LenderFitResult] = None
     matrix: Matrix = ()
+    rule_version: Optional[int] = None
     try:
-        matrix = services.load_matrix()
+        matrix, rule_version = services.load_matrix()
         fit = _score(services, file, matrix)
     except Exception as exc:
         logger.error("[partner-door] lender fit failed file=%s (%s)", file_id, type(exc).__name__)
@@ -364,6 +367,14 @@ def _process(file_id: int, services: PipelineServices, session_factory: Callable
                  "WHERE id = :id"),
             {"fit": fit.model_dump_json() if fit is not None else None, "pdf": pdf_path, "now": now, "id": file_id},
         )
+        if fit is not None:
+            deal_ledger.record_safely(
+                db, file_id, "quote_generated", actor=deal_ledger.system("partner_pipeline"), occurred_at=now,
+                rule_version=rule_version,
+                detail={"kind": "lender_fit", "fitting": [lender.lender_key for lender in fit.fitting],
+                        "possible": len(fit.possible), "non_fitting": len(fit.non_fitting),
+                        "missing_fields": fit.missing_fields},
+                dedupe_key=f"lender_fit:{file_id}:{hashlib.sha1(fit.model_dump_json().encode()).hexdigest()[:16]}")
         db.commit()  # keep the score and PDF even if routing fails below
         try:
             route_file(db, file_id, now=now)

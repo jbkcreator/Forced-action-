@@ -19,6 +19,7 @@ from typing import Optional
 import requests
 
 from config.settings import get_settings
+from src.lending.dispatch import circuit_breaker
 
 logger = logging.getLogger(__name__)
 
@@ -26,7 +27,24 @@ TIMEOUT_SECONDS = 20
 
 
 class InstantlyError(RuntimeError):
-    """Instantly refused or could not be reached. The message never carries the address or the text."""
+    """Instantly refused or could not be reached. The message never carries the address or the text.
+
+    ``ambiguous`` is True when Instantly may nonetheless have accepted the email (a timeout or connection error, or
+    HTTP 5xx): the outcome is unknown and the send must never be repeated."""
+
+    def __init__(self, message: str, *, ambiguous: bool = False) -> None:
+        super().__init__(message)
+        self.ambiguous = ambiguous
+
+
+class InstantlyChannelPaused(InstantlyError):
+    """Nothing was sent: the Instantly breaker is open (five failures in a row; a person must reopen it) or the
+    channel already sent its per-minute cap (``rate_limited``)."""
+
+    def __init__(self, cause: circuit_breaker.ChannelPaused) -> None:
+        super().__init__(str(cause))
+        self.channel = cause.channel
+        self.rate_limited = isinstance(cause, circuit_breaker.RateLimited)
 
 
 @dataclass(frozen=True)
@@ -53,9 +71,9 @@ def _post(account: InstantlyAccount, path: str, payload: dict) -> dict:
         response = requests.post(f"{account.base_url}{path}", json=payload, timeout=TIMEOUT_SECONDS,
                                  headers={"Authorization": f"Bearer {account.api_key}"})
     except requests.RequestException as exc:
-        raise InstantlyError(f"{path} unreachable ({type(exc).__name__})") from None
+        raise InstantlyError(f"{path} unreachable ({type(exc).__name__})", ambiguous=True) from None
     if response.status_code >= 400:
-        raise InstantlyError(f"{path} returned HTTP {response.status_code}")
+        raise InstantlyError(f"{path} returned HTTP {response.status_code}", ambiguous=response.status_code >= 500)
     try:
         return response.json() or {}
     except ValueError:
@@ -69,12 +87,25 @@ def send_reply(account: InstantlyAccount, *, eaccount: str, reply_to_uuid: str, 
 
     if is_globally_halted():
         raise InstantlyError("lending emergency halt is on; nothing was sent")
-    result = _post(account, "/api/v2/emails/reply", {
-        "eaccount": eaccount, "reply_to_uuid": reply_to_uuid, "subject": subject,
-        "body": {"text": body, "html": _html_body(body)},
-    })
+    try:
+        circuit_breaker.admit(circuit_breaker.CHANNEL_INSTANTLY)
+    except circuit_breaker.ChannelPaused as exc:
+        logger.warning("[instantly] reply refused: %s", exc.why)
+        raise InstantlyChannelPaused(exc) from None
+    try:
+        result = _post(account, "/api/v2/emails/reply", {
+            "eaccount": eaccount, "reply_to_uuid": reply_to_uuid, "subject": subject,
+            "body": {"text": body, "html": _html_body(body)},
+        })
+    except InstantlyError as exc:
+        circuit_breaker.record_failure(circuit_breaker.CHANNEL_INSTANTLY, type(exc).__name__, ambiguous=exc.ambiguous)
+        raise
     email_id = result.get("id")
-    return str(email_id) if email_id else None
+    if not email_id:  # Instantly's reply response carries the email id; without it the send is unconfirmed
+        circuit_breaker.record_failure(circuit_breaker.CHANNEL_INSTANTLY, "no_reply_id", ambiguous=True)
+        raise InstantlyError("/api/v2/emails/reply returned no email id", ambiguous=True)
+    circuit_breaker.record_success(circuit_breaker.CHANNEL_INSTANTLY)
+    return str(email_id)
 
 
 def block_address(account: InstantlyAccount, email: str) -> bool:

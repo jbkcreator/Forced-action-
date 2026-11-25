@@ -33,6 +33,7 @@ from src.lending.after_hours_intake import record_intake
 from src.lending.after_hours_responder import run_send_cycle_now
 from src.lending.closing.blockers import current_stage, upsert_current_stage
 from src.lending.cora_inbox import add_to_inbox_safely
+from src.lending.ghl_stage_bridge import GHL_STAGE_TO_LOAN_STAGE, apply_stage
 from src.lending.ghl_disposition_match import (
     InvalidDispositionEvent,
     attach_pending,
@@ -43,7 +44,8 @@ from src.lending.ghl_disposition_match import record_event as record_disposition
 from src.lending.ghl_missed_call import InvalidMissedCall, parse_missed_call, record_missed_call, run_text_back_now
 from src.lending.payload_shape import log_shape
 from src.lending.ghl_consent_events import InvalidEvent, field as _field, record_ghl_opt_out, record_inbound_consent
-from src.lending.webhook_failures import AFTER_HOURS_INTAKE, GHL_OPT_OUT, GHL_TEXT_CONSENT, report_webhook_failure
+from src.lending.webhook_failures import (AFTER_HOURS_INTAKE, GHL_LOAN_STAGE, GHL_OPT_OUT, GHL_TEXT_CONSENT,
+                                         report_webhook_failure)
 from src.services.phone_utils import normalize
 
 logger = logging.getLogger(__name__)
@@ -139,7 +141,11 @@ def _flag_held_stage(db: Session, opportunity_id: str, stage: str, now: datetime
 def _record_current_stage(db: Session, opportunity_id: str, stage: str, phone: Optional[str], *,
                           repeat: bool) -> None:
     """P2.4 current stage, in a savepoint: a failure is logged and never loses the scoreboard's stage event.
-    ``repeat``: the event was already recorded; a redelivery never moves the deal (blockers.upsert_current_stage)."""
+    ``repeat``: the event was already recorded; a redelivery never moves the deal (blockers.upsert_current_stage).
+
+    R1 0.1: for a stage that moves a loan file (Funded / Paid) the failure is re-raised instead. The loan bridge applies
+    an event only while it is the deal's current stage, so without this write it would skip a valid update as stale.
+    The webhook then rolls back and answers 500, and GHL delivers the event again."""
     try:
         with db.begin_nested():
             now = _now()
@@ -148,6 +154,27 @@ def _record_current_stage(db: Session, opportunity_id: str, stage: str, phone: O
                 _flag_held_stage(db, opportunity_id, stage, now)
     except Exception as exc:  # class only: SQL errors embed bound parameters
         logger.error("[lending-ghl] current stage not recorded (%s)", type(exc).__name__)
+        if stage.strip().lower() in GHL_STAGE_TO_LOAN_STAGE:
+            raise
+
+
+def _apply_loan_stage(db: Session, opportunity_id: str, stage: str, phone: Optional[str]) -> None:
+    """R1 0.1: a Funded / Paid stage moves the loan file (``ghl_stage_bridge``), in a savepoint: a failure never loses
+    the scoreboard's stage event, and the event is saved to ``lending.webhook_failures`` (with an ops alert) and
+    replayed every 5 minutes until the file takes it, so GHL's 200 never hides a lost loan update. A refused move is
+    stored and carded by the state machine; GHL still gets 200. If the retry cannot be saved either, the error is
+    re-raised: the webhook rolls back and answers 500, so GHL delivers the event again (the stage insert is idempotent)."""
+    try:
+        with db.begin_nested():
+            outcome = apply_stage(db, opportunity_id=opportunity_id, stage_name=stage, phone=phone)
+        if outcome:
+            logger.info("[lending-ghl] loan stage from GHL: %s", outcome)
+    except Exception as exc:
+        logger.error("[lending-ghl] loan stage not applied (%s); saving it for retry", type(exc).__name__)
+        saved = report_webhook_failure(GHL_LOAN_STAGE,
+                                       {"opportunity_id": opportunity_id, "stage_name": stage, "phone": phone}, exc)
+        if saved is None:  # not saved for retry either: fail the webhook so GHL delivers it again
+            raise
 
 
 @router.post("/ghl-stage")
@@ -175,6 +202,7 @@ def ghl_stage(
              "phone": phone, "by": _resolved(body, "booked_by"), "raw": json.dumps(body)},
         ).rowcount
         _record_current_stage(db, opportunity_id, stage, phone, repeat=not inserted)
+        _apply_loan_stage(db, opportunity_id, stage, phone)
         db.commit()
     except Exception as exc:
         db.rollback()

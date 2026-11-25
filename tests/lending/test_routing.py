@@ -1240,7 +1240,7 @@ def partner_mail(rdb, monkeypatch):
     sent: list[tuple[str, str, str]] = []
     services = partner_pipeline.PipelineServices(
         email=lambda to, subject, body: sent.append((to, subject, body)), sms=None, slack=None, render_pdf=None,
-        evaluate_fit=lambda *a, **k: None, fit_limits=lambda *a, **k: [], load_matrix=lambda: (),
+        evaluate_fit=lambda *a, **k: None, fit_limits=lambda *a, **k: [], load_matrix=lambda: ((), None),
         opt_outs=lambda phone, email: partner_pipeline.OptOuts(False, False),
         text_window_open=lambda phone: False, upload_dir="", prequal_pct=10,
     )
@@ -2508,7 +2508,7 @@ def _repair_wiring(rdb, sent: list):
 
     services = partner_pipeline.PipelineServices(
         email=lambda to, subject, body: sent.append((to, subject, body)), sms=None, slack=None, render_pdf=None,
-        evaluate_fit=lambda *a, **k: None, fit_limits=lambda *a, **k: [], load_matrix=lambda: (),
+        evaluate_fit=lambda *a, **k: None, fit_limits=lambda *a, **k: [], load_matrix=lambda: ((), None),
         opt_outs=lambda phone, email: partner_pipeline.OptOuts(False, False),
         text_window_open=lambda phone: False, upload_dir="", prequal_pct=10,
     )

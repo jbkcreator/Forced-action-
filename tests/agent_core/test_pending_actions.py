@@ -99,6 +99,17 @@ def test_one_open_revision_per_user(queue: PendingActionQueue) -> None:
     assert queue.revising_for(APPROVER).action_id == second
 
 
+def test_a_stale_revise_click_keeps_the_revision_already_open(queue: PendingActionQueue) -> None:
+    """PR #476 review: a Revise click from a replaced card moves nothing, so the approver's edit in progress stays."""
+    editing, other = enqueue_sms(queue), enqueue_sms(queue, "Second draft")
+    queue.attach_card(other, "C1", "222.0")
+    queue.request_revision(editing, APPROVER)
+    assert not queue.request_revision(other, APPROVER, card_ts="111.0")  # old card
+    assert queue.get(editing).status is ActionStatus.REVISING
+    assert queue.get(other).status is ActionStatus.PENDING
+    assert queue.revising_for(APPROVER).action_id == editing
+
+
 def test_cancel_revision_returns_to_pending(queue: PendingActionQueue) -> None:
     action_id = enqueue_sms(queue)
     queue.request_revision(action_id, APPROVER)

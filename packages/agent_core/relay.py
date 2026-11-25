@@ -28,6 +28,29 @@ class SendDeferred(str):
     a later sweep tries again, until the action's expiry, when it is blocked."""
 
 
+# The held reason for a send whose outcome is unknown (timeout, 5xx, no message id): it may have gone out.
+HELD_UNCERTAIN_OUTCOME = "uncertain_outcome"
+
+
+class SendHold(str):
+    """A send-check reason meaning "a person must look": the action is held (``held_reason`` = the string's value),
+    nothing is sent, and it is never retried. A reviewer reopens it, which asks for a fresh approval."""
+
+
+class SendHeld(Exception):
+    """Raised by an executor that could not tell whether the send happened, or must not go ahead (a tripped channel
+    breaker): the action is held for a person, never retried and never marked failed."""
+
+    def __init__(self, held_reason: str, detail: str = "") -> None:
+        super().__init__(detail or held_reason)
+        self.held_reason = held_reason
+
+
+class SendRetryLater(Exception):
+    """Raised by an executor that sent nothing and wants the action tried again by a later sweep (a rate limit):
+    the claim is released, like a deferred send."""
+
+
 # Returns None when the send may go ahead, or a short reason (no PII) when it must be blocked; a
 # :class:`SendDeferred` reason holds the send for a later sweep instead.
 SendCheck = Callable[[PendingAction], "str | None"]
@@ -41,6 +64,7 @@ class DispatchOutcome(str, Enum):
     NOT_ENABLED = "not_enabled"
     BLOCKED = "blocked"
     DEFERRED = "deferred"
+    HELD = "held"
     NOT_CLAIMED = "not_claimed"
 
 
@@ -57,6 +81,7 @@ class RelayResult:
     blocked: tuple[int, ...]
     not_claimed: tuple[int, ...]
     deferred: tuple[int, ...] = ()
+    held: tuple[int, ...] = ()
 
 
 class Relay:
@@ -113,6 +138,10 @@ class Relay:
             self._queue.release_claim(action_id)
             logger.debug("relay: action %s held for a later sweep: %s", action_id, reason)
             return DispatchResult(DispatchOutcome.DEFERRED, reason)
+        if isinstance(reason, SendHold):
+            logger.warning("relay: action %s held for review at send time: %s", action_id, reason)
+            self._queue.mark_held(action_id, str(reason))
+            return DispatchResult(DispatchOutcome.HELD, str(reason))
         if reason is not None:
             logger.warning("relay: action %s blocked at send time: %s", action_id, reason)
             self._queue.mark_blocked(action_id, reason)
@@ -127,6 +156,14 @@ class Relay:
             logger.error("relay SECURITY: action %s blocked by its executor's lane check; nothing sent", action_id)
             self._queue.mark_blocked(action_id, reason)
             return DispatchResult(DispatchOutcome.BLOCKED, reason)
+        except SendHeld as exc:
+            logger.warning("relay: action %s held for review after %s: %s", action_id, action.channel, exc.held_reason)
+            self._queue.mark_held(action_id, exc.held_reason, str(exc))
+            return DispatchResult(DispatchOutcome.HELD, exc.held_reason)
+        except SendRetryLater:
+            self._queue.release_claim(action_id)
+            logger.debug("relay: action %s over the channel's rate limit; a later sweep sends it", action_id)
+            return DispatchResult(DispatchOutcome.DEFERRED, "over the channel's per-minute limit")
         except Exception as exc:
             # Payload values can carry contact details; log the id and the error type only.
             logger.error("relay: executor for %s failed on action %s (%s)", action.channel, action_id,
@@ -149,4 +186,5 @@ class Relay:
             blocked=tuple(buckets[DispatchOutcome.BLOCKED]),
             not_claimed=tuple(buckets[DispatchOutcome.NOT_CLAIMED]),
             deferred=tuple(buckets[DispatchOutcome.DEFERRED]),
+            held=tuple(buckets[DispatchOutcome.HELD]),
         )

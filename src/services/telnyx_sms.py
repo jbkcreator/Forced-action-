@@ -38,6 +38,9 @@ def send_message(
     to: str,
     body: str,
     message_type: str = "marketing",
+    *,
+    from_number: Optional[str] = None,
+    messaging_profile_id: Optional[str] = None,
 ) -> dict:
     """
     Send a single SMS via the Telnyx Messaging API.
@@ -56,20 +59,25 @@ def send_message(
 
     `message_type` is currently informational only (we tag it on logs);
     Telnyx routes based on the messaging profile, not the request.
+
+    `from_number` / `messaging_profile_id` override the settings values for one call
+    (the watchdog's own alerts number); None keeps the settings behavior.
     """
     settings = get_settings()
     if not settings.telnyx_sms_api_key:
         raise TelnyxSMSError("TELNYX_SMS_API_KEY is not configured")
-    if not settings.telnyx_messaging_profile_id:
+    sender = from_number or settings.telnyx_from_number
+    profile_id = messaging_profile_id or settings.telnyx_messaging_profile_id
+    if not profile_id:
         raise TelnyxSMSError("TELNYX_MESSAGING_PROFILE_ID is not configured")
-    if not settings.telnyx_from_number:
+    if not sender:
         raise TelnyxSMSError("TELNYX_FROM_NUMBER is not configured")
 
     payload = {
-        "from": settings.telnyx_from_number,
+        "from": sender,
         "to":   to,
         "text": body,
-        "messaging_profile_id": settings.telnyx_messaging_profile_id,
+        "messaging_profile_id": profile_id,
     }
     headers = {
         "Authorization": f"Bearer {settings.telnyx_sms_api_key.get_secret_value()}",

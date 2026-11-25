@@ -16,7 +16,9 @@ from config.lending_standing_sends import AUTO_GRADUATED_ACTOR
 from packages.agent_core.lane_guard import LANE_BLOCK_PREFIX
 from packages.agent_core.pending_actions import ActionStatus, PendingAction
 
-_OPEN = frozenset({ActionStatus.PENDING, ActionStatus.REVISING, ActionStatus.APPROVED, ActionStatus.SENDING})
+# A held action (R1 0.4) waits for a person to reopen or reject it: no receipt until then.
+_OPEN = frozenset({ActionStatus.PENDING, ActionStatus.REVISING, ActionStatus.APPROVED, ActionStatus.SENDING,
+                   ActionStatus.HELD})
 _CONSENT_WORDS = ("consent", "suppressed", "do-not-contact", "opt", "do-not-disturb")
 _EDIT_FIELDS = ("body", "stage", "tag", "title")
 
