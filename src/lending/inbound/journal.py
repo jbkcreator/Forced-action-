@@ -49,6 +49,7 @@ Reporter = Callable[[str, dict[str, Any], BaseException], Optional[int]]  # webh
 # Modules that call register_source at import (T3-T6 add theirs); imported by load_handlers() in the cron process.
 HANDLER_MODULES: tuple[str, ...] = (
     "src.lending.inbound.ghl_stage",
+    "src.lending.inbound.lendingflow",
 )
 
 STUCK_AFTER_SECONDS = 120

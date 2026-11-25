@@ -1354,6 +1354,11 @@ COUNTY_ID=hillsborough
 # lending.webhook_failures) until they succeed; alerts LENDING_OPS_CHANNEL when one is given up.
 */5 * * * * $PROJECT/scripts/cron/run.sh src.lending.webhook_failures
 
+# Lending inbound retention (R1 0.5 D11) — 08:30 UTC (03:30 EST / 04:30 EDT): nulls the raw body of inbound_events
+# processed 30+ days ago and empties the payload of webhook_failures resolved 30+ days ago; open/failed rows untouched.
+# Idle until LENDING_INBOUND_JOURNAL_ENABLED=true.
+30 8 * * * $PROJECT/scripts/cron/run.sh src.lending.inbound.retention
+
 # OFR mortgage-broker refresh (WP-W0-1 Pool 3) — MONTHLY.
 # OFR publishes the MBR-MBRB file monthly; this downloads + unzips + loads it
 # into ofr_mortgage_brokers (Pool 3's source). Runs 1st of month 05:00 UTC,
