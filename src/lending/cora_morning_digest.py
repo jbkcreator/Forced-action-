@@ -1,8 +1,8 @@
-"""Cora's 7:30 AM morning digest in her own channel (Runbook § 3, Line 4).
+"""Cora's 7:47 AM morning digest in her own channel (Runbook § 3, Line 4).
 
 Content follows the Chunk 2 spec, Task E5 (Morning Brief): "Josh's morning operational summary, highlighting
 overdue actions, new high-score leads, and today's calling queues". Cora's minute sweep calls
-``post_morning_digest``. From 7:30 to noon ET it posts one digest a day:
+``post_morning_digest``. From 7:47 (``LENDING_MORNING_DIGEST_TIME``) to noon ET it posts one digest a day:
 
   * Status: whether Cora is halted.
   * Needs your action: drafts waiting for approval, confirmation calls due today or earlier, open inbox items.
@@ -21,6 +21,10 @@ started after noon skips that day rather than posting a stale morning digest.
 
 The digest goes to Cora's internal channel only and is posted while Cora is halted (the halt stops sends to
 borrowers). It shows first names and last-4 digits only: no emails, phone numbers or consent text.
+
+R1 1.3 (``LENDING_MORNING_LIST_ENABLED``, ``MorningListConfig``): "Today's list" replaces the new-leads, today's-calls
+and confirmation-calls sections with one ranked list of up to 50 items in a Josh block and a David block
+(``src/lending/morning_list``). ``on_listed`` receives the posted items after the commit, for the morning drafts.
 """
 from __future__ import annotations
 
@@ -29,7 +33,7 @@ import logging
 import re
 from dataclasses import dataclass, field
 from datetime import date, datetime, time, timedelta, timezone
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Optional, Sequence
 from zoneinfo import ZoneInfo
 
 from sqlalchemy import bindparam, text
@@ -39,12 +43,14 @@ from sqlalchemy.orm import Session
 from packages.agent_core.briefing import BriefSection, render_brief_blocks
 from packages.agent_core.chatport import ChatPort
 from src.lending.cora_inbox import slack_safe
+from src.lending.morning_list.items import ListItem, build, render_sections
+from src.lending.morning_list.read import read_candidates
 from src.lending.standing_sends import morning_card_lines, template_stats
 
 logger = logging.getLogger(__name__)
 
 ET = ZoneInfo("America/New_York")
-DIGEST_TIME = time(7, 30)
+DIGEST_TIME = time(7, 47)  # R1 1.3 D10; LENDING_MORNING_DIGEST_TIME overrides it
 LAST_POST_TIME = time(12, 0)
 LIST_LIMIT = 10
 INBOX_PREVIEW = 3
@@ -143,6 +149,18 @@ class DigestData:
     held_files: int = 0
     exhausted_files: int = 0
     standing_sends: list[Any] = field(default_factory=list)  # P1.4 tracker rows (TemplateStats)
+    today_list: Optional[list[ListItem]] = None  # R1 1.3: None while the list is off
+    david_user_id: str = ""
+
+
+@dataclass(frozen=True)
+class MorningListConfig:
+    """R1 1.3 list settings; ``stuck_deals`` is ``closing.blockers.stuck_deals`` (a parameter so tests need no GHL
+    stage tables)."""
+    size: int
+    lead_days: int
+    david_user_id: str
+    stuck_deals: Callable[[Session, datetime], Sequence[Any]]
 
 
 def _rows(db: Session, statement, params: dict[str, Any]) -> list[dict[str, Any]]:
@@ -165,10 +183,10 @@ def _as_date(value: Any) -> date:
     return value if isinstance(value, date) else date.fromisoformat(str(value)[:10])
 
 
-def digest_day(now: datetime) -> Optional[date]:
-    """The ET day a digest is due for at ``now``, or None outside 7:30 to noon ET."""
+def digest_day(now: datetime, at: time = DIGEST_TIME) -> Optional[date]:
+    """The ET day a digest is due for at ``now``, or None outside ``at`` (7:47 by default) to noon ET."""
     local = now.astimezone(ET)
-    return local.date() if DIGEST_TIME <= local.time() < LAST_POST_TIME else None
+    return local.date() if at <= local.time() < LAST_POST_TIME else None
 
 
 def _section(db: Session, name: str, read: Callable[[], Any], default: Any, unavailable: list[str]) -> Any:
@@ -183,7 +201,8 @@ def _section(db: Session, name: str, read: Callable[[], Any], default: Any, unav
         return default
 
 
-def gather(db: Session, day: date, now: datetime, *, halted: bool, halt_reason: str) -> DigestData:
+def gather(db: Session, day: date, now: datetime, *, halted: bool, halt_reason: str,
+           morning_list: Optional[MorningListConfig] = None) -> DigestData:
     start = datetime.combine(day, time.min, ET).astimezone(timezone.utc)
     since = now - timedelta(hours=24)
     missing: list[str] = []
@@ -192,7 +211,8 @@ def gather(db: Session, day: date, now: datetime, *, halted: bool, halt_reason: 
     drafts = _section(db, "approval drafts", lambda: [
         {**row, "created_at": _as_datetime(row["created_at"])}
         for row in _rows(db, _PENDING_DRAFTS, {"limit": LIST_LIMIT})], [], missing)
-    confirmations = _section(db, "confirmation calls", lambda: [
+    listing = morning_list is not None
+    confirmations = [] if listing else _section(db, "confirmation calls", lambda: [
         {**row, "due_date": _as_date(row["due_date"]), "slot_start": _as_datetime(row["slot_start"])}
         for row in _rows(db, _DUE_CONFIRMATIONS, {"day": day, "limit": LIST_LIMIT})],
         [], missing)
@@ -203,17 +223,23 @@ def gather(db: Session, day: date, now: datetime, *, halted: bool, halt_reason: 
         db, _UNCALLED_NAMES, {"ids": alarm_ids})} if alarm_ids else {}, {}, missing)
     inbox = [{**item, "full_name": names.get(int(item["dedup_key"])) if str(item["dedup_key"]).isdigit() else None}
              for item in inbox]
-    leads = _section(db, "LendingFlow leads", lambda: _rows(
+    leads = [] if listing else _section(db, "LendingFlow leads", lambda: _rows(
         db, _NEW_LENDINGFLOW_LEADS, {"since": since, "limit": LIST_LIMIT}), [], missing)
-    web = _section(db, "web leads", lambda: dict(db.execute(_WEB_LEADS, {"since": since}).mappings().one()),
+    web = no_web if listing else _section(db, "web leads", lambda: dict(db.execute(_WEB_LEADS, {"since": since}).mappings().one()),
                    no_web, missing)
-    calls = _section(db, "booked calls", lambda: [
+    calls = [] if listing else _section(db, "booked calls", lambda: [
         {**row, "slot_start": _as_datetime(row["slot_start"])}
         for row in _rows(db, _TODAYS_CALLS, {"start": start, "end": start + timedelta(days=1), "limit": LIST_LIMIT})], [], missing)
     queues = _section(db, "dialer queues", lambda: _rows(db, _DIALER_QUEUES, {}), [], missing)
     hold = _section(db, "loan files without a lender",
                     lambda: dict(db.execute(_HOLD_QUEUE).mappings().one()), no_hold, missing)
     standing = _section(db, "standing sends tracker", lambda: template_stats(db), [], missing)
+    today_list = None
+    if morning_list is not None:
+        candidates, unread = read_candidates(db, now, lead_days=morning_list.lead_days, size=morning_list.size,
+                                             stuck_deals=morning_list.stuck_deals)
+        missing.extend(unread)
+        today_list = build(candidates, size=morning_list.size)
     return DigestData(
         halted=halted, halt_reason=halt_reason,
         pending_drafts=drafts, pending_total=_total(drafts),
@@ -222,7 +248,8 @@ def gather(db: Session, day: date, now: datetime, *, halted: bool, halt_reason: 
         web_leads=int(web["total"]), web_leads_not_in_ghl=int(web["not_in_ghl"]),
         todays_calls=calls, dialer_queues=queues, unavailable=tuple(missing), inbox_items=inbox,
         held_files=int(hold["held"] or 0), exhausted_files=int(hold["exhausted"] or 0),
-        standing_sends=standing,
+        standing_sends=standing, today_list=today_list,
+        david_user_id=morning_list.david_user_id if morning_list is not None else "",
     )
 
 
@@ -345,13 +372,17 @@ def render(day: date, data: DigestData, *, now: Optional[datetime] = None,
              f"(booked by {_booker(c['booked_by'])})" for c in data.todays_calls]
     queues = [f"• {slack_safe(str(q['campaign']).replace('_', ' ').capitalize())}: {_plural(int(q['contacts']), 'contact')}"
               for q in data.dialer_queues]
+    if data.today_list is not None:
+        work = list(render_sections(data.today_list, david_user_id=data.david_user_id))
+    else:
+        work = [BriefSection(f"New leads, last 24 hours: {data.new_leads_total + data.web_leads}", _lead_lines(data),
+                             "No new leads."),
+                BriefSection(f"Today's calls: {len(data.todays_calls)} booked", calls, "No calls booked today.")]
     sections = [
         BriefSection("Status", status_lines),
         BriefSection("Needs your action", _action_lines(data, day, now, approvals_channel),
                      "Nothing needs your action."),
-        BriefSection(f"New leads, last 24 hours: {data.new_leads_total + data.web_leads}", _lead_lines(data),
-                     "No new leads."),
-        BriefSection(f"Today's calls: {len(data.todays_calls)} booked", calls, "No calls booked today."),
+        *work,
         BriefSection("Dialer lists ready", queues, "No contacts loaded."),
         BriefSection(f"Loan files with no lender yet: {data.held_files}", _hold_lines(data),
                      "All loan files are routed."),
@@ -364,21 +395,28 @@ def render(day: date, data: DigestData, *, now: Optional[datetime] = None,
 
 def post_morning_digest(engine: Engine, chat: ChatPort, channel: Optional[str], *, halted: bool,
                         halt_reason: str = "", now: Optional[datetime] = None,
-                        approvals_channel: Optional[str] = None) -> bool:
+                        approvals_channel: Optional[str] = None, at: time = DIGEST_TIME,
+                        morning_list: Optional[MorningListConfig] = None,
+                        on_listed: Optional[Callable[[list[ListItem]], Any]] = None) -> bool:
     """Post today's digest if it is due and not yet posted. Returns True when a digest was posted."""
     now = now or datetime.now(timezone.utc)
-    day = digest_day(now)
+    day = digest_day(now, at)
     if day is None or not channel:
         return False
     with Session(engine) as db, db.begin():
         if db.execute(_CLAIM, {"day": day}).scalar() is None:
             return False
-        header, blocks = render(day, gather(db, day, now, halted=halted, halt_reason=halt_reason), now=now,
-                                approvals_channel=approvals_channel)
+        data = gather(db, day, now, halted=halted, halt_reason=halt_reason, morning_list=morning_list)
+        header, blocks = render(day, data, now=now, approvals_channel=approvals_channel)
         result = chat.post(text=header, blocks=blocks, channel=channel)
         if not result.ok:
             # Raising rolls the claim back, so the next minute's sweep tries again.
             raise RuntimeError(f"morning digest not posted ({result.error or 'no Slack response'})")
         db.execute(_RECORD_POST, {"channel": result.channel or channel, "ts": result.ts, "day": day})
     logger.info("[cora] morning digest posted for %s", day.isoformat())
+    if on_listed is not None and data.today_list:
+        try:
+            on_listed(data.today_list)
+        except Exception as exc:  # the digest is posted; a failed follow-up never re-posts it
+            logger.error("[cora] morning list follow-up failed (%s)", type(exc).__name__)
     return True

@@ -27,6 +27,7 @@ from sqlalchemy import (
     SmallInteger,
     String,
     Text,
+    UniqueConstraint,
     text,
 )
 from sqlalchemy.dialects.postgresql import JSONB, UUID
@@ -2146,4 +2147,26 @@ class LendingSunbizLlcContact(LendingBase):
 
     __table_args__ = (
         CheckConstraint("subject_role IN ('officer', 'agent')", name="ck_lending_sunbiz_llc_contacts_role"),
+    )
+
+
+class LendingClayEnrichment(LendingBase):
+    """R1 1.3: one Clay lookup per (morning-list item, field). ``src.lending.morning_list.clay`` writes it; a row inside
+    ``LENDING_CLAY_TTL_DAYS`` means the lead is never paid for twice, and today's rows count toward the daily cap."""
+
+    __tablename__ = "clay_enrichments"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    lead_ref: Mapped[str] = mapped_column(String(64), nullable=False)  # morning-list ref, e.g. dlr:99, lf:12
+    field: Mapped[str] = mapped_column(String(20), nullable=False)  # email / llc_owner
+    run_id: Mapped[Optional[str]] = mapped_column(String(64))  # Clay routine_run_id
+    status: Mapped[str] = mapped_column(String(12), nullable=False)  # pending / found / not_found
+    value: Mapped[Optional[str]] = mapped_column(String(255))  # found email (lower-cased) or verified owner name
+    requested_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    enriched_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+
+    __table_args__ = (
+        UniqueConstraint("lead_ref", "field", name="uq_lending_clay_enrichments_ref_field"),
+        CheckConstraint("status IN ('pending', 'found', 'not_found')", name="ck_lending_clay_enrichments_status"),
+        Index("ix_lending_clay_enrichments_requested_at", "requested_at"),
     )

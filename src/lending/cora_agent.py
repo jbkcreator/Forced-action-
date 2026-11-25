@@ -85,7 +85,8 @@ from src.lending.standing_sends import (
     return_for_approval,
 )
 from src.lending.ops_alerts import post_ops_notice, post_replies_notice
-from src.lending.cora_morning_digest import post_morning_digest
+from src.lending.cora_morning_digest import MorningListConfig, post_morning_digest
+from src.lending.morning_list.step import make_morning_enrichment, make_morning_list
 from src.lending.models import LENDING_SCHEMA
 from src.lending.routing.slack_extension import RoutingSlack
 from src.services.phone_utils import normalize
@@ -138,6 +139,7 @@ class CoraServices(NamedTuple):
     standing_sends: Optional[Callable[[], Any]] = None  # P1.4: graduates templates that meet the rule
     after_hours_responder: Optional[Callable[[], Any]] = None  # sends the night responder's due messages
     closing_blockers: Optional[Callable[[], bool]] = None  # P2.4: the 7 AM stuck-deal card; True when posted
+    morning_enrichment: Optional[Callable[[], Any]] = None  # R1 1.3: Clay gap lookups, 6:00-7:40 AM ET
     doc_chase: Optional[Callable[[], int]] = None  # P2.4: queues due document requests and reminders
     block_list: Optional[Callable[[], Any]] = None  # P1.3: sends queued opt-out addresses to Instantly's block list
     backflip_alerts: Optional[Callable[[], int]] = None  # queues each new Backflip block for the inbox digest
@@ -152,14 +154,23 @@ def lending_channel_ids(settings: AppSettings) -> dict[str, str]:
     return {key: channel_id for key, channel_id in channels.items() if channel_id}
 
 
-def make_morning_digest(engine: Engine, store: AgentStore, chat: ChatPort, config: AgentCoreConfig) -> Callable[[], bool]:
-    """The 7:30 AM digest, posted to Cora's channel; reads the kill switch each time so the digest shows it."""
+def make_morning_digest(engine: Engine, store: AgentStore, chat: ChatPort, config: AgentCoreConfig,
+                        settings: Optional[AppSettings] = None, gate: Optional[SendGate] = None,
+                        messages_client: Optional[MessagesClient] = None) -> Callable[[], bool]:
+    """The morning digest (7:47 AM by default), posted to Cora's channel; reads the kill switch each time so the
+    digest shows it. With R1 1.3's list on, the list replaces the lead and call sections and, with drafts on, each
+    eligible item gets an approval card after the post."""
     halt = HaltSwitch(store, config.agent_name)
+    listing = make_morning_list(engine, settings, gate=gate, messages_client=messages_client,
+                                approvals_channel=config.approval_channel_id or "") if settings else None
 
     def digest() -> bool:
+        if listing is None:
+            return post_morning_digest(engine, chat, config.slack_channel_id, halted=halt.is_halted(),
+                                       halt_reason=halt.reason(), approvals_channel=config.approval_channel_id)
         return post_morning_digest(engine, chat, config.slack_channel_id, halted=halt.is_halted(),
-                                   halt_reason=halt.reason(),
-                                   approvals_channel=config.approval_channel_id)
+                                   halt_reason=halt.reason(), approvals_channel=config.approval_channel_id,
+                                   at=listing.at, morning_list=listing.config, on_listed=listing.on_listed)
 
     return digest
 
@@ -609,6 +620,11 @@ def run_sweep(services: CoraServices) -> None:
         else:
             if surfaced:
                 logger.info("[cora] surfaced %s inbox item(s)", surfaced)
+    if services.morning_enrichment is not None:
+        try:
+            services.morning_enrichment()
+        except Exception as exc:  # class only; Clay is optional and the list never waits for it
+            logger.error("[cora] morning Clay pass failed (%s)", type(exc).__name__)
     if services.morning_digest is not None:
         try:
             services.morning_digest()
@@ -694,7 +710,9 @@ def build_live_services(settings: AppSettings) -> Optional[CoraServices]:
     closing_blockers, doc_chase = build_closing_steps(settings, engine=engine, chat=chat, gate=services.gate,
                                                       config=config, queue=services.queue)
     return services._replace(web_client=web, inbox_digest=digest, backflip_alerts=make_backflip_alerts(engine),
-                             morning_digest=make_morning_digest(engine, store, chat, config),
+                             morning_digest=make_morning_digest(engine, store, chat, config, settings,
+                                                                services.gate, messages_client),
+                             morning_enrichment=make_morning_enrichment(engine, settings),
                              instantly_replies=make_instantly_replies(engine, store, config, messages_client,
                                                                       services.gate),
                              agent_jobs=worker.run_once if worker is not None else None,
