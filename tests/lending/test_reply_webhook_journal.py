@@ -191,21 +191,42 @@ def test_a_duplicate_reply_posts_the_handoff_once(client, poster, store):
     assert [(r.source, r.dedup_key, r.status) for r in store.rows.values()] == [("ghl_reply", "m-1", "processed")]
 
 
-def test_a_failed_slack_post_answers_200_and_is_saved_for_the_retry(client, poster, saved, store):
+def test_a_failed_slack_post_answers_200_and_saves_only_the_handoff(client, poster, saved, store):
     poster.error = RuntimeError("slack down")
     response = post(client, RATE_QUESTION)
-    assert response.status_code == 200 and response.json() == {"status": "failed"}
+    assert response.status_code == 200 and response.json() == {"status": "handoff_saved_for_retry"}
     assert [(endpoint, body["messageId"], error) for endpoint, body, error in saved] == [
-        ("ghl_reply", "m-1", "RuntimeError")]
-    assert [r.status for r in store.rows.values()] == ["failed"]
+        ("ghl_reply_handoff", "m-1", "RuntimeError")]
+    assert [r.status for r in store.rows.values()] == ["processed"]
     assert poster.messages == []
 
 
-def test_an_unset_replies_channel_answers_200_and_is_saved(client, saved, monkeypatch):
+def test_an_unset_replies_channel_answers_200_and_saves_the_handoff(client, saved, monkeypatch):
     monkeypatch.setattr(reply_webhook, "slack_poster", lambda: None)
     response = post(client, RATE_QUESTION)
+    assert response.status_code == 200 and response.json() == {"status": "handoff_saved_for_retry"}
+    assert [(endpoint, error) for endpoint, _, error in saved] == [
+        ("ghl_reply_handoff", "ReplyHandoffNotConfigured")]
+
+
+def test_a_failed_handoff_keeps_the_after_hours_answer(client, poster, saved, send_cycles, monkeypatch):
+    from src.lending.after_hours_conversation import OUTCOME_ANSWERED
+
+    monkeypatch.setattr(reply_webhook, "conversations_enabled", lambda: True)
+    monkeypatch.setattr(reply_webhook, "record_reply", lambda db, **kwargs: OUTCOME_ANSWERED)
+    poster.error = RuntimeError("slack down")
+    response = post(client, RATE_QUESTION)
+    assert response.status_code == 200
+    assert send_cycles == ["run"]  # the answer was applied: the next question goes out
+    assert [endpoint for endpoint, _, _ in saved] == ["ghl_reply_handoff"]
+
+
+def test_a_handoff_that_cannot_be_saved_retries_the_whole_message(client, poster, store, monkeypatch):
+    poster.error = RuntimeError("slack down")
+    monkeypatch.setattr(webhook_failures, "report_webhook_failure", lambda endpoint, body, error: None)
+    response = post(client, RATE_QUESTION)
     assert response.status_code == 200 and response.json() == {"status": "failed"}
-    assert [(endpoint, error) for endpoint, _, error in saved] == [("ghl_reply", "ReplyHandoffNotConfigured")]
+    assert [r.status for r in store.rows.values()] == ["received"]  # the 5-minute reclaim runs it again
 
 
 def test_an_after_hours_answer_that_cannot_be_saved_answers_200_and_is_saved(client, saved, poster, send_cycles,
@@ -226,7 +247,7 @@ def test_the_replay_of_a_saved_reply_posts_the_handoff_once(client, poster, save
     post(client, RATE_QUESTION)
     poster.error = None
     (_, body, _), = saved
-    replay = webhook_failures.ENDPOINT_HANDLERS["ghl_reply"]
+    replay = webhook_failures.ENDPOINT_HANDLERS["ghl_reply_handoff"]
     for _ in range(2):  # the 5-minute retry, then a manual --replay of the same row
         replay(lending_db, body)
         lending_db.finish(True)

@@ -21,6 +21,7 @@ from src.lending.after_hours_conversation import (OUTCOME_ANSWERED, OUTCOME_NO_C
                                                   OUTCOME_SLOT_CHOSEN, conversations_enabled,
                                                   inbound_text_inquiry_key, open_conversation, record_reply)
 from src.lending.after_hours_responder import run_send_cycle_now
+from src.lending import webhook_failures
 from src.lending.inbound import journal
 from src.lending.instantly_replies import is_stop_request
 from src.lending.payload_shape import log_shape
@@ -85,27 +86,51 @@ def _advance_after_hours_conversation(db: Session, event: ReplyEvent) -> Optiona
 # ---- inbound journal (R1 0.5, LENDING_INBOUND_JOURNAL_ENABLED) --------------------------------------------------
 
 JOURNAL_SOURCE = "ghl_reply"
+HANDOFF_SOURCE = "ghl_reply_handoff"  # a handoff whose post failed, retried on its own (the answer is already kept)
+HANDOFF_SAVED = "handoff_saved_for_retry"
 
 
 class ReplyHandoffNotConfigured(RuntimeError):
     """A handoff is due but the replies channel or bot token is unset: saved for the 5-minute retry."""
 
 
+class HandoffNotSaved(RuntimeError):
+    """The handoff failed and could not be saved for retry: the whole message is retried instead."""
+
+
+def handle_reply_handoff(db: Session, raw: dict[str, Any]) -> str:
+    """The Slack handoff alone (also the retry of a saved handoff). Never commits; idempotent on the message id.
+    Raises when the post fails or the channel is unset."""
+    event = parse_event(raw)
+    if event is None:
+        return "ignored"
+    outcome = handle_reply_event(db, event, poster=slack_poster(), commit=False)
+    if outcome == "not_configured":
+        raise ReplyHandoffNotConfigured("reply handoff channel is not configured")
+    return outcome
+
+
 def handle_ghl_reply(db: Session, raw: dict[str, Any]) -> dict[str, Any]:
-    """The journal / replay handler: after-hours answer + Slack handoff in the caller's transaction (never commits).
-    Idempotent on the message id: an applied answer and a posted handoff are never applied twice. Raises when the
-    answer cannot be saved, the post fails or the channel is unset, so the whole message is retried."""
+    """The journal / replay handler (never commits). The after-hours answer is applied in the caller's transaction;
+    the handoff runs in a savepoint, and a failed handoff is saved for its own retry (``ghl_reply_handoff``), so a
+    Slack outage or an unset channel never holds back the borrower's answer. Raises when the answer cannot be saved
+    or a failed handoff cannot be saved either: the whole message is then retried (both steps are idempotent)."""
     event = parse_event(raw)
     if event is None:
         return {"status": "ignored", "advanced": False}
     advanced = _apply_after_hours(db, event)
-    outcome = handle_reply_event(db, event, poster=slack_poster(), commit=False)
-    if outcome == "not_configured":
-        raise ReplyHandoffNotConfigured("reply handoff channel is not configured")
-    return {"status": outcome, "advanced": advanced}
+    try:
+        with db.begin_nested():
+            status = handle_reply_handoff(db, raw)
+    except Exception as exc:  # class only: the message text can carry personal details
+        if webhook_failures.report_webhook_failure(HANDOFF_SOURCE, raw, exc) is None:
+            raise HandoffNotSaved(type(exc).__name__) from None
+        status = HANDOFF_SAVED
+    return {"status": status, "advanced": advanced}
 
 
 journal.register_source(JOURNAL_SOURCE, handle_ghl_reply, label="GHL reply (handoff / after-hours answer)")
+journal.register_source(HANDOFF_SOURCE, handle_reply_handoff, label="GHL reply handoff (Slack post)")
 
 
 def _journal_body(body: dict[str, Any], event: ReplyEvent) -> dict[str, Any]:
