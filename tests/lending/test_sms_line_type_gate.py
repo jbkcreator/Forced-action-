@@ -1,4 +1,5 @@
-"""R1 0.11 SMS line-type gate: only a mobile number is texted; Telnyx fills a missing line type. No DB, no network."""
+"""R1 0.11 SMS line-type gate: a landline is never texted; mobile and VoIP are; Telnyx fills a missing line type; a
+still-unknown number is texted only with text consent. No DB, no network."""
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
@@ -18,8 +19,9 @@ ACCOUNT = GhlAccount(api_key="k", location_id="loc")
 class Store:
     """Stands in for the three DB helpers the gate uses."""
 
-    def __init__(self, monkeypatch, line_type=None, checked_at=None, lookups_today=0):
+    def __init__(self, monkeypatch, line_type=None, checked_at=None, lookups_today=0, consented=False):
         self.line_type, self.checked_at, self.lookups_today, self.saved = line_type, checked_at, lookups_today, []
+        monkeypatch.setattr("src.lending.consent.has_text_consent", lambda db, phone: consented)
         monkeypatch.setattr(compliance, "_stored_line_type", lambda db, phone: (self.line_type, self.checked_at))
         monkeypatch.setattr(compliance, "_lookups_today", lambda db, now: self.lookups_today)
         monkeypatch.setattr(compliance, "_save_lookup", lambda db, phone, t, now: self.saved.append((phone, t)))
@@ -44,7 +46,7 @@ def _fallback_on(monkeypatch):
 
 
 @pytest.mark.parametrize("stored, expected", [
-    ("mobile", None), ("landline", SmsBlock.LANDLINE), ("voip", SmsBlock.NOT_MOBILE),
+    ("mobile", None), ("landline", SmsBlock.LANDLINE), ("voip", None),
 ])
 def test_stored_line_type_decides_without_a_lookup(monkeypatch, stored, expected):
     Store(monkeypatch, line_type=stored)
@@ -145,3 +147,19 @@ def test_internal_alerts_skip_the_line_type_gate():
     sender = GhlSmsSender(ACCOUNT, "+18135550100", request=lambda *a, **k: responses.pop(0), internal_alert=True,
                           sms_gate=lambda p: SmsBlock.LANDLINE)
     assert sender(PHONE, "alarm") == "m1"
+
+
+def test_unknown_with_text_consent_is_texted(monkeypatch):
+    """An inbound lead (LendingFlow, website with SMS consent) is still texted when Telnyx cannot answer."""
+    Store(monkeypatch, consented=True)
+    assert sms_block_reason(None, PHONE, now=NOW, lookup=Lookup(error=RuntimeError("down"))) is None
+
+
+def test_landline_with_text_consent_is_still_blocked(monkeypatch):
+    Store(monkeypatch, line_type="landline", consented=True)
+    assert sms_block_reason(None, PHONE, now=NOW, lookup=Lookup()) == SmsBlock.LANDLINE
+
+
+def test_telnyx_voip_answer_is_texted(monkeypatch):
+    Store(monkeypatch)
+    assert sms_eligible(None, PHONE, now=NOW, lookup=Lookup("voip")) is True
