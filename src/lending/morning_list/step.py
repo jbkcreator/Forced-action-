@@ -25,7 +25,7 @@ from src.lending.morning_list.drafts import (
     DraftContext, anthropic_writer, morning_drafts, submit_all, touched_phones, voice_examples,
 )
 from src.lending.morning_list.items import ListItem, build
-from src.lending.morning_list.read import read_candidates
+from src.lending.morning_list.read import LinkConfig, read_candidates
 from src.lending.morning_list.time import ET
 
 logger = logging.getLogger(__name__)
@@ -58,7 +58,9 @@ def _stuck_deals(db: Session, now: datetime):
 
 def list_config(settings: AppSettings) -> MorningListConfig:
     return MorningListConfig(size=settings.lending_morning_list_size, lead_days=settings.lending_morning_list_lead_days,
-                             david_user_id=settings.lending_david_slack_user_id, stuck_deals=_stuck_deals)
+                             david_user_id=settings.lending_david_slack_user_id, stuck_deals=_stuck_deals,
+                             links=LinkConfig(ghl_app_url=settings.lending_ghl_app_url,
+                                              ghl_location_id=settings.lending_ghl_location_id or ""))
 
 
 def make_morning_list(engine: Engine, settings: AppSettings, *, gate=None, messages_client=None,

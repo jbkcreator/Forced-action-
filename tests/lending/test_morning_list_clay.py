@@ -145,7 +145,7 @@ def test_sweep_step_runs_only_6_to_7_40_et_every_5_minutes(engine) -> None:
                         lending_clay_api_base="", lending_morning_list_size=50, lending_morning_list_lead_days=14,
                         lending_david_slack_user_id="", lending_clay_email_routine="workflow:wf_email",
                         lending_clay_llc_routine="", lending_clay_email_enabled=True, lending_clay_llc_enabled=False,
-                        lending_clay_ttl_days=30)
+                        lending_clay_ttl_days=30, lending_ghl_app_url="", lending_ghl_location_id="")
     clock = [datetime(2026, 11, 25, 10, 59, tzinfo=timezone.utc)]  # 5:59 AM ET
     step = make_morning_enrichment(engine, s, port=FakeClay(), clock=lambda: clock[0])
     assert step() is None

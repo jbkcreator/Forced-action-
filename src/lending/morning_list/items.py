@@ -3,17 +3,22 @@
 ``build`` takes every candidate the readers found (all tiers, padding included) and returns the ranked list: tier
 order from ``config.lending_morning_list.TIER``, the reader's ``sort_key`` inside a tier, one line per phone at its
 highest tier, warm leads and padding only with a Mobile number, cut at ``size``. Padding (``COLD_TOP``) therefore
-only fills what real work leaves. ``render_sections`` turns the list into the Josh and David blocks.
+only fills what real work leaves.
+
+Slack layout: ``render_main`` = Josh's items in full plus a one-line David summary (the main digest post);
+``render_thread`` = David's items grouped by reason (callbacks, new leads, then the calling queue by list), posted as
+replies under it. Each line links to the contact in GHL and BatchDialer when we hold the id.
 """
 from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
 from datetime import datetime
 from typing import Iterable, Optional
+from urllib.parse import quote
 
 from config.lending_morning_list import (
-    BRIEF_MAX_CHARS, CALLBACK, JOSH, JOSH_CALLER_PREFIXES, MOBILE_LINE_TYPE, MOBILE_REQUIRED, OWNER, REASON_LABELS,
-    TIER,
+    ACTIVE_DEAL, BOOKED_TODAY, BRIEF_MAX_CHARS, CALLBACK, CLOSING_BLOCKER, COLD_TOP, JOSH, JOSH_CALLER_PREFIXES,
+    MOBILE_LINE_TYPE, MOBILE_REQUIRED, NEW_WARM_LEAD, OWNER, REASON_LABELS, TIER,
 )
 from packages.agent_core.briefing import BriefSection
 from packages.agent_core.redaction import slack_safe
@@ -34,6 +39,11 @@ class ListItem:
     property_address: Optional[str] = None    # Clay LLC lookup input
     caller_name: Optional[str] = None         # callbacks: who logged the call
     received_at: Optional[datetime] = None    # warm leads: when the lead arrived
+    group: Optional[str] = None               # calling queue: the list it is on (thread sub-heading)
+    ghl_contact_id: Optional[str] = None
+    dialer_contact_id: Optional[str] = None
+    ghl_url: Optional[str] = None             # contact page in GHL
+    dialer_url: Optional[str] = None          # contact page in BatchDialer
     owner: str = field(default="")
 
     @property
@@ -77,18 +87,29 @@ def build(candidates: Iterable[ListItem], *, size: int) -> list[ListItem]:
     return picked
 
 
+ICONS = {CLOSING_BLOCKER: ":triangular_flag_on_post:", ACTIVE_DEAL: ":page_facing_up:", BOOKED_TODAY: ":calendar:",
+         CALLBACK: ":telephone_receiver:", NEW_WARM_LEAD: ":star:", COLD_TOP: ":small_blue_diamond:"}
+GROUP_TITLES = {CALLBACK: "Callbacks", NEW_WARM_LEAD: "New leads"}
+SECTION_BUDGET = 2700  # under agent_core.briefing's 2,900-character cut, with room for the title
+THREAD_MAX_BLOCKS = 45  # Slack allows 50 blocks a message
+
+
+def _link(url: Optional[str], label: str) -> Optional[str]:
+    return f"<{quote(url, safe=':/?=&#%')}|{label}>" if url else None
+
+
 def _line(item: ListItem) -> str:
+    """One item: icon, first name (or company) with last 4, the brief, then the GHL / BatchDialer links. Names and
+    briefs are escaped; links are built from our own ids, never from borrower text."""
     flags = [f"…{item.last4}"] if item.last4 else []
     if not item.has_mobile:
         flags.append("no mobile")
-    who = slack_safe(item.first_name or item.entity_name or "Lead") + (f" ({', '.join(flags)})" if flags else "")
-    extras = [slack_safe(item.brief[:BRIEF_MAX_CHARS])] if item.brief else []
+    who = f"*{slack_safe(item.first_name or item.entity_name or 'Lead')}*" + (f" ({', '.join(flags)})" if flags else "")
+    parts = [slack_safe(item.brief[:BRIEF_MAX_CHARS])] if item.brief else []
     if item.email_source == "clay":
-        extras.append("email found")
-    return f"• *{REASON_LABELS[item.reason]}*: {who}." + (f" {' '.join(extras)}" if extras else "")
-
-
-SECTION_BUDGET = 2700  # under agent_core.briefing's 2,900-character cut, with room for the title
+        parts.append("email found")
+    parts += [p for p in (_link(item.ghl_url, "GHL ↗"), _link(item.dialer_url, "BatchDialer ↗")) if p]
+    return f"{ICONS[item.reason]} {who}  " + " · ".join(parts)
 
 
 def _chunks(lines: list[str]) -> list[list[str]]:
@@ -111,11 +132,40 @@ def _sections(title: str, lines: list[str], empty: str) -> list[BriefSection]:
     return [BriefSection(f"{title} ({n} of {len(parts)})", part, empty) for n, part in enumerate(parts, 1)]
 
 
-def render_sections(items: list[ListItem], *, david_user_id: str) -> list[BriefSection]:
-    """Josh's block (stuck deals, deals, booked calls) then David's block (callbacks, new leads, top of queue); a
-    block longer than one Slack section continues in the next one."""
+def _groups(items: list[ListItem]) -> list[tuple[str, list[ListItem]]]:
+    """David's items in thread order: callbacks, new leads, then the calling queue one list at a time."""
+    groups: dict[str, list[ListItem]] = {}
+    for item in items:
+        title = GROUP_TITLES.get(item.reason) or (
+            f"Top of queue · {item.group}" if item.group else REASON_LABELS[item.reason])
+        groups.setdefault(title, []).append(item)
+    return list(groups.items())
+
+
+def render_main(items: list[ListItem], *, david_user_id: str) -> list[BriefSection]:
+    """The main post's list part: Josh's items in full, then David's count with a pointer to the thread."""
     josh = [_line(i) for i in items if i.owner == JOSH]
-    david_lines = [_line(i) for i in items if i.owner != JOSH]
-    david = ([f"<@{david_user_id}>"] if david_user_id and david_lines else []) + david_lines
-    return (_sections(f"Today's list for Josh: {len(josh)}", josh, "Nothing for Josh today.")
-            + _sections(f"Today's list for David: {len(david_lines)}", david, "Nothing for David today."))
+    david = [i for i in items if i.owner != JOSH]
+    counts = " · ".join(f"{title}: {len(group)}" for title, group in _merge_queue(_groups(david)))
+    summary = ([f"<@{david_user_id}>"] if david_user_id and david else []) + (
+        [counts, "Full list in the thread below :arrow_down:"] if david else [])
+    return (_sections(f"Josh · {len(josh)}", josh, "Nothing for Josh today.")
+            + [BriefSection(f"David · {len(david)}", summary, "Nothing for David today.")])
+
+
+def _merge_queue(groups: list[tuple[str, list[ListItem]]]) -> list[tuple[str, list[ListItem]]]:
+    """For the summary count: all calling-queue lists as one "top of queue" group."""
+    merged: dict[str, list[ListItem]] = {}
+    for title, group in groups:
+        merged.setdefault("Top of queue" if title.startswith("Top of queue") else title, []).extend(group)
+    return list(merged.items())
+
+
+def render_thread(items: list[ListItem]) -> list[list[dict]]:
+    """David's items as thread replies (Block Kit), grouped and split so no section or message is cut."""
+    blocks: list[dict] = []
+    for title, group in _groups([i for i in items if i.owner != JOSH]):
+        for section in _sections(f"{title} · {len(group)}", [_line(i) for i in group], ""):
+            body = "\n".join(section.lines)
+            blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": f"*{section.title}*\n{body}"}})
+    return [blocks[n:n + THREAD_MAX_BLOCKS] for n in range(0, len(blocks), THREAD_MAX_BLOCKS)]

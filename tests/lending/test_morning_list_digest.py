@@ -11,6 +11,7 @@ from sqlalchemy.pool import StaticPool
 
 from packages.agent_core.chatport import FakeChatPort
 from src.lending.cora_morning_digest import MorningListConfig, digest_day, post_morning_digest
+from src.lending.morning_list.read import LinkConfig
 
 # 2026-11-25 is EST (UTC-5): 12:47 UTC is 7:47 AM ET.
 AT_7_46 = datetime(2026, 11, 25, 12, 46, tzinfo=timezone.utc)
@@ -30,21 +31,23 @@ _DDL = (
     " cancelled_at TIMESTAMP)",
     "CREATE TABLE lending.uncalled_alarms (id INTEGER PRIMARY KEY, lendingflow_lead_id INTEGER, web_lead_id INTEGER)",
     "CREATE TABLE lending.lendingflow_leads (id INTEGER PRIMARY KEY, first_name TEXT, last_name TEXT, phone TEXT,"
-    " email TEXT, loan_type TEXT, loan_amount INTEGER, loan_amount_range TEXT, property_city TEXT,"
+    " email TEXT, ghl_contact_id TEXT, loan_type TEXT, loan_amount INTEGER, loan_amount_range TEXT, property_city TEXT,"
     " property_state TEXT, received_at TIMESTAMP, handled_in_ghl_at TIMESTAMP, suppressed BOOLEAN NOT NULL DEFAULT 0,"
     " is_test BOOLEAN NOT NULL DEFAULT 0)",
     "CREATE TABLE lending.lendingflow_enrichment (lead_id INTEGER, routing_tag TEXT, closer_priority BOOLEAN,"
     " fit TEXT)",
-    "CREATE TABLE lending.web_leads (id INTEGER PRIMARY KEY, name TEXT, phone TEXT, email TEXT, deal_type TEXT,"
+    "CREATE TABLE lending.web_leads (id INTEGER PRIMARY KEY, name TEXT, phone TEXT, email TEXT, ghl_contact_id TEXT, deal_type TEXT,"
     " loan_amount INTEGER, property_city TEXT, property_state TEXT, credit_band TEXT, completed_projects_3y TEXT,"
     " received_at TIMESTAMP, handled_in_ghl_at TIMESTAMP, ghl_status TEXT, suppressed BOOLEAN NOT NULL DEFAULT 0,"
     " is_test BOOLEAN NOT NULL DEFAULT 0)",
     "CREATE TABLE lending.dialer_load_records (id INTEGER PRIMARY KEY, pool TEXT, campaign_tag TEXT, phone TEXT,"
+    " ghl_contact_id TEXT, dialer_contact_id TEXT,"
     " borrower_name TEXT, entity_name TEXT, property_address TEXT, estimated_loan_value INTEGER, active BOOLEAN)",
     "CREATE TABLE lending.contacts (phone TEXT PRIMARY KEY, line_type TEXT, email TEXT,"
     " do_not_contact BOOLEAN NOT NULL DEFAULT 0, is_test BOOLEAN NOT NULL DEFAULT 0)",
     "CREATE TABLE lending.suppression_list (phone TEXT, email TEXT)",
     "CREATE TABLE lending.call_dispositions (id INTEGER PRIMARY KEY, phone TEXT, caller_name TEXT, disposition TEXT,"
+    " dialer_contact_id TEXT,"
     " call_started_at TIMESTAMP, created_at TIMESTAMP)",
     "CREATE TABLE lending.loan_files (id INTEGER PRIMARY KEY, borrower_first_name TEXT, borrower_last_name TEXT,"
     " borrower_phone TEXT, borrower_email TEXT, product TEXT, loan_amount INTEGER, property_city TEXT, stage TEXT,"
@@ -93,10 +96,14 @@ def _seed(engine) -> None:
                           " ('+18135552222', 'Mobile'), ('+18135553333', 'Landline'), ('+18135556666', 'Mobile'),"
                           " ('+17275550001', 'Mobile'), ('+17275550002', 'Mobile'), ('+17275550003', 'Landline')"))
         conn.execute(text("INSERT INTO lending.clay_enrichments VALUES ('dlr:20', 'email', 'found', 'pat@baylending.com')"))
+        conn.execute(text("UPDATE lending.lendingflow_leads SET ghl_contact_id = 'G1' WHERE id = 1"))
+        conn.execute(text("UPDATE lending.dialer_load_records SET dialer_contact_id = 'B21' WHERE id = 21"))
 
 
 def _config(size: int = 50) -> MorningListConfig:
-    return MorningListConfig(size=size, lead_days=14, david_user_id="U_DAVID", stuck_deals=lambda db, now: [
+    return MorningListConfig(size=size, lead_days=14, david_user_id="U_DAVID",
+                             links=LinkConfig(ghl_app_url="https://app.gohighlevel.com", ghl_location_id="LOC"),
+                             stuck_deals=lambda db, now: [
         SimpleNamespace(opportunity_id="o1", stage_name="Submitted to lender", days=5, first_name="Stu",
                         phone="+18135557777", email=None, owner=SimpleNamespace(value="lender"))])
 
@@ -117,13 +124,20 @@ def test_list_on_ranks_real_rows_and_replaces_the_lead_and_call_sections(engine)
     assert post_morning_digest(engine, chat, "C_CORA", halted=False, now=AT_7_47, morning_list=_config(),
                                on_listed=listed.extend)
     body = _text(chat)
-    assert "Today's list for Josh: 2" in body and "Today's list for David: 4" in body
+    assert "Josh · 2" in body and "David · 4" in body and "<@U_DAVID>" in body
     assert "New leads, last 24 hours" not in body and "Today's calls" not in body
     assert [i.ref for i in listed] == ["opp:o1", "loan:5", "cb:9", "lf:1", "dlr:20", "dlr:21"]
-    assert "Stuck deal" in body and "stuck 5 days" in body and "waiting on lender" in body
-    assert "8135551111" not in body and "ann@x.com" not in body and "pat@baylending.com" not in body
-    assert "email found" in body  # Clay found dlr:20's email
-    assert "<@U_DAVID>" in body
+    assert "stuck 5 days" in body and "waiting on lender" in body
+    thread = chat.posts[1]
+    assert thread["thread_ts"] == chat.posts[0]["ts"]
+    reply = "\n".join(b["text"]["text"] for b in thread["blocks"])
+    assert "*Callbacks · 1*" in reply and "*New leads · 1*" in reply and "*Top of queue · Partners · 1*" in reply
+    assert "email found" in reply  # Clay found dlr:20's email
+    assert "<https://app.gohighlevel.com/v2/location/LOC/contacts/detail/G1|GHL ↗>" in reply
+    assert "<https://app.batchdialer.com/contacts/view/B21|BatchDialer ↗>" in reply
+    everything = body + reply
+    assert "8135551111" not in everything and "ann@x.com" not in everything
+    assert "pat@baylending.com" not in everything
 
 
 def test_list_size_caps_padding(engine) -> None:

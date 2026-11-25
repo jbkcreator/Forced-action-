@@ -43,8 +43,8 @@ from sqlalchemy.orm import Session
 from packages.agent_core.briefing import BriefSection, render_brief_blocks
 from packages.agent_core.chatport import ChatPort
 from src.lending.cora_inbox import slack_safe
-from src.lending.morning_list.items import ListItem, build, render_sections
-from src.lending.morning_list.read import read_candidates
+from src.lending.morning_list.items import ListItem, build, render_main, render_thread
+from src.lending.morning_list.read import LinkConfig, read_candidates
 from src.lending.standing_sends import morning_card_lines, template_stats
 
 logger = logging.getLogger(__name__)
@@ -161,6 +161,7 @@ class MorningListConfig:
     lead_days: int
     david_user_id: str
     stuck_deals: Callable[[Session, datetime], Sequence[Any]]
+    links: LinkConfig = LinkConfig()
 
 
 def _rows(db: Session, statement, params: dict[str, Any]) -> list[dict[str, Any]]:
@@ -237,7 +238,7 @@ def gather(db: Session, day: date, now: datetime, *, halted: bool, halt_reason: 
     today_list = None
     if morning_list is not None:
         candidates, unread = read_candidates(db, now, lead_days=morning_list.lead_days, size=morning_list.size,
-                                             stuck_deals=morning_list.stuck_deals)
+                                             stuck_deals=morning_list.stuck_deals, links=morning_list.links)
         missing.extend(unread)
         today_list = build(candidates, size=morning_list.size)
     return DigestData(
@@ -373,7 +374,7 @@ def render(day: date, data: DigestData, *, now: Optional[datetime] = None,
     queues = [f"• {slack_safe(str(q['campaign']).replace('_', ' ').capitalize())}: {_plural(int(q['contacts']), 'contact')}"
               for q in data.dialer_queues]
     if data.today_list is not None:
-        work = list(render_sections(data.today_list, david_user_id=data.david_user_id))
+        work = render_main(data.today_list, david_user_id=data.david_user_id)
     else:
         work = [BriefSection(f"New leads, last 24 hours: {data.new_leads_total + data.web_leads}", _lead_lines(data),
                              "No new leads."),
@@ -391,6 +392,20 @@ def render(day: date, data: DigestData, *, now: Optional[datetime] = None,
     ]
     header = f"Next Deal Lending morning update: {day:%A}, {day:%B} {day.day}"
     return header, render_brief_blocks(header, sections)
+
+
+def _post_thread(chat: ChatPort, channel: str, ts: Optional[str], items: list[ListItem]) -> None:
+    """David's full list as replies under the digest. A failed reply is logged, never raised: raising would roll
+    back the day's claim and post the whole digest again."""
+    for blocks in render_thread(items):
+        try:
+            reply = chat.post(text="Today's list for David", blocks=blocks, channel=channel, thread_ts=ts)
+        except Exception as exc:  # class only
+            logger.error("[cora] morning list thread reply failed (%s)", type(exc).__name__)
+            return
+        if not reply.ok:
+            logger.error("[cora] morning list thread reply not posted (%s)", reply.error or "no Slack response")
+            return
 
 
 def post_morning_digest(engine: Engine, chat: ChatPort, channel: Optional[str], *, halted: bool,
@@ -413,6 +428,8 @@ def post_morning_digest(engine: Engine, chat: ChatPort, channel: Optional[str], 
             # Raising rolls the claim back, so the next minute's sweep tries again.
             raise RuntimeError(f"morning digest not posted ({result.error or 'no Slack response'})")
         db.execute(_RECORD_POST, {"channel": result.channel or channel, "ts": result.ts, "day": day})
+        if data.today_list:
+            _post_thread(chat, result.channel or channel, result.ts, data.today_list)
     logger.info("[cora] morning digest posted for %s", day.isoformat())
     if on_listed is not None and data.today_list:
         try:

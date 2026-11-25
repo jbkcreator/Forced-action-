@@ -9,7 +9,8 @@ from __future__ import annotations
 
 import logging
 import re
-from dataclasses import replace
+from dataclasses import dataclass, replace
+from functools import partial
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Iterable, Optional, Sequence
 
@@ -22,6 +23,8 @@ from config.lending_morning_list import (
     NEW_WARM_LEAD,
 )
 from config.lending_queues import DIAL_ORDER
+from src.lending.dispositions import contact_view_url
+from src.lending.lead_arrival_alert import ghl_contact_url
 from src.lending.borrower_score import facts_from_lendingflow_lead, facts_from_web_lead, score_borrower
 from src.lending.morning_list.items import ListItem
 from src.lending.morning_list.time import ET, et_day_start
@@ -90,6 +93,20 @@ _COLD_TOP = text("""
     bindparam("pools", expanding=True))
 _CONTACTS = text("SELECT phone, line_type, email FROM lending.contacts WHERE phone IN :phones"
                  ).bindparams(bindparam("phones", expanding=True))
+_GHL_IDS = text("""
+    SELECT phone, ghl_contact_id FROM lending.lendingflow_leads WHERE phone IN :phones AND ghl_contact_id IS NOT NULL
+    UNION ALL
+    SELECT phone, ghl_contact_id FROM lending.web_leads WHERE phone IN :phones AND ghl_contact_id IS NOT NULL
+    UNION ALL
+    SELECT phone, ghl_contact_id FROM lending.dialer_load_records WHERE phone IN :phones AND ghl_contact_id IS NOT NULL
+""").bindparams(bindparam("phones", expanding=True))
+_DIALER_IDS = text("""
+    SELECT phone, dialer_contact_id FROM lending.dialer_load_records
+     WHERE phone IN :phones AND dialer_contact_id IS NOT NULL AND active
+    UNION ALL
+    SELECT phone, dialer_contact_id FROM lending.call_dispositions
+     WHERE phone IN :phones AND dialer_contact_id IS NOT NULL
+""").bindparams(bindparam("phones", expanding=True))
 _CLAY_FOUND = text("""
     SELECT lead_ref, field, value FROM lending.clay_enrichments
      WHERE status = 'found' AND value IS NOT NULL AND lead_ref IN :refs
@@ -134,6 +151,7 @@ def blockers_from_stuck_deals(deals: Iterable[Any]) -> list[ListItem]:
         items.append(ListItem(
             ref=f"opp:{deal.opportunity_id}", reason=CLOSING_BLOCKER, name=deal.first_name,
             phone=normalize(deal.phone) if deal.phone else None, line_type=None, email=deal.email,
+            ghl_contact_id=getattr(deal, "ghl_contact_id", None),
             sort_key=(-deal.days,),
             brief=_brief(f"{deal.stage_name}, stuck {deal.days} days", f"waiting on {owner}",
                          "see the 7 AM blocker card")))
@@ -233,7 +251,7 @@ def read_cold_top(db: Session, *, limit: int) -> list[ListItem]:
         items.append(ListItem(
             ref=f"dlr:{row['id']}", reason=COLD_TOP, name=row["borrower_name"] or None,
             entity_name=row["entity_name"], phone=normalize(row["phone"]), line_type="mobile",
-            property_address=row["property_address"],
+            property_address=row["property_address"], group=pool.replace("_", " ").capitalize(),
             sort_key=(DIAL_ORDER.index(pool), row["id"]),
             brief=_brief(pool.replace("_", " "), row["entity_name"] if row["borrower_name"] else None,
                          _city(row["property_address"]), _money(row["estimated_loan_value"]))))
@@ -270,6 +288,32 @@ def _with_clay(db: Session, items: list[ListItem]) -> list[ListItem]:
     return out
 
 
+@dataclass(frozen=True)
+class LinkConfig:
+    ghl_app_url: str = ""
+    ghl_location_id: str = ""
+
+
+def _with_links(db: Session, items: list[ListItem], links: LinkConfig) -> list[ListItem]:
+    """GHL and BatchDialer contact links, from ids we already hold (one batch read per system, by phone)."""
+    phones = sorted({i.phone for i in items if i.phone})
+    ghl: dict[str, str] = {}
+    dialer: dict[str, str] = {}
+    if phones:
+        for row in db.execute(_GHL_IDS, {"phones": phones}).mappings():
+            ghl.setdefault(row["phone"], row["ghl_contact_id"])
+        for row in db.execute(_DIALER_IDS, {"phones": phones}).mappings():
+            dialer.setdefault(row["phone"], str(row["dialer_contact_id"]))
+    out = []
+    for item in items:
+        ghl_id = item.ghl_contact_id or ghl.get(item.phone or "")
+        dialer_id = item.dialer_contact_id or dialer.get(item.phone or "")
+        out.append(replace(item, ghl_contact_id=ghl_id, dialer_contact_id=dialer_id,
+                           ghl_url=ghl_contact_url(links.ghl_app_url, links.ghl_location_id, ghl_id),
+                           dialer_url=contact_view_url(dialer_id)))
+    return out
+
+
 def _tier(db: Session, name: str, read: Callable[[], list[ListItem]], unavailable: list[str]) -> list[ListItem]:
     try:
         with db.begin_nested():
@@ -281,7 +325,8 @@ def _tier(db: Session, name: str, read: Callable[[], list[ListItem]], unavailabl
 
 
 def read_candidates(db: Session, now: datetime, *, lead_days: int, size: int,
-                    stuck_deals: Callable[[Session, datetime], Sequence[Any]]) -> tuple[list[ListItem], list[str]]:
+                    stuck_deals: Callable[[Session, datetime], Sequence[Any]],
+                    links: Optional[LinkConfig] = None) -> tuple[list[ListItem], list[str]]:
     """Every tier's candidates plus line types and emails, and the names of the tiers that could not be read."""
     unavailable: list[str] = []
     items = (_tier(db, "stuck deals", lambda: blockers_from_stuck_deals(stuck_deals(db, now)), unavailable)
@@ -290,12 +335,13 @@ def read_candidates(db: Session, now: datetime, *, lead_days: int, size: int,
              + _tier(db, "callbacks", lambda: read_callbacks(db, now), unavailable)
              + _tier(db, "new leads", lambda: read_warm_leads(db, now, lead_days=lead_days), unavailable)
              + _tier(db, "calling queue", lambda: read_cold_top(db, limit=size), unavailable))
-    for name, step in (("contact details", _with_contacts), ("Clay results", _with_clay)):
+    link_step = partial(_with_links, links=links or LinkConfig())
+    for name, step in (("contact details", _with_contacts), ("Clay results", _with_clay), ("links", link_step)):
         try:
             with db.begin_nested():
                 items = step(db, items)
         except Exception as exc:  # class only
             logger.warning("[morning-list] %s not available (%s)", name, type(exc).__name__)
-            if step is _with_contacts:  # Clay is optional (D9): its absence is logged, not shown to the client
+            if step is _with_contacts:  # Clay and links are optional: their absence is logged, not shown
                 unavailable.append(name)
     return items, unavailable
