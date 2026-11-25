@@ -115,9 +115,13 @@ def test_a_redelivery_while_nothing_changed_reuses_the_key(calls):
     assert {kw["source_event_id"] for _, _, kw in calls["transition"]} == {"o1:funded@CLOSING"}
 
 
-def test_linking_applies_the_deals_current_stage(calls):
-    assert bridge.link(_Db((7, "CLOSING")), 7, "o1") == "applied"
+def test_linking_applies_the_deals_current_stage_and_records_the_link(calls, monkeypatch):
+    recorded = []
+    monkeypatch.setattr(bridge.deal_ledger, "record", lambda db, file_id, event_type, **kw: recorded.append(
+        (file_id, event_type, kw["diff"], kw["dedupe_key"])) or 1)
+    assert bridge.link(_Db((7, "CLOSING")), 7, "o1", actor="human:cli:josh") == "applied"
     assert calls["transition"][0][0] == 7
+    assert recorded == [(7, "field_update", {"ghl_opportunity_id": {"before": None, "after": "o1"}}, "ghl_link:7:o1")]
 
 
 def test_a_link_to_a_missing_or_already_linked_file_is_refused(calls):

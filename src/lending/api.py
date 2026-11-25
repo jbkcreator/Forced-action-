@@ -29,6 +29,7 @@ from src.api.lending_doc_upload_router import UploadTokenLogFilter, router as le
 from src.api.lending_instant_quote_router import router as lending_instant_quote_router
 from src.api.lending_loan_stage_router import router as lending_loan_stage_router
 from src.api.lending_lender_rules_router import router as lending_lender_rules_router
+from src.api.lending_deal_ledger_router import router as lending_deal_ledger_router
 
 app = FastAPI(title="Lending API", docs_url=None, redoc_url=None)
 # Borrower upload links carry their token in the path: the access logs record it redacted.
@@ -60,6 +61,7 @@ app.include_router(lending_doc_upload_router)
 app.include_router(lending_instant_quote_router)
 app.include_router(lending_loan_stage_router)
 app.include_router(lending_lender_rules_router)
+app.include_router(lending_deal_ledger_router)
 
 
 @app.get("/health")

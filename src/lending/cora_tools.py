@@ -216,6 +216,8 @@ class InstantQuoteInput(_Input):
     rehab: Decimal = Field(..., ge=0, le=MAX_QUOTE_AMOUNT)
     arv: Decimal = Field(..., gt=0, le=MAX_QUOTE_AMOUNT, description="After-repair value.")
     existing_debt: Optional[Decimal] = Field(None, ge=0, le=MAX_QUOTE_AMOUNT, description="Refinance only.")
+    loan_file_id: Optional[int] = Field(None, ge=1, description="The loan file (lending.loan_files.id) this quote is "
+                                                               "for, when known; the quote is then logged on it.")
 
 
 class AttemptLogInput(_Input):
@@ -628,7 +630,7 @@ class CoraToolkit:
             existing_debt=args.existing_debt)
         result = quote(request, new_construction_exit_rule=settings.lending_instant_quote_exit_rule_enabled)
         try:
-            quote_id = (self._quote_store or SqlQuoteStore()).save(audit_record(request, result, QUOTE_CALLER))
+            quote_id = (self._quote_store or SqlQuoteStore()).save(audit_record(request, result, QUOTE_CALLER, args.loan_file_id))
         except Exception as exc:  # class only: SQL errors embed bound parameters
             logger.error("[cora-tools] instant quote audit write failed (%s); quote withheld", type(exc).__name__)
             raise ToolInputError("the quote could not be saved, so it is not shown; try again") from None

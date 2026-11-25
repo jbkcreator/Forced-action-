@@ -12,6 +12,7 @@ from sqlalchemy import create_engine, event, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
+from migrations.apply_lending_deal_audit_ledger import apply_to as apply_ledger
 from migrations.apply_lending_loan_state_machine import apply_to
 from src.lending import state_machine as sm
 from src.lending.contracts import (
@@ -74,6 +75,7 @@ def sm_db():
     engine, conn, tx = _connect(schema)
     LendingBase.metadata.create_all(conn.execution_options(schema_translate_map={LENDING_SCHEMA: schema}),
                                     tables=[m.__table__ for m in TABLES])
+    apply_ledger(conn, schema)  # R1 0.8: every stage move and file write records an event
     session = Session(bind=conn, join_transaction_mode="create_savepoint")
     session.info["schema"] = schema
     yield session

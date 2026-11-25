@@ -14,7 +14,7 @@ import logging
 from typing import Optional
 
 from fastapi import APIRouter, Depends, Header, HTTPException
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 from sqlalchemy.orm import Session
 
 from config.settings import get_settings
@@ -33,7 +33,14 @@ class StageIn(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     to_stage: LoanStage
-    actor: str = Field(min_length=1, max_length=80)
+    actor: str = Field(min_length=1, max_length=80, pattern=r"^[^\x00-\x1f]+$")  # no tabs or control characters
+
+    @field_validator("actor")
+    @classmethod
+    def _actor_has_a_name(cls, value: str) -> str:
+        if value.strip().lower() in ("human:", "system:", "slack:", "cora:") or not value.strip():
+            raise ValueError("actor must name who made the change")
+        return value
     source_event_id: Optional[str] = Field(default=None, max_length=120)
     reason: Optional[str] = Field(default=None, max_length=200)
 

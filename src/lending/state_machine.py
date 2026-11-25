@@ -21,11 +21,12 @@ from __future__ import annotations
 import logging
 import re
 from dataclasses import dataclass
-from typing import Any, Optional
+from typing import Any, Mapping, Optional
 
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
+from src.lending.audit import deal_ledger
 from src.lending.contracts import (
     LOAN_STAGE_ORDER,
     BorrowerRecord,
@@ -189,8 +190,13 @@ def transition(db: Session, loan_file_id: int, to_stage: LoanStage | str, *, sou
     if event_id is None:  # this event was already handled: change nothing
         return TransitionResult(loan_file_id, current, target, OUTCOME_DUPLICATE)
 
+    ledger_actor = deal_ledger.tag_actor(actor, source=source)
     if outcome == OUTCOME_REJECTED:
         _park_rejected(db, event_id, loan_file_id, current, target, why or "", source)
+        deal_ledger.record(db, loan_file_id, "stage_rejected", actor=ledger_actor,
+                           diff={"stage": {"before": current.value, "after": target.value}},
+                           detail={"source": source, "source_event_id": source_event_id, "reason": why},
+                           ref_table="loan_stage_events", ref_id=event_id)
         raise IllegalStageTransitionError(loan_file_id, current, target, why or "")
     if outcome == OUTCOME_NOOP:
         return TransitionResult(loan_file_id, current, target, OUTCOME_NOOP)
@@ -201,8 +207,14 @@ def transition(db: Session, loan_file_id: int, to_stage: LoanStage | str, *, sou
              "funded_at = CASE WHEN :stage = 'FUNDED' THEN COALESCE(funded_at, now()) ELSE funded_at END WHERE id = :id"),
         {"stage": target.value, "id": loan_file_id})
     if new_status != row.status:
-        # The shared lifecycle write: status, its history and the partner notice (queued for the retry sweep).
-        record_status_change(db, loan_file_id, new_status, reason or f"stage {target.value}")
+        # The shared lifecycle write: status, its history and the partner notice (queued for the retry sweep). The
+        # ledger event below records the move, so this write adds no second one.
+        record_status_change(db, loan_file_id, new_status, reason or f"stage {target.value}", record_ledger=False)
+    deal_ledger.record(db, loan_file_id, "stage_transition", actor=ledger_actor,
+                       diff={"stage": {"before": current.value, "after": target.value},
+                             **deal_ledger.diff_fields({"status": row.status}, {"status": new_status})},
+                       detail={"source": source, "source_event_id": source_event_id, "reason": reason},
+                       ref_table="loan_stage_events", ref_id=event_id)
     return TransitionResult(loan_file_id, current, target, OUTCOME_APPLIED)
 
 
@@ -222,7 +234,7 @@ def close_file(db: Session, loan_file_id: int, reason: DeclineReason | str, *, a
     """Mark a deal dead (declined, withdrew, unresponsive).  The stage stays where it is; every later move is
     rejected.  Returns False when the file was already closed or the event already seen."""
     code = DeclineReason(reason)
-    row = db.execute(text("SELECT stage, closed_at FROM lending.loan_files WHERE id = :id FOR UPDATE"), {"id": loan_file_id}).first()
+    row = db.execute(text("SELECT stage, status, closed_at FROM lending.loan_files WHERE id = :id FOR UPDATE"), {"id": loan_file_id}).first()
     if row is None:
         raise LoanFileNotFound(f"loan file {loan_file_id} not found")
     if row.closed_at is not None:
@@ -238,7 +250,12 @@ def close_file(db: Session, loan_file_id: int, reason: DeclineReason | str, *, a
     db.execute(text("UPDATE lending.loan_files SET closed_reason = :reason, closed_at = now(), updated_at = now() "
                     "WHERE id = :id AND closed_at IS NULL"), {"reason": code.value, "id": loan_file_id})
     # The shared lifecycle write records the status and queues the partner's "declined" notice.
-    record_status_change(db, loan_file_id, CLOSED_STATUS, code.value)
+    record_status_change(db, loan_file_id, CLOSED_STATUS, code.value, record_ledger=False)
+    deal_ledger.record(db, loan_file_id, "closed", actor=deal_ledger.tag_actor(actor, source=source),
+                       diff={"closed_reason": {"before": None, "after": code.value},
+                             **deal_ledger.diff_fields({"status": row.status}, {"status": CLOSED_STATUS})},
+                       detail={"stage": row.stage, "source": source, "source_event_id": source_event_id},
+                       ref_table="loan_stage_events", ref_id=event_id)
     return True
 
 
@@ -275,6 +292,11 @@ def record_payment(db: Session, loan_file_id: int, *, source: str, payment_id: s
     balance = outstanding_after(locked.payoff_balance, int(paid_total))
     db.execute(text("UPDATE lending.loan_files SET outstanding_balance = :b, updated_at = now() WHERE id = :id"),
                {"b": balance, "id": loan_file_id})
+    deal_ledger.record(db, loan_file_id, "payment_recorded", actor=deal_ledger.tag_actor(actor, source=source),
+                       diff=deal_ledger.diff_fields({"outstanding_balance": locked.outstanding_balance},
+                                                    {"outstanding_balance": balance}),
+                       detail={"source": source, "payment_id": payment_id, "amount": amount},
+                       ref_table="loan_payments", ref_id=inserted)
 
     paid = False
     if LoanStage(locked.stage) is LoanStage.FUNDED and (mark_paid or balance == 0):
@@ -365,10 +387,14 @@ def ingest_loan_file(db: Session, loan: LoanFile, *, actor: str) -> IngestResult
         {"file": file_id, "actor": actor})
     db.execute(text("INSERT INTO lending.loan_file_status_events (loan_file_id, status, reason) VALUES (:id, 'received', 'file created')"),
                {"id": file_id})
+    deal_ledger.record(db, file_id, "file_created", actor=deal_ledger.tag_actor(actor, source="ingest"),
+                       detail={"source": loan.source, "product": loan.product, "borrower_id": borrower_id,
+                               "property_id": property_id, "entity_id": entity_id})
     return IngestResult(file_id, True, borrower_id, property_id, entity_id)
 
 
-def record_lender_submission(db: Session, loan_file_id: int, lender_key: str, *, status: str = "submitted") -> int:
+def record_lender_submission(db: Session, loan_file_id: int, lender_key: str, *, status: str = "submitted",
+                             actor: Optional[str] = None) -> int:
     """One more attempt with a lender.  Always a new row: a re-submit to the same lender is attempt 2, 3, ..."""
     locked = db.execute(text("SELECT id FROM lending.loan_files WHERE id = :id FOR UPDATE"), {"id": loan_file_id}).scalar_one_or_none()
     if locked is None:
@@ -376,7 +402,51 @@ def record_lender_submission(db: Session, loan_file_id: int, lender_key: str, *,
     attempt = db.execute(
         text("SELECT COALESCE(MAX(attempt_no), 0) + 1 FROM lending.lender_submissions WHERE loan_file_id = :id AND lender_key = :lender"),
         {"id": loan_file_id, "lender": lender_key}).scalar_one()
-    return int(db.execute(
+    submission_id = int(db.execute(
         text("INSERT INTO lending.lender_submissions (loan_file_id, lender_key, attempt_no, status) "
              "VALUES (:id, :lender, :attempt, :status) RETURNING id"),
         {"id": loan_file_id, "lender": lender_key, "attempt": attempt, "status": status}).scalar_one())
+    deal_ledger.record(db, loan_file_id, "lender_submission", actor=deal_ledger.tag_actor(actor, source="lender_submission"),
+                       detail={"lender_key": lender_key, "attempt_no": attempt, "status": status},
+                       ref_table="lender_submissions", ref_id=submission_id)
+    return submission_id
+
+
+# ── Field edits ────────────────────────────────────────────────────────────────
+
+AMOUNT_FIELDS = frozenset({"loan_amount", "purchase_price", "rehab_budget", "arv", "payoff_balance"})
+EDITABLE_FIELDS = AMOUNT_FIELDS | {"property_address", "property_city", "property_state", "property_zip", "credit_band",
+                                   "completed_projects", "timeline", "occupancy", "notes"}
+
+
+def update_fields(db: Session, loan_file_id: int, changes: Mapping[str, Any], *, actor: str,
+                  source: str = "manual") -> dict[str, dict]:
+    """Change fields of a loan file and record exactly what changed, who changed it and under which rule version.
+
+    Only ``EDITABLE_FIELDS`` can be edited (raises ``ValueError`` otherwise).  An amount that is blank or not a number
+    becomes None (unknown), never 0.  A new ``payoff_balance`` recalculates ``outstanding_balance`` from the payments
+    already stored.  Returns the diff (empty, and nothing written, when no value changed).  The caller commits."""
+    unknown = set(changes) - EDITABLE_FIELDS
+    if unknown:
+        raise ValueError(f"not editable: {sorted(unknown)}")
+    wanted = {name: (amount_or_none(value) if name in AMOUNT_FIELDS else value) for name, value in changes.items()}
+    columns = ", ".join(sorted(set(wanted) | ({"payoff_balance", "outstanding_balance"} if "payoff_balance" in wanted else set())))
+    row = db.execute(text(f"SELECT {columns} FROM lending.loan_files WHERE id = :id FOR UPDATE"), {"id": loan_file_id}).mappings().first()
+    if row is None:
+        raise LoanFileNotFound(f"loan file {loan_file_id} not found")
+    diff = deal_ledger.diff_fields({name: row[name] for name in wanted}, wanted)
+    if not diff:
+        return {}
+    new_values = {name: change["after"] for name, change in diff.items()}
+    if "payoff_balance" in diff:
+        paid_total = db.execute(text("SELECT COALESCE(SUM(amount), 0) FROM lending.loan_payments WHERE loan_file_id = :id"),
+                                {"id": loan_file_id}).scalar_one()
+        balance = outstanding_after(new_values["payoff_balance"], int(paid_total))
+        diff.update(deal_ledger.diff_fields({"outstanding_balance": row["outstanding_balance"]}, {"outstanding_balance": balance}))
+        new_values["outstanding_balance"] = balance
+    assignments = ", ".join(f"{name} = :{name}" for name in sorted(new_values))  # names come from EDITABLE_FIELDS
+    db.execute(text(f"UPDATE lending.loan_files SET {assignments}, updated_at = now() WHERE id = :id"),
+               {**new_values, "id": loan_file_id})
+    deal_ledger.record(db, loan_file_id, "field_update", actor=deal_ledger.tag_actor(actor, source=source), diff=diff,
+                       detail={"source": source})
+    return diff

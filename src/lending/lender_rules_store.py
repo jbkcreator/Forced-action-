@@ -194,6 +194,27 @@ def current_matrix() -> tuple[LenderRules, ...]:
         return LENDER_MATRIX
 
 
+def current_matrix_with_version() -> tuple[tuple[LenderRules, ...], Optional[int]]:
+    """Read the effective rules and their snapshot version in one PostgreSQL statement."""
+    if not get_settings().lending_rules_from_db:
+        return LENDER_MATRIX, None
+    try:
+        from src.core.database import get_db_context
+
+        with get_db_context() as session:
+            rows = session.execute(text(
+                f"SELECT rules.*, (SELECT max(version_no) FROM {LENDING_SCHEMA}.lender_rule_snapshots) AS version "
+                f"FROM ({_SELECT_SQL}) AS rules"
+            )).all()
+        if not rows:
+            return LENDER_MATRIX, None
+        matrix = apply_rows(LENDER_MATRIX, [(r.lender_key, r.field, r.value, r.status) for r in rows])
+        return matrix, rows[0].version
+    except Exception as exc:
+        logger.warning("[lender-rules] versioned matrix unavailable (%s)", type(exc).__name__)
+        return current_matrix(), None
+
+
 def routing_priorities() -> dict[str, int]:
     """T-05 lender key -> R-1 ``/lenders`` priority (lower first), the cost tie-break in ``evaluate_lender_fit``.
 

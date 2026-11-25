@@ -32,6 +32,7 @@ from typing import Optional, Sequence
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
+from src.lending.audit import deal_ledger
 from src.lending.closing.blockers import current_stage
 from src.lending.contracts import LoanStage
 from src.lending.cora_inbox import add_to_inbox_safely
@@ -100,13 +101,16 @@ def apply_stage(db: Session, *, opportunity_id: str, stage_name: str, phone: Opt
         return "rejected"  # stored as a rejected event, card queued (state_machine.transition)
 
 
-def link(db: Session, loan_file_id: int, opportunity_id: str) -> Optional[str]:
-    """A person ties a loan file to its GHL deal, then the deal's current GHL stage is applied (None when that stage
-    has no loan meaning). Raises ValueError when the file does not exist or either side is already linked elsewhere.
-    The caller commits."""
+def link(db: Session, loan_file_id: int, opportunity_id: str, *, actor: str = "system:ghl_link") -> Optional[str]:
+    """A person ties a loan file to its GHL deal (recorded in the deal ledger), then the deal's current GHL stage is
+    applied (None when that stage has no loan meaning). Raises ValueError when the file does not exist or either side is
+    already linked elsewhere. The caller commits."""
     if db.execute(_LINK, {"id": loan_file_id, "opp": opportunity_id}).rowcount != 1:
         raise ValueError(f"loan file {loan_file_id} not found, or it or GHL deal {opportunity_id} is already linked "
                          "to something else")
+    deal_ledger.record(db, loan_file_id, "field_update", actor=actor,
+                       diff={"ghl_opportunity_id": {"before": None, "after": opportunity_id}},
+                       detail={"source": "ghl_link"}, dedupe_key=f"ghl_link:{loan_file_id}:{opportunity_id}")
     current = current_stage(db, opportunity_id)
     return apply_stage(db, opportunity_id=opportunity_id, stage_name=current[0]) if current else None
 
@@ -120,7 +124,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     try:
         with lending_session() as db:
-            outcome = link(db, int(args.link[0]), args.link[1])
+            import getpass
+
+            outcome = link(db, int(args.link[0]), args.link[1], actor=deal_ledger.human(f"cli:{getpass.getuser()}"))
     except ValueError as exc:
         sys.stdout.write(f"{exc}\n")
         return 2

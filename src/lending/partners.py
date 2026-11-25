@@ -50,6 +50,7 @@ from config.lending_partners import (
 )
 from src.lending.contracts import DeclineReason, LoanStage
 from src.services.phone_utils import normalize
+from src.lending.audit import deal_ledger
 
 logger = logging.getLogger(__name__)
 
@@ -345,6 +346,8 @@ def save_submission(db, partner: Partner, data: SubmissionInput, uploads: Sequen
          "notes": data.notes, "occupancy": data.occupancy, "now": now},
     ).scalar_one())
     _record_status_event(db, file_id, "received", None, now)
+    deal_ledger.record_safely(db, file_id, "file_created", actor=deal_ledger.system("partner_door"), occurred_at=now,
+                              detail={"source": SOURCE_PARTNER, "partner_id": partner.id, "product": data.product})
     db.execute(
         text("INSERT INTO lending.partner_submissions (file_id, partner_id, consent_checked, consent_text, "
              "consented_at, ip_address, page_url, user_agent, created_at) VALUES (:file_id, :partner_id, :checked, "
@@ -437,8 +440,24 @@ def _record_stage_event(db, file_id: int, before: str, after: str, reason: str) 
         logger.error("[partners] stage event for file %s not recorded (%s)", file_id, type(exc).__name__)
 
 
+_LIFECYCLE_COLUMNS = "SELECT status, stage, closed_reason, closed_at FROM lending.loan_files WHERE id = :id"
+
+
+def _lifecycle_read(db):
+    """The file's status, stage and closure, locked for this transaction on PostgreSQL (SQLite, in the partner tests,
+    has no row locks and serialises writes anyway), so the ledger's before and after are the values really written."""
+    bind = db.get_bind() if hasattr(db, "get_bind") else db
+    dialect = getattr(getattr(bind, "dialect", None), "name", "")
+    return text(_LIFECYCLE_COLUMNS + (" FOR UPDATE" if dialect == "postgresql" else ""))
+
+
+def _lifecycle_view(row) -> dict:
+    return {"status": row["status"], "stage": row["stage"], "closed_reason": row["closed_reason"],
+            "closed": row["closed_at"] is not None}
+
+
 def record_status_change(db, file_id: int, status: str, reason: Optional[str] = None,
-                         now: Optional[datetime] = None) -> Optional[StatusChange]:
+                         now: Optional[datetime] = None, *, record_ledger: bool = True) -> Optional[StatusChange]:
     """Move a file to ``status``: the one lifecycle write every status change goes through (R-1's route, decline,
     approval and funding, and the loan state machine). In one statement it sets the status, the partner notice fields
     (``notice_status`` and the delivery stamps the retry sweep reads), the loan ``stage`` (forward only) and the
@@ -452,7 +471,8 @@ def record_status_change(db, file_id: int, status: str, reason: Optional[str] = 
         raise ValueError(f"status must be one of {FILE_STATUSES}")
     now = now or _utcnow()
     clipped = (reason or None) and reason[:200]
-    before = db.execute(_READ_STAGE, {"id": file_id}).scalar_one_or_none()
+    prior = db.execute(_lifecycle_read(db), {"id": file_id}).mappings().first()
+    before = prior["stage"] if prior else None
     if before in _FUNDED_STAGES and status != "funded":
         # A funded loan never reads as approved, routed or declined again (an old Approve button, a late route): the
         # stage cannot go back, so neither may the status the partner sees.
@@ -467,6 +487,11 @@ def record_status_change(db, file_id: int, status: str, reason: Optional[str] = 
         _record_status_event(db, file_id, status, reason, now)
         if new_stage is not None:
             _record_stage_event(db, file_id, before, new_stage, clipped or f"status {status}")
+        if record_ledger and prior is not None:
+            after = db.execute(_lifecycle_read(db), {"id": file_id}).mappings().first()
+            deal_ledger.record_safely(db, file_id, "status_change", actor=deal_ledger.system("router"), occurred_at=now,
+                                      diff=deal_ledger.diff_fields(_lifecycle_view(prior), _lifecycle_view(after)),
+                                      detail={"reason": reason})
     if not changed or status not in PARTNER_NOTIFY_STATUSES:
         return None
     row = db.execute(

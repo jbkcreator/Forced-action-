@@ -46,6 +46,7 @@ from packages.agent_core.slack_session import InboundMessage, SlackSession, run_
 from packages.agent_core.store import AgentStore
 from packages.agent_core.thread_history import build_history
 from packages.agent_core.tools import ToolContext, ToolRegistry
+from src.lending.audit import deal_ledger
 from src.lending.agent_jobs.drive import google_job_folders
 from src.lending.agent_jobs.worker import JobQueueWorker, make_check, may_send_without_card
 from src.lending.attempt_log import lending_ghl_readers
@@ -141,6 +142,7 @@ class CoraServices(NamedTuple):
     doc_chase: Optional[Callable[[], int]] = None  # P2.4: queues due document requests and reminders
     block_list: Optional[Callable[[], Any]] = None  # P1.3: sends queued opt-out addresses to Instantly's block list
     backflip_alerts: Optional[Callable[[], int]] = None  # queues each new Backflip block for the inbox digest
+    deal_ledger_sync: Optional[Callable[[], int]] = None  # R1 0.8: records card drafts, edits and approvals in the deal audit ledger
 
 
 def lending_channel_ids(settings: AppSettings) -> dict[str, str]:
@@ -583,6 +585,11 @@ def run_sweep(services: CoraServices) -> None:
             step()
         except Exception as exc:  # class only: SQL errors embed bound parameters; never skip the sends below
             logger.error("[cora] %s failed (%s); retrying next sweep", name, type(exc).__name__)
+    if services.deal_ledger_sync is not None:
+        try:
+            services.deal_ledger_sync()
+        except Exception as exc:  # class only; the events are found again next sweep (each has a dedupe key)
+            logger.error("[cora] deal ledger catch-up failed (%s); retrying next sweep", type(exc).__name__)
     if services.block_list is not None:
         try:
             services.block_list()
@@ -699,6 +706,7 @@ def build_live_services(settings: AppSettings) -> Optional[CoraServices]:
                                                                       services.gate),
                              agent_jobs=worker.run_once if worker is not None else None,
                              standing_sends=make_standing_sends_step(engine),
+                             deal_ledger_sync=make_deal_ledger_step(engine),
                              closing_blockers=closing_blockers, doc_chase=doc_chase,
                              block_list=BlockListSweep(engine),
                              after_hours_responder=run_send_cycle)
@@ -763,6 +771,19 @@ def build_closing_steps(settings: AppSettings, *, engine: Engine, chat: ChatPort
 
     return (blocker_card if settings.lending_closing_blockers_enabled else None,
             chase_sweep if settings.lending_doc_chase_enabled else None)
+
+
+def make_deal_ledger_step(engine: Engine) -> Callable[[], int]:
+    """R1 0.8 sweep step: ledger the drafts, approvals and edits of cards that belong to a loan file, on its own
+    transaction. Idempotent, so a missed minute is caught up by the next."""
+
+    def step() -> int:
+        with Session(engine) as db:
+            added = deal_ledger.sync_card_events(db)
+            db.commit()
+            return added
+
+    return step
 
 
 def make_standing_sends_step(engine: Engine) -> Callable[[], Any]:
