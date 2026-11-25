@@ -33,7 +33,7 @@ from src.lending.after_hours_intake import record_intake
 from src.lending.after_hours_responder import run_send_cycle_now
 from src.lending.closing.blockers import current_stage, upsert_current_stage
 from src.lending.cora_inbox import add_to_inbox_safely
-from src.lending.ghl_stage_bridge import apply_stage
+from src.lending.ghl_stage_bridge import GHL_STAGE_TO_LOAN_STAGE, apply_stage
 from src.lending.ghl_disposition_match import (
     InvalidDispositionEvent,
     attach_pending,
@@ -141,7 +141,11 @@ def _flag_held_stage(db: Session, opportunity_id: str, stage: str, now: datetime
 def _record_current_stage(db: Session, opportunity_id: str, stage: str, phone: Optional[str], *,
                           repeat: bool) -> None:
     """P2.4 current stage, in a savepoint: a failure is logged and never loses the scoreboard's stage event.
-    ``repeat``: the event was already recorded; a redelivery never moves the deal (blockers.upsert_current_stage)."""
+    ``repeat``: the event was already recorded; a redelivery never moves the deal (blockers.upsert_current_stage).
+
+    R1 0.1: for a stage that moves a loan file (Funded / Paid) the failure is re-raised instead. The loan bridge applies
+    an event only while it is the deal's current stage, so without this write it would skip a valid update as stale.
+    The webhook then rolls back and answers 500, and GHL delivers the event again."""
     try:
         with db.begin_nested():
             now = _now()
@@ -150,6 +154,8 @@ def _record_current_stage(db: Session, opportunity_id: str, stage: str, phone: O
                 _flag_held_stage(db, opportunity_id, stage, now)
     except Exception as exc:  # class only: SQL errors embed bound parameters
         logger.error("[lending-ghl] current stage not recorded (%s)", type(exc).__name__)
+        if stage.strip().lower() in GHL_STAGE_TO_LOAN_STAGE:
+            raise
 
 
 def _apply_loan_stage(db: Session, opportunity_id: str, stage: str, phone: Optional[str]) -> None:

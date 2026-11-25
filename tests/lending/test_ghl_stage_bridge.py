@@ -171,3 +171,26 @@ def test_the_saved_event_is_replayed_through_the_bridge():
     from src.lending import webhook_failures
 
     assert webhook_failures.ENDPOINT_HANDLERS[webhook_failures.GHL_LOAN_STAGE] is bridge.apply_stage_payload
+
+
+def _stage_write_fails(monkeypatch):
+    from src.api import lending_ghl_router as router
+
+    def boom(db, **kwargs):
+        raise RuntimeError("database restarting")
+
+    monkeypatch.setattr(router, "upsert_current_stage", boom)
+    return router
+
+
+@pytest.mark.parametrize("stage", ["Funded", " paid "])
+def test_a_failed_stage_write_for_funded_or_paid_fails_the_webhook_so_ghl_sends_it_again(monkeypatch, stage):
+    """PR #473 re-review: without the current-stage write the bridge would skip a valid Funded / Paid as stale."""
+    router = _stage_write_fails(monkeypatch)
+    with pytest.raises(RuntimeError):
+        router._record_current_stage(SimpleNamespace(begin_nested=nullcontext), "o1", stage, None, repeat=False)
+
+
+def test_a_failed_stage_write_for_another_stage_is_only_logged(monkeypatch):
+    router = _stage_write_fails(monkeypatch)
+    router._record_current_stage(SimpleNamespace(begin_nested=nullcontext), "o1", "Showed", None, repeat=False)
