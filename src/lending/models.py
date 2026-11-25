@@ -79,6 +79,8 @@ class LendingContact(LendingBase):
     email: Mapped[Optional[str]] = mapped_column(String(255))
     last_dnc_scrub: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
     line_type: Mapped[Optional[str]] = mapped_column(String(20))  # Tracerfy phone_type (mobile/landline)
+    line_type_source: Mapped[Optional[str]] = mapped_column(String(20))  # telnyx when the 0.11 fallback looked it up
+    line_type_checked_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))  # when telnyx looked it up
     do_not_contact: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default=text("false"))
     nurture: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default=text("false"))  # phone blocked by DNC; email nurture only
     pinned_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))  # after-hours voicemail: call first next morning

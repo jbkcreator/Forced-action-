@@ -1549,3 +1549,96 @@ def reconcile_suppression(db, source_schema: str = "public", target_schema: str 
     added = db.execute(text(f'SELECT count(*) FROM "{t}".suppression_list')).scalar() - before
     logger.info("[lending-compliance] reconcile_suppression added=%d", added)
     return added
+
+
+# --- R1 0.11: SMS line-type gate ------------------------------------------------------------------------------
+# Only a mobile number may be texted. The line type comes from the Tracerfy DNC scrub (free with it); a number with
+# none is looked up once with Telnyx (LINE_TYPE_TELNYX_FALLBACK_ENABLED, at most LINE_TYPE_MAX_LOOKUPS_PER_DAY per ET
+# day). Anything else (landline, VoIP, unknown, lookup failed, over the cap) is not texted: fail closed.
+
+SMS_LINE_TYPE_ALLOWED = "mobile"
+LINE_TYPE_UNKNOWN_RETRY_DAYS = 30
+LineTypeLookup = Callable[[str], dict]
+
+
+class SmsBlock:
+    LANDLINE = "landline"
+    NOT_MOBILE = "line_type_not_mobile"
+    UNKNOWN = "line_type_unknown"
+
+
+def _stored_line_type(db, phone: str) -> tuple[Optional[str], Optional[datetime]]:
+    """(line type, Telnyx check time) from the contact row, else the freshest scrub; lower-cased, '' as None."""
+    row = db.execute(
+        text("SELECT lower(nullif(trim(line_type), '')), line_type_checked_at FROM lending.contacts WHERE phone = :p"),
+        {"p": phone},
+    ).first()
+    if row and row[0]:
+        return row[0], row[1]
+    scrub = _stored_scrubs(db, [phone]).get(phone)
+    scrubbed = (scrub.line_type or "").strip().lower() if scrub else ""
+    return (scrubbed or None), (row[1] if row else None)
+
+
+def _lookups_today(db, now: datetime) -> int:
+    day_start = now.astimezone(ZoneInfo("America/New_York")).replace(hour=0, minute=0, second=0, microsecond=0)
+    return db.execute(
+        text("SELECT count(*) FROM lending.contacts WHERE line_type_source = 'telnyx' AND line_type_checked_at >= :d"),
+        {"d": day_start},
+    ).scalar() or 0
+
+
+def _save_lookup(db, phone: str, line_type: str, now: datetime) -> None:
+    db.execute(
+        text(
+            "INSERT INTO lending.contacts (phone, phone_hash, line_type, line_type_source, line_type_checked_at) "
+            "VALUES (:p, :h, :t, 'telnyx', :now) ON CONFLICT (phone) DO UPDATE SET "
+            "line_type = EXCLUDED.line_type, line_type_source = 'telnyx', line_type_checked_at = EXCLUDED.line_type_checked_at"
+        ),
+        {"p": phone, "h": phone_hash(phone), "t": line_type, "now": now},
+    )
+
+
+def _telnyx_line_type(db, phone: str, now: datetime, lookup: Optional[LineTypeLookup]) -> Optional[str]:
+    from config.settings import get_settings
+
+    settings = get_settings()
+    if not settings.line_type_telnyx_fallback_enabled:
+        return None
+    if _lookups_today(db, now) >= settings.line_type_max_lookups_per_day:
+        logger.warning("[lending-sms-gate] Telnyx line-type lookup cap reached for today; number not texted")
+        return None
+    if lookup is None:
+        from src.services.telnyx_lookup import lookup_phone as lookup
+    try:
+        line_type = (lookup(phone).get("type") or "unknown").lower()
+    except Exception as exc:  # class only: the message can carry the number
+        logger.warning("[lending-sms-gate] Telnyx line-type lookup failed (%s); number not texted", type(exc).__name__)
+        return None
+    _save_lookup(db, phone, line_type, now)
+    return line_type
+
+
+def sms_block_reason(db, phone: str, *, now: Optional[datetime] = None,
+                     lookup: Optional[LineTypeLookup] = None) -> Optional[str]:
+    """None when ``phone`` may be texted (a mobile number), else why not (``SmsBlock``). May spend one Telnyx lookup
+    and write it to ``lending.contacts``; does not commit."""
+    normalized = normalize_phone(phone)
+    if not normalized:
+        return SmsBlock.UNKNOWN
+    now = now or datetime.now(timezone.utc)
+    line_type, checked_at = _stored_line_type(db, normalized)
+    retry_unknown = line_type == "unknown" and (
+        checked_at is None or checked_at < now - timedelta(days=LINE_TYPE_UNKNOWN_RETRY_DAYS))
+    if line_type is None or retry_unknown:
+        line_type = _telnyx_line_type(db, normalized, now, lookup) or line_type
+    if line_type == SMS_LINE_TYPE_ALLOWED:
+        return None
+    if line_type == "landline":
+        return SmsBlock.LANDLINE
+    return SmsBlock.NOT_MOBILE if line_type and line_type != "unknown" else SmsBlock.UNKNOWN
+
+
+def sms_eligible(db, phone: str, **kwargs) -> bool:
+    """Whether ``phone`` may be texted: only a mobile number (see ``sms_block_reason``)."""
+    return sms_block_reason(db, phone, **kwargs) is None

@@ -1015,6 +1015,10 @@ class AppSettings(BaseSettings):
 	lending_after_hours_calendar_id: Optional[str] = Field(default=None, env="LENDING_AFTER_HOURS_CALENDAR_ID")
 	# Carrier (10DLC) approval for lending texts Cora sends after Approve; until true an approved text waits (then blocks at expiry)
 	lending_sms_carrier_approved: bool = Field(default=False, env="LENDING_SMS_CARRIER_APPROVED")
+	# R1 0.11 SMS line-type gate: a lending phone with no stored line type is looked up with Telnyx (TELNYX_API_KEY),
+	# at most this many lookups per ET day; off, or over the cap, the number is not texted.
+	line_type_telnyx_fallback_enabled: bool = Field(default=True, env="LINE_TYPE_TELNYX_FALLBACK_ENABLED")
+	line_type_max_lookups_per_day: int = Field(default=200, env="LINE_TYPE_MAX_LOOKUPS_PER_DAY")
 	lending_ghl_cf_intro_name: Optional[str] = Field(default=None, env="LENDING_GHL_CF_INTRO_NAME")
 	# GHL contact custom field "lead_id": every LendingFlow push writes our lendingflow_leads.lead_uuid; unset = not written
 	lending_ghl_cf_lead_id: Optional[str] = Field(default=None, env="LENDING_GHL_CF_LEAD_ID")
