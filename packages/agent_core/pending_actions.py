@@ -256,23 +256,25 @@ class PendingActionQueue:
                                 {"status": ActionStatus.REJECTED.value, "user_id": user_id}, card_ts=card_ts)
 
     def request_revision(self, action_id: int, user_id: str, *, card_ts: str | None = None) -> bool:
-        """Open a revision for this user. Any other revision they had open goes back to pending."""
+        """Open a revision for this user. Any other revision they had open goes back to pending, but only once this
+        one is open: a click that moves nothing (stale card, not pending) leaves their current revision alone."""
         now = self._clock()
         params = {"pending": ActionStatus.PENDING.value, "revising": ActionStatus.REVISING.value,
-                  "user_id": user_id, "action_id": action_id, "now": now}
+                  "user_id": user_id, "action_id": action_id, "now": now, "card_ts": card_ts}
+        card = " AND card_ts = :card_ts" if card_ts is not None else ""
         with self._store.transaction() as conn:
-            conn.execute(
-                text(f"UPDATE {self._table} SET status = :pending, updated_at = :now "
-                     "WHERE status = :revising AND revised_by = :user_id AND action_id <> :action_id"),
-                params,
-            )
-            card = " AND card_ts = :card_ts" if card_ts is not None else ""
-            result = conn.execute(
+            opened = conn.execute(
                 text(f"UPDATE {self._table} SET status = :revising, revised_by = :user_id, updated_at = :now "
                      f"WHERE action_id = :action_id AND status = :pending{card}"),
-                {**params, "card_ts": card_ts},
-            )
-        return result.rowcount == 1
+                params,
+            ).rowcount == 1
+            if opened:
+                conn.execute(
+                    text(f"UPDATE {self._table} SET status = :pending, updated_at = :now "
+                         "WHERE status = :revising AND revised_by = :user_id AND action_id <> :action_id"),
+                    params,
+                )
+        return opened
 
     def revising_for(self, user_id: str) -> PendingAction | None:
         with self._store.transaction() as conn:
