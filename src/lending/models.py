@@ -1407,6 +1407,23 @@ class LendingLoanFileStatusEvent(LendingBase):
     )
 
 
+class LendingLenderRuleSnapshot(LendingBase):
+    """R1 0.7: the full lender rule set after every change, append-only (a trigger refuses UPDATE and DELETE).
+    ``version_no`` is the rule version other records name (the audit ledger).  A rollback copies an old snapshot back
+    into ``lender_rule_values`` and is itself a new snapshot ("rollback to vN"); history is never rewritten."""
+
+    __tablename__ = "lender_rule_snapshots"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    version_no: Mapped[int] = mapped_column(Integer, nullable=False)
+    rules: Mapped[Any] = mapped_column(JSONB, nullable=False)  # [{lender_key, field, value, status, note, updated_by, effective_from}]
+    created_by: Mapped[str] = mapped_column(String(80), nullable=False)
+    reason: Mapped[str] = mapped_column(String(200), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_now, server_default=text("now()"))
+
+    __table_args__ = (Index("uq_lending_lender_rule_snapshots_version", "version_no", unique=True),)
+
+
 class LendingBorrowerProfile(LendingBase):
     """R1 0.1: one borrower.  Matched on normalized phone, then email (``state_machine.ingest_loan_file``)."""
 
