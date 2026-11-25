@@ -8,6 +8,10 @@ The event is stored and committed first. A STOP reply or an unsubscribe is then 
 fails, Cora's minute sweep retries it, so the 60-second stop rule does not depend on Instantly redelivering. Every
 other reply is classified and drafted by Cora's sweep (``instantly_replies.ReplyProcessor``). An event this route
 does not handle is answered 200 and ignored, so Instantly does not retry it.
+
+R1 0.5 (``LENDING_INBOUND_JOURNAL_ENABLED``): a handled NDL event is saved raw to the inbound journal first (source
+``instantly_event``, key = the event's ``dedup_key``) and ``handle_journaled_event`` runs once; a repeat is answered
+``duplicate`` and a failure is answered 200 and replayed by the 5-minute ``webhook_failures`` cron instead of a 503.
 """
 from __future__ import annotations
 
@@ -20,6 +24,7 @@ from sqlalchemy.orm import Session
 
 from config.settings import get_settings
 from src.api.deps import get_db
+from src.lending.inbound import journal
 from src.lending.instantly_client import block_address, lending_instantly_account
 from src.lending.instantly_replies import (
     EVENT_UNSUBSCRIBED,
@@ -86,6 +91,47 @@ def _suppress_now(db: Session, reply_id: int, email: str, *, via_unsubscribe_lin
         block_address(account, email)
 
 
+def _announce_suppression(db: Session, reply_id: int, email: str, event_id: Optional[int], *,
+                          via_unsubscribe_link: bool) -> None:
+    posted = post_ops_notice(suppression_notice(email, event_id, via_unsubscribe_link=via_unsubscribe_link))
+    queue_suppression_for_cora(db, reply_id, email, event_id, posted=posted)
+    account = lending_instantly_account()
+    if account is not None:
+        try:
+            block_address(account, email)
+        except Exception as exc:  # best effort: the opt-out is recorded in our stores either way
+            logger.warning("[instantly-webhook] reply %s not added to the Instantly block list (%s)", reply_id,
+                           type(exc).__name__)
+
+
+def handle_journaled_event(db: Session, raw: dict[str, Any]) -> dict[str, Any]:
+    """Journal handler (also the replay): store the event once and suppress a STOP / unsubscribe at once. Runs in
+    the journal's transaction and never commits. A failed opt-out is rolled back to its savepoint and left on the
+    stored reply for Cora's minute sweep, as on the flag-off path."""
+    event = parse_event(raw)
+    if event is None:
+        return {"status": "ignored"}
+    recorded = record_event(db, event)
+    if recorded.status != "recorded":
+        return {"status": recorded.status}
+    if not recorded.stop_request:
+        return {"status": "recorded"}
+    try:
+        with db.begin_nested():
+            opt_out_event_id = suppress_reply(db, recorded.reply_id)
+    except Exception as exc:  # class only: SQL errors embed the address
+        logger.error("[instantly-webhook] opt-out for reply %s not recorded yet (%s); Cora's sweep retries it",
+                     recorded.reply_id, type(exc).__name__)
+        return {"status": "suppressed"}
+    _announce_suppression(db, recorded.reply_id, event.lead_email, opt_out_event_id,
+                          via_unsubscribe_link=event.event_type == EVENT_UNSUBSCRIBED)
+    return {"status": "suppressed"}
+
+
+journal.register_source("instantly_event", handle_journaled_event, label="Instantly reply / unsubscribe",
+                        resend_hint="find the reply or unsubscribe in Instantly's unibox and record it by hand")
+
+
 @router.post("/instantly")
 def instantly_event(
     body: dict[str, Any],
@@ -101,6 +147,12 @@ def instantly_event(
         logger.warning("[instantly-webhook] %s from campaign %s ignored: not an NDL campaign", event.event_type,
                        (event.campaign_id or "")[:64])
         return {"status": "ignored"}
+    if journal.journal_enabled():
+        try:
+            result = journal.ingest("instantly_event", event.dedup_key, body)
+        except Exception:  # logged by the journal (class only); Instantly delivers it again
+            raise HTTPException(status_code=503, detail="Could not store the event; it will be retried") from None
+        return result.value if result.outcome == "processed" else {"status": result.outcome}
     try:
         recorded = record_event(db, event)
         db.commit()
