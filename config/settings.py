@@ -1082,6 +1082,10 @@ class AppSettings(BaseSettings):
 	# R1 0.5 durable inbound (src/lending/inbound/journal.py): webhooks save the raw body to lending.inbound_events first,
 	# then process it; a failure goes to webhook_failures and the endpoint still answers 200. Off = endpoints as before
 	lending_inbound_journal_enabled: bool = Field(default=False, env="LENDING_INBOUND_JOURNAL_ENABLED")
+	# R1 0.5 nightly reconcile (src/tasks/lending_reconciliation.py, acts at 2:xx ET): GHL stages of the NDL pipeline(s) updated in the
+	# last 24 h that our current stage lacks are fed through the ghl_stage journal handler. Pipeline ids comma-separated; unset = GHL slot fails
+	lending_reconcile_enabled: bool = Field(default=False, env="LENDING_RECONCILE_ENABLED")
+	lending_reconcile_ghl_pipeline_ids: str = Field(default="", env="LENDING_RECONCILE_GHL_PIPELINE_IDS")
 	# Morning BatchDialer load of the PropertyRadar pool the bridge stages (src/tasks/lending_pr_dialer_autoload.py,
 	# 09:xx and 12:xx ET): only phones not already loaded. The cap is Tracerfy do-not-call credits per ET day (a phone with a
 	# fresh check costs nothing); 0 = only phones already checked are loaded

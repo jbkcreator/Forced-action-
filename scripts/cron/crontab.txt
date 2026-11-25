@@ -1359,6 +1359,13 @@ COUNTY_ID=hillsborough
 # Idle until LENDING_INBOUND_JOURNAL_ENABLED=true.
 30 8 * * * $PROJECT/scripts/cron/run.sh src.lending.inbound.retention
 
+# Lending nightly reconcile (R1 0.5 D9/D10) — 2:00 AM ET: GHL stage changes of the NDL pipeline(s) updated in the last 24 h that
+# never reached us are healed through the ghl_stage journal handler. Two lines because ET is UTC-4 until Nov 1 and UTC-5 after;
+# the task acts only at 2:xx ET. Posts to LENDING_OPS_CHANNEL only when it healed something or failed. Idle until
+# LENDING_RECONCILE_ENABLED=true (+ LENDING_RECONCILE_GHL_PIPELINE_IDS).
+0 6 * * * $PROJECT/scripts/cron/run.sh src.tasks.lending_reconciliation
+0 7 * * * $PROJECT/scripts/cron/run.sh src.tasks.lending_reconciliation
+
 # OFR mortgage-broker refresh (WP-W0-1 Pool 3) — MONTHLY.
 # OFR publishes the MBR-MBRB file monthly; this downloads + unzips + loads it
 # into ofr_mortgage_brokers (Pool 3's source). Runs 1st of month 05:00 UTC,
