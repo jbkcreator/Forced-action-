@@ -65,6 +65,15 @@ def test_removed_approver_link_is_403_even_while_lending_api_still_lists_them(vi
     assert client.get(url).status_code == 403
 
 
+def test_removing_the_sole_approver_revokes_their_link(view):
+    """PR #478 re-review: with the only approver removed the list is empty; Cora's start-up revocation (which runs
+    before it refuses to start) gets that empty list and revokes every live Slack-issued link."""
+    client, link, _, docs = view
+    url = link()
+    assert revoke_links_of_removed_approvers(docs.db, frozenset(), datetime.now(timezone.utc)) == 1
+    assert client.get(url).status_code == 403
+
+
 def test_new_approver_link_opens_before_lending_api_restarts(view, monkeypatch):
     """The other side of the same cache: Cora issued it to a new approver; lending-api's old list must not block it."""
     client, link, *_ = view

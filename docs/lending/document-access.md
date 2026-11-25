@@ -12,8 +12,10 @@ in `src/lending/cora_tools.py`. Builds on the P2.4 document chase (`docs/lending
 | caller | everyone else: David, Cora operators, `--role caller` tokens | **none**. Callers see status only ("bank statement received / missing"), as today |
 
 **Removing an approver:** take them out of `LENDING_CORA_APPROVER_USER_IDS` and restart **both** `fa-lending-cora` and
-`lending-api` (each reads the setting once, at start). Within a minute Cora's sweep revokes every live link that person
-was given (`lending.doc_view_links.revoked_at`), and a revoked link answers 403. This does not depend on lending-api's
+`lending-api` (each reads the setting once, at start). Cora revokes every live link that person was given
+(`lending.doc_view_links.revoked_at`) the moment it starts, before any other check, and again on every minute sweep;
+a revoked link answers 403. This holds even when the removed person was the **only** approver: Cora then refuses to
+start (no approvers), but it has already revoked every live Slack-issued link with the empty list. This does not depend on lending-api's
 copy of the list: a Slack-issued link is never checked against it, so a stale lending-api neither keeps a removed
 approver's link open nor blocks a new approver's. **Revoking a token** (`--revoke`) stops its links at once: a token
 link re-checks its token every time it is opened.

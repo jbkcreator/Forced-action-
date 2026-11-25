@@ -156,6 +156,23 @@ def make_doc_link_revocation(engine: Engine, approver_ids: frozenset[str]) -> Ca
     return step
 
 
+def revoke_document_links_at_start(settings: AppSettings, approver_ids: frozenset[str]) -> int:
+    """R1 0.2: revoke former approvers' document links before anything else at start. Runs before the settings check
+    on purpose: removing the only approver leaves the list empty, so Cora refuses to start and never sweeps, and an
+    empty list here revokes every live Slack-issued link. A database failure is logged and never blocks the start;
+    the sweep retries every minute once Cora runs."""
+    if not settings.database_url:
+        return 0
+    engine = create_engine(str(settings.database_url), pool_pre_ping=True, connect_args={"connect_timeout": 10})
+    try:
+        return make_doc_link_revocation(engine, approver_ids)()
+    except Exception as exc:  # class only: SQL errors embed bound parameters
+        logger.error("[cora] document link revocation at start failed (%s)", type(exc).__name__)
+        return 0
+    finally:
+        engine.dispose()
+
+
 def lending_channel_ids(settings: AppSettings) -> dict[str, str]:
     """Inbox channel keys -> Slack channel ids, for naming where an item was already posted."""
     channels = {"replies": settings.lending_replies_channel, "ops": settings.lending_ops_channel,
@@ -844,6 +861,7 @@ def main(stop: Optional[threading.Event] = None) -> int:
         signal.signal(signum, lambda *_: stop.set())
     settings = get_settings()
     config = build_config(settings)
+    revoke_document_links_at_start(settings, config.approver_user_ids)
     missing = missing_settings(config)
     if missing:
         logger.error("[cora] not starting; missing settings: %s", ", ".join(missing))
