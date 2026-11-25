@@ -6,7 +6,8 @@ After=network.target
 Type=simple
 User=root
 WorkingDirectory=/root/Forced-action-
-Environment="PATH=/root/Forced-action-/.venv/bin"
+# systemctl lives in the system dirs; the watchdog runs it to check the lending units.
+Environment="PATH=/root/Forced-action-/.venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 Environment="PYTHONPATH=/root/Forced-action-"
 EnvironmentFile=/root/Forced-action-/.env
 ExecStart=/root/Forced-action-/.venv/bin/python -m src.lending.watchdog.daemon

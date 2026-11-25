@@ -49,6 +49,27 @@ def test_units_missing_output_line_is_down():
     assert [o.ok for o in obs] == [True, False]
 
 
+def test_default_runner_finds_systemctl_when_path_holds_only_the_virtualenv(tmp_path, monkeypatch):
+    system_bin = tmp_path / "usr-bin"
+    system_bin.mkdir()
+    fake = system_bin / "systemctl"
+    fake.write_text("#!/bin/sh\nfor unit in \"$@\"; do [ \"$unit\" = is-active ] || echo active; done\n")
+    fake.chmod(0o755)
+    monkeypatch.setenv("PATH", str(tmp_path / "venv" / "bin"))
+    monkeypatch.setattr(collectors, "_SYSTEM_BIN_DIRS", (str(system_bin),))
+    assert unit_observations(["lending-api"]) == [collectors.Observation("unit:lending-api", True, "active")]
+
+
+def test_deployed_unit_path_reaches_the_system_binaries(monkeypatch):
+    import re
+    from pathlib import Path
+
+    unit = (Path(__file__).resolve().parents[2] / "deploy/systemd/ndl-watchdog.service").read_text()
+    monkeypatch.setenv("PATH", re.search(r'Environment="PATH=([^"]+)"', unit).group(1))
+    monkeypatch.setattr(collectors, "_SYSTEM_BIN_DIRS", ())
+    assert collectors._resolve("ls") != "ls"
+
+
 def test_health_ok():
     obs = health_observation("http://x/health", get=lambda *a, **k: _Resp(200, {"status": "ok"}))
     assert obs.key == "health:lending-api" and obs.ok
@@ -174,13 +195,33 @@ def test_ghl_decision_one_outcome_is_ok():
     assert collectors._ghl_decision([_ago(30)] * 5, [_ago(10)], NOW, _cfg()).ok
 
 
-def test_ghl_decision_below_min_calls_is_quiet():
-    obs = collectors._ghl_decision([_ago(30)] * 4, [], NOW, _cfg())
-    assert obs == Observation("ghl_outcomes", True, "quiet: 4 calls")
+def test_ghl_decision_low_volume_without_outcomes_is_inconclusive():
+    assert collectors._ghl_decision([_ago(30)] * 4, [], NOW, _cfg()) is None
+
+
+def test_ghl_decision_an_outcome_with_low_volume_is_ok():
+    obs = collectors._ghl_decision([_ago(30)] * 2, [_ago(10)], NOW, _cfg())
+    assert obs == Observation("ghl_outcomes", True, "2 GHL calls, 1 outcomes")
 
 
 def test_ghl_decision_ignores_calls_outside_the_window():
-    assert collectors._ghl_decision([_ago(241 + 24 * 60)] * 5, [], NOW, _cfg()).ok
+    assert collectors._ghl_decision([_ago(241 + 24 * 60)] * 5, [], NOW, _cfg()) is None
+
+
+def test_low_volume_does_not_close_an_open_ghl_outage():
+    from src.lending.watchdog.rules import evaluate
+
+    def poll(calls, outcomes, state, at):
+        obs = collectors._ghl_decision(calls, outcomes, at, _cfg())
+        return evaluate([obs] if obs else [], state, at, fail_polls=1, repeat_minutes=120)
+
+    alerts, state = poll([_ago(30)] * 5, [], {}, NOW)
+    assert [a.kind for a in alerts] == ["down"]
+    later = NOW + timedelta(minutes=2)
+    alerts, state = poll([_ago(30, later)] * 4, [], state, later)
+    assert alerts == [] and state["ghl_outcomes"].open_since == NOW
+    alerts, state = poll([_ago(30, later)] * 4, [_ago(1, later)], state, later + timedelta(minutes=2))
+    assert [a.kind for a in alerts] == ["recovered"]
 
 
 def test_ghl_decision_window_counts_business_minutes_over_a_weekend():
@@ -338,13 +379,13 @@ def test_ghl_calls_with_one_outcome_ok(db):
 
 
 def test_ghl_quiet_day_no_alert(db):
-    assert ghl_outcome_observation(db, NOW, _cfg()).ok is True
+    assert ghl_outcome_observation(db, NOW, _cfg()) is None
 
 
 def test_ghl_below_min_calls_no_alert(db):
     for i in range(4):
         _ghl_call(db, _ago(10 + i * 20))
-    assert ghl_outcome_observation(db, NOW, _cfg()).ok is True
+    assert ghl_outcome_observation(db, NOW, _cfg()) is None
 
 
 def test_ghl_window_counts_business_minutes(db):
@@ -361,7 +402,7 @@ def test_ghl_ignores_inbound_and_dialer_calls(db):
                 "INSERT INTO lending.call_dispositions (dialer_call_id, call_source, direction, phone, call_started_at, "
                 "raw_event) VALUES (:id, :src, :dir, '+18137200000', :s, '{}')"),
                 {"id": f"t-{uuid.uuid4().hex}", "src": source, "dir": direction, "s": _ago(30)})
-    assert ghl_outcome_observation(db, NOW, _cfg()).detail == "quiet: 0 calls"
+    assert ghl_outcome_observation(db, NOW, _cfg()) is None
 
 
 def test_ghl_check_off_when_min_calls_zero(db):

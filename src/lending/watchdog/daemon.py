@@ -33,6 +33,7 @@ from src.lending.watchdog.notify import deliver
 from src.lending.watchdog.rules import (
     Alert,
     CheckState,
+    Observation,
     WatchdogConfig,
     evaluate,
     load_state,
@@ -45,6 +46,10 @@ logger = logging.getLogger(__name__)
 
 CONNECT_TIMEOUT_SECONDS = 5
 STATEMENT_TIMEOUT_MS = 5000
+# A connection whose traffic is silently dropped is killed by the kernel in about 25 s instead of ~15 min.
+TCP_KEEPALIVE_ARGS = {"keepalives": 1, "keepalives_idle": 10, "keepalives_interval": 5, "keepalives_count": 3,
+                      "tcp_user_timeout": 15000}
+DB_PROBE_DEADLINE_SECONDS = 30
 
 
 def load_config(settings: AppSettings) -> WatchdogConfig:
@@ -125,7 +130,8 @@ def _factory() -> sessionmaker:
         engine = create_engine(
             str(get_settings().database_url),
             pool_pre_ping=True,
-            connect_args={"connect_timeout": CONNECT_TIMEOUT_SECONDS, "options": f"-c statement_timeout={STATEMENT_TIMEOUT_MS}"},
+            connect_args={"connect_timeout": CONNECT_TIMEOUT_SECONDS, "options": f"-c statement_timeout={STATEMENT_TIMEOUT_MS}",
+                          **TCP_KEEPALIVE_ARGS},
         )
         _session_factory = sessionmaker(bind=engine, autoflush=False, expire_on_commit=False)
     return _session_factory
@@ -203,6 +209,23 @@ def _hold_undelivered(
     return held
 
 
+def _db_observations_with_deadline(now: datetime, cfg: WatchdogConfig) -> list[Observation]:
+    """The statement timeout runs on the server, so a stalled connection can block here far longer. The probe runs
+    in a daemon thread and is abandoned at the deadline: this cycle's other alerts still go out, and the next poll
+    starts on time."""
+    result: list[list[Observation]] = []
+    worker = threading.Thread(
+        target=lambda: result.append(db_observations(_timed_session, now, cfg)), name="watchdog-db-probe", daemon=True
+    )
+    worker.start()
+    worker.join(DB_PROBE_DEADLINE_SECONDS)
+    if result:
+        return result[0]
+    detail = "Timeout" if worker.is_alive() else "ProbeError"
+    logger.error("[watchdog] database probe gave no answer within %ss (%s)", DB_PROBE_DEADLINE_SECONDS, detail)
+    return [Observation("database", False, detail)]
+
+
 def run_cycle(*, now: Optional[datetime] = None, dry_run: bool = False) -> list[Alert]:
     settings = get_settings()
     if not settings.lending_watchdog_enabled and not dry_run:
@@ -216,7 +239,7 @@ def run_cycle(*, now: Optional[datetime] = None, dry_run: bool = False) -> list[
     observations.append(health)
     if health.ok:
         observations.extend(door_observations(cfg.public_base_url, selected_doors(settings)))
-    observations.extend(db_observations(_timed_session, now, cfg))
+    observations.extend(_db_observations_with_deadline(now, cfg))
 
     path = Path(settings.lending_watchdog_state_path)
     old_state = _memory_state if _memory_state is not None else load_state(path)

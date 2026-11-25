@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import logging
+import os
+import shutil
 import subprocess
 from datetime import datetime, timedelta
 from typing import Any, Callable, ContextManager, Optional, Sequence
@@ -19,8 +21,16 @@ logger = logging.getLogger(__name__)
 _warned_doors_off = False
 
 
+_SYSTEM_BIN_DIRS = ("/usr/local/sbin", "/usr/local/bin", "/usr/sbin", "/usr/bin", "/sbin", "/bin")
+
+
+def _resolve(program: str) -> str:
+    """Absolute path of ``program``. The unit's PATH may hold only the virtualenv, so the system dirs are tried too."""
+    return shutil.which(program) or shutil.which(program, path=os.pathsep.join(_SYSTEM_BIN_DIRS)) or program
+
+
 def _run(cmd: list[str]) -> subprocess.CompletedProcess:
-    return subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+    return subprocess.run([_resolve(cmd[0]), *cmd[1:]], capture_output=True, text=True, timeout=10)
 
 
 def unit_observations(
@@ -95,15 +105,17 @@ _FAILURE_COUNTS = text("""
 
 def _ghl_decision(
     calls: Sequence[datetime], outcomes: Sequence[datetime], now: datetime, cfg: WatchdogConfig
-) -> Observation:
+) -> Optional[Observation]:
+    """An outcome in the window proves the webhook works; enough calls with none means it is broken. Fewer calls
+    and no outcome proves nothing either way, so it is not observed and an open outage stays open."""
     in_window = lambda moment: business_minutes(moment, now) <= cfg.ghl_window_minutes  # noqa: E731
     n_calls = sum(1 for moment in calls if in_window(moment))
-    if n_calls < cfg.ghl_min_calls:
-        return Observation("ghl_outcomes", True, f"quiet: {n_calls} calls")
     n_outcomes = sum(1 for moment in outcomes if in_window(moment))
-    if n_outcomes == 0:
-        return Observation("ghl_outcomes", False, f"{n_calls} GHL calls, 0 outcomes in {cfg.ghl_window_minutes} business min")
-    return Observation("ghl_outcomes", True, f"{n_calls} GHL calls, {n_outcomes} outcomes")
+    if n_outcomes:
+        return Observation("ghl_outcomes", True, f"{n_calls} GHL calls, {n_outcomes} outcomes")
+    if n_calls < cfg.ghl_min_calls:
+        return None
+    return Observation("ghl_outcomes", False, f"{n_calls} GHL calls, 0 outcomes in {cfg.ghl_window_minutes} business min")
 
 
 def _card_decision(oldest: Optional[datetime], count: int, now: datetime, cfg: WatchdogConfig) -> Observation:

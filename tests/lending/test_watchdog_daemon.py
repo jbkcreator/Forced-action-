@@ -130,8 +130,32 @@ def test_session_factory_sets_connect_and_statement_timeouts(monkeypatch):
     create = MagicMock(return_value=engine)
     monkeypatch.setattr(daemon, "create_engine", create)
     daemon._factory()
-    assert create.call_args.kwargs["connect_args"] == {"connect_timeout": 5, "options": "-c statement_timeout=5000"}
+    assert create.call_args.kwargs["connect_args"] == {
+        "connect_timeout": 5, "options": "-c statement_timeout=5000",
+        "keepalives": 1, "keepalives_idle": 10, "keepalives_interval": 5, "keepalives_count": 3,
+        "tcp_user_timeout": 15000,
+    }
     monkeypatch.setattr(daemon, "_session_factory", None)
+
+
+def test_stalled_database_probe_does_not_hold_up_other_alerts_or_the_next_poll(env, fakes, monkeypatch):
+    import threading
+
+    stalled = threading.Event()
+    monkeypatch.setattr(daemon, "db_observations", lambda factory, now, cfg: stalled.wait(10) and [])
+    monkeypatch.setattr(daemon, "DB_PROBE_DEADLINE_SECONDS", 0.2)
+    try:
+        started = time.monotonic()
+        alerts = daemon.run_cycle(now=NOW)
+        next_poll = daemon.run_cycle(now=NOW)
+        elapsed = time.monotonic() - started
+    finally:
+        stalled.set()
+    assert elapsed < 3
+    assert {a.key for a in alerts} == {"unit:fa-lending-cora", "database"}
+    assert next(a for a in alerts if a.key == "database").detail == "Timeout"
+    assert next_poll == []
+    fakes[0].assert_called()
 
 
 def test_timed_session_commits_and_rolls_back(monkeypatch):
