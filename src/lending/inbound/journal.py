@@ -47,7 +47,9 @@ Outcome = Literal["processed", "duplicate", "failed"]
 Reporter = Callable[[str, dict[str, Any], BaseException], Optional[int]]  # webhook_failures.report_webhook_failure
 
 # Modules that call register_source at import (T3-T6 add theirs); imported by load_handlers() in the cron process.
-HANDLER_MODULES: tuple[str, ...] = ()
+HANDLER_MODULES: tuple[str, ...] = (
+    "src.lending.inbound.ghl_stage",
+)
 
 STUCK_AFTER_SECONDS = 120
 RECLAIM_BATCH_SIZE = 50

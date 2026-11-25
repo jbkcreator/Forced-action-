@@ -29,7 +29,7 @@ def client(closing_db, monkeypatch):
 @pytest.fixture
 def clock(monkeypatch):
     now = {"t": T0}
-    monkeypatch.setattr("src.api.lending_ghl_router._now", lambda: now["t"])
+    monkeypatch.setattr("src.lending.inbound.ghl_stage._now", lambda: now["t"])
     return now
 
 
