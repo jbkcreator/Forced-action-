@@ -88,90 +88,51 @@ class TestBaselineJudge:
 
 # ── V1 judge — card signals ──────────────────────────────────────────────────
 
-def _v1_clean() -> CardFeatures:
-    """A clean card that the baseline would approve with no signals fired."""
-    return CardFeatures(
-        template_version="LF-D2-SMS-v1",
-        past_total=20,
-        past_edit=0,
-        past_reject=0,
-        borrower_replied_since_draft=False,
-        agent_job_verdict="unknown",
-        hold_history_count=0,
-        prev_draft_edited=False,
-        is_first_touch=True,
-        body_length=80,
-        has_link=False,
-        missing_first_name=False,
-    )
+def _v1(**changes) -> CardFeatures:
+    """A clean first-touch card the baseline approves, with no red flag, plus the given changes."""
+    clean = dict(template_version="LF-D2-SMS-v1", past_total=20, past_edit=0, past_reject=0,
+                 is_first_touch=True, hours_since_last_message=None, body_length=80)
+    return CardFeatures(**{**clean, **changes})
 
 
 class TestV1Judge:
     def test_clean_card_keeps_baseline_approve(self):
-        p = predict_v1(_v1_clean())
-        assert p.decision == "approve"
+        assert predict_v1(_v1()).decision == "approve"
 
-    def test_agent_job_fail_predicts_reject(self):
-        f = CardFeatures(**{**_v1_clean().__dict__, "agent_job_verdict": "fail"})
-        p = predict_v1(f)
-        assert p.decision == "reject"
-        assert p.confidence == 0.90
-
-    def test_agent_job_fail_overrides_even_edit_baseline(self):
-        # Edit baseline + fail verdict → reject wins
-        f = CardFeatures(
-            template_version="LF-D2-SMS-v1",
-            past_total=10, past_edit=1, past_reject=0,  # edit baseline
-            agent_job_verdict="fail",
-            borrower_replied_since_draft=False,
-            hold_history_count=0, prev_draft_edited=False, is_first_touch=True,
-            body_length=80, has_link=False, missing_first_name=False,
-        )
-        assert predict_v1(f).decision == "reject"
-
-    def test_borrower_replied_downgrades_approve_to_edit(self):
-        f = CardFeatures(**{**_v1_clean().__dict__, "borrower_replied_since_draft": True})
-        assert predict_v1(f).decision == "edit"
-
-    def test_hold_history_2_downgrades_to_edit(self):
-        f = CardFeatures(**{**_v1_clean().__dict__, "hold_history_count": 2})
-        assert predict_v1(f).decision == "edit"
-
-    def test_hold_history_1_does_not_downgrade(self):
-        f = CardFeatures(**{**_v1_clean().__dict__, "hold_history_count": 1})
-        assert predict_v1(f).decision == "approve"
-
-    def test_prev_draft_edited_downgrades_to_edit(self):
-        f = CardFeatures(**{**_v1_clean().__dict__, "prev_draft_edited": True})
-        assert predict_v1(f).decision == "edit"
-
-    def test_short_body_downgrades_to_edit(self):
-        f = CardFeatures(**{**_v1_clean().__dict__, "body_length": 10})
-        assert predict_v1(f).decision == "edit"
-
-    def test_body_length_exactly_20_does_not_fire(self):
-        f = CardFeatures(**{**_v1_clean().__dict__, "body_length": 20})
-        assert predict_v1(f).decision == "approve"
-
-    def test_missing_first_name_downgrades_to_edit(self):
-        f = CardFeatures(**{**_v1_clean().__dict__, "missing_first_name": True})
-        assert predict_v1(f).decision == "edit"
-
-    def test_reject_baseline_not_upgraded_by_good_signals(self):
-        # Reject baseline with no bad signals → still reject
-        f = CardFeatures(
-            template_version="LF-D2-SMS-v1",
-            past_total=10, past_edit=0, past_reject=2,  # reject baseline
-            agent_job_verdict="pass",
-            borrower_replied_since_draft=False, hold_history_count=0,
-            prev_draft_edited=False, is_first_touch=True, body_length=100,
-            has_link=False, missing_first_name=False,
-        )
-        assert predict_v1(f).decision == "reject"
-
-    def test_confidence_on_edit_signal_is_proportional_to_signal_count(self):
-        # 2 signals → confidence = 0.50
-        f = CardFeatures(**{**_v1_clean().__dict__, "borrower_replied_since_draft": True, "hold_history_count": 2})
-        p = predict_v1(f)
+    @pytest.mark.parametrize("signal", [
+        {"borrower_replied_since_last_send": True},
+        {"from_agent_job": True, "agent_job_held": True},
+        {"prev_draft_edited": True},
+        {"is_first_touch": False, "hours_since_last_message": 3.0},
+        {"has_link": True},
+        {"body_length": 10},
+        {"missing_first_name": True},
+    ])
+    def test_each_red_flag_downgrades_approve_to_edit(self, signal):
+        p = predict_v1(_v1(**signal))
         assert p.decision == "edit"
-        assert p.confidence == 0.50
+        assert p.confidence == 0.25
+
+    def test_agent_job_that_was_never_held_is_no_flag(self):
+        assert predict_v1(_v1(from_agent_job=True, agent_job_held=False)).decision == "approve"
+
+    def test_follow_up_after_a_day_is_no_flag(self):
+        assert predict_v1(_v1(is_first_touch=False, hours_since_last_message=30.0)).decision == "approve"
+
+    def test_link_on_a_follow_up_is_no_flag(self):
+        assert predict_v1(_v1(is_first_touch=False, hours_since_last_message=48.0, has_link=True)).decision == "approve"
+
+    def test_body_length_exactly_20_is_no_flag(self):
+        assert predict_v1(_v1(body_length=20)).decision == "approve"
+
+    def test_two_flags_give_confidence_half(self):
+        p = predict_v1(_v1(borrower_replied_since_last_send=True, prev_draft_edited=True))
+        assert (p.decision, p.confidence) == ("edit", 0.5)
+
+    def test_reject_baseline_is_never_upgraded(self):
+        assert predict_v1(_v1(past_total=10, past_reject=2)).decision == "reject"
+
+    def test_edit_baseline_with_a_flag_stays_edit_with_baseline_confidence(self):
+        # 10 total, 1 edited = 10% → baseline edit at confidence 1.0; v1 keeps the baseline
+        p = predict_v1(_v1(past_total=10, past_edit=1, prev_draft_edited=True))
+        assert (p.decision, p.confidence) == ("edit", 1.0)

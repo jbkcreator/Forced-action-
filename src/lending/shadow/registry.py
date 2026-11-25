@@ -1,21 +1,26 @@
-"""R1 0.9 Shadow class registry.
-
-Maps class names to their predict callable and version.  New classes are added here and nowhere else.
-No plugin framework — this list stays thin until a real second class arrives.
-"""
+"""R1 0.9 shadow classes: name → decision-maker and comparator. Thin until a real second class arrives."""
 from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Callable, Optional
 
 from src.lending.shadow.judge import (
-    CardFeatures,
     CLASS_VERSION_BASELINE,
     CLASS_VERSION_V1,
+    CardFeatures,
     Prediction,
     predict_baseline,
     predict_v1,
 )
+
+NO_DECISION = "no_decision"
+
+
+def compare_decision(proposed: dict, actual: Optional[str]) -> Optional[bool]:
+    """Match when the proposed decision equals Josh's; None while there is no decision to compare with."""
+    if actual is None or actual == NO_DECISION:
+        return None
+    return proposed.get("decision") == actual
 
 
 @dataclass(frozen=True)
@@ -23,27 +28,18 @@ class ShadowClassDef:
     name: str
     version: int
     predict: Callable[[CardFeatures], Prediction]
-    subject_kind: str = "pending_action"
+    compare: Callable[[dict, Optional[str]], Optional[bool]]
+    subject_kind: str
 
 
-_REGISTRY: dict[str, ShadowClassDef] = {}
+_CLASSES = (
+    ShadowClassDef("auto-send-judge-baseline", CLASS_VERSION_BASELINE, predict_baseline, compare_decision,
+                   "pending_action"),
+    ShadowClassDef("auto-send-judge-v1", CLASS_VERSION_V1, predict_v1, compare_decision, "pending_action"),
+)
+_REGISTRY = {c.name: c for c in _CLASSES}
 
-
-def _register(defn: ShadowClassDef) -> None:
-    _REGISTRY[defn.name] = defn
-
-
-_register(ShadowClassDef(
-    name="auto-send-judge-baseline",
-    version=CLASS_VERSION_BASELINE,
-    predict=predict_baseline,
-))
-
-_register(ShadowClassDef(
-    name="auto-send-judge-v1",
-    version=CLASS_VERSION_V1,
-    predict=predict_v1,
-))
+BASELINE_CLASS = "auto-send-judge-baseline"
 
 
 def get(class_name: str) -> Optional[ShadowClassDef]:
@@ -51,4 +47,4 @@ def get(class_name: str) -> Optional[ShadowClassDef]:
 
 
 def all_classes() -> list[ShadowClassDef]:
-    return list(_REGISTRY.values())
+    return list(_CLASSES)

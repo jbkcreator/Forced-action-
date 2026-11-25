@@ -80,6 +80,7 @@ from src.lending.instantly_email import (InstantlySendError, InstantlySendPaused
                                          get_ndl_instantly_sender)
 from src.lending.after_hours_responder import run_send_cycle
 from src.lending.instantly_replies import CHANNEL as INSTANTLY_CHANNEL, ReplyProcessor
+from src.lending.shadow.shadow_runner import ShadowRunnerStep
 from src.lending.standing_sends import (
     StandingSendsStep,
     auto_approval_lapsed,
@@ -632,12 +633,12 @@ def run_sweep(services: CoraServices) -> None:
             logger.error("[cora] deal ledger catch-up failed (%s); retrying next sweep", type(exc).__name__)
     if services.shadow_runner is not None:
         try:
-            result_sr = services.shadow_runner()
-            if result_sr and (result_sr.scored or result_sr.filled or result_sr.day14_alerts):
-                logger.info("[cora] shadow runner scored=%s filled=%s day14=%s",
-                            result_sr.scored, result_sr.filled, result_sr.day14_alerts)
-        except Exception as exc:  # class only; rows without a prediction are retried next sweep
+            shadow_run = services.shadow_runner()
+        except Exception as exc:  # class only; the same cards are rescanned next sweep
             logger.error("[cora] shadow runner failed (%s); retrying next sweep", type(exc).__name__)
+        else:
+            if shadow_run:
+                logger.info("[cora] shadow runner %s", shadow_run)
     if services.block_list is not None:
         try:
             services.block_list()
@@ -849,7 +850,6 @@ def make_standing_sends_step(engine: Engine) -> Callable[[], Any]:
 
 def make_shadow_runner_step(engine: Engine) -> Callable[[], Any]:
     """R1 0.9 sweep step: score new cards for active shadow classes, fill in outcomes for older rows."""
-    from src.lending.shadow.shadow_runner import ShadowRunnerStep
     return ShadowRunnerStep(engine)
 
 

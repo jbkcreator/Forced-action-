@@ -1,533 +1,355 @@
-"""R1 0.9 Seam A: ShadowRunnerStep — zero-sends proof and core behaviour.
-
-All tests use fakes at the external ports (DB, clock, senders) so the shared
-DB is never touched.  The critical test is test_14_simulated_days_zero_external_sends,
-which simulates 14 days of sweeps and asserts:
-  * no pending_actions row was written from shadow
-  * no spy (GHL SMS/email, Instantly, Slack post) was called
-  * the day-14 inbox alert was raised exactly once
-
-Other tests cover card filtering, scoring idempotency, actual-decision derivation,
-and outcome fill-in.
-"""
+"""R1 0.9 Seam A: ``ShadowRunnerStep`` driven through its call, with fakes only at the ports (card reader, store,
+inbox, clock) and spies on every real send path. Nothing here touches a database."""
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
-from typing import Any, Optional
-from unittest.mock import MagicMock, patch
+from typing import Optional
+from unittest.mock import MagicMock
 
 import pytest
+import slack_sdk
 
-from src.lending.shadow.judge import CardFeatures, Prediction
-from src.lending.shadow.shadow_runner import (
-    SHADOW_WINDOW_DAYS,
-    ShadowRunnerStep,
-    _derive_actual,
-    _derive_send_result,
-    _edit_distance,
-)
+from packages.agent_core.pending_actions import PendingActionQueue
+from packages.agent_core.relay import Relay
+from packages.agent_core.send_gate import SendGate
+from src.lending import ops_alerts
+from src.lending.ghl_email import GhlEmailSender
+from src.lending.ghl_sms import GhlSmsSender
+from src.lending.instantly_email import NdlInstantlySender
+from src.lending.shadow.judge import CardFeatures
+from src.lending.shadow.shadow_runner import ShadowRunnerStep, edit_distance
 
-
-# ── Fake infrastructure ───────────────────────────────────────────────────────
-
-UTC = timezone.utc
-
-START = datetime(2026, 11, 1, 10, 0, 0, tzinfo=UTC)
+START = datetime(2026, 11, 1, 10, 0, tzinfo=timezone.utc)
+CLASSES = ("auto-send-judge-baseline", "auto-send-judge-v1")
 
 
-def _card(
-    *,
-    action_id: int = 1,
-    tool_name: str = "ghl_sms",
-    channel: str = "ghl_sms",
-    payload: Optional[dict] = None,
-    requested_by: str = "cora",
-    status: str = "approved",
-    contact_ref: str = "contact:42",
-    deal_ref: Optional[str] = None,
-    created_at: Optional[datetime] = None,
-    decided_at: Optional[datetime] = None,
-    decided_by: Optional[str] = "josh",
-    revisions: list = None,
-    recipient_phone: str = "5550001234",
-) -> dict:
-    if payload is None:
-        payload = {"template_version": "LF-D2-SMS-v1", "body": "Hello Alex, your loan is ready."}
-    if created_at is None:
-        created_at = START
-    if decided_at is None and status not in ("pending", "revising", "expired", "held", "blocked"):
-        decided_at = created_at + timedelta(hours=2)
-    return {
-        "action_id": action_id,
-        "tool_name": tool_name,
-        "channel": channel,
-        "payload": payload,
-        "requested_by": requested_by,
-        "status": status,
-        "contact_ref": contact_ref,
-        "deal_ref": deal_ref,
-        "created_at": created_at,
-        "decided_at": decided_at,
-        "decided_by": decided_by,
-        "revisions": revisions or [],
-        "recipient_phone": recipient_phone,
-    }
+class Clock:
+    def __init__(self, now: datetime) -> None:
+        self.now = now
+
+    def __call__(self) -> datetime:
+        return self.now
 
 
-@dataclass
-class FakeShadowStore:
-    """In-memory stand-in for src.lending.shadow.store."""
+class FakeStore:
+    """In-memory shadow store with the same rules as the SQL one (insert-if-absent, settled rows not reopened)."""
 
-    class_modes: dict[str, str] = field(default_factory=dict)
-    started_ats: dict[str, datetime] = field(default_factory=dict)
-    decisions: list[dict] = field(default_factory=list)
-    filled: list[dict] = field(default_factory=list)
-    outcomes: list[dict] = field(default_factory=list)
-    inbox_events: list[dict] = field(default_factory=list)
+    def __init__(self, clock: Clock, started_at: datetime = START, classes=CLASSES) -> None:
+        self.clock = clock
+        self.classes = {name: {"mode": "shadow", "started_at": started_at} for name in classes}
+        self.rows: dict[tuple[str, str], dict] = {}
 
-    def set_mode(self, db, class_name, mode, changed_by="cli"):
-        self.class_modes[class_name] = mode
-        if mode == "shadow":
-            self.started_ats[class_name] = datetime.now(UTC)
+    def get_mode(self, db, class_name):
+        return self.classes.get(class_name, {}).get("mode")
 
-    def get_mode(self, db, class_name) -> Optional[str]:
-        return self.class_modes.get(class_name)
+    def get_started_at(self, db, class_name):
+        return self.classes.get(class_name, {}).get("started_at")
 
-    def get_started_at(self, db, class_name) -> Optional[datetime]:
-        return self.started_ats.get(class_name)
+    def insert_decision(self, db, *, class_name, class_version, subject_kind, subject_ref, inputs, rule_version,
+                        confidence, proposed) -> Optional[int]:
+        key = (class_name, subject_ref)
+        if key in self.rows:
+            return None
+        self.rows[key] = {"class_name": class_name, "subject_ref": subject_ref, "subject_kind": subject_kind,
+                          "inputs": json.loads(json.dumps(inputs)), "rule_version": rule_version,
+                          "proposed": proposed, "created_at": self.clock.now, "actual": None,
+                          "decision_match": None, "decided_at": None, "send_result": None, "deal_outcome": None,
+                          "outcome_at": None, "edit_distance": None}
+        return len(self.rows)
 
-    def get_all_shadow_classes(self, db) -> list[dict]:
-        return []
+    def open_rows(self, db, class_name, since):
+        def settled(r):
+            return (r["deal_outcome"] is not None and r["actual"] in ("approve", "edit", "reject")
+                    and (r["actual"] == "reject" or r["send_result"] in ("sent", "failed")))
+        return [dict(r) for (cls, _), r in self.rows.items()
+                if cls == class_name and r["created_at"] >= since and not settled(r)]
 
-    def insert_decision(self, db, *, class_name, class_version, subject_kind, subject_ref,
-                        inputs, rule_version, confidence, proposed) -> Optional[int]:
-        # check uniqueness
-        for d in self.decisions:
-            if d["class_name"] == class_name and d["subject_ref"] == subject_ref:
-                return None  # already exists (idempotency)
-        new_id = len(self.decisions) + 1
-        self.decisions.append({
-            "id": new_id,
-            "class_name": class_name,
-            "class_version": class_version,
-            "subject_kind": subject_kind,
-            "subject_ref": subject_ref,
-            "inputs": inputs,
-            "rule_version": rule_version,
-            "confidence": confidence,
-            "proposed": proposed,
-        })
-        return new_id
-
-    def fill_actual(self, db, subject_ref, actual, decided_at, decision_seconds, edit_distance, send_result) -> int:
-        self.filled.append({
-            "subject_ref": subject_ref,
-            "actual": actual,
-            "decided_at": decided_at,
-            "decision_seconds": decision_seconds,
-            "edit_distance": edit_distance,
-            "send_result": send_result,
-        })
-        # update decisions in place
-        count = 0
-        for d in self.decisions:
-            if d["subject_ref"] == subject_ref:
-                d["actual"] = actual
-                count += 1
-        return count
-
-    def fill_outcome(self, db, subject_ref, deal_outcome, outcome_at) -> int:
-        self.outcomes.append({"subject_ref": subject_ref, "deal_outcome": deal_outcome})
+    def update_match(self, db, class_name, subject_ref, **fields) -> int:
+        row = self.rows[(class_name, subject_ref)]
+        if all(row[k] == v for k, v in fields.items() if k != "decision_seconds"):
+            return 0
+        row.update(fields)
         return 1
 
-    def rows_for_digest(self, db, class_name, since=None, until=None) -> list[dict]:
-        return [d for d in self.decisions if d["class_name"] == class_name]
-
-    def shadow_sent_count(self, db) -> int:
-        return 0
-
-
-class FakePendingActionsDB:
-    """Wraps FakeShadowStore to intercept the SQL queries the runner makes.
-
-    ``new_cards`` is the list of pending_action rows returned for each call.
-    ``open_rows`` is the list of rows with open match fields.
-    """
-
-    def __init__(self, store: FakeShadowStore, new_cards: list[dict], open_rows: list[dict] = None):
-        self.store = store
-        self.new_cards = new_cards
-        self.open_rows = open_rows or []
-        self._pending_actions: list[dict] = []  # zero-sends proof: shadow must never append here
-
-    @property
-    def pending_send_count(self) -> int:
-        return len(self._pending_actions)
-
-
-class _PatchedRunner:
-    """Test harness: drives ShadowRunnerStep with fakes for the DB-touching parts.
-
-    ``active_classes`` lists the class names that are in shadow mode; both baseline and v1 are
-    started by default so each card is scored by both (matching production behaviour).
-    """
-
-    def __init__(self, *, fake_store, new_cards, open_rows, now,
-                 active_classes: Optional[list[str]] = None):
-        self.fake_store = fake_store
-        self.new_cards = new_cards
-        self.open_rows = open_rows
-        self.now = now
-        self._pending_actions_written: list[dict] = []
-        self._inbox_events: list[dict] = []
-
-        # Register the requested classes as shadow in the store
-        if active_classes is None:
-            active_classes = ["auto-send-judge-baseline", "auto-send-judge-v1"]
-        for cls_name in active_classes:
-            if cls_name not in fake_store.class_modes:
-                fake_store.class_modes[cls_name] = "shadow"
-            if cls_name not in fake_store.started_ats:
-                fake_store.started_ats[cls_name] = START
-
-    def run(self):
-        """Drive the runner's _run logic using fakes; return ShadowRunResult."""
-        from src.lending.shadow import registry
-        from src.lending.shadow.shadow_runner import ShadowRunResult, _build_features, _derive_actual, _edit_distance, _derive_send_result, SHADOW_WINDOW_DAYS, OUTCOME_HORIZON_DAYS, _fill_deal_outcome
-        from datetime import timedelta, timezone
-
-        result = ShadowRunResult()
-        now = self.now
-        horizon = now - timedelta(days=OUTCOME_HORIZON_DAYS)
-
-        shadow_classes = [c for c in registry.all_classes()
-                          if self.fake_store.get_mode(None, c.name) == "shadow"]
-
-        for cls in shadow_classes:
-            started_at = self.fake_store.get_started_at(None, cls.name)
-            if not started_at:
-                continue
-
-            # Score new cards (using the fake list)
-            for card in self.new_cards:
-                subject_ref = f"action:{card['action_id']}"
-                # Build features from the card payload (no real DB needed for the pure parts)
-                payload = card["payload"] if isinstance(card["payload"], dict) else json.loads(card["payload"])
-                template_version = payload.get("template_version")
-                features = CardFeatures(
-                    template_version=template_version,
-                    past_total=0, past_edit=0, past_reject=0,
-                )
-                prediction = cls.predict(features)
-
-                new_id = self.fake_store.insert_decision(
-                    None,
-                    class_name=cls.name,
-                    class_version=cls.version,
-                    subject_kind="pending_action",
-                    subject_ref=subject_ref,
-                    inputs={"template_version": template_version},
-                    rule_version=None,
-                    confidence=float(prediction.confidence) if prediction.confidence is not None else None,
-                    proposed={"decision": prediction.decision},
-                )
-                if new_id is not None:
-                    result.scored += 1
-                else:
-                    result.already_scored += 1
-
-            # Fill actual decisions
-            for row in self.open_rows:
-                actual = _derive_actual(row)
-                if actual is None:
-                    continue
-
-                payload = row.get("payload") or {}
-                if isinstance(payload, str):
-                    payload = json.loads(payload)
-                body = payload.get("body", "") or ""
-
-                decided_at = row.get("decided_at")
-                decision_seconds = None
-                if decided_at and row.get("created_at"):
-                    created = row["created_at"]
-                    delta = decided_at - created
-                    decision_seconds = round(delta.total_seconds(), 2)
-
-                edit_dist = _edit_distance(row.get("revisions"), body)
-                send_result = _derive_send_result(row["status"])
-
-                updated = self.fake_store.fill_actual(
-                    None,
-                    subject_ref=row["subject_ref"],
-                    actual=actual,
-                    decided_at=decided_at,
-                    decision_seconds=decision_seconds,
-                    edit_distance=edit_dist,
-                    send_result=send_result,
-                )
-                result.filled += updated
-
-            # Day-14 alert
-            elapsed_days = (now - started_at).days
-            if elapsed_days >= SHADOW_WINDOW_DAYS:
-                dedup = f"shadow_day14_{cls.name}"
-                if dedup not in [e["dedup_key"] for e in self._inbox_events]:
-                    self._inbox_events.append({
-                        "event_type": "shadow_window_complete",
-                        "dedup_key": dedup,
-                        "class_name": cls.name,
-                    })
-                result.day14_alerts.append(cls.name)
-
-        return result
-
-
-# ── Core behaviour tests ──────────────────────────────────────────────────────
-
-class TestCardScoring:
-    def test_new_card_scored_once(self):
-        store = FakeShadowStore()
-        runner = _PatchedRunner(
-            fake_store=store,
-            new_cards=[_card(action_id=1)],
-            open_rows=[],
-
-            now=START + timedelta(days=1),
-        )
-        result = runner.run()
-        # Two classes in registry → 2 decisions per card
-        assert result.scored == 2  # baseline + v1
-
-    def test_same_card_not_scored_twice(self):
-        store = FakeShadowStore()
-        runner = _PatchedRunner(
-            fake_store=store,
-            new_cards=[_card(action_id=1)],
-            open_rows=[],
-
-            now=START + timedelta(days=1),
-        )
-        result1 = runner.run()
-        result2 = runner.run()
-        assert result1.scored == 2  # baseline + v1 on first run
-        assert result2.already_scored == 2  # idempotent on second run
-        assert result2.scored == 0
-
-    def test_no_cards_no_errors(self):
-        store = FakeShadowStore()
-        runner = _PatchedRunner(
-            fake_store=store,
-            new_cards=[],
-            open_rows=[],
-
-            now=START + timedelta(days=1),
-        )
-        result = runner.run()
-        assert result.scored == 0
-        assert result.errors == []
-
-    def test_inputs_stored_without_pii(self):
-        store = FakeShadowStore()
-        payload = {"template_version": "LF-D2-SMS-v1", "body": "Hi Alex", "recipient_phone": "5550001234"}
-        runner = _PatchedRunner(
-            fake_store=store,
-            new_cards=[_card(action_id=1, payload=payload)],
-            open_rows=[],
-
-            now=START + timedelta(days=1),
-        )
-        runner.run()
-        for decision in store.decisions:
-            inputs = decision["inputs"]
-            assert "recipient_phone" not in inputs
-            assert "5550001234" not in str(inputs)
-            assert "phone" not in str(inputs)
-
-
-class TestActualDecisionDerivation:
-    def test_approved_no_revisions_is_approve(self):
-        assert _derive_actual({"status": "approved", "revisions": []}) == "approve"
-
-    def test_approved_with_revision_is_edit(self):
-        assert _derive_actual({"status": "approved", "revisions": [{"old": "a"}]}) == "edit"
-
-    def test_sent_no_revisions_is_approve(self):
-        assert _derive_actual({"status": "sent", "revisions": []}) == "approve"
-
-    def test_rejected_is_reject(self):
-        assert _derive_actual({"status": "rejected", "revisions": []}) == "reject"
-
-    def test_revise_then_reject_is_reject(self):
-        assert _derive_actual({"status": "rejected", "revisions": [{"old": "x"}]}) == "reject"
-
-    def test_pending_is_none(self):
-        assert _derive_actual({"status": "pending", "revisions": []}) is None
-
-    def test_revising_is_none(self):
-        assert _derive_actual({"status": "revising", "revisions": []}) is None
-
-    def test_expired_is_none(self):
-        assert _derive_actual({"status": "expired", "revisions": []}) is None
-
-    def test_held_is_none(self):
-        assert _derive_actual({"status": "held", "revisions": []}) is None
-
-    def test_blocked_is_none(self):
-        assert _derive_actual({"status": "blocked", "revisions": []}) is None
-
-
-class TestSendResultDerivation:
-    def test_sent_gives_sent(self):
-        assert _derive_send_result("sent") == "sent"
-
-    def test_failed_gives_failed(self):
-        assert _derive_send_result("failed") == "failed"
-
-    def test_held_gives_held(self):
-        assert _derive_send_result("held") == "held"
-
-    def test_approved_gives_none(self):
-        assert _derive_send_result("approved") is None
-
-
-class TestEditDistance:
-    def test_no_revisions_gives_none(self):
-        assert _edit_distance([], "final body") is None
-
-    def test_identical_body_gives_zero(self):
-        revision = [{"payload": {"body": "same text"}}]
-        assert _edit_distance(revision, "same text") == 0.0
-
-    def test_completely_different_gives_nonzero(self):
-        revision = [{"payload": {"body": "aaa"}}]
-        dist = _edit_distance(revision, "bbb")
-        assert dist is not None and dist > 0.0
-
-    def test_result_bounded_0_to_1(self):
-        revision = [{"payload": {"body": "completely different from final"}}]
-        dist = _edit_distance(revision, "XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX")
-        assert dist is not None
-        assert 0.0 <= dist <= 1.0
-
-
-class TestDay14Alert:
-    def test_no_alert_before_day_14(self):
-        store = FakeShadowStore()
-        runner = _PatchedRunner(
-            fake_store=store,
-            new_cards=[],
-            open_rows=[],
-
-            now=START + timedelta(days=13),
-        )
-        result = runner.run()
-        assert result.day14_alerts == []
-        assert runner._inbox_events == []
-
-    def test_alert_on_day_14(self):
-        store = FakeShadowStore()
-        runner = _PatchedRunner(
-            fake_store=store,
-            new_cards=[],
-            open_rows=[],
-
-            now=START + timedelta(days=14),
-        )
-        result = runner.run()
-        assert len(result.day14_alerts) > 0
-
-    def test_alert_deduped_on_subsequent_runs(self):
-        store = FakeShadowStore()
-        runner = _PatchedRunner(
-            fake_store=store,
-            new_cards=[],
-            open_rows=[],
-
-            now=START + timedelta(days=14),
-        )
-        runner.run()
-        first_count = len(runner._inbox_events)
-        runner.run()
-        # second run: same dedup key, so no new events added
-        assert len(runner._inbox_events) == first_count
-
-    def test_class_stays_in_shadow_after_day_14(self):
-        store = FakeShadowStore()
-        store.class_modes["auto-send-judge-baseline"] = "shadow"
-        store.started_ats["auto-send-judge-baseline"] = START
-        runner = _PatchedRunner(
-            fake_store=store,
-            new_cards=[],
-            open_rows=[],
-
-            now=START + timedelta(days=20),
-        )
-        runner.run()
-        # mode must still be shadow — nobody auto-stopped it
-        assert store.class_modes.get("auto-send-judge-baseline") == "shadow"
-
-
-class TestZeroSendsProof:
-    """D14: simulated 14-day run with spy senders — zero external side effects."""
-
-    def test_14_simulated_days_zero_external_sends(self):
-        """The critical safety test for shadow mode.
-
-        14 simulated days, one new card per day.  After each sweep:
-        * No GHL SMS was sent (spy not called)
-        * No Instantly email was sent (spy not called)
-        * No Slack post was made by shadow (spy not called)
-        * No pending_action row was written from a shadow requester
-        * The shadow decisions table grew by 2 per card (baseline + v1)
-        """
-        ghl_sms_spy = MagicMock(name="ghl_sms_send")
-        instantly_spy = MagicMock(name="instantly_send")
-        slack_post_spy = MagicMock(name="slack_post")
-
-        store = FakeShadowStore()
-
-        total_scored = 0
-        for day in range(1, SHADOW_WINDOW_DAYS + 1):
-            now = START + timedelta(days=day)
-            card = _card(
-                action_id=day,
-                created_at=START + timedelta(days=day - 1),
-                decided_at=START + timedelta(days=day - 1, hours=2),
-            )
-            runner = _PatchedRunner(
-                fake_store=store,
-                new_cards=[card],
-                open_rows=[],
-    
-                now=now,
-            )
-            result = runner.run()
-            total_scored += result.scored
-
-        # Assertions
-        ghl_sms_spy.assert_not_called()
-        instantly_spy.assert_not_called()
-        slack_post_spy.assert_not_called()
-
-        # No pending action from shadow
-        assert store.shadow_sent_count(None) == 0
-
-        # Decisions grew: 14 days × 1 card × 2 classes = 28 decisions
-        assert len(store.decisions) == SHADOW_WINDOW_DAYS * 2
-
-    def test_shadow_requested_by_prefix_never_in_pending_actions(self):
-        """Verifies the structural invariant: shadow never writes to pending_actions."""
-        store = FakeShadowStore()
-        runner = _PatchedRunner(
-            fake_store=store,
-            new_cards=[_card(action_id=1)],
-            open_rows=[],
-
-            now=START + timedelta(days=1),
-        )
-        runner.run()
-        # FakeShadowStore.shadow_sent_count always returns 0 — the store never got a write
-        assert store.shadow_sent_count(None) == 0
+    def fill_outcome(self, db, class_name, subject_ref, deal_outcome, outcome_at) -> int:
+        row = self.rows[(class_name, subject_ref)]
+        if row["deal_outcome"] is not None:
+            return 0
+        row.update(deal_outcome=deal_outcome, outcome_at=outcome_at)
+        return 1
+
+    def discard(self, db, class_name, subject_ref) -> int:
+        return 1 if self.rows.pop((class_name, subject_ref), None) else 0
+
+    def row(self, class_name: str, action_id: int) -> dict:
+        return self.rows[(class_name, f"action:{action_id}")]
+
+
+class FakeReader:
+    def __init__(self) -> None:
+        self.by_id: dict[int, dict] = {}
+        self.features_by_id: dict[int, CardFeatures] = {}
+        self.outcomes: dict[str, tuple[str, datetime]] = {}
+        self.since_seen: list[datetime] = []
+        self.rule_version_asked: list[datetime] = []
+
+    def add(self, card: dict, features: Optional[CardFeatures] = None) -> dict:
+        self.by_id[card["action_id"]] = card
+        if features is not None:
+            self.features_by_id[card["action_id"]] = features
+        return card
+
+    def new_cards(self, db, since):
+        self.since_seen.append(since)
+        return [dict(c) for c in self.by_id.values() if c["created_at"] >= since]
+
+    def features(self, db, card):
+        return self.features_by_id.get(card["action_id"],
+                                       CardFeatures(template_version="T-1", past_total=0, past_edit=0, past_reject=0,
+                                                    body_length=80))
+
+    def cards(self, db, action_ids):
+        return {i: dict(self.by_id[i]) for i in action_ids if i in self.by_id}
+
+    def deal_outcome(self, db, deal_ref):
+        return self.outcomes.get(deal_ref)
+
+    def rule_version_at(self, db, at):
+        self.rule_version_asked.append(at)
+        return 7
+
+
+class FakeInbox:
+    def __init__(self) -> None:
+        self.calls: list[dict] = []
+        self._keys: set[str] = set()
+
+    def __call__(self, db, **event) -> Optional[int]:
+        self.calls.append(event)
+        if event["dedup_key"] in self._keys:
+            return None
+        self._keys.add(event["dedup_key"])
+        return len(self._keys)
+
+
+def _card(action_id: int, *, status: str = "pending", created_at: datetime = START + timedelta(minutes=1),
+          decided_at: Optional[datetime] = None, decided_by: Optional[str] = None, revisions: Optional[list] = None,
+          deal_ref: Optional[str] = None, body: str = "Hi Alex, your term sheet is ready.") -> dict:
+    return {"action_id": action_id, "tool_name": "send_sms", "channel": "ghl_sms", "status": status,
+            "payload": {"template_version": "T-1", "body": body, "to_phone": "+15550001234"},
+            "contact_ref": "ghl:abc", "deal_ref": deal_ref, "created_at": created_at, "decided_at": decided_at,
+            "decided_by": decided_by, "revisions": revisions or [], "executed_at": None,
+            "recipient_phone": "+15550001234", "recipient_email": "alex@example.com"}
+
+
+@pytest.fixture
+def clock():
+    return Clock(START + timedelta(minutes=2))
+
+
+@pytest.fixture
+def reader():
+    return FakeReader()
+
+
+@pytest.fixture
+def store(clock):
+    return FakeStore(clock)
+
+
+@pytest.fixture
+def inbox():
+    return FakeInbox()
+
+
+@pytest.fixture
+def step(reader, store, inbox, clock):
+    return ShadowRunnerStep(None, reader=reader, store=store, inbox=inbox, clock=clock)
+
+
+class TestScoring:
+    def test_each_new_card_scored_once_per_class(self, step, reader, store):
+        reader.add(_card(1))
+        assert step().scored == 2
+        assert step().scored == 0
+        assert {k[0] for k in store.rows} == set(CLASSES)
+
+    def test_excluded_cards_are_skipped(self, step, reader, store):
+        reader.add(_card(1, created_at=START - timedelta(minutes=1)))  # before start
+        reader.add(_card(2, status="approved", decided_at=START, decided_by="auto:graduated"))
+        reader.add(_card(3, status="blocked"))  # lane-blocked at submit: never decided
+        reader.add(_card(4, status="blocked", decided_at=START + timedelta(minutes=1), decided_by="josh"))
+        step()
+        assert {ref for _, ref in store.rows} == {"action:4"}
+
+    def test_class_not_in_shadow_mode_scores_nothing(self, step, reader, store):
+        store.classes = {"auto-send-judge-v1": {"mode": "off", "started_at": START}}
+        reader.add(_card(1))
+        assert step().scored == 0
+
+    def test_later_sweeps_read_since_the_last_run_less_the_overlap(self, step, reader, clock):
+        clock.now = START + timedelta(hours=1)
+        step()
+        clock.now += timedelta(minutes=1)
+        step()
+        assert reader.since_seen == [START] * 2 + [START + timedelta(hours=1) - timedelta(minutes=5)] * 2  # per class
+
+    def test_overlap_never_reaches_back_before_the_start(self, step, reader, clock):
+        step()
+        clock.now += timedelta(minutes=1)
+        step()
+        assert reader.since_seen == [START] * 4
+
+    def test_rule_version_asked_at_card_creation(self, step, reader, store):
+        card = reader.add(_card(1, created_at=START + timedelta(minutes=1)))
+        step()
+        assert reader.rule_version_asked == [card["created_at"]]
+        assert store.row("auto-send-judge-v1", 1)["rule_version"] == 7
+
+    def test_inputs_hold_no_personal_details(self, step, reader, store):
+        reader.add(_card(1))
+        step()
+        stored = json.dumps(store.row("auto-send-judge-v1", 1)["inputs"])
+        for secret in ("5550001234", "alex@example.com", "Alex", "term sheet"):
+            assert secret not in stored
+
+    def test_inputs_frozen_when_the_card_changes_later(self, step, reader, store, clock):
+        reader.add(_card(1), CardFeatures(template_version="T-1", past_total=3, past_edit=0, past_reject=0,
+                                          body_length=80))
+        step()
+        reader.features_by_id[1] = CardFeatures(template_version="T-1", past_total=99, past_edit=0, past_reject=0)
+        clock.now += timedelta(hours=1)
+        step()
+        assert store.row("auto-send-judge-v1", 1)["inputs"]["past_total"] == 3
+
+
+class TestActualDecision:
+    @pytest.mark.parametrize("card, actual, send_result", [
+        (dict(status="approved"), "approve", None),
+        (dict(status="sent"), "approve", "sent"),
+        (dict(status="failed"), "approve", "failed"),
+        (dict(status="sent", revisions=[{"payload": {"body": "old"}}]), "edit", "sent"),
+        (dict(status="rejected", revisions=[{"payload": {"body": "old"}}]), "reject", None),
+        (dict(status="expired"), "no_decision", None),
+        (dict(status="held"), "no_decision", "held"),
+        (dict(status="pending"), "no_decision", None),
+    ])
+    def test_derivation(self, step, reader, store, card, actual, send_result):
+        decided = START + timedelta(minutes=30) if card["status"] not in ("expired", "pending") else None
+        reader.add(_card(1, decided_at=decided, decided_by="josh" if decided else None, **card))
+        step()
+        row = store.row("auto-send-judge-baseline", 1)
+        assert (row["actual"], row["send_result"]) == (actual, send_result)
+        assert row["decision_match"] is (None if actual == "no_decision" else actual == "approve")
+
+    def test_pending_card_decided_later_is_updated(self, step, reader, store, clock):
+        card = reader.add(_card(1))
+        step()
+        assert store.row("auto-send-judge-v1", 1)["actual"] == "no_decision"
+        card.update(status="approved", decided_at=START + timedelta(days=20), decided_by="josh")
+        clock.now = START + timedelta(days=20, minutes=1)
+        step()
+        row = store.row("auto-send-judge-v1", 1)
+        assert row["actual"] == "approve"
+        assert row["decided_at"] == START + timedelta(days=20)
+
+    def test_card_auto_approved_after_scoring_is_discarded(self, step, reader, store, clock):
+        card = reader.add(_card(1))
+        step()
+        card.update(status="approved", decided_at=START + timedelta(minutes=3), decided_by="auto:graduated")
+        clock.now += timedelta(minutes=5)
+        assert step().discarded == 2
+        assert not store.rows
+
+    def test_unchanged_rows_are_not_rewritten(self, step, reader, clock):
+        reader.add(_card(1, status="sent", decided_at=START + timedelta(minutes=1), decided_by="josh"))
+        assert step().updated == 2
+        clock.now += timedelta(minutes=1)
+        assert step().updated == 0
+
+
+def test_edit_distance_compares_first_draft_with_final_body():
+    assert edit_distance([{"payload": {"body": "abcd"}}], "abcd") == 0.0
+    assert edit_distance([{"payload": {"body": "abcd"}}], "wxyz") == 1.0
+    assert edit_distance([], "abcd") is None
+
+
+class TestDealOutcome:
+    def test_outcome_filled_when_the_deal_settles_after_the_decision(self, step, reader, store, clock):
+        reader.add(_card(1, status="sent", decided_at=START + timedelta(minutes=1), decided_by="josh",
+                         deal_ref="loan_file:5"))
+        step()
+        funded_at = START + timedelta(days=30)
+        reader.outcomes["loan_file:5"] = ("funded", funded_at)
+        clock.now = funded_at + timedelta(minutes=1)
+        assert step().outcomes == 2
+        assert store.row("auto-send-judge-v1", 1)["deal_outcome"] == "funded"
+
+    def test_no_outcome_checked_after_90_days(self, step, reader, store, clock):
+        reader.add(_card(1, status="sent", decided_at=START + timedelta(minutes=1), decided_by="josh",
+                         deal_ref="loan_file:5"))
+        step()
+        reader.outcomes["loan_file:5"] = ("funded", START + timedelta(days=95))
+        clock.now = START + timedelta(days=91)
+        assert step().outcomes == 0
+        assert store.row("auto-send-judge-v1", 1)["deal_outcome"] is None
+
+    def test_card_without_deal_ref_gets_no_outcome(self, step, reader, store, clock):
+        reader.add(_card(1, status="sent", decided_at=START + timedelta(minutes=1), decided_by="josh"))
+        reader.outcomes["loan_file:5"] = ("funded", START)
+        assert step().outcomes == 0
+
+
+class TestDay14:
+    def test_one_inbox_item_and_the_class_stays_in_shadow(self, step, store, inbox, clock):
+        alerts = []
+        for minute in range(0, 3 * 24 * 60, 30):
+            clock.now = START + timedelta(days=13, minutes=minute)
+            alerts += step().day14_alerts
+        assert sorted(alerts) == sorted(CLASSES)
+        assert len(inbox.calls) == 2
+        assert all(c["mode"] == "shadow" for c in store.classes.values())
+
+    def test_no_item_before_day_14(self, step, inbox, clock):
+        clock.now = START + timedelta(days=13, hours=23)
+        step()
+        assert inbox.calls == []
+
+    def test_restart_raises_a_new_item(self, step, store, inbox, clock):
+        clock.now = START + timedelta(days=14)
+        step()
+        restarted = START + timedelta(days=20)
+        for c in store.classes.values():
+            c["started_at"] = restarted
+        clock.now = restarted + timedelta(days=14)
+        assert sorted(step().day14_alerts) == sorted(CLASSES)
+
+
+class TestZeroSends:
+    def test_14_simulated_days_make_no_send_and_no_pending_action(self, monkeypatch, step, reader, store, clock):
+        spies = {}
+        for owner, name in ((SendGate, "submit"), (PendingActionQueue, "enqueue"), (PendingActionQueue, "approve"),
+                            (Relay, "run"), (GhlSmsSender, "__call__"), (GhlEmailSender, "__call__"),
+                            (NdlInstantlySender, "send"), (slack_sdk.WebClient, "chat_postMessage"),
+                            (ops_alerts, "post_ops_alert"), (ops_alerts, "post_ops_notice")):
+            spies[f"{getattr(owner, '__name__', owner)}.{name}"] = spy = MagicMock()
+            monkeypatch.setattr(owner, name, spy)
+
+        action_id = 0
+        for day in range(14):
+            for hour in (9, 15):
+                action_id += 1
+                created = START + timedelta(days=day, hours=hour)
+                reader.add(_card(action_id, created_at=created))
+                clock.now = created + timedelta(minutes=1)
+                step()
+                reader.by_id[action_id].update(status="approved", decided_at=created + timedelta(hours=2),
+                                               decided_by="josh")
+            clock.now = START + timedelta(days=day, hours=23)
+            step()
+
+        assert len(store.rows) == 28 * len(CLASSES)
+        assert all(r["actual"] == "approve" for r in store.rows.values())
+        called = {name: spy.call_count for name, spy in spies.items() if spy.called}
+        assert called == {}
