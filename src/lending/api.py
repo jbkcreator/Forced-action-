@@ -12,6 +12,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from config.settings import get_settings
+from src.api.health_router import router as health_router
 from src.api.lending_ghl_router import router as lending_ghl_router
 from src.lending.booking_webhook import router as lending_booking_webhook_router
 from src.lending.reply_webhook import router as lending_reply_webhook_router
@@ -62,8 +63,4 @@ app.include_router(lending_instant_quote_router)
 app.include_router(lending_loan_stage_router)
 app.include_router(lending_lender_rules_router)
 app.include_router(lending_deal_ledger_router)
-
-
-@app.get("/health")
-def health() -> dict:
-    return {"status": "ok"}
+app.include_router(health_router)

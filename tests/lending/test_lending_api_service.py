@@ -12,6 +12,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from src.lending.api import app
+from src.utils.build_info import BuildInfo
 
 FA_API_MAIN = Path(__file__).resolve().parents[2] / "src" / "api" / "main.py"
 
@@ -34,8 +35,10 @@ def test_lending_app_serves_the_booking_reply_and_consent_webhooks():
         assert f"/webhooks/lending{path}" in paths, path
 
 
-def test_health():
-    assert TestClient(app).get("/health").json() == {"status": "ok"}
+def test_health(monkeypatch):
+    sha = "e1636938" + "0" * 32
+    monkeypatch.setattr("src.api.health_router.build_info", lambda: BuildInfo(sha, "apply_x"))
+    assert TestClient(app).get("/health").json() == {"status": "ok", "commit_sha": sha, "migration_head": "apply_x"}
 
 
 def test_fa_api_mounts_no_lending_router():
