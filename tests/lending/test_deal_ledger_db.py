@@ -140,7 +140,7 @@ def test_done_when_the_whole_lifecycle_reads_back_in_order(ledger_db):
     assert [(e["event_type"], e["actor"]) for e in events] == [
         ("file_created", "system:test"), ("lender_submission", "system:lender_submission"),
         ("stage_transition", "human:U0JOSH"), ("field_update", "human:josh"),
-        ("cora_draft", "cora"), ("card_approved", "human:U0JOSH"), ("human_edit", "human:U0JOSH")]
+        ("cora_draft", "cora"), ("human_edit", "human:U0JOSH"), ("card_approved", "human:U0JOSH")]
     by_type = {e["event_type"]: e for e in events}
     assert by_type["file_created"]["rule_version"] == 1 and by_type["stage_transition"]["rule_version"] == 2
     assert by_type["stage_transition"]["diff"]["stage"] == {"before": "INTAKE", "after": "FIT"}
@@ -224,7 +224,8 @@ def test_closing_a_file_is_ledgered_with_the_stage_it_died_at(ledger_db):
 
 def test_a_duplicate_payment_is_ledgered_once_and_paying_off_records_the_stage_move(ledger_db):
     db = ledger_db
-    file_id = _new_file(db, payoff_balance=250000)
+    file_id = _new_file(db)
+    sm.update_fields(db, file_id, {"payoff_balance": 250000}, actor="lender", source="api")
     for stage in (LoanStage.FIT, LoanStage.SUBMITTED, LoanStage.ACCEPTED, LoanStage.TERM_SHEET_ISSUED, LoanStage.CLOSING, LoanStage.FUNDED):
         sm.transition(db, file_id, stage, source="api", actor="josh")
     for _ in range(2):
