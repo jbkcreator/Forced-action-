@@ -11,7 +11,7 @@ from fastapi.testclient import TestClient
 from config.settings import get_settings
 from src.api import lending_doc_upload_router
 from src.api.lending_doc_upload_router import redact_upload_tokens
-from src.lending.closing.doc_access import issue_view_link, latest_upload
+from src.lending.closing.doc_access import issue_view_link, latest_upload, revoke_links_of_removed_approvers
 from src.lending.db import get_lending_db
 from src.lending.security.rbac import Role
 from src.lending.security.staff_tokens import issue_token, revoke_token, token_for
@@ -54,11 +54,23 @@ def test_unknown_token_is_403(view):
     assert response.status_code == 403 and "not valid" in response.text
 
 
-def test_issuer_no_longer_admin_gets_403(view, monkeypatch):
+def test_removed_approver_link_is_403_even_while_lending_api_still_lists_them(view):
+    """PR #478 review finding 1: lending-api's settings are cached until it restarts, so its approver list can be
+    stale. Here it still lists U_JOSH; Cora, restarted without him, revokes his link on its sweep -> 403 at once."""
+    client, link, _, docs = view
+    url = link()
+    assert client.get(url).status_code == 200
+    assert "U_JOSH" in get_settings().lending_cora_approver_user_ids  # lending-api's stale copy
+    assert revoke_links_of_removed_approvers(docs.db, frozenset({"U_SOMEONE_ELSE"}), datetime.now(timezone.utc)) == 1
+    assert client.get(url).status_code == 403
+
+
+def test_new_approver_link_opens_before_lending_api_restarts(view, monkeypatch):
+    """The other side of the same cache: Cora issued it to a new approver; lending-api's old list must not block it."""
     client, link, *_ = view
     url = link()
-    monkeypatch.setattr(get_settings(), "lending_cora_approver_user_ids", "U_SOMEONE_ELSE", raising=False)
-    assert client.get(url).status_code == 403
+    monkeypatch.setattr(get_settings(), "lending_cora_approver_user_ids", "", raising=False)  # lending-api's old list
+    assert client.get(url).status_code == 200
 
 
 def test_link_from_revoked_token_gets_403(view):

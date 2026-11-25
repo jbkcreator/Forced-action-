@@ -11,15 +11,21 @@ in `src/lending/cora_tools.py`. Builds on the P2.4 document chase (`docs/lending
 | admin | a Slack user in `LENDING_CORA_APPROVER_USER_IDS` (Josh), or a staff token issued with `--role admin` | can open any borrower upload through a 15-minute link |
 | caller | everyone else: David, Cora operators, `--role caller` tokens | **none**. Callers see status only ("bank statement received / missing"), as today |
 
-Removing someone from `LENDING_CORA_APPROVER_USER_IDS` (restart `fa-lending-cora`) or revoking their token stops
-their open links at once: a link re-checks its issuer every time it is opened.
+**Removing an approver:** take them out of `LENDING_CORA_APPROVER_USER_IDS` and restart **both** `fa-lending-cora` and
+`lending-api` (each reads the setting once, at start). Within a minute Cora's sweep revokes every live link that person
+was given (`lending.doc_view_links.revoked_at`), and a revoked link answers 403. This does not depend on lending-api's
+copy of the list: a Slack-issued link is never checked against it, so a stale lending-api neither keeps a removed
+approver's link open nor blocks a new approver's. **Revoking a token** (`--revoke`) stops its links at once: a token
+link re-checks its token every time it is opened.
 
 ## Josh in Slack
 
 In #cora (or any channel Cora answers in): *"Send me Mark Smith's bank statement."*
 
 - One match: Cora sends an **only-visible-to-you** message with a link that opens the newest upload for 15 minutes.
-  Nobody else in the channel sees it and Slack does not keep it in the history. The thread only says it was sent.
+  Nobody else in the channel sees it and Slack does not keep it in the history. Asked in a thread, it appears in that
+  thread; asked at top level, it appears at top level (Slack shows a private message in a thread only once the
+  thread exists). Cora's reply only says it was sent.
 - Names match at the start of a word: "ann" finds Ann Lee, never Joanne.
 - Several matches (two Marks): no link is made. Cora lists them as `Mark S. …0101` / `Mark T. …4432`, with whether
   each uploaded that document, and asks which one. Answer "the 0101 one".

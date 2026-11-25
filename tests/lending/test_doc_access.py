@@ -16,6 +16,7 @@ from src.lending.closing.doc_access import (
     issue_view_link,
     latest_upload,
     resolve_view_token,
+    revoke_links_of_removed_approvers,
 )
 from src.lending.partners import hash_token
 from src.lending.security.rbac import DocumentAccessDenied
@@ -112,3 +113,27 @@ def test_resolve_valid_expired_and_unknown(documents_db):
         with pytest.raises(ViewRefused) as refused:
             resolve_view_token(documents_db.db, token_value, when)
         assert refused.value.status == status
+
+
+def test_revocation_touches_only_live_slack_links_of_former_approvers(documents_db):
+    from src.lending.security.rbac import Role
+    from src.lending.security.staff_tokens import issue_token, token_for
+
+    smith, _ = _two_marks(documents_db)
+    db = documents_db.db
+    upload_id = latest_upload(db, smith.lead_ref, "bank_statements")[0]
+    josh = issue_view_link(db, upload_id, "slack:U_JOSH", NOW)
+    old = issue_view_link(db, upload_id, "slack:U_JOSH", NOW - timedelta(minutes=20))  # already expired
+    token = token_for(db, issue_token(db, "Ops", Role.ADMIN, "ops", NOW), NOW)
+    api = issue_view_link(db, upload_id, f"token:{token.id}", NOW)
+    assert revoke_links_of_removed_approvers(db, frozenset({"U_JOSH"}), NOW) == 0  # still an approver
+    assert revoke_links_of_removed_approvers(db, frozenset(), NOW) == 1  # Josh removed: his live link only
+    assert db.execute(text("SELECT count(*) FROM lending.doc_view_links WHERE revoked_at IS NOT NULL")).scalar() == 1
+    for link, status in ((josh, 403), (old, 410), (api, None)):
+        token_value = link.url.rsplit("/", 1)[1]
+        if status is None:
+            assert resolve_view_token(db, token_value, NOW).download_name == "bank_statements.pdf"
+        else:
+            with pytest.raises(ViewRefused) as refused:
+                resolve_view_token(db, token_value, NOW)
+            assert refused.value.status == status

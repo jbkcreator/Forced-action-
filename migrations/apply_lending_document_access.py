@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import logging
 
-from sqlalchemy import Table, create_engine
+from sqlalchemy import Table, create_engine, text
 from sqlalchemy.engine import Connection, Engine
 from sqlalchemy.schema import CreateIndex
 
@@ -33,6 +33,8 @@ def apply_to(conn: Connection, schema: str = LENDING_SCHEMA) -> None:
         table: Table = model.__table__  # type: ignore[assignment]  # declarative tables are Table at runtime
         for index in sorted(table.indexes, key=lambda i: str(i.name or "")):
             translated.execute(CreateIndex(index, if_not_exists=True))
+    # Added after the first review of PR #478: Cora revokes a Slack-issued link once its issuer is not an approver.
+    conn.execute(text(f'ALTER TABLE "{schema}".doc_view_links ADD COLUMN IF NOT EXISTS revoked_at timestamptz'))
     # Both tables hold token hashes: closed to callers at once when lending_caller already exists.
     revoke_from_caller_role(conn, schema, tuple(model.__tablename__ for model in TABLES))
 

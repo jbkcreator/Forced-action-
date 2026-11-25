@@ -835,7 +835,8 @@ class CoraToolkit:
         message = (f"{match.display} – {label} (uploaded {uploaded_at:%b %d}). Opens for 15 minutes, only you can "
                    f"see this message: {link.url}")
         try:
-            self._channels.post_private(context.channel, context.user_id, context.thread_ts, message)
+            self._channels.post_private(context.channel, context.user_id,
+                                        context.thread_ts if context.in_thread else None, message)
         except Exception as exc:  # class only: Slack errors can echo the request
             logger.warning("[cora-tools] private document link not posted (%s)", type(exc).__name__)
             raise ToolInputError("Slack refused the private message; nothing was shared")

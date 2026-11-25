@@ -11,6 +11,8 @@ from packages.agent_core.tools import ToolContext, ToolInputError
 from src.lending.cora_tools import CoraToolkit, SendDocumentLinkInput
 
 JOSH = ToolContext(user_id="U_JOSH", is_approver=True, channel="C", thread_ts="1.0", tool_use_id="toolu_1")
+JOSH_IN_THREAD = ToolContext(user_id="U_JOSH", is_approver=True, channel="C", thread_ts="1.0", tool_use_id="toolu_3",
+                             in_thread=True)
 DAVID = ToolContext(user_id="U_DAVID", is_approver=False, channel="C", thread_ts="1.0", tool_use_id="toolu_2")
 
 
@@ -57,9 +59,19 @@ def test_registered_approver_only():
     assert tool.approver_only and tool.safety is SafetyLevel.INTERNAL_WRITE
 
 
-def test_one_match_sends_ephemeral_in_thread_and_returns_no_link(cora):
+def test_top_level_request_gets_a_top_level_private_message(cora):
+    """PR #478 review finding 2: a request posted at top level has no thread yet, and Slack hides an ephemeral
+    message sent to a thread that is not active, so the link must go top level."""
     toolkit, channels, *_ = cora
-    result = toolkit.send_document_link(SendDocumentLinkInput(borrower="Mark Smith", item_code="bank_statements"), JOSH)
+    toolkit.send_document_link(SendDocumentLinkInput(borrower="Mark Smith", item_code="bank_statements"), JOSH)
+    (channel, user, thread, _), = channels.private_posts
+    assert (channel, user, thread) == ("C", "U_JOSH", None)
+
+
+def test_one_match_in_a_thread_sends_ephemeral_in_that_thread_and_returns_no_link(cora):
+    toolkit, channels, *_ = cora
+    result = toolkit.send_document_link(SendDocumentLinkInput(borrower="Mark Smith", item_code="bank_statements"),
+                                        JOSH_IN_THREAD)
     (channel, user, thread, message), = channels.private_posts
     assert (channel, user, thread) == ("C", "U_JOSH", "1.0") and channels.public_posts == []
     assert "https://api.example.com/api/lending/docs/view/" in message and "Mark S. …0101" in message
@@ -112,3 +124,23 @@ def test_slack_refusal_reports_nothing_shared(cora):
     channels.refuse = True
     with pytest.raises(ToolInputError, match="nothing was shared"):
         toolkit.send_document_link(SendDocumentLinkInput(borrower="Mark Smith", item_code="bank_statements"), JOSH)
+
+
+class _RecordingSlackClient:
+    def __init__(self):
+        self.calls = []
+
+    def chat_postEphemeral(self, **kwargs):
+        self.calls.append(kwargs)
+
+
+def test_post_private_sends_thread_ts_only_for_an_existing_thread():
+    from src.lending.cora_channels import ChannelDirectory
+
+    client = _RecordingSlackClient()
+    directory = ChannelDirectory(client, own_channel_id="C_CORA", key_ids={})
+    directory.post_private("C", "U_JOSH", None, "top")
+    directory.post_private("C", "U_JOSH", "1.0", "threaded")
+    assert "thread_ts" not in client.calls[0] and client.calls[0]["user"] == "U_JOSH"
+    assert client.calls[1]["thread_ts"] == "1.0"
+    assert all(call["unfurl_links"] is False and call["unfurl_media"] is False for call in client.calls)

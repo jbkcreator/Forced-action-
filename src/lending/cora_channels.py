@@ -121,11 +121,14 @@ class ChannelDirectory:
         self._client.files_upload_v2(channel=channel_id, thread_ts=thread_ts, content=content, filename=filename,
                                      title=title)
 
-    def post_private(self, channel_id: str, user_id: str, thread_ts: str, text: str) -> None:
-        """An "only visible to you" message to one person in a thread (chat:write). Slack does not keep it in the
-        channel history. Raises when Slack refuses."""
-        self._client.chat_postEphemeral(channel=channel_id, user=user_id, thread_ts=thread_ts, text=text,
-                                        unfurl_links=False, unfurl_media=False)
+    def post_private(self, channel_id: str, user_id: str, thread_ts: Optional[str], text: str) -> None:
+        """An "only visible to you" message to one person (chat:write); Slack does not keep it in the channel history.
+        ``thread_ts`` only for a thread that already exists: Slack does not show an ephemeral message in a thread
+        that is not active yet, so a request posted at top level gets a top-level message. Raises when Slack
+        refuses."""
+        kwargs = {"thread_ts": thread_ts} if thread_ts else {}
+        self._client.chat_postEphemeral(channel=channel_id, user=user_id, text=text, unfurl_links=False,
+                                        unfurl_media=False, **kwargs)
 
 
 def _author(item: Mapping[str, Any]) -> str:

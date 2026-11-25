@@ -23,7 +23,7 @@ from sqlalchemy import text
 from config.lending_closing import DOC_VIEW_LINK_PATH, DOC_VIEW_LINK_TTL
 from src.lending.partner_service import PartnerLinkNotConfigured, link_base_url
 from src.lending.partners import hash_token
-from src.lending.security.rbac import DocumentAccessDenied, Role, role_of_issuer
+from src.lending.security.rbac import SLACK_ISSUER, TOKEN_ISSUER, DocumentAccessDenied, Role, role_of_issuer
 from src.services.phone_utils import normalize
 
 logger = logging.getLogger(__name__)
@@ -79,8 +79,15 @@ _LATEST = text("""
 _UPLOAD_EXISTS = text("SELECT 1 FROM lending.doc_chase_uploads WHERE id = :id")
 _INSERT_LINK = text("INSERT INTO lending.doc_view_links (token_hash, upload_id, issued_to, expires_at, created_at) "
                     "VALUES (:hash, :upload, :issued_to, :expires, :now) RETURNING id")
+# Live Slack-issued links whose issuer is not in the approver list Cora holds now.
+_REVOKE_SLACK_LINKS = text("""
+    UPDATE lending.doc_view_links SET revoked_at = :now
+     WHERE revoked_at IS NULL AND expires_at > :now AND issued_to LIKE 'slack:%'
+       AND NOT (issued_to = ANY(CAST(:allowed AS text[])))
+""")
+_LINKS_TABLE = text("SELECT to_regclass('lending.doc_view_links')")
 _LINK = text("""
-    SELECT l.id, l.upload_id, l.issued_to, l.expires_at, u.stored_path, u.content_type, u.item_code
+    SELECT l.id, l.upload_id, l.issued_to, l.expires_at, l.revoked_at, u.stored_path, u.content_type, u.item_code
       FROM lending.doc_view_links l JOIN lending.doc_chase_uploads u ON u.id = l.upload_id
      WHERE l.token_hash = :hash
 """)
@@ -216,10 +223,17 @@ def resolve_view_token(db, token: str, now: datetime) -> ViewableFile:
     row = db.execute(_LINK, {"hash": hash_token(token)}).first() if token and len(token) <= 200 else None
     if row is None:
         raise ViewRefused(403)
+    if row.revoked_at is not None:
+        logger.warning("[doc-access] view link %s refused: revoked (its issuer is no longer admin)", row.id)
+        raise ViewRefused(403)
     if row.expires_at <= now:
         raise ViewRefused(410)
-    if role_of_issuer(db, row.issued_to, now) is not Role.ADMIN:
-        logger.warning("[doc-access] view link %s refused: its issuer is no longer admin", row.id)
+    # A token link is re-checked against its token here. A Slack link is not checked against this process's
+    # approver list, which is only as fresh as its last restart: Cora revokes it (revoked_at, above) instead.
+    if row.issued_to.startswith(TOKEN_ISSUER) and role_of_issuer(db, row.issued_to, now) is not Role.ADMIN:
+        logger.warning("[doc-access] view link %s refused: its token is no longer an admin token", row.id)
+        raise ViewRefused(403)
+    if not row.issued_to.startswith((TOKEN_ISSUER, SLACK_ISSUER)):
         raise ViewRefused(403)
     if not os.path.isfile(row.stored_path):
         logger.error("[doc-access] view link %s: upload %s is missing on disk", row.id, row.upload_id)
@@ -227,3 +241,17 @@ def resolve_view_token(db, token: str, now: datetime) -> ViewableFile:
     logger.info("[doc-access] view link %s opened (upload %s)", row.id, row.upload_id)
     extension = os.path.splitext(row.stored_path)[1].lower()
     return ViewableFile(row.stored_path, row.content_type, f"{row.item_code}{extension}")
+
+
+def revoke_links_of_removed_approvers(db, approver_ids: frozenset[str], now: datetime) -> int:
+    """Revoke every live Slack-issued link whose issuer is not in ``approver_ids``. Run by Cora at start and on each
+    minute sweep, from the approver list it was started with, so removing an approver (and restarting Cora) stops
+    their open links within a minute, whatever lending-api's cached settings say. Returns how many were revoked;
+    0 while the table does not exist yet (migration not run)."""
+    if db.execute(_LINKS_TABLE).scalar() is None:
+        return 0
+    allowed = [f"{SLACK_ISSUER}{user_id}" for user_id in sorted(approver_ids)]
+    revoked = db.execute(_REVOKE_SLACK_LINKS, {"now": now, "allowed": allowed}).rowcount
+    if revoked:
+        logger.warning("[doc-access] revoked %s live document link(s) of former approvers", revoked)
+    return revoked

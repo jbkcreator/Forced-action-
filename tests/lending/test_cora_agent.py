@@ -535,3 +535,35 @@ def test_send_check_blocks_a_reminder_of_a_closed_document_chase() -> None:
     action = replace(_action(), deal_ref="doc_chase:5")
     reason = cora_agent.make_send_check(ScriptedEngine(False), carrier_approved=True)(action)
     assert reason == "the document chase is closed" and not isinstance(reason, SendDeferred)
+
+
+def test_sweep_revokes_former_approvers_document_links_first_and_survives_a_failure() -> None:
+    """R1 0.2 (PR #478 review finding 1): Cora, which holds the current approver list, revokes each sweep."""
+    order: list[str] = []
+    parts = _SweepParts()
+    original_run = parts.run
+    parts.run = lambda: order.append("relay") or original_run()
+    cora_agent.run_sweep(_sweep_services(parts, None)._replace(doc_link_revocation=lambda: order.append("revoke") or 0))
+    assert order == ["revoke", "relay"]
+
+    def database_down() -> int:
+        raise RuntimeError("db down")
+
+    order.clear()
+    cora_agent.run_sweep(_sweep_services(parts, None)._replace(doc_link_revocation=database_down))
+    assert order == ["relay"]
+
+
+def test_tool_context_marks_requests_inside_a_thread() -> None:
+    """PR #478 review finding 2: the document tool posts into the thread only when the request was in one."""
+    from types import SimpleNamespace
+
+    from packages.agent_core.slack_session import InboundMessage
+
+    conversation = object.__new__(cora_agent.CoraConversation)
+    conversation._config = SimpleNamespace(approver_user_ids=frozenset({"U1"}))
+    top = InboundMessage(user_id="U1", channel="C", text="hi", ts="2.0", thread_ts=None, is_direct=False)
+    reply = InboundMessage(user_id="U1", channel="C", text="hi", ts="2.5", thread_ts="2.0", is_direct=False)
+    top_context, reply_context = conversation._context(top, "t1"), conversation._context(reply, "t2")
+    assert (top_context.thread_ts, top_context.in_thread) == ("2.0", False)
+    assert (reply_context.thread_ts, reply_context.in_thread) == ("2.0", True)

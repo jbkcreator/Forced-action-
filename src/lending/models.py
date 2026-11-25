@@ -1776,8 +1776,9 @@ class LendingDocChaseUpload(LendingBase):
 
 class LendingDocViewLink(LendingBase):
     """R1 0.2: a 15-minute link an admin was given to view or download one upload. Only the token's SHA-256 is
-    stored. ``issued_to`` (``slack:<user id>`` or ``token:<staff token id>``) is re-checked when the link is opened,
-    so it stops working as soon as that person or token is no longer admin."""
+    stored. ``issued_to`` is ``slack:<user id>`` or ``token:<staff token id>``. A token link re-checks its token when
+    opened; a Slack link is stopped by ``revoked_at``, which Cora sets as soon as its issuer is no longer an approver
+    (Cora holds the current approver list; lending-api's copy is only as fresh as its last restart)."""
 
     __tablename__ = "doc_view_links"
 
@@ -1786,6 +1787,7 @@ class LendingDocViewLink(LendingBase):
     upload_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("lending.doc_chase_uploads.id"), nullable=False)
     issued_to: Mapped[str] = mapped_column(String(40), nullable=False)
     expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    revoked_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_now, server_default=text("now()"))
 
     __table_args__ = (Index("idx_lending_doc_view_links_upload", "upload_id"),)
