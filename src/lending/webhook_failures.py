@@ -169,6 +169,13 @@ def _retry_one(db, row, result: RetryResult) -> None:
         logger.warning("[lending-webhook-failure] #%s retry %s failed: %s", row.id, attempts, error)
 
 
+def replay_one(db, row) -> RetryResult:
+    """Run one saved failure once now, exactly as the sweep would (the DLQ replay CLI)."""
+    result = RetryResult()
+    _retry_one(db, row, result)
+    return result
+
+
 def retry_pending(*, session_factory: Callable = lending_session,
                   notify: Callable[[str], bool] = post_ops_notice) -> RetryResult:
     """Replay every open failure once, each in its own savepoint; alerts go out after the commit."""
