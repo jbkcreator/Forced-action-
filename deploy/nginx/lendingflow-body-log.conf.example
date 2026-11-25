@@ -1,5 +1,14 @@
-# R1 0.5 D13: http-level log format for the LendingFlow edge log. Copy to /etc/nginx/conf.d/lendingflow-body-log.conf
-# (conf.d is included inside the http block). One JSON object per line; $request_body is JSON-escaped (nginx >= 1.11.8).
-# The body holds a borrower's phone and email: the file is root-only and kept 7 days
-# (deploy/logrotate/lendingflow-body-log.example). Read by src/lending/inbound/lendingflow_edge_log.py.
+# R1 0.5 D13: http-level log format for the LendingFlow edge log, read by the 2 AM reconcile
+# (src/lending/inbound/lendingflow_edge_log.py) to replay leads that reached nginx but were never stored.
+# One JSON object per line; $request_body is JSON-escaped (nginx >= 1.11.8). No headers are logged (no webhook secret).
+# The body holds a borrower's phone and email: root-only, kept 7 days.
+#
+# One-time manual setup on the server:
+#   sudo cp deploy/nginx/lendingflow-body-log.conf.example /etc/nginx/conf.d/lendingflow-body-log.conf
+#   add the "location = /api/lending/lendingflow" block from deploy/nginx/lending-api.conf.example
+#     above "location /api/lending/"
+#   sudo cp deploy/logrotate/lendingflow-body-log.example /etc/logrotate.d/lendingflow-body-log
+#   sudo touch /var/log/nginx/lendingflow_body.log && sudo chmod 600 /var/log/nginx/lendingflow_body.log
+#   sudo nginx -t && sudo systemctl reload nginx
+#   .env: LENDING_LENDINGFLOW_BODY_LOG=/var/log/nginx/lendingflow_body.log
 log_format lendingflow_body escape=json '{"t":"$time_iso8601","status":"$status","body":"$request_body"}';
