@@ -1076,6 +1076,9 @@ class AppSettings(BaseSettings):
 	lending_ghl_call_gate_enabled: bool = Field(default=False, env="LENDING_GHL_CALL_GATE_ENABLED")
 	# BatchDialer load -> GHL contact sync (src/lending/ghl_load_sync.py): every active dialer load pushed to GHL as a cold contact
 	lending_ghl_load_sync_enabled: bool = Field(default=False, env="LENDING_GHL_LOAD_SYNC_ENABLED")
+	# R1 0.5 durable inbound (src/lending/inbound/journal.py): webhooks save the raw body to lending.inbound_events first,
+	# then process it; a failure goes to webhook_failures and the endpoint still answers 200. Off = endpoints as before
+	lending_inbound_journal_enabled: bool = Field(default=False, env="LENDING_INBOUND_JOURNAL_ENABLED")
 	# Morning BatchDialer load of the PropertyRadar pool the bridge stages (src/tasks/lending_pr_dialer_autoload.py,
 	# 09:xx and 12:xx ET): only phones not already loaded. The cap is Tracerfy do-not-call credits per ET day (a phone with a
 	# fresh check costs nothing); 0 = only phones already checked are loaded

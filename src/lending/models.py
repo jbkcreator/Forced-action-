@@ -1085,6 +1085,36 @@ class LendingWebhookFailure(LendingBase):
     )
 
 
+class LendingInboundEvent(LendingBase):
+    """R1 0.5 inbound journal: every journaled webhook body, saved raw before it is processed
+    (``src.lending.inbound.journal``). ``(source, dedup_key)`` is unique, so a redelivery is a duplicate.
+    ``status``: received -> processed, or failed (the body was saved to ``webhook_failures`` as ``failure_id``;
+    a successful replay sets processed). A row still ``received`` after two minutes is run again by the 5-minute
+    cron. ``last_error_class`` is an exception class only, no PII; ``raw`` is nulled 30 days after processing."""
+
+    __tablename__ = "inbound_events"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    source: Mapped[str] = mapped_column(String(40), nullable=False)
+    dedup_key: Mapped[str] = mapped_column(String(255), nullable=False)
+    raw: Mapped[Optional[dict]] = mapped_column(JSONB)
+    received_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False,
+                                                  server_default=text("now()"))
+    status: Mapped[str] = mapped_column(String(12), nullable=False, server_default=text("'received'"))
+    attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default=text("0"))
+    processed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    failure_id: Mapped[Optional[int]] = mapped_column(
+        Integer, ForeignKey("lending.webhook_failures.id", ondelete="SET NULL"))
+    last_error_class: Mapped[Optional[str]] = mapped_column(String(200))
+
+    __table_args__ = (
+        CheckConstraint("status IN ('received', 'processed', 'failed')", name="ck_lending_inbound_events_status"),
+        Index("uq_lending_inbound_events_source_key", "source", "dedup_key", unique=True),
+        Index("idx_lending_inbound_events_status_received", "status", "received_at"),
+        Index("idx_lending_inbound_events_failure", "failure_id", postgresql_where=text("failure_id IS NOT NULL")),
+    )
+
+
 class LendingCoraInboxItem(LendingBase):
     """One event for Cora to raise with the operator in her main thread before it goes to a team channel.
 
