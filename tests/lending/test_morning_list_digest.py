@@ -154,3 +154,34 @@ def test_a_tier_that_cannot_be_read_is_named_and_the_rest_still_posts(engine) ->
     unavailable = next(line for line in _text(chat).split("\\n") if "Not available today" in line)
     assert "active deals" in unavailable
     assert "loan:5" not in [i.ref for i in listed] and "lf:1" in [i.ref for i in listed]
+
+
+def test_padding_follows_the_dial_order_not_insert_order(engine) -> None:
+    with engine.begin() as conn:
+        conn.execute(text("INSERT INTO lending.dialer_load_records (id, pool, phone, borrower_name, active) VALUES"
+                          " (1, 'verified_maturity', '+17275550011', 'Mat One', 1),"
+                          " (2, 'partners', '+17275550012', 'Pat Two', 1)"))
+        conn.execute(text("INSERT INTO lending.contacts (phone, line_type) VALUES ('+17275550011', 'Mobile'),"
+                          " ('+17275550012', 'Mobile')"))
+    listed = []
+    config = MorningListConfig(size=1, lead_days=14, david_user_id="", stuck_deals=lambda db, now: [])
+    post_morning_digest(engine, FakeChatPort(default_channel="C"), "C", halted=False, now=AT_7_47,
+                        morning_list=config, on_listed=listed.extend)
+    assert [i.ref for i in listed] == ["dlr:2"]
+
+
+def test_batched_text_consent_matches_the_single_check(engine) -> None:
+    from src.lending.consent import has_text_consent, text_consented_phones
+
+    with engine.begin() as conn:
+        conn.execute(text("CREATE TABLE lending.text_consents (phone TEXT, revoked_at TIMESTAMP)"))
+        conn.execute(text("INSERT INTO lending.text_consents VALUES ('+18135550001', NULL),"
+                          " ('+18135550003', '2026-11-01')"))
+        conn.execute(text("INSERT INTO lending.lendingflow_leads (id, phone, received_at) VALUES"
+                          " (1, '+18135550002', '2026-11-20'), (2, '+18135550003', '2026-11-20'),"
+                          " (3, '+18135550004', '2026-11-20')"))
+        conn.execute(text("INSERT INTO lending.suppression_list (phone) VALUES ('+18135550004')"))
+    phones = [f"+1813555000{n}" for n in range(1, 6)]
+    with engine.connect() as conn:
+        single = {p for p in phones if has_text_consent(conn, p)}
+        assert text_consented_phones(conn, phones) == single == {"+18135550001", "+18135550002"}

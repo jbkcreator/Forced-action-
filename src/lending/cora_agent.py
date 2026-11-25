@@ -85,8 +85,8 @@ from src.lending.standing_sends import (
     return_for_approval,
 )
 from src.lending.ops_alerts import post_ops_notice, post_replies_notice
-from src.lending.cora_morning_digest import MorningListConfig, post_morning_digest
-from src.lending.morning_list.step import make_morning_enrichment, make_morning_list
+from src.lending.cora_morning_digest import DIGEST_TIME, post_morning_digest
+from src.lending.morning_list.step import make_morning_enrichment, make_morning_list, parse_time
 from src.lending.models import LENDING_SCHEMA
 from src.lending.routing.slack_extension import RoutingSlack
 from src.services.phone_utils import normalize
@@ -163,14 +163,13 @@ def make_morning_digest(engine: Engine, store: AgentStore, chat: ChatPort, confi
     halt = HaltSwitch(store, config.agent_name)
     listing = make_morning_list(engine, settings, gate=gate, messages_client=messages_client,
                                 approvals_channel=config.approval_channel_id or "") if settings else None
+    at = parse_time(settings.lending_morning_digest_time) if settings else DIGEST_TIME
 
     def digest() -> bool:
-        if listing is None:
-            return post_morning_digest(engine, chat, config.slack_channel_id, halted=halt.is_halted(),
-                                       halt_reason=halt.reason(), approvals_channel=config.approval_channel_id)
         return post_morning_digest(engine, chat, config.slack_channel_id, halted=halt.is_halted(),
-                                   halt_reason=halt.reason(), approvals_channel=config.approval_channel_id,
-                                   at=listing.at, morning_list=listing.config, on_listed=listing.on_listed)
+                                   halt_reason=halt.reason(), approvals_channel=config.approval_channel_id, at=at,
+                                   morning_list=listing.config if listing else None,
+                                   on_listed=listing.on_listed if listing else None)
 
     return digest
 

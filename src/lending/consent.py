@@ -8,7 +8,7 @@ import logging
 from datetime import datetime, timezone
 from typing import Optional
 
-from sqlalchemy import text
+from sqlalchemy import bindparam, text
 
 from src.services.phone_utils import normalize
 
@@ -38,6 +38,26 @@ def revoke_consent(db, phone: str) -> None:
     if norm:
         db.execute(text("UPDATE lending.text_consents SET revoked_at = now() WHERE phone = :p AND revoked_at IS NULL"),
                    {"p": norm})
+
+
+def text_consented_phones(db, phones) -> set[str]:
+    """The subset of ``phones`` (normalized) that ``has_text_consent`` would allow, in one query."""
+    norms = sorted({n for n in (normalize(p) for p in phones) if n})
+    if not norms:
+        return set()
+    rows = db.execute(
+        text("SELECT p.phone FROM (SELECT phone FROM lending.text_consents WHERE phone IN :ps UNION "
+             "      SELECT phone FROM lending.lendingflow_leads WHERE phone IN :ps) p "
+             "WHERE (EXISTS (SELECT 1 FROM lending.text_consents c WHERE c.phone = p.phone AND c.revoked_at IS NULL) "
+             "       OR (EXISTS (SELECT 1 FROM lending.lendingflow_leads l WHERE l.phone = p.phone) "
+             "           AND NOT EXISTS (SELECT 1 FROM lending.text_consents c WHERE c.phone = p.phone "
+             "                            AND c.revoked_at IS NOT NULL))) "
+             "  AND NOT EXISTS (SELECT 1 FROM lending.suppression_list s WHERE s.phone = p.phone) "
+             "  AND NOT EXISTS (SELECT 1 FROM lending.contacts ct WHERE ct.phone = p.phone AND ct.do_not_contact)"
+             ).bindparams(bindparam("ps", expanding=True)),
+        {"ps": norms},
+    ).scalars().all()
+    return set(rows)
 
 
 def has_text_consent(db, phone: str) -> bool:

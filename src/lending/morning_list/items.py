@@ -8,6 +8,7 @@ only fills what real work leaves. ``render_sections`` turns the list into the Jo
 from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
+from datetime import datetime
 from typing import Iterable, Optional
 
 from config.lending_morning_list import (
@@ -32,7 +33,7 @@ class ListItem:
     entity_name: Optional[str] = None
     property_address: Optional[str] = None    # Clay LLC lookup input
     caller_name: Optional[str] = None         # callbacks: who logged the call
-    received_at: Optional[object] = None      # warm leads: when the lead arrived
+    received_at: Optional[datetime] = None    # warm leads: when the lead arrived
     owner: str = field(default="")
 
     @property
@@ -42,6 +43,10 @@ class ListItem:
     @property
     def has_mobile(self) -> bool:
         return (self.line_type or "").strip().lower() == MOBILE_LINE_TYPE
+
+    @property
+    def first_name(self) -> Optional[str]:
+        return (self.name or "").strip().split(" ")[0] or None
 
     @property
     def last4(self) -> str:
@@ -76,7 +81,7 @@ def _line(item: ListItem) -> str:
     flags = [f"…{item.last4}"] if item.last4 else []
     if not item.has_mobile:
         flags.append("no mobile")
-    who = slack_safe(item.name or item.entity_name or "Lead") + (f" ({', '.join(flags)})" if flags else "")
+    who = slack_safe(item.first_name or item.entity_name or "Lead") + (f" ({', '.join(flags)})" if flags else "")
     extras = [slack_safe(item.brief[:BRIEF_MAX_CHARS])] if item.brief else []
     if item.email_source == "clay":
         extras.append("email found")

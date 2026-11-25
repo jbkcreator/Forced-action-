@@ -60,12 +60,13 @@ def test_owner_split_josh_gets_deals_and_booked_david_gets_the_rest() -> None:
                                                "cb:2": JOSH, "lf:1": DAVID, "dlr:1": DAVID}
 
 
-def test_lines_show_label_name_last4_and_brief_never_full_phone_or_email() -> None:
+def test_lines_show_label_first_name_last4_and_brief_never_full_phone_or_email() -> None:
     items = build([item("lf:1", NEW_WARM_LEAD, phone="+18135551234", email="ann@example.com",
                         brief="Fix and flip, $250k, Tampa")], size=50)
     josh, david = render_sections(items, david_user_id="U_DAVID")
     line = david.lines[-1]
-    assert line == "• *New lead*: Ann Lee (…1234). Fix and flip, $250k, Tampa"
+    assert line == "• *New lead*: Ann (…1234). Fix and flip, $250k, Tampa"
+    assert "Lee" not in line
     assert "8135551234" not in "".join(david.lines) and "example.com" not in "".join(david.lines)
     assert david.lines[0] == "<@U_DAVID>"
     assert josh.lines == []
@@ -82,3 +83,9 @@ def test_email_found_by_clay_is_flagged_not_shown() -> None:
     items = build([item("dlr:1", COLD_TOP, email="x@y.com", email_source="clay")], size=50)
     _, david = render_sections(items, david_user_id="")
     assert david.lines[-1].endswith("(…0100). email found")
+
+
+def test_tier_3_lists_todays_booked_calls_before_callbacks() -> None:
+    items = build([item("cb:1", CALLBACK, phone="+18135550001", sort_key=(1, 100.0)),
+                   item("bk:1", BOOKED_TODAY, phone="+18135550002", sort_key=(0, 900.0))], size=50)
+    assert [i.ref for i in items] == ["bk:1", "cb:1"]

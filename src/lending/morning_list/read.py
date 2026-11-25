@@ -10,9 +10,8 @@ from __future__ import annotations
 import logging
 import re
 from dataclasses import replace
-from datetime import datetime, time, timedelta, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Iterable, Optional, Sequence
-from zoneinfo import ZoneInfo
 
 from sqlalchemy import bindparam, text
 from sqlalchemy.orm import Session
@@ -25,11 +24,11 @@ from config.lending_morning_list import (
 from config.lending_queues import DIAL_ORDER
 from src.lending.borrower_score import facts_from_lendingflow_lead, facts_from_web_lead, score_borrower
 from src.lending.morning_list.items import ListItem
+from src.lending.morning_list.time import ET, et_day_start
 from src.services.phone_utils import normalize
 
 logger = logging.getLogger(__name__)
 
-ET = ZoneInfo("America/New_York")
 CALLBACK_CODE = "CALLBACK_REQUESTED"
 
 _NAME_BY_PHONE = """COALESCE(
@@ -85,9 +84,10 @@ _COLD_TOP = text("""
      WHERE d.active AND d.pool IN :pools AND lower(coalesce(ct.line_type, '')) = 'mobile'
        AND NOT ct.do_not_contact AND NOT ct.is_test
        AND NOT EXISTS (SELECT 1 FROM lending.suppression_list s WHERE s.phone = d.phone)
-     ORDER BY d.id
+     ORDER BY CASE d.pool {when} END, d.id
      LIMIT :limit
-""").bindparams(bindparam("pools", expanding=True))
+""".format(when=" ".join(f"WHEN :pool{n} THEN {n}" for n in range(len(DIAL_ORDER))))).bindparams(
+    bindparam("pools", expanding=True))
 _CONTACTS = text("SELECT phone, line_type, email FROM lending.contacts WHERE phone IN :phones"
                  ).bindparams(bindparam("phones", expanding=True))
 _CLAY_FOUND = text("""
@@ -159,8 +159,7 @@ def read_active_deals(db: Session, now: datetime) -> list[ListItem]:
 
 
 def read_booked_today(db: Session, now: datetime) -> list[ListItem]:
-    day = now.astimezone(ET).date()
-    start = datetime.combine(day, time.min, ET).astimezone(timezone.utc)
+    start = et_day_start(now)
     rows = db.execute(_BOOKED_TODAY, {"start": start, "end": start + timedelta(days=1)}).mappings().all()
     items = []
     for row in rows:
@@ -169,7 +168,7 @@ def read_booked_today(db: Session, now: datetime) -> list[ListItem]:
         items.append(ListItem(
             ref=f"bk:{row['booking_ref']}", reason=BOOKED_TODAY, name=row["full_name"] or row["first_name"],
             phone=normalize(row["phone"]) if row["phone"] else None, line_type=None,
-            sort_key=(slot.timestamp() if slot else 0,),
+            sort_key=(0, slot.timestamp() if slot else 0),  # tier 3: today's booked calls by time, then callbacks
             brief=f"call at {local.hour % 12 or 12}:{local:%M %p}" if local else "call today"))
     return items
 
@@ -181,7 +180,7 @@ def read_callbacks(db: Session, now: datetime) -> list[ListItem]:
         called = _aware(row["called_at"])
         items.append(ListItem(
             ref=f"cb:{row['id']}", reason=CALLBACK, name=row["full_name"], phone=normalize(row["phone"]),
-            line_type=None, caller_name=row["caller_name"], sort_key=(called.timestamp() if called else 0,),
+            line_type=None, caller_name=row["caller_name"], sort_key=(1, called.timestamp() if called else 0),
             brief=f"asked for a callback {_days(called, now)} days ago" if _days(called, now) else
             "asked for a callback today"))
     return items
@@ -226,7 +225,8 @@ def _city(address: Optional[str]) -> Optional[str]:
 
 def read_cold_top(db: Session, *, limit: int) -> list[ListItem]:
     """Padding: active BatchDialer records with a Mobile number, queue order first (D5)."""
-    rows = db.execute(_COLD_TOP, {"pools": list(DIAL_ORDER), "limit": limit * 4}).mappings().all()
+    order = {f"pool{n}": pool for n, pool in enumerate(DIAL_ORDER)}
+    rows = db.execute(_COLD_TOP, {"pools": list(DIAL_ORDER), "limit": limit, **order}).mappings().all()
     items = []
     for row in rows:
         pool = str(row["pool"])

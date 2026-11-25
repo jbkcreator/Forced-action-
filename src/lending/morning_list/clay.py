@@ -20,19 +20,19 @@ from __future__ import annotations
 import logging
 import re
 from dataclasses import dataclass, field
-from datetime import datetime, time, timedelta, timezone
-from typing import Optional, Protocol, Sequence
-from zoneinfo import ZoneInfo
+from datetime import datetime, timedelta
+from typing import Callable, Optional, Protocol, Sequence
 
-import httpx
+import requests
 from sqlalchemy import bindparam, text
 from sqlalchemy.orm import Session
 
 from src.lending.morning_list.items import ListItem
+from src.lending.morning_list.time import et_day_start
+from src.utils.http_helpers import requests_get_with_retry
 
 logger = logging.getLogger(__name__)
 
-ET = ZoneInfo("America/New_York")
 EMAIL = "email"
 LLC_OWNER = "llc_owner"
 DEFAULT_STATE = "FL"
@@ -43,7 +43,8 @@ _KNOWN = text("""
     SELECT lead_ref, field FROM lending.clay_enrichments WHERE lead_ref IN :refs AND requested_at >= :fresh
 """).bindparams(bindparam("refs", expanding=True))
 _TODAY = text("SELECT count(*) FROM lending.clay_enrichments WHERE requested_at >= :start")
-_FORGET = text("DELETE FROM lending.clay_enrichments WHERE lead_ref = :ref AND field = :field")
+_FORGET = text("DELETE FROM lending.clay_enrichments WHERE field = :field AND lead_ref IN :refs"
+               ).bindparams(bindparam("refs", expanding=True))
 _REQUEST = text("""
     INSERT INTO lending.clay_enrichments (lead_ref, field, run_id, status, requested_at)
     VALUES (:ref, :field, :run_id, 'pending', :now)
@@ -95,24 +96,24 @@ class LiveClayRoutines:
         self._timeout = timeout
 
     def run(self, routine: str, items: list[dict]) -> str:
+        """Never retried: a run spends Actions, and a timeout may still have started it."""
         try:
-            response = httpx.post(f"{self._base}/routines/{routine}/run", headers=self._headers,
-                                  json={"items": items}, timeout=self._timeout)
+            response = requests.post(f"{self._base}/routines/{routine}/run", headers=self._headers,
+                                     json={"items": items}, timeout=self._timeout)
             response.raise_for_status()
             return str(response.json()["routine_run_id"])
-        except (httpx.HTTPError, KeyError, ValueError) as exc:
+        except (requests.RequestException, KeyError, ValueError) as exc:
             raise ClayError(f"run refused ({type(exc).__name__})") from exc
 
     def results(self, run_id: str) -> RunResults:
         try:
-            response = httpx.get(f"{self._base}/routines/run/{run_id}/results", headers=self._headers,
-                                 timeout=self._timeout)
-            response.raise_for_status()
+            response = requests_get_with_retry(f"{self._base}/routines/run/{run_id}/results", max_retries=2,
+                                               retry_delay=2, headers=self._headers, timeout=self._timeout)
             body = response.json()
             rows = {str(row["id"]): row.get("result") or {} for row in body.get("data") or []
                     if row.get("status") == "complete"}
             return RunResults(complete=body.get("status") == "complete", rows=rows)
-        except (httpx.HTTPError, KeyError, ValueError, AttributeError) as exc:
+        except (requests.RequestException, KeyError, ValueError, AttributeError) as exc:
             raise ClayError(f"results refused ({type(exc).__name__})") from exc
 
 
@@ -169,43 +170,56 @@ def _llc_input(item: ListItem) -> Optional[dict]:
             "property_address": item.property_address}
 
 
-def _collect(db: Session, port: ClayPort, now: datetime, stats: ClayStats) -> None:
+@dataclass(frozen=True)
+class _Kind:
+    enabled: bool
+    routine: str
+    make_input: Callable[[ListItem], Optional[dict]]
+    parse: Callable[[dict], Optional[str]]
+
+
+def _kinds(settings: ClaySettings) -> dict[str, _Kind]:
+    return {EMAIL: _Kind(settings.email_enabled, settings.email_routine, _email_input, _email_value),
+            LLC_OWNER: _Kind(settings.llc_enabled, settings.llc_routine, _llc_input, _llc_value)}
+
+
+def _collect(db: Session, port: ClayPort, kinds: dict[str, _Kind], now: datetime, stats: ClayStats) -> None:
     by_run: dict[str, list[tuple[str, str]]] = {}
     for row in db.execute(_PENDING).mappings():
         by_run.setdefault(row["run_id"], []).append((row["lead_ref"], row["field"]))
+    settled = []
     for run_id, pending in by_run.items():
         results = port.results(run_id)
         for ref, kind in pending:
-            if ref not in results.rows:
-                continue
-            value = (_email_value if kind == EMAIL else _llc_value)(results.rows[ref])
-            db.execute(_SETTLE, {"status": "found" if value else "not_found", "value": value, "now": now,
-                                 "ref": ref, "field": kind})
-            stats.settled += 1
+            if ref in results.rows:
+                value = kinds[kind].parse(results.rows[ref])
+                settled.append({"status": "found" if value else "not_found", "value": value, "now": now,
+                                "ref": ref, "field": kind})
+    if settled:
+        db.execute(_SETTLE, settled)
+        stats.settled += len(settled)
 
 
-def _submit(db: Session, port: ClayPort, items: Sequence[ListItem], settings: ClaySettings, now: datetime,
-            stats: ClayStats) -> None:
-    start = datetime.combine(now.astimezone(ET).date(), time.min, ET).astimezone(timezone.utc)
-    room = settings.daily_cap - int(db.execute(_TODAY, {"start": start}).scalar() or 0)
+def _submit(db: Session, port: ClayPort, items: Sequence[ListItem], settings: ClaySettings,
+            kinds: dict[str, _Kind], now: datetime, stats: ClayStats) -> None:
+    room = settings.daily_cap - int(db.execute(_TODAY, {"start": et_day_start(now)}).scalar() or 0)
     refs = [i.ref for i in items]
     known = {(r["lead_ref"], r["field"]) for r in db.execute(
         _KNOWN, {"refs": refs, "fresh": now - timedelta(days=settings.ttl_days)}).mappings()} if refs else set()
     batches: dict[str, tuple[str, list[dict]]] = {}
     for item in items:  # list order: real work first, padding last
-        for kind, enabled, routine, make in ((EMAIL, settings.email_enabled, settings.email_routine, _email_input),
-                                             (LLC_OWNER, settings.llc_enabled, settings.llc_routine, _llc_input)):
-            inputs = make(item) if enabled and routine else None
-            if inputs is None or (item.ref, kind) in known or room <= 0:
+        for name, kind in kinds.items():
+            inputs = kind.make_input(item) if kind.enabled and kind.routine else None
+            if inputs is None or (item.ref, name) in known or room <= 0:
                 continue
-            batches.setdefault(kind, (routine, []))[1].append({"id": item.ref, "inputs": inputs})
-            known.add((item.ref, kind))
+            batches.setdefault(name, (kind.routine, []))[1].append({"id": item.ref, "inputs": inputs})
+            known.add((item.ref, name))
             room -= 1
-    for kind, (routine, batch) in batches.items():
+    for name, (routine, batch) in batches.items():
         run_id = port.run(routine, batch)
-        for entry in batch:
-            db.execute(_FORGET, {"ref": entry["id"], "field": kind})  # a stale row past its TTL
-            db.execute(_REQUEST, {"ref": entry["id"], "field": kind, "run_id": run_id, "now": now})
+        refs = [entry["id"] for entry in batch]
+        db.execute(_FORGET, {"field": name, "refs": refs})  # stale rows past their TTL
+        db.execute(_REQUEST, [{"ref": ref, "field": name, "run_id": run_id, "now": now} for ref in refs])
         stats.submitted += len(batch)
 
 
@@ -214,15 +228,12 @@ def enrich_gaps(db: Session, items: Sequence[ListItem], port: ClayPort, settings
     """One pass: settle finished runs, then submit the list's new gaps within the daily cap."""
     stats = ClayStats()
     try:
-        _collect(db, port, now, stats)
+        kinds = _kinds(settings)
+        _collect(db, port, kinds, now, stats)
         if settings.daily_cap > 0:
-            _submit(db, port, items, settings, now, stats)
+            _submit(db, port, items, settings, kinds, now, stats)
     except ClayError as exc:
         logger.warning("[morning-list] Clay pass stopped: %s", exc)
         stats.failed = True
     logger.info("[morning-list] Clay pass: %s submitted, %s settled", stats.submitted, stats.settled)
     return stats
-
-
-def clay_port(api_key: Optional[str], base: str) -> Optional[ClayPort]:
-    return LiveClayRoutines(api_key, base) if api_key else None

@@ -24,6 +24,7 @@ from config.lending_morning_list import (
 from packages.agent_core.send_gate import SendGate
 from packages.agent_core.tools import EgressDraft, ToolContext
 from src.lending.morning_list.items import ListItem
+from src.lending.morning_list.time import et_date
 from src.lending.reply_guard import quotes_numbers
 
 logger = logging.getLogger(__name__)
@@ -47,6 +48,7 @@ class DraftRequest:
     brief: str
     channel: str  # "sms" or "email"
     reason: str
+    examples: tuple[str, ...] = ()  # recent approved Cora texts, for Josh's voice (D8)
 
 
 DraftWriter = Callable[[DraftRequest], Optional[str]]
@@ -58,6 +60,7 @@ class DraftContext:
     text_consent: Callable[[str], bool]
     recently_contacted: set[str]
     open_drafts: set[str]
+    examples: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -65,10 +68,6 @@ class MorningDraft:
     item: ListItem
     draft: EgressDraft
     key: str
-
-
-def _first_name(item: ListItem) -> str:
-    return (item.name or "").split(" ")[0].strip() or "there"
 
 
 def _eligible(item: ListItem, ctx: DraftContext) -> bool:
@@ -97,8 +96,9 @@ def _draft(item: ListItem, writer: DraftWriter, ctx: DraftContext) -> Optional[E
     if not text_ok and not item.email:
         return None
     channel = "sms" if text_ok else "email"
-    first = _first_name(item)
-    body = _written(writer, DraftRequest(first_name=first, brief=item.brief, channel=channel, reason=item.reason))
+    first = item.first_name or "there"
+    body = _written(writer, DraftRequest(first_name=first, brief=item.brief, channel=channel, reason=item.reason,
+                                         examples=ctx.examples))
     version = WRITER_VERSION if body else TEMPLATE_VERSION
     contact_ref = None
     prefix, _, number = item.ref.partition(":")
@@ -119,7 +119,7 @@ def _draft(item: ListItem, writer: DraftWriter, ctx: DraftContext) -> Optional[E
 
 def morning_drafts(items: Iterable[ListItem], writer: DraftWriter, ctx: DraftContext) -> list[MorningDraft]:
     """The drafts to hold for approval, in list order."""
-    day = ctx.now.date().isoformat()
+    day = et_date(ctx.now).isoformat()
     out = []
     for item in items:
         if not _eligible(item, ctx):
@@ -137,6 +137,24 @@ def touched_phones(db: Session, phones: list[str], now: datetime) -> tuple[set[s
     rows = db.execute(_TOUCHED, {"phones": phones, "since": now - NO_TOUCH_WINDOW}).mappings().all()
     return ({r["recipient_phone"] for r in rows},
             {r["recipient_phone"] for r in rows if r["status"] in _OPEN})
+
+
+# Recent texts Josh approved without edits through Cora: examples of his voice for the writer (D8).
+_EXAMPLES = text("""
+    SELECT payload FROM lending.pending_actions
+     WHERE channel = 'ghl_sms' AND status = 'executed' AND revised_by IS NULL
+     ORDER BY executed_at DESC LIMIT :limit
+""")
+
+
+def voice_examples(db: Session, limit: int = 5) -> tuple[str, ...]:
+    bodies = []
+    for row in db.execute(_EXAMPLES, {"limit": limit}).mappings():
+        payload = row["payload"]
+        body = payload.get("body") if isinstance(payload, dict) else None
+        if body and not quotes_numbers(body):
+            bodies.append(str(body)[:SMS_MAX_CHARS])
+    return tuple(bodies)
 
 
 def submit_all(gate: SendGate, drafts: Iterable[MorningDraft], *, approvals_channel: str) -> int:
@@ -165,7 +183,9 @@ def anthropic_writer(messages_client, model: str) -> DraftWriter:
     """An LLM writer on Cora's Anthropic client. Input: first name, brief, channel; output: the message text."""
     def write(request: DraftRequest) -> Optional[str]:
         limit = "under 300 characters, SMS" if request.channel == "sms" else "3 to 5 sentences, email body"
-        prompt = (f"Borrower first name: {request.first_name}\nWhat we know: {request.brief or 'a loan request'}\n"
+        examples = "".join(f"Example of Josh's style:\n{e}\n\n" for e in request.examples)
+        prompt = (f"{examples}Borrower first name: {request.first_name}\n"
+                  f"What we know: {request.brief or 'a loan request'}\n"
                   f"Why now: {'they asked for a callback' if request.reason == CALLBACK else 'new lead, not reached'}\n"
                   f"Length: {limit}.")
         response = messages_client.create(model=model, max_tokens=300, system=JOSH_VOICE,
