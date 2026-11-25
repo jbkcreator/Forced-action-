@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import functools
 import re
+import shutil
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
@@ -29,7 +30,9 @@ class BuildInfo:
 
 
 def _git(args: Sequence[str]) -> str:
-    return subprocess.run(["git", "-C", str(REPO_ROOT), *args], capture_output=True, text=True, timeout=5,
+    # The systemd units set PATH to the venv's bin only, so a bare "git" is not found there.
+    git = shutil.which("git") or "/usr/bin/git"
+    return subprocess.run([git, "-C", str(REPO_ROOT), *args], capture_output=True, text=True, timeout=5,
                           check=True).stdout.strip()
 
 
@@ -39,6 +42,8 @@ def _commit_sha(git: Callable[[Sequence[str]], str]) -> str:
 
 
 def _migration_head(git: Callable[[Sequence[str]], str]) -> str:
+    if git(["rev-parse", "--is-shallow-repository"]) == "true":
+        return UNKNOWN  # a depth-1 clone makes its one commit look like it added every migration
     out = git(["log", "-1", "--diff-filter=A", "--format=", "--name-only", "--", "migrations/apply_*.py"])
     names = [line for line in out.splitlines() if line.strip()]
     return Path(max(names)).stem if names else UNKNOWN

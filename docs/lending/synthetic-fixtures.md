@@ -67,6 +67,9 @@ routes that prefix, and fa-api is unchanged. It is public and needs no login; it
   in sort order if one commit added several). Alembic is retired (ADR 0024) and no table records applied migrations, so this is
   **not proof the migration ran**.
 - `"unknown"` means git could not be read (not a repository, git missing, a timeout, or a git "dubious ownership" refusal).
+  `migration_head` is also `"unknown"` in a shallow clone (`git rev-parse --is-shallow-repository` is `true`, e.g. GitHub's
+  default checkout), where git cannot tell which commit added a migration. git is looked up outside `PATH` too
+  (`/usr/bin/git`), because the systemd units set `PATH` to the venv's `bin` only.
   Each field fails alone and the route still answers 200, so the deploy gate and the watchdog keep working.
 - No database access: the route answers while the database is slow.
 
