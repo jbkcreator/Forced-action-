@@ -184,12 +184,12 @@ def test_an_unknown_version_is_refused(rules_db):
 def test_an_export_loads_into_another_database_as_one_version(rules_db):
     _set(rules_db, 0.9)
     exported = json.loads(json.dumps(store.get_snapshot(rules_db, 2)))
-    rules_db.execute(text("SELECT set_config('lending.rule_snapshot_skip', 'on', true)"))
+    # The target's newest snapshot must differ from the import, as another database's would (v3: table emptied).
     rules_db.execute(text("DELETE FROM lending.lender_rule_values"))
-    rules_db.execute(text("SELECT set_config('lending.rule_snapshot_skip', 'off', true)"))
+    assert _versions(rules_db) == [1, 2, 3]
     version = store.replace_rules(rules_db, exported, actor="josh", reason="imported from prod v2")
-    assert _value(rules_db) == 0.9 and version == 3
-    assert rules_db.execute(text("SELECT reason FROM lending.lender_rule_snapshots WHERE version_no = 3")).scalar_one() == "imported from prod v2"
+    assert _value(rules_db) == 0.9 and version == 4 and _versions(rules_db) == [1, 2, 3, 4]
+    assert rules_db.execute(text("SELECT reason FROM lending.lender_rule_snapshots WHERE version_no = 4")).scalar_one() == "imported from prod v2"
 
 
 def test_the_current_version_is_the_newest_snapshot(rules_db):
