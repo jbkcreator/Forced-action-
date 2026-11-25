@@ -88,10 +88,34 @@ def _line(item: ListItem) -> str:
     return f"• *{REASON_LABELS[item.reason]}*: {who}." + (f" {' '.join(extras)}" if extras else "")
 
 
-def render_sections(items: list[ListItem], *, david_user_id: str) -> tuple[BriefSection, BriefSection]:
-    """Josh's block (stuck deals, deals, booked calls) and David's block (callbacks, new leads, top of queue)."""
+SECTION_BUDGET = 2700  # under agent_core.briefing's 2,900-character cut, with room for the title
+
+
+def _chunks(lines: list[str]) -> list[list[str]]:
+    """Lines grouped so each Slack section stays under SECTION_BUDGET characters (none is ever cut)."""
+    chunks: list[list[str]] = [[]]
+    size = 0
+    for line in lines:
+        if chunks[-1] and size + len(line) + 1 > SECTION_BUDGET:
+            chunks.append([])
+            size = 0
+        chunks[-1].append(line)
+        size += len(line) + 1
+    return chunks
+
+
+def _sections(title: str, lines: list[str], empty: str) -> list[BriefSection]:
+    parts = _chunks(lines)
+    if len(parts) == 1:
+        return [BriefSection(title, parts[0], empty)]
+    return [BriefSection(f"{title} ({n} of {len(parts)})", part, empty) for n, part in enumerate(parts, 1)]
+
+
+def render_sections(items: list[ListItem], *, david_user_id: str) -> list[BriefSection]:
+    """Josh's block (stuck deals, deals, booked calls) then David's block (callbacks, new leads, top of queue); a
+    block longer than one Slack section continues in the next one."""
     josh = [_line(i) for i in items if i.owner == JOSH]
     david_lines = [_line(i) for i in items if i.owner != JOSH]
     david = ([f"<@{david_user_id}>"] if david_user_id and david_lines else []) + david_lines
-    return (BriefSection(f"Today's list for Josh: {len(josh)}", josh, "Nothing for Josh today."),
-            BriefSection(f"Today's list for David: {len(david_lines)}", david, "Nothing for David today."))
+    return (_sections(f"Today's list for Josh: {len(josh)}", josh, "Nothing for Josh today.")
+            + _sections(f"Today's list for David: {len(david_lines)}", david, "Nothing for David today."))

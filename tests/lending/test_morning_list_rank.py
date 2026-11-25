@@ -89,3 +89,17 @@ def test_tier_3_lists_todays_booked_calls_before_callbacks() -> None:
     items = build([item("cb:1", CALLBACK, phone="+18135550001", sort_key=(1, 100.0)),
                    item("bk:1", BOOKED_TODAY, phone="+18135550002", sort_key=(0, 900.0))], size=50)
     assert [i.ref for i in items] == ["bk:1", "cb:1"]
+
+
+def test_fifty_long_lines_are_split_across_sections_and_none_is_cut() -> None:
+    from packages.agent_core.briefing import render_brief_blocks
+
+    brief = "verified maturity, Demo Holdings Long Name LLC, Port Charlotte, $450k, " + "x" * 80
+    items = build([item(f"dlr:{n}", COLD_TOP, phone=f"+1727555{n:04d}", brief=brief, sort_key=(n,))
+                   for n in range(50)], size=50)
+    sections = render_sections(items, david_user_id="U_DAVID")
+    blocks = render_brief_blocks("h", sections)
+    texts = [b["text"]["text"] for b in blocks if b["type"] == "section"]
+    assert all(len(t) <= 2900 for t in texts)
+    assert sum(t.count("*Top of queue*") for t in texts) == 50
+    assert not any(t.endswith("…") for t in texts)
