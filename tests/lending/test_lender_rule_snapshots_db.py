@@ -144,6 +144,29 @@ def test_rolling_back_to_the_rules_already_in_force_does_nothing(rules_db):
     assert rules_db.execute(text("SELECT count(*) FROM lending.cora_inbox")).scalar_one() == 0
 
 
+def test_restoring_the_version_in_force_as_another_operator_does_nothing(rules_db):
+    """PR #474 re-review 1: updated_by differs, the rules do not; no new version and no alert."""
+    _set(rules_db, 0.9, actor="josh")                    # v2
+    result = store.rollback_to(rules_db, 2, actor="lesly")
+    assert not result.changed and _versions(rules_db) == [1, 2]
+    assert rules_db.execute(text("SELECT count(*) FROM lending.cora_inbox")).scalar_one() == 0
+
+
+def test_rollback_takes_the_write_lock_before_reading_the_version_it_replaces(rules_db):
+    """PR #474 re-review 2: an edit committed while rollback waits must be the version it reports replacing."""
+    _set(rules_db, 0.9)
+    seen = []
+
+    @event.listens_for(rules_db.connection(), "before_cursor_execute")
+    def _log(_conn, _cursor, statement, *_):
+        seen.append(statement)
+
+    store.rollback_to(rules_db, 1, actor="josh")
+    lock = next(i for i, s in enumerate(seen) if "pg_advisory_xact_lock" in s)
+    read = next(i for i, s in enumerate(seen) if "max(version_no)" in s)
+    assert lock < read
+
+
 def test_a_rollback_restores_a_deleted_rule_and_removes_a_later_one(rules_db):
     _set(rules_db, 0.9)                                              # v2
     _set(rules_db, 680, field="credit_floor")                        # v3

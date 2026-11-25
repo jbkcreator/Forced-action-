@@ -93,6 +93,20 @@ def test_a_status_change_alone_is_a_difference():
         "a.max_ltv: 0.9 [placeholder] -> 0.9 [confirmed]"]
 
 
+def test_a_start_date_change_alone_is_a_difference():
+    """PR #474 re-review 3: the live reader skips a rule whose start date is in the future."""
+    old = [{**_row("a", "max_ltv", 0.9), "effective_from": "2026-11-01"}]
+    new = [{**_row("a", "max_ltv", 0.9), "effective_from": "2027-01-01"}]
+    assert store.diff_rules(old, new) == [
+        "a.max_ltv: 0.9 [confirmed] from 2026-11-01 -> 0.9 [confirmed] from 2027-01-01"]
+
+
+def test_rules_differing_only_in_who_wrote_them_are_the_same():
+    old = [{**_row("a", "max_ltv", 0.9), "note": None, "updated_by": "josh"}]
+    new = [{**_row("a", "max_ltv", 0.9), "note": None, "updated_by": "lesly"}]
+    assert store._same_rules(old, new) and not store.diff_rules(old, new)
+
+
 def test_identical_rule_sets_have_no_diff():
     rows = [_row("a", "max_ltv", 0.9)]
     assert store.diff_rules(rows, list(rows)) == []

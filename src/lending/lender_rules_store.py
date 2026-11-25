@@ -320,15 +320,38 @@ def diff_rules(old: Iterable[dict], new: Iterable[dict]) -> list[str]:
         return row["lender_key"], row["field"]
 
     def shown(row: Optional[dict]) -> str:
-        return "(none)" if row is None else f"{json.dumps(row['value'])} [{row['status']}]"
+        if row is None:
+            return "(none)"
+        start = f" from {row['effective_from']}" if row.get("effective_from") else ""
+        return f"{json.dumps(row['value'])} [{row['status']}]{start}"
 
     before, after = {key(r): r for r in old}, {key(r): r for r in new}
     lines = []
     for name in sorted(before.keys() | after.keys()):
         a, b = before.get(name), after.get(name)
-        if a is None or b is None or (a["value"], a["status"]) != (b["value"], b["status"]):
+        if a is None or b is None or _applied(a) != _applied(b):
             lines.append(f"{name[0]}.{name[1]}: {shown(a)} -> {shown(b)}")
     return lines
+
+
+def _applied(row: dict) -> tuple:
+    """What a rule row means for quotes and routing: value, status and start date (the live reader skips a rule
+    whose start date is in the future). ``note`` and ``updated_by`` are bookkeeping."""
+    return row["value"], row["status"], row.get("effective_from")
+
+
+def _same_rules(old: Iterable[dict], new: Iterable[dict]) -> bool:
+    """True when two rule lists hold the same rules (value, status, start date and note); who last wrote them is
+    ignored, so restoring the rules in force as another operator is not a change."""
+    def content(rows: Iterable[dict]) -> dict:
+        return {(r["lender_key"], r["field"]): (*_applied(r), r.get("note")) for r in rows}
+
+    return content(old) == content(new)
+
+
+def _lock(session: Session) -> None:
+    """The rule write lock (the snapshot trigger takes the same one), held until the transaction ends."""
+    session.execute(text("SELECT pg_advisory_xact_lock(:key)"), {"key": SNAPSHOT_LOCK_KEY})
 
 
 _DELETE_NOT_IN = text("""
@@ -350,8 +373,12 @@ _UPSERT_ALL = text("""
 
 def replace_rules(session: Session, rules: list[dict], *, actor: str, reason: str) -> int:
     """Make ``lender_rule_values`` exactly ``rules`` and write one snapshot for it (none when the table already
-    matched the newest snapshot).  Returns the version now in force.  The caller commits."""
-    session.execute(text("SELECT pg_advisory_xact_lock(:key)"), {"key": SNAPSHOT_LOCK_KEY})
+    matched the newest snapshot, or already holds ``rules`` apart from who wrote them).  Returns the version now in
+    force.  The caller commits."""
+    _lock(session)
+    in_force = current_rule_version(session)
+    if in_force is not None and _same_rules(current_rules(session), rules):
+        return in_force
     payload = json.dumps(rules)
     session.execute(text("SELECT set_config('lending.rule_snapshot_skip', 'on', true)"))
     try:
@@ -366,6 +393,7 @@ def replace_rules(session: Session, rules: list[dict], *, actor: str, reason: st
 def rollback_to(session: Session, version_no: int, *, actor: str, reason: Optional[str] = None) -> RollbackResult:
     """Restore the rules of snapshot ``version_no``.  Written as a new snapshot "rollback to vN" (history is kept),
     posted to Cora's inbox, and a no-op when the table already holds those rules.  The caller commits."""
+    _lock(session)  # before reading the version replaced, so an edit committed meanwhile is the one reported
     rules = get_snapshot(session, version_no)
     before = current_rule_version(session)
     new_version = replace_rules(session, rules, actor=actor, reason=reason or f"rollback to v{version_no}")
