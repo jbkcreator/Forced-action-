@@ -196,7 +196,7 @@ def test_ghl_decision_one_outcome_is_ok():
 
 
 def test_ghl_decision_low_volume_without_outcomes_is_inconclusive():
-    assert collectors._ghl_decision([_ago(30)] * 4, [], NOW, _cfg()) is None
+    assert collectors._ghl_decision([_ago(30)] * 4, [], NOW, _cfg()).ok is None
 
 
 def test_ghl_decision_an_outcome_with_low_volume_is_ok():
@@ -205,7 +205,18 @@ def test_ghl_decision_an_outcome_with_low_volume_is_ok():
 
 
 def test_ghl_decision_ignores_calls_outside_the_window():
-    assert collectors._ghl_decision([_ago(241 + 24 * 60)] * 5, [], NOW, _cfg()) is None
+    assert collectors._ghl_decision([_ago(241 + 24 * 60)] * 5, [], NOW, _cfg()).ok is None
+
+
+def test_five_four_five_calls_without_outcomes_does_not_alert_on_nonconsecutive_failures():
+    from src.lending.watchdog.rules import evaluate
+
+    state = {}
+    for minutes, n_calls in ((0, 5), (2, 4), (4, 5)):
+        at = NOW + timedelta(minutes=minutes)
+        obs = collectors._ghl_decision([_ago(30, at)] * n_calls, [], at, _cfg())
+        alerts, state = evaluate([obs], state, at, fail_polls=2, repeat_minutes=120)
+        assert alerts == []
 
 
 def test_low_volume_does_not_close_an_open_ghl_outage():
@@ -213,7 +224,7 @@ def test_low_volume_does_not_close_an_open_ghl_outage():
 
     def poll(calls, outcomes, state, at):
         obs = collectors._ghl_decision(calls, outcomes, at, _cfg())
-        return evaluate([obs] if obs else [], state, at, fail_polls=1, repeat_minutes=120)
+        return evaluate([obs], state, at, fail_polls=1, repeat_minutes=120)
 
     alerts, state = poll([_ago(30)] * 5, [], {}, NOW)
     assert [a.kind for a in alerts] == ["down"]
@@ -379,13 +390,13 @@ def test_ghl_calls_with_one_outcome_ok(db):
 
 
 def test_ghl_quiet_day_no_alert(db):
-    assert ghl_outcome_observation(db, NOW, _cfg()) is None
+    assert ghl_outcome_observation(db, NOW, _cfg()).ok is None
 
 
 def test_ghl_below_min_calls_no_alert(db):
     for i in range(4):
         _ghl_call(db, _ago(10 + i * 20))
-    assert ghl_outcome_observation(db, NOW, _cfg()) is None
+    assert ghl_outcome_observation(db, NOW, _cfg()).ok is None
 
 
 def test_ghl_window_counts_business_minutes(db):
@@ -402,7 +413,7 @@ def test_ghl_ignores_inbound_and_dialer_calls(db):
                 "INSERT INTO lending.call_dispositions (dialer_call_id, call_source, direction, phone, call_started_at, "
                 "raw_event) VALUES (:id, :src, :dir, '+18137200000', :s, '{}')"),
                 {"id": f"t-{uuid.uuid4().hex}", "src": source, "dir": direction, "s": _ago(30)})
-    assert ghl_outcome_observation(db, NOW, _cfg()) is None
+    assert ghl_outcome_observation(db, NOW, _cfg()).ok is None
 
 
 def test_ghl_check_off_when_min_calls_zero(db):

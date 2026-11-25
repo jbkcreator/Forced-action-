@@ -105,16 +105,16 @@ _FAILURE_COUNTS = text("""
 
 def _ghl_decision(
     calls: Sequence[datetime], outcomes: Sequence[datetime], now: datetime, cfg: WatchdogConfig
-) -> Optional[Observation]:
+) -> Observation:
     """An outcome in the window proves the webhook works; enough calls with none means it is broken. Fewer calls
-    and no outcome proves nothing either way, so it is not observed and an open outage stays open."""
+    and no outcome proves nothing either way: inconclusive, so an open outage stays open and a streak restarts."""
     in_window = lambda moment: business_minutes(moment, now) <= cfg.ghl_window_minutes  # noqa: E731
     n_calls = sum(1 for moment in calls if in_window(moment))
     n_outcomes = sum(1 for moment in outcomes if in_window(moment))
     if n_outcomes:
         return Observation("ghl_outcomes", True, f"{n_calls} GHL calls, {n_outcomes} outcomes")
     if n_calls < cfg.ghl_min_calls:
-        return None
+        return Observation("ghl_outcomes", None, f"inconclusive: {n_calls} GHL calls, 0 outcomes")
     return Observation("ghl_outcomes", False, f"{n_calls} GHL calls, 0 outcomes in {cfg.ghl_window_minutes} business min")
 
 

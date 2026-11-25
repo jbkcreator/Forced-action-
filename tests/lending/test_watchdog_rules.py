@@ -79,6 +79,22 @@ def test_unobserved_key_keeps_state():
     assert alerts == [] and s2["cards"].open_since is not None
 
 
+def test_inconclusive_poll_breaks_a_failure_streak_before_an_alert():
+    unsure = Observation("ghl_outcomes", None, "inconclusive")
+    s = {}
+    for minutes, obs in ((0, bad("ghl_outcomes")), (2, unsure), (4, bad("ghl_outcomes"))):
+        alerts, s = evaluate([obs], s, NOW + timedelta(minutes=minutes), fail_polls=2, repeat_minutes=120)
+        assert alerts == []
+    assert s["ghl_outcomes"].failures == 1
+
+
+def test_inconclusive_poll_keeps_an_open_incident():
+    _, s = evaluate([bad("ghl_outcomes")], {}, NOW, fail_polls=1, repeat_minutes=120)
+    alerts, s2 = evaluate([Observation("ghl_outcomes", None, "inconclusive")], s, NOW + timedelta(minutes=2),
+                          fail_polls=1, repeat_minutes=120)
+    assert alerts == [] and s2["ghl_outcomes"] == s["ghl_outcomes"]
+
+
 def test_keys_are_independent():
     alerts, s = run([bad("cards"), good("replies")], {}, 0, fail_polls=1)
     assert [(a.key, a.kind) for a in alerts] == [("cards", "down")]

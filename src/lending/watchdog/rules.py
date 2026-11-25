@@ -20,7 +20,7 @@ BUSINESS_TIMEZONE = ZoneInfo("America/New_York")
 @dataclass(frozen=True)
 class Observation:
     key: str
-    ok: bool
+    ok: Optional[bool]  # None = inconclusive: breaks a failure streak, never opens or closes an incident
     detail: str
 
 
@@ -73,6 +73,10 @@ def evaluate(
     repeat = timedelta(minutes=repeat_minutes)
     for obs in observations:
         current = new_state.setdefault(obs.key, CheckState())
+        if obs.ok is None:
+            if current.open_since is None:
+                current.failures = 0
+            continue
         if obs.ok:
             if current.open_since is not None:
                 alerts.append(Alert(obs.key, "recovered", obs.detail, current.open_since))

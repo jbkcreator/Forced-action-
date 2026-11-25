@@ -247,7 +247,7 @@ def run_cycle(*, now: Optional[datetime] = None, dry_run: bool = False) -> list[
         observations, old_state, now,
         fail_polls=cfg.fail_polls, repeat_minutes=cfg.repeat_minutes,
     )
-    failing = sum(1 for o in observations if not o.ok)
+    failing = sum(1 for o in observations if o.ok is False)
     logger.info("[watchdog] %d checks, %d failing, %d alerts", len(observations), failing, len(alerts))
     if dry_run:
         for alert in alerts:
