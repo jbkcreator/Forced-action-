@@ -988,6 +988,9 @@ class AppSettings(BaseSettings):
 	# T-11 LendingFlow intake. Off by default; the receiver is closed (503) until the flag is on AND the secret is set.
 	lending_lendingflow_enabled: bool = Field(default=False, env="LENDING_LENDINGFLOW_ENABLED")
 	lending_lendingflow_webhook_secret: Optional[SecretStr] = Field(default=None, env="LENDING_LENDINGFLOW_WEBHOOK_SECRET")
+	# R1 0.5 D6: optional HMAC-SHA256 (hex) of the raw LendingFlow body in this header; checked only while the key is set
+	lending_lendingflow_hmac_secret: Optional[SecretStr] = Field(default=None, env="LENDING_LENDINGFLOW_HMAC_SECRET")
+	lending_lendingflow_hmac_header: str = Field(default="X-LendingFlow-Signature", env="LENDING_LENDINGFLOW_HMAC_HEADER")
 	# Pipeline stage (in LENDING_GHL_PIPELINE_ID) for new LendingFlow leads; unset = contact only.
 	lending_ghl_stage_lendingflow_new: Optional[str] = Field(default=None, env="LENDING_GHL_STAGE_LENDINGFLOW_NEW")
 	# LendingFlow -> BatchDialer campaign "LendingFlow" (src/lending/lendingflow_dialer.py). Off: nothing is loaded; leads
