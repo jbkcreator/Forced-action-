@@ -1,0 +1,26 @@
+[Unit]
+Description=Forced Action — NDL external watchdog (R1 0.3)
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/Forced-action-
+# systemctl lives in the system dirs; the watchdog runs it to check the lending units.
+Environment="PATH=/root/Forced-action-/.venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+Environment="PYTHONPATH=/root/Forced-action-"
+EnvironmentFile=/root/Forced-action-/.env
+ExecStart=/root/Forced-action-/.venv/bin/python -m src.lending.watchdog.daemon
+StateDirectory=ndl-watchdog
+Restart=always
+RestartSec=15
+StartLimitIntervalSec=120
+StartLimitBurst=5
+NoNewPrivileges=true
+PrivateTmp=true
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=ndl-watchdog
+
+[Install]
+WantedBy=multi-user.target

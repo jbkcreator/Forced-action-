@@ -1050,6 +1050,28 @@ class AppSettings(BaseSettings):
 	lending_ghl_app_url: str = Field(default="https://app.gohighlevel.com", env="LENDING_GHL_APP_URL")  # GHL web app base for contact links (white-label domain if any)
 	lending_lead_arrival_alert_enabled: bool = Field(default=False, env="LENDING_LEAD_ARRIVAL_ALERT_ENABLED")  # T-05: @-mention Josh in LENDING_OPS_CHANNEL when a LendingFlow lead arrives
 	lending_alarm_sms_to: Optional[str] = Field(default=None, env="LENDING_ALARM_SMS_TO")  # Josh's mobile; normalized before use
+	# External watchdog (src/lending/watchdog/daemon.py, systemd ndl-watchdog; docs/lending/watchdog.md)
+	lending_watchdog_enabled: bool = Field(default=False, env="LENDING_WATCHDOG_ENABLED")
+	lending_watchdog_backup_sms_to: Optional[str] = Field(default=None, env="LENDING_WATCHDOG_BACKUP_SMS_TO")  # second recipient; normalized before use
+	lending_watchdog_telnyx_from_number: Optional[str] = Field(default=None, env="LENDING_WATCHDOG_TELNYX_FROM_NUMBER")  # the alerts-only number; unset = no Telnyx fallback
+	lending_watchdog_telnyx_messaging_profile_id: Optional[str] = Field(default=None, env="LENDING_WATCHDOG_TELNYX_MESSAGING_PROFILE_ID")  # falls back to TELNYX_MESSAGING_PROFILE_ID
+	lending_watchdog_public_base_url: str = Field(default="", env="LENDING_WATCHDOG_PUBLIC_BASE_URL")  # https://<lending domain>; unset = door checks off
+	lending_watchdog_poll_seconds: int = Field(default=120, env="LENDING_WATCHDOG_POLL_SECONDS")
+	lending_watchdog_fail_polls: int = Field(default=2, env="LENDING_WATCHDOG_FAIL_POLLS")
+	lending_watchdog_repeat_minutes: int = Field(default=120, env="LENDING_WATCHDOG_REPEAT_MINUTES")
+	lending_watchdog_ghl_window_minutes: int = Field(default=240, env="LENDING_WATCHDOG_GHL_WINDOW_MINUTES")
+	lending_watchdog_ghl_min_calls: int = Field(default=5, env="LENDING_WATCHDOG_GHL_MIN_CALLS")  # 0 = GHL cross-check off
+	lending_watchdog_card_age_minutes: int = Field(default=120, env="LENDING_WATCHDOG_CARD_AGE_MINUTES")
+	lending_watchdog_reply_backlog: int = Field(default=3, env="LENDING_WATCHDOG_REPLY_BACKLOG")
+	lending_watchdog_open_failures: int = Field(default=5, env="LENDING_WATCHDOG_OPEN_FAILURES")
+	lending_watchdog_units: str = Field(
+		default="lending-api,fa-lending-cora,fa-lending-cdr-poller,fa-lending-uncalled-alarm-worker,"
+		"fa-lending-reminder-worker,fa-lending-transcript-worker,fa-lending-opt-out-poller,fa-lending-dialer-sweep",
+		env="LENDING_WATCHDOG_UNITS")  # comma-separated systemd units; empty = unit check off
+	lending_watchdog_doors: str = Field(
+		default="ghl-stage,ghl-disposition,lendingflow,instantly,website", env="LENDING_WATCHDOG_DOORS")  # comma-separated door names (config/lending_watchdog.py); remove a connector that is off on purpose
+	lending_watchdog_health_url: str = Field(default="http://127.0.0.1:8010/health", env="LENDING_WATCHDOG_HEALTH_URL")
+	lending_watchdog_state_path: str = Field(default="/var/lib/ndl-watchdog/state.json", env="LENDING_WATCHDOG_STATE_PATH")
 	# Uncalled-lead alarm working hours, Eastern, HH:MM 24h, Mon-Fri. No alarm or retry outside them; those leads go
 	# on the 08:55 "call these first" list. Start inclusive, end exclusive.
 	lending_alarm_hours_start: str = Field(default="09:00", env="LENDING_ALARM_HOURS_START")

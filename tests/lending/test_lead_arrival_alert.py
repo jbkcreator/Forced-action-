@@ -200,12 +200,12 @@ def test_borrower_texts_are_still_refused_during_the_emergency_halt(monkeypatch)
     assert not any("/conversations/messages" in url for url in calls)
 
 
-def test_only_the_alarm_worker_uses_the_internal_alert_sender() -> None:
+def test_only_the_team_alert_senders_use_the_internal_alert_sender() -> None:
     import pathlib
 
-    users = [path.as_posix() for path in pathlib.Path("src").rglob("*.py")
-             if "get_sender(internal_alert=True)" in path.read_text(encoding="utf-8")]
-    assert users == ["src/lending/uncalled_alarm_worker.py"]
+    users = sorted(path.as_posix() for path in pathlib.Path("src").rglob("*.py")
+                   if "get_sender(internal_alert=True)" in path.read_text(encoding="utf-8"))
+    assert users == ["src/lending/uncalled_alarm_worker.py", "src/lending/watchdog/daemon.py"]
 
 
 def test_the_5_minute_alarm_post_mentions_josh() -> None:

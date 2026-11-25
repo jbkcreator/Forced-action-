@@ -51,7 +51,8 @@ LENDING_CDR_UNIT_DST="/etc/systemd/system/fa-lending-cdr-poller.service"
 # fa-lending-cora is Cora (Slack Socket Mode session + minute sweep; exactly one instance, Restart=always). Left out
 # until P0.4, so deploys never cycled her and she kept running stale code. Warn-only like the workers: a Cora problem
 # never rolls back the FA platform; check journalctl -u fa-lending-cora.
-LENDING_UNITS=(fa-lending-opt-out-poller fa-lending-dialer-sweep fa-lending-uncalled-alarm-worker fa-lending-transcript-worker fa-lending-reminder-worker lending-api fa-lending-cora)
+# ndl-watchdog (R1 0.3) idles until LENDING_WATCHDOG_ENABLED=true, so installing it is safe; it must not depend on lending-api or Cora.
+LENDING_UNITS=(fa-lending-opt-out-poller fa-lending-dialer-sweep fa-lending-uncalled-alarm-worker fa-lending-transcript-worker fa-lending-reminder-worker lending-api fa-lending-cora ndl-watchdog)
 
 cd "$PROJECT_DIR"
 
