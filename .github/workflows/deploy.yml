@@ -127,6 +127,7 @@ jobs:
               "-m", "not scenario and not scenario_lifecycle and not scenario_platform and not scenario_chat and not integration",
           ]
           args += [f"--ignore={e}" for e in entries if "::" not in e]
+          args.append("--ignore=tests/lending/test_synthetic_loan_matrix.py")  # runs as its own step below
           args += [f"--deselect={e}" for e in entries if "::" in e]
           print(f"known pre-existing failures excluded: {len(entries)}", flush=True)
 
@@ -157,6 +158,11 @@ jobs:
               print("::warning title=Random test failure::passed on rerun, fix or list it: " + ", ".join(passed_on_rerun))
           sys.exit(code)
           PY
+
+      # R1 0.10: the synthetic loan matrix runs on every PR as its own visible step; a DB skip here is a failure.
+      - name: Synthetic loan matrix (R1 0.10)
+        if: ${{ !cancelled() }}
+        run: python -m pytest tests/lending/test_synthetic_loan_matrix.py -v -rs -p no:cacheprovider
 
   deploy:
     name: Deploy
