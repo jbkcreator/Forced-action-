@@ -55,7 +55,7 @@ Matrix = Sequence[LenderRules]
 FitEvaluator = Callable[[BorrowerProfile, LoanRequest, Matrix], LenderFitResult]
 FitLimitsLookup = Callable[[LenderFitResult, Matrix], list[FitLimits]]  # fitting lenders -> their loan-amount limits
 ContactCheck = Callable[[str], bool]  # phone -> True when the text window is open
-MatrixLoader = Callable[[], Matrix]
+MatrixLoader = Callable[[], tuple[Matrix, Optional[int]]]
 LetterSender = Callable[["Partner", dict, bytes], None]  # emails the pre-qual PDF to the partner  # the lender rules in force (config, or the DB table when LENDING_RULES_FROM_DB)
 
 _STATUS_WORDING = {
@@ -120,7 +120,7 @@ def live_services() -> PipelineServices:
     from src.lending.ghl_sms import get_sender
     from src.lending.lender_fit import evaluate_lender_fit
     from src.lending.compliance import text_window_open
-    from src.lending.lender_rules_store import current_matrix
+    from src.lending.lender_rules_store import current_matrix_with_version
     from src.lending.pdf.render import NON_BINDING_PREQUAL_WATERMARK, render_pdf
 
     from src.lending.partner_ghl import get_partner_letter_sink
@@ -145,7 +145,7 @@ def live_services() -> PipelineServices:
         render_pdf=lambda template, context: render_pdf(template, context, watermark=NON_BINDING_PREQUAL_WATERMARK),
         evaluate_fit=lambda borrower, loan, matrix: evaluate_lender_fit(borrower, loan, matrix=tuple(matrix)),
         fit_limits=fit_limits_from_result,
-        load_matrix=current_matrix,
+        load_matrix=current_matrix_with_version,
         opt_outs=_opt_outs,
         text_window_open=lambda phone: text_window_open(phone),
         upload_dir=settings.lending_partner_upload_dir,
@@ -349,13 +349,7 @@ def _process(file_id: int, services: PipelineServices, session_factory: Callable
     matrix: Matrix = ()
     rule_version: Optional[int] = None
     try:
-        # The rule version is read right before and after the rules are loaded; when a change lands in between, the
-        # version the evaluation used is unknown and is recorded as such (None), never as the newer one.
-        with session_factory() as db:
-            version_before = deal_ledger.rule_version_at(db)
-            matrix = services.load_matrix()
-            version_after = deal_ledger.rule_version_at(db)
-        rule_version = version_before if version_before == version_after else None
+        matrix, rule_version = services.load_matrix()
         fit = _score(services, file, matrix)
     except Exception as exc:
         logger.error("[partner-door] lender fit failed file=%s (%s)", file_id, type(exc).__name__)

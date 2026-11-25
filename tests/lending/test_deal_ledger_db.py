@@ -403,3 +403,15 @@ def test_a_document_chase_for_a_borrower_with_two_files_puts_the_quote_on_neithe
     assert db.execute(text("SELECT min(id) FROM lending.loan_files WHERE borrower_phone = :p HAVING count(*) = 1"),
                       {"p": "+18135550101"}).first() is None
     assert "quote_generated" not in _types(db, first) + _types(db, second)
+
+def test_ghl_card_links_only_to_the_named_opportunity(ledger_db):
+    db = ledger_db
+    file_id = _new_file(db)
+    db.execute(text("UPDATE lending.loan_files SET ghl_opportunity_id = 'older-opp' WHERE id = :id"),
+               {"id": file_id})
+    _card(db, deal_ref="ghl_opportunity:other-opp", phone="+18135550101", secs=10)
+    assert deal_ledger.sync_card_events(db) == 0
+
+    _card(db, deal_ref="ghl_opportunity:older-opp", secs=20)
+    assert deal_ledger.sync_card_events(db) == 1
+    assert _types(db, file_id) == ["file_created", "cora_draft"]

@@ -191,12 +191,15 @@ WITH cards AS (
      WHERE a.updated_at > now() - make_interval(days => :days)
 ),
 resolved AS (
-    SELECT c.*, COALESCE(
+    SELECT c.*, CASE WHEN starts_with(c.deal_ref, 'ghl_opportunity:') THEN
+        (SELECT min(f.id) FROM lending.loan_files f WHERE f.ghl_opportunity_id = substr(c.deal_ref, 17)
+          HAVING count(*) = 1)
+        ELSE COALESCE(
         CASE WHEN c.deal_ref ~ '^loan_file:[0-9]+$' THEN substr(c.deal_ref, 11)::bigint END,
         (SELECT d.loan_file_id FROM lending.doc_chases d
           WHERE c.deal_ref ~ '^doc_chase:[0-9]+$' AND d.id = substr(c.deal_ref, 11)::bigint),
         (SELECT min(f.id) FROM lending.loan_files f WHERE f.borrower_phone = c.recipient_phone
-          HAVING count(*) = 1)) AS loan_file_id
+          HAVING count(*) = 1)) END AS loan_file_id
       FROM cards c
 )
 """

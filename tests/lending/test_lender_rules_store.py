@@ -143,6 +143,7 @@ def test_the_config_is_used_when_the_flag_is_off(monkeypatch):
 
     monkeypatch.setattr(store, "get_settings", lambda: _Off())
     assert current_matrix() is LENDER_MATRIX
+    assert store.current_matrix_with_version() == (LENDER_MATRIX, None)
 
 
 def test_the_config_is_used_when_the_database_is_unavailable(monkeypatch, caplog):
