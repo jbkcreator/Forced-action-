@@ -12,7 +12,7 @@ from types import SimpleNamespace
 import pytest
 from pydantic import SecretStr
 
-from packages.agent_core.relay import SendDeferred
+from packages.agent_core.relay import SendDeferred, SendHold
 from packages.agent_core.pending_actions import ActionStatus, PendingAction
 from src.lending import cora_agent
 
@@ -352,9 +352,9 @@ def test_suppressed_recipient_is_blocked() -> None:
     assert reason == "recipient is suppressed or marked do-not-contact"
 
 
-def test_text_without_consent_is_blocked() -> None:
+def test_text_without_consent_is_held_for_review_not_blocked() -> None:
     reason = cora_agent.make_send_check(ScriptedEngine(False, False))(_action())
-    assert reason == "no text consent on record for this number"
+    assert reason == "consent_revoked" and isinstance(reason, SendHold)
 
 
 def test_email_needs_no_text_consent_but_is_checked_for_suppression() -> None:

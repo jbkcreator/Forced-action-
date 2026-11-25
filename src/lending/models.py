@@ -639,6 +639,7 @@ class LendingPendingAction(LendingBase):
     decided_by: Mapped[Optional[str]] = mapped_column(String(32))  # approved or rejected it
     decided_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
     revised_by: Mapped[Optional[str]] = mapped_column(String(32))  # opened the last revision
+    held_reason: Mapped[Optional[str]] = mapped_column(String(32))  # R1 0.4: why a held action waits for review
     revision_note: Mapped[Optional[str]] = mapped_column(Text)
     revisions: Mapped[list] = mapped_column(JSONB, nullable=False, default=list, server_default=text("'[]'::jsonb"))  # replaced drafts, oldest first
     recipient_phone: Mapped[Optional[str]] = mapped_column(String(20))  # phone_utils.normalize; read by the send-time opt-out check
@@ -655,7 +656,7 @@ class LendingPendingAction(LendingBase):
 
     __table_args__ = (
         CheckConstraint(
-            "status IN ('pending', 'revising', 'approved', 'rejected', 'sending', 'sent', 'failed', 'blocked', 'expired')",
+            "status IN ('pending', 'revising', 'approved', 'rejected', 'sending', 'sent', 'failed', 'blocked', 'expired', 'held')",
             name="ck_pending_actions_status",
         ),
         Index("ix_pending_actions_status", "status", "decided_at"),
@@ -1214,6 +1215,50 @@ class LendingGlobalHaltEvent(LendingBase):
     reason: Mapped[str] = mapped_column(Text, nullable=False, default="", server_default=text("''"))
     set_by: Mapped[Optional[str]] = mapped_column(String(32))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_now, server_default=text("now()"))
+
+
+class LendingChannelBreaker(LendingBase):
+    """R1 0.4: one circuit breaker per sending channel (``ghl_sms`` / ``ghl_email`` / ``instantly``), shared by every
+    sender process (``src.lending.dispatch.circuit_breaker``). Five failures in a row open it; a person reopens it."""
+
+    __tablename__ = "channel_breakers"
+
+    channel: Mapped[str] = mapped_column(String(20), primary_key=True)
+    state: Mapped[str] = mapped_column(String(8), nullable=False, default="closed", server_default=text("'closed'"))
+    consecutive_failures: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default=text("0"))
+    last_error: Mapped[Optional[str]] = mapped_column(String(100))
+    tripped_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    tripped_reason: Mapped[Optional[str]] = mapped_column(String(100))
+    reset_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    reset_by: Mapped[Optional[str]] = mapped_column(String(64))
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_now, server_default=text("now()"))
+
+    __table_args__ = (CheckConstraint("state IN ('closed', 'open')", name="ck_channel_breakers_state"),)
+
+
+class LendingChannelBreakerEvent(LendingBase):
+    """Every trip and reopen of a channel breaker: who, when, what was held."""
+
+    __tablename__ = "channel_breaker_events"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    channel: Mapped[str] = mapped_column(String(20), nullable=False)
+    event: Mapped[str] = mapped_column(String(16), nullable=False)  # tripped | reset
+    actor: Mapped[str] = mapped_column(String(64), nullable=False)
+    detail: Mapped[Optional[dict]] = mapped_column(JSONB)
+    occurred_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_now, server_default=text("now()"))
+
+    __table_args__ = (Index("idx_lending_channel_breaker_events_channel", "channel", "occurred_at"),)
+
+
+class LendingChannelRateCounter(LendingBase):
+    """Sends taken in one channel-minute (the per-minute cap, shared by every sender process)."""
+
+    __tablename__ = "channel_rate_counters"
+
+    channel: Mapped[str] = mapped_column(String(20), primary_key=True)
+    minute_start: Mapped[datetime] = mapped_column(DateTime(timezone=True), primary_key=True)
+    sent: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default=text("0"))
 
 
 class LendingEmailOptOutMessage(LendingBase):

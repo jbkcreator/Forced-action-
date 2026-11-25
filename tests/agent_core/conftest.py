@@ -38,13 +38,13 @@ SQLITE_DDL = (
         payload TEXT NOT NULL,
         summary TEXT NOT NULL DEFAULT '',
         status TEXT NOT NULL DEFAULT 'pending'
-            CHECK (status IN ('pending','revising','approved','rejected','sending','sent','failed','blocked','expired')),
+            CHECK (status IN ('pending','revising','approved','rejected','sending','sent','failed','blocked','expired','held')),
         requested_by TEXT, source_channel TEXT, source_thread_ts TEXT,
         card_channel TEXT, card_ts TEXT, decided_by TEXT, decided_at TIMESTAMP,
         revision_note TEXT, executed_at TIMESTAMP, provider_ref TEXT, error TEXT,
         created_at TIMESTAMP NOT NULL, updated_at TIMESTAMP NOT NULL,
         revisions TEXT NOT NULL DEFAULT '[]', recipient_phone TEXT, recipient_email TEXT,
-        contact_ref TEXT, deal_ref TEXT, idempotency_key TEXT, expires_at TIMESTAMP, revised_by TEXT
+        contact_ref TEXT, deal_ref TEXT, idempotency_key TEXT, expires_at TIMESTAMP, revised_by TEXT, held_reason TEXT
     )
     """,
     "CREATE UNIQUE INDEX uq_pending_actions_idempotency_key ON pending_actions (idempotency_key)",

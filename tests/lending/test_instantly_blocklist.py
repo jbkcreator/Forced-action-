@@ -165,8 +165,8 @@ def test_instantly_saying_the_address_is_already_blocked_is_a_success(monkeypatc
 
 def test_the_sweep_step_is_wired_into_coras_minute_pass():
     calls = []
-    services = cora_agent.CoraServices(session=SimpleNamespace(expire_stale_actions=lambda: 0),
-                                       relay=SimpleNamespace(run=lambda: SimpleNamespace(sent=0, failed=0, blocked=0)),
+    services = cora_agent.CoraServices(session=SimpleNamespace(expire_stale_actions=lambda: 0, mark_held_cards=lambda: 0),
+                                       relay=SimpleNamespace(run=lambda: SimpleNamespace(sent=0, failed=0, blocked=0, held=())),
                                        gate=SimpleNamespace(retry_missing_cards=lambda: 0),
                                        block_list=lambda: calls.append("ran"))
     cora_agent.run_sweep(services)
@@ -179,9 +179,9 @@ def test_a_failing_block_list_step_never_stops_the_sends(caplog):
     def boom():
         raise RuntimeError("db down for a@example.com")
 
-    services = cora_agent.CoraServices(session=SimpleNamespace(expire_stale_actions=lambda: 0),
+    services = cora_agent.CoraServices(session=SimpleNamespace(expire_stale_actions=lambda: 0, mark_held_cards=lambda: 0),
                                        relay=SimpleNamespace(run=lambda: relay_ran.append(1) or SimpleNamespace(
-                                           sent=0, failed=0, blocked=0)),
+                                           sent=0, failed=0, blocked=0, held=())),
                                        gate=SimpleNamespace(retry_missing_cards=lambda: 0), block_list=boom)
     cora_agent.run_sweep(services)
     assert relay_ran == [1] and "a@example.com" not in caplog.text
