@@ -244,6 +244,10 @@ def save_web_lead(db, data: WebLeadInput) -> tuple[int, bool]:
     ).scalar_one()
     if data.sms_consent and not suppressed:
         record_consent(db, data.phone, "web_form")
+    # R1 0.6: a new request from this person lifts an exhausted mark (savepoint, never raises).
+    from src.lending.exhausted import CLEARED_BY_WEBSITE, clear_for_new_inbound
+
+    clear_for_new_inbound(db, data.phone, CLEARED_BY_WEBSITE)
     logger.info("[lending-web] lead saved id=%s sms_consent=%s call_consent=%s ai_call_consent=%s deal_drop=%s "
                 "suppressed=%s occupancy=%s", lead_id, data.sms_consent, data.call_consent, data.ai_call_consent,
                 data.deal_drop_optin, suppressed, data.occupancy)

@@ -83,6 +83,19 @@ def _breaker_off_the_database(request, monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _dependency_health_off_the_database(monkeypatch):
+    """R1 0.6: feeds and the LendingFlow door record their health in the shared database in their own session. Tests
+    never write it: the session factory refuses (record_* log and carry on; reads fail closed). The pause switch is
+    off by default, so senders read nothing; test_dependency_health swaps in its own fake session."""
+    from src.lending import dependency_health
+
+    def no_database():
+        raise RuntimeError("no dependency-health database in tests")
+
+    monkeypatch.setattr(dependency_health, "_session_factory", no_database)
+
+
+@pytest.fixture(autouse=True)
 def _no_live_ghl(monkeypatch):
     """The shared DB holds real opt-outs: a test poll must never write them to the real GHL
     account. Tests that cover the GHL sync pass their own ``ghl_dnd``."""

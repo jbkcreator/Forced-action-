@@ -13,6 +13,8 @@ import argparse
 import time
 
 from config.lending_compliance import OPT_OUT_POLL_SECONDS
+from config.lending_fallbacks import FEED_FA_OPT_OUT_POLLER, FEED_GHL_DND_PUSH
+from src.lending import dependency_health
 from src.core.database import get_db_context
 from src.lending.compliance import PollResult, poll_fa_opt_outs, sync_ghl_dnd
 from src.utils.logger import get_logger
@@ -24,14 +26,17 @@ def run_once() -> PollResult:
     with get_db_context() as db:  # session_scope commits on exit
         result = poll_fa_opt_outs(db, sync_ghl=False)
     if not result.skipped_locked:
+        dependency_health.record_success(FEED_FA_OPT_OUT_POLLER)  # committed above: FA opt-outs are mirrored
         # Own transaction: up to a batch of sequential GHL calls must not hold the poll's
         # advisory lock, or delay (or, on error, roll back) the opt-outs mirrored above.
         try:
             with get_db_context() as db:
                 sync_ghl_dnd(db)
+            dependency_health.record_success(FEED_GHL_DND_PUSH)
         except Exception as exc:
             logger.error("[lending-opt-out-poller] GHL DND sync failed (%s); retrying next interval",
                          type(exc).__name__)
+            dependency_health.record_failure(FEED_GHL_DND_PUSH, type(exc).__name__)
     return result
 
 
@@ -46,6 +51,7 @@ def main(argv: list[str] | None = None) -> None:
         except Exception as exc:
             # Class only: SQL errors embed bound params (phones/emails).
             logger.error("[lending-opt-out-poller] cycle failed (%s); retrying next interval", type(exc).__name__)
+            dependency_health.record_failure(FEED_FA_OPT_OUT_POLLER, type(exc).__name__)
             if args.once:
                 raise
         if args.once:

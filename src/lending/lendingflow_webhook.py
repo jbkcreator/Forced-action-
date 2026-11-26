@@ -15,11 +15,12 @@ from typing import Optional
 from fastapi import APIRouter, BackgroundTasks, Depends, Header, HTTPException, Request
 from sqlalchemy.orm import Session
 
+from config.lending_fallbacks import FEED_LENDINGFLOW_INBOUND
 from config.lending_lendingflow import MAX_BODY_BYTES
 from config.settings import get_settings
 from src.lending.db import get_lending_db
 from config.lending_speed_to_lead import SOURCE_LENDINGFLOW
-from src.lending import speed_to_lead
+from src.lending import dependency_health, speed_to_lead
 from src.lending.lendingflow import ParseError, deliver_and_follow_up, parse_lendingflow, save_lead
 from src.lending.lendingflow_ghl import get_live_sink
 
@@ -73,6 +74,7 @@ async def receive_lendingflow_lead(
         db.rollback()
         logger.error("[lendingflow] save failed vendor=%s: %s", parsed.vendor_lead_id, type(exc).__name__)
         raise HTTPException(status_code=500, detail="Could not store the lead") from None
+    dependency_health.record_success(FEED_LENDINGFLOW_INBOUND)  # R1 0.6: LendingFlow is delivering (silence watch)
     if not result.created:
         return {"status": "duplicate", "lead_id": result.lead_uuid}
     if not result.suppressed:

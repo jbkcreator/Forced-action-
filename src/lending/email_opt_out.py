@@ -42,6 +42,8 @@ from sqlalchemy import text
 from config.lending_compliance import OptOutChannel
 from config.lending_prequal import BORROWER_CALLBACK_PHONE
 from config.settings import get_settings
+from config.lending_fallbacks import FEED_IMAP_OPT_OUT
+from src.lending import dependency_health
 from packages.agent_core.redaction import mask_emails
 from src.lending.compliance import propagate_opt_out
 from src.lending.cora_inbox import add_to_inbox_in_own_session
@@ -322,6 +324,8 @@ def run(now: Optional[datetime] = None) -> int:
     password = settings.lending_optout_imap_password
     if not (settings.lending_optout_imap_user and password):
         logger.info("[lending-email-opt-out] not configured (LENDING_OPTOUT_IMAP_USER / _PASSWORD); skipped")
+        # No mailbox = no opt-out can wait in one: nothing to verify, so the feed is not stale (R1 0.6).
+        dependency_health.record_success(FEED_IMAP_OPT_OUT)
         return 0
     since = (now or datetime.now(timezone.utc)).date() - timedelta(days=LOOKBACK_DAYS)
     try:
@@ -332,7 +336,9 @@ def run(now: Optional[datetime] = None) -> int:
                            own_numbers=own_business_numbers())
     except Exception as exc:  # class only: IMAP and SQL errors can echo the login or addresses
         logger.error("[lending-email-opt-out] sweep failed: %s", type(exc).__name__)
+        dependency_health.record_failure(FEED_IMAP_OPT_OUT, type(exc).__name__)
         return 1
+    dependency_health.record_success(FEED_IMAP_OPT_OUT)
     logger.info("[lending-email-opt-out] examined %d message(s), %d new opt-out(s), %d failed", result.examined,
                 result.recorded, result.failed)
     return 0
