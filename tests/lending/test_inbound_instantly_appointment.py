@@ -256,6 +256,17 @@ def test_a_reschedule_to_a_new_time_is_a_new_event_and_a_repeat_is_not(appointme
     assert [p["slot_start_utc"].day for p in appointments.schedules] == [1, 2, 1]
 
 
+def test_a_booking_already_scheduled_without_a_phone_still_leaves_the_dialer(appointments):
+    # booking-confirmed scheduled the reminders from person_id with no phone, so nothing left the dialer then
+    body = {"appointmentId": "appt-4", "appointmentStatus": "confirmed", "startTime": START, "phone": "+18135550122"}
+    post_appointment(appointments, body)  # stands in for the earlier scheduling: the reminders now exist
+    appointments.out_of_dialer.clear()
+    answer = post_appointment(appointments, {**body, "title": "Call with Josh"})  # same slot, a new delivery
+    assert answer.status_code == 200 and answer.json()["status"] == "duplicate"
+    assert len(appointments.schedules) == 1  # reminders not duplicated
+    assert appointments.out_of_dialer == ["+18135550122"]
+
+
 def test_an_appointment_raw_save_failure_asks_ghl_to_resend(appointments, store):
     store.insert_error = RuntimeError("insert failed")
     answer = post_appointment(appointments, {"appointmentId": "appt-1", "appointmentStatus": "cancelled"})

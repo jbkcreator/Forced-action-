@@ -147,7 +147,9 @@ def _ingest_appointment(body: dict[str, Any], background_tasks: BackgroundTasks,
                                 rerun_duplicates=_schedules(body, status) and not _appointment_updated_at(body))
     except Exception:  # logged by the journal (class only)
         raise HTTPException(status_code=503, detail="Could not store the appointment event") from None
-    if result.outcome != "duplicate" and (result.value or {}).get("status") != "duplicate" and _schedules(body, status):
+    # Even when the reminders already exist: the removal is idempotent, and an earlier booking-confirmed post
+    # without a phone never removed this contact from the dialer.
+    if result.outcome != "duplicate" and _schedules(body, status):
         _take_out_of_dialer(background_tasks, _contact_phone(body))
     return result.value if result.outcome == "processed" else {"status": result.outcome}
 
