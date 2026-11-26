@@ -216,7 +216,7 @@ def test_search_is_the_advanced_search_filtered_by_pipeline_and_date_updated_pag
     assert first == {
         "locationId": "loc-1", "limit": 500, "page": 1,
         "filters": [{"field": "pipeline_id", "operator": "eq", "value": "pipe-ndl"},
-                    {"field": "date_updated", "operator": "range", "value": {"gte": "2026-11-24T07:10:00Z"}}],
+                    {"field": "date_updated", "operator": "range", "value": {"gte": "2026-11-23T07:10:00Z"}}],
         "sort": [{"field": "date_updated", "direction": "asc"}]}
     assert second["page"] == 2
     assert len(ours.heals) == 501

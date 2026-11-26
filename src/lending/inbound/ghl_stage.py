@@ -37,7 +37,7 @@ logger = logging.getLogger(__name__)
 Request = Callable[..., Any]
 
 SOURCE = "ghl_stage"
-RECONCILE = "reconcile"  # raw["source"] of a T7 reconcile payload: its stage is already GHL's
+RECONCILE = "reconcile"  # raw["source"] of a T7 reconcile payload: its stage is a search result, refreshed before applying
 
 _TIMEOUT = 10  # seconds; the read is inside the webhook, so it is kept short
 
@@ -216,7 +216,7 @@ def _read_ghl(opportunity_id: str, reader: Optional[StageReader]) -> Optional[Gh
     try:
         return reader(opportunity_id)
     except Exception as exc:
-        logger.warning("[lending-ghl] GHL stage read failed for opportunity %s (%s); using the webhook's stage",
+        logger.warning("[lending-ghl] GHL stage read failed for opportunity %s (%s)",
                        opportunity_id, type(exc).__name__)
         return None
 
@@ -231,18 +231,13 @@ def handle_stage(db, raw: dict[str, Any], *, reader: Any = _DEFAULT_READER) -> d
     opportunity_id, stage = _stage_fields(raw)
     if not opportunity_id or not stage:
         raise ValueError("ghl_stage payload has no opportunity_id / stage_name")
-    inserted, phone = _store_event(db, raw, opportunity_id, stage)
-    if raw.get("source") == RECONCILE:
-        current, repeat = stage, False  # the reconcile read GHL itself
-    else:
-        ghl = _read_ghl(opportunity_id, default_reader() if reader is _DEFAULT_READER else reader)
-        if ghl is None:
-            current, repeat = stage, not inserted  # today's redelivery hold
-        else:
-            current, repeat = ghl.stage_name, False  # GHL's own stage: never a redelivery
-            if current.strip().lower() != stage.strip().lower():
-                logger.info("[lending-ghl] opportunity %s: GHL's current stage differs from the webhook's; "
-                            "recording GHL's", opportunity_id)
+    reconcile = raw.get("source") == RECONCILE
+    ghl = _read_ghl(opportunity_id, default_reader() if reader is _DEFAULT_READER else reader)
+    if ghl is None and reconcile:
+        raise GhlStageReadError("could not verify the current stage before reconciliation")
+    current = ghl.stage_name if ghl is not None else stage
+    inserted, phone = _store_event(db, raw, opportunity_id, current if reconcile else stage)
+    repeat = ghl is None and not inserted
     record_current_stage(db, opportunity_id, current, phone, repeat=repeat)
     apply_loan_stage(db, opportunity_id, current, phone)
     return {"recorded": inserted, "stage": current}

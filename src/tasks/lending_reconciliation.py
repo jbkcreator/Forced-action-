@@ -1,6 +1,6 @@
 """Nightly reconcile of lost inbound webhooks (R1 0.5 T7, grill D9 / D10 / D12).
 
-    python -m src.tasks.lending_reconciliation [--dry-run] [--hours 24] [--force]
+    python -m src.tasks.lending_reconciliation [--dry-run] [--hours 48] [--force]
 
 One job, a list of source slots. A slot finds the events of the trailing window that never reached us
 (``find_missing(since)`` -> payloads) and heals each one through the normal journal handler (``heal(payload)``,
@@ -30,7 +30,7 @@ from src.services import ghl_webhook
 logger = logging.getLogger(__name__)
 
 RUN_HOUR_ET = 2
-DEFAULT_HOURS = 24
+DEFAULT_HOURS = 48
 
 
 # ---- slot protocol ---------------------------------------------------------------------------------------------
@@ -239,7 +239,7 @@ def main(argv: Optional[Sequence[str]] = None, *, now: Optional[datetime] = None
          add_inbox: Callable[..., Any] = _add_inbox) -> int:
     parser = argparse.ArgumentParser(prog="python -m src.tasks.lending_reconciliation")
     parser.add_argument("--dry-run", action="store_true", help="find and report missing events, heal nothing")
-    parser.add_argument("--hours", type=int, default=DEFAULT_HOURS, help="window to check (default 24)")
+    parser.add_argument("--hours", type=int, default=DEFAULT_HOURS, help="window to check (default 48)")
     parser.add_argument("--force", action="store_true", help="run regardless of the ET hour")
     args = parser.parse_args(argv)
     if not get_settings().lending_reconcile_enabled:

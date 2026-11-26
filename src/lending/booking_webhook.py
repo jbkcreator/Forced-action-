@@ -23,6 +23,8 @@ once; a repeat is answered ``duplicate`` and a failure (scheduling or cancelling
 """
 from __future__ import annotations
 
+import hashlib
+import json
 import logging
 from datetime import datetime
 from typing import Any, Optional
@@ -125,19 +127,27 @@ def handle_appointment_event(db: Session, raw: dict[str, Any]) -> dict[str, Any]
 journal.register_source("ghl_appointment", handle_appointment_event, label="GHL appointment status change")
 
 
-def _journal_key(body: dict[str, Any], appointment_id: str, status: str) -> str:
-    """One event per appointment, status and start time: a reschedule to a new time is a new event."""
-    start = _start_time(body)
-    return f"{appointment_id}:{status}:{start.isoformat() if start else ''}"
+def _journal_key(body: dict[str, Any], appointment_id: str) -> str:
+    """Hash the full delivery so a corrected contact or appointment is processed."""
+    canonical = json.dumps(body, sort_keys=True, separators=(",", ":"))
+    return f"{appointment_id}:{hashlib.sha256(canonical.encode('utf-8')).hexdigest()}"
+
+
+def _appointment_updated_at(body: dict[str, Any]) -> Optional[str]:
+    return _first(body, ("updatedAt",), ("updated_at",), ("appointment", "updatedAt"),
+                  ("appointment", "updated_at"))
 
 
 def _ingest_appointment(body: dict[str, Any], background_tasks: BackgroundTasks, appointment_id: str,
                         status: str) -> dict[str, Any]:
     try:
-        result = journal.ingest("ghl_appointment", _journal_key(body, appointment_id, status), body)
+        # A versionless scheduling event may return to a previously seen slot. Let the booking scheduler,
+        # which checks the current slot and existing reminders, decide whether there is work to do.
+        result = journal.ingest("ghl_appointment", _journal_key(body, appointment_id), body,
+                                rerun_duplicates=_schedules(body, status) and not _appointment_updated_at(body))
     except Exception:  # logged by the journal (class only)
         raise HTTPException(status_code=503, detail="Could not store the appointment event") from None
-    if result.outcome != "duplicate" and _schedules(body, status):
+    if result.outcome != "duplicate" and (result.value or {}).get("status") != "duplicate" and _schedules(body, status):
         _take_out_of_dialer(background_tasks, _contact_phone(body))
     return result.value if result.outcome == "processed" else {"status": result.outcome}
 

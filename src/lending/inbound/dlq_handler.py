@@ -127,6 +127,10 @@ def main(argv: Optional[list[str]] = None, *, session_factory: Callable = lendin
     args = parser.parse_args(argv)
     if not logging.getLogger().handlers:
         logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
+    if args.replay is not None or args.replay_all is not None:
+        from src.lending.inbound import journal
+
+        journal.load_handlers()
     with session_factory() as db:
         if args.list:
             ok = list_failures(db, args.limit)

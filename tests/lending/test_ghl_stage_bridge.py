@@ -14,13 +14,16 @@ from src.lending.state_machine import IllegalStageTransitionError, PaymentResult
 class _Db:
     """The loan file linked to the opportunity (None: no link), and the rowcount a link UPDATE reports."""
 
-    def __init__(self, linked=None, link_rowcount=1):
+    def __init__(self, linked=None, link_rowcount=1, funded_event=False):
+        self.funded_event = funded_event
         self.linked, self.link_rowcount, self.queries = linked, link_rowcount, []
 
     def execute(self, stmt, params=None):
         self.queries.append((stmt, params))
         if stmt is bridge._LINK:
             return SimpleNamespace(rowcount=self.link_rowcount)
+        if "SELECT EXISTS" in str(stmt):
+            return SimpleNamespace(scalar=lambda: self.funded_event)
         row = SimpleNamespace(id=self.linked[0], stage=self.linked[1]) if self.linked else None
         return SimpleNamespace(first=lambda: row)
 
@@ -194,3 +197,11 @@ def test_a_failed_stage_write_for_funded_or_paid_fails_the_webhook_so_ghl_sends_
 def test_a_failed_stage_write_for_another_stage_is_only_logged(monkeypatch):
     router = _stage_write_fails(monkeypatch)
     router.record_current_stage(SimpleNamespace(begin_nested=nullcontext), "o1", "Showed", None, repeat=False)
+
+
+def test_paid_catches_up_a_closing_file_with_a_funded_webhook(calls):
+    calls["current"] = "paid"
+    db = _Db((7, "CLOSING"), funded_event=True)
+    assert bridge.apply_stage(db, opportunity_id="o1", stage_name="Paid") == "applied"
+    assert calls["transition"][0][1] is LoanStage.FUNDED
+    assert calls["payment"][0][1]["mark_paid"] is True

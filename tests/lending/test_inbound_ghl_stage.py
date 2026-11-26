@@ -155,11 +155,11 @@ def test_when_ghl_cannot_be_read_the_body_stage_is_used(book, reader):
     assert book.current == {"opp-9": "funded"} and len(book.held) == 1
 
 
-def test_a_reconcile_payload_is_recorded_without_reading_ghl(book):
+def test_reconcile_uses_the_fresh_stage_instead_of_the_search_result(book):
     read = _ghl_says("Lost")
     ghl_stage.handle_stage(_Db(), {"opportunity_id": "opp-9", "stage_name": "Funded", "pipeline_id": "pipe-1",
                                    "source": "reconcile"}, reader=read)
-    assert read.seen == [] and book.current == {"opp-9": "funded"} and book.loan == {"opp-9": "funded"}
+    assert read.seen == ["opp-9"] and book.current == {"opp-9": "lost"} and book.loan == {}
 
 
 def test_a_ghl_key_value_body_under_custom_data_is_handled(book):
@@ -237,3 +237,8 @@ def test_flag_on_a_bad_body_is_still_422_and_never_journaled(ingested, body):
 def test_flag_on_a_wrong_secret_is_401_and_never_journaled(ingested):
     r = ingested.client.post("/webhooks/lending/ghl-stage", headers={"X-Webhook-Secret": "nope"}, json=_body("Funded"))
     assert r.status_code == 401 and ingested.calls == []
+
+def test_reconciliation_does_not_apply_a_search_result_when_the_fresh_read_fails(book):
+    with pytest.raises(ghl_stage.GhlStageReadError):
+        ghl_stage.handle_stage(_Db(), {**_body("Funded"), "source": "reconcile"}, reader=None)
+    assert not book.current and not book.loan

@@ -4,7 +4,7 @@ Josh moves a deal by hand in GHL; the ``/webhooks/lending/ghl-stage`` webhook ha
 
 * "Funded" -> ``transition(FUNDED)``.
 * "Paid"   -> a payment event (``record_payment(mark_paid=True)``), which moves a FUNDED file to PAID.  On a file that
-  is not FUNDED the move is refused like any other skipped stage.
+  is CLOSING, a recorded Funded webhook allows the bridge to apply both steps in sequence.
 
 Which file: only the file **linked** to the GHL opportunity (``loan_files.ghl_opportunity_id``). A GHL event carries no
 loan file id, and a borrower can have more deals in GHL than files here, so a phone match could move the wrong loan
@@ -92,6 +92,14 @@ def apply_stage(db: Session, *, opportunity_id: str, stage_name: str, phone: Opt
     file_id, current = int(row.id), LoanStage(row.stage)
     event_id = f"{opportunity_id}:{stage_key}@{current.value}"
     try:
+        if target is LoanStage.PAID and current is LoanStage.CLOSING and db.execute(text(
+            "SELECT EXISTS (SELECT 1 FROM lending.ghl_stage_events "
+            "WHERE ghl_opportunity_id = :opp AND stage_key = 'funded' "
+            "AND raw_event->>'source' IS DISTINCT FROM 'reconcile')"
+        ), {"opp": opportunity_id}).scalar():
+            transition(db, file_id, LoanStage.FUNDED, source=SOURCE, actor=ACTOR,
+                       source_event_id=f"{opportunity_id}:funded@{current.value}")
+            current = LoanStage.FUNDED
         if target is LoanStage.PAID and current is LoanStage.FUNDED:
             result = record_payment(db, file_id, source=SOURCE, payment_id=event_id, actor=ACTOR, mark_paid=True)
             return "applied" if result.paid else "duplicate"

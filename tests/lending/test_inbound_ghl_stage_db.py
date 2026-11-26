@@ -47,5 +47,5 @@ def test_a_late_submitted_after_funded_keeps_funded_and_is_still_stored(closing_
 
 def test_a_reconcile_payload_records_a_dropped_stage(closing_db, bridge):
     ghl_stage.handle_stage(closing_db, {"opportunity_id": "opp-9", "stage_name": "Funded", "pipeline_id": "pipe-1",
-                                        "source": "reconcile"}, reader=None)
+                                        "source": "reconcile"}, reader=_ghl_says("Funded"))
     assert _events(closing_db) == ["funded"] and _current(closing_db) == ["funded"] and bridge == ["funded"]

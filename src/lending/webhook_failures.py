@@ -217,7 +217,10 @@ def retry_pending(*, session_factory: Callable = lending_session,
 def main() -> int:
     if not logging.getLogger().handlers:
         logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
+    from src.lending.inbound import journal
+
     try:
+        journal.load_handlers()
         result = retry_pending()
     except Exception as exc:  # class only
         logger.error("[lending-webhook-failure] retry sweep failed: %s", type(exc).__name__)
@@ -235,7 +238,6 @@ def _reclaim_inbound_journal() -> int:
     if not journal.journal_enabled():
         return 0
     try:
-        journal.load_handlers()
         reclaimed = journal.reclaim_stuck()
     except Exception as exc:  # class only
         logger.error("[lending-webhook-failure] inbound journal reclaim failed: %s", type(exc).__name__)
@@ -247,4 +249,6 @@ def _reclaim_inbound_journal() -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    from src.lending import webhook_failures
+
+    raise SystemExit(webhook_failures.main())

@@ -13,3 +13,6 @@ installed, remove its body logging directive and validate the nginx configuratio
 before reloading. For LendingFlow deliveries that never reached the authenticated
 journal, request a resend from LendingFlow. The nightly reconciliation job
 queries GHL for missing stage changes when LENDING_RECONCILE_ENABLED is enabled.
+
+Nightly GHL reconciliation looks back 48 hours to cover daylight-saving gaps.
+It verifies the current stage immediately before applying a repair.

@@ -122,7 +122,7 @@ def test_an_instantly_stop_delivered_three_times_is_suppressed_once(instantly, s
     assert [a.status_code for a in answers] == [200, 200, 200]
     assert [a.json()["status"] for a in answers] == ["suppressed", "duplicate", "duplicate"]
     assert len(instantly.recorded) == 1 and instantly.suppressed == [1]
-    assert len(instantly.notices) == 1 and instantly.inbox == [1]
+    assert instantly.notices == [] and instantly.inbox == [1]
     assert [r.source for r in store.rows.values()] == ["instantly_event"]
 
 
@@ -141,7 +141,7 @@ def test_an_instantly_event_that_cannot_be_stored_is_answered_200_and_replayed(i
     monkeypatch.setattr(instantly_webhook, "record_event", working_record)
     replay = webhook_failures.ENDPOINT_HANDLERS["instantly_event"]
     assert replay(FakeDb(), dlq[0][1]) == {"status": "suppressed"}
-    assert len(instantly.recorded) == 1 and instantly.suppressed == [1] and len(instantly.notices) == 1
+    assert len(instantly.recorded) == 1 and instantly.suppressed == [1] and instantly.notices == []
 
 
 def test_an_instantly_opt_out_that_fails_is_left_for_coras_sweep_without_failing_the_event(instantly, store, dlq,
@@ -194,6 +194,9 @@ def appointments(monkeypatch, store, dlq):
         return 4
 
     def schedule(db, payload):
+        if client.schedules and all(client.schedules[-1][key] == payload[key]
+                                    for key in ("booking_ref", "slot_start_utc", "phone", "email")):
+            return SimpleNamespace(skip_reason=None, inserted=0)
         client.schedules.append(payload)
         return SimpleNamespace(skip_reason=None, inserted=3)
 
@@ -248,9 +251,9 @@ def test_a_booking_whose_scheduling_fails_is_saved_and_still_leaves_the_dialer(a
 def test_a_reschedule_to_a_new_time_is_a_new_event_and_a_repeat_is_not(appointments):
     first = {"appointmentId": "appt-3", "appointmentStatus": "rescheduled", "startTime": START}
     moved = {**first, "startTime": "2026-12-02T15:00:00Z"}
-    answers = [post_appointment(appointments, b).json()["status"] for b in (first, first, moved)]
-    assert answers == ["scheduled", "duplicate", "scheduled"]
-    assert [p["slot_start_utc"].day for p in appointments.schedules] == [1, 2]
+    answers = [post_appointment(appointments, b).json()["status"] for b in (first, first, moved, first)]
+    assert answers == ["scheduled", "duplicate", "scheduled", "scheduled"]
+    assert [p["slot_start_utc"].day for p in appointments.schedules] == [1, 2, 1]
 
 
 def test_an_appointment_raw_save_failure_asks_ghl_to_resend(appointments, store):
@@ -284,3 +287,10 @@ def test_with_the_journal_off_a_cancel_runs_on_the_request_session_as_before(mon
     app.dependency_overrides[get_db] = lambda: session
     answer = post_appointment(TestClient(app), {"appointmentId": "appt-1", "appointmentStatus": "cancelled"})
     assert answer.json() == {"status": "cancelled", "cancelled": 2} and session.commits == 1
+
+
+def test_an_appointment_delivery_with_missing_contact_details_can_be_repaired(appointments):
+    body = {"appointmentId": "appt-4", "appointmentStatus": "confirmed", "startTime": START}
+    assert post_appointment(appointments, body).json()["status"] == "scheduled"
+    assert post_appointment(appointments, {**body, "email": "borrower@example.com"}).json()["status"] == "scheduled"
+    assert appointments.schedules[-1]["email"] == "borrower@example.com"

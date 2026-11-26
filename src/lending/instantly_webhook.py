@@ -91,19 +91,6 @@ def _suppress_now(db: Session, reply_id: int, email: str, *, via_unsubscribe_lin
         block_address(account, email)
 
 
-def _announce_suppression(db: Session, reply_id: int, email: str, event_id: Optional[int], *,
-                          via_unsubscribe_link: bool) -> None:
-    posted = post_ops_notice(suppression_notice(email, event_id, via_unsubscribe_link=via_unsubscribe_link))
-    queue_suppression_for_cora(db, reply_id, email, event_id, posted=posted)
-    account = lending_instantly_account()
-    if account is not None:
-        try:
-            block_address(account, email)
-        except Exception as exc:  # best effort: the opt-out is recorded in our stores either way
-            logger.warning("[instantly-webhook] reply %s not added to the Instantly block list (%s)", reply_id,
-                           type(exc).__name__)
-
-
 def handle_journaled_event(db: Session, raw: dict[str, Any]) -> dict[str, Any]:
     """Journal handler (also the replay): store the event once and suppress a STOP / unsubscribe at once. Runs in
     the journal's transaction and never commits. A failed opt-out is rolled back to its savepoint and left on the
@@ -123,8 +110,7 @@ def handle_journaled_event(db: Session, raw: dict[str, Any]) -> dict[str, Any]:
         logger.error("[instantly-webhook] opt-out for reply %s not recorded yet (%s); Cora's sweep retries it",
                      recorded.reply_id, type(exc).__name__)
         return {"status": "suppressed"}
-    _announce_suppression(db, recorded.reply_id, event.lead_email, opt_out_event_id,
-                          via_unsubscribe_link=event.event_type == EVENT_UNSUBSCRIBED)
+    queue_suppression_for_cora(db, recorded.reply_id, event.lead_email, opt_out_event_id, posted=False)
     return {"status": "suppressed"}
 
 
