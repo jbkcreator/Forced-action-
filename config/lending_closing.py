@@ -44,6 +44,17 @@ class ChecklistItem:
 
 # Josh's Term Sheet Intake Checklist (Nov 2), "what can wait until after the term sheet". Central Lending only:
 # Backflip stays blocked until Josh approves it in writing.
+# R1 1.7: pricing_sheet is a new item type (client Q25 for expiry); required by no lender yet.
+# Secondary lenders (corevest / rcn_capital / temple_view / abl) start as a copy of Central Lending's 6 items,
+# marked placeholder until the client answers Q24 (required documents per secondary lender).
+_PLACEHOLDER_SECONDARY: tuple[ChecklistItem, ...] = (
+    ChecklistItem("purchase_agreement", "Signed purchase agreement [placeholder]"),
+    ChecklistItem("valuation", "Valuation or appraisal [placeholder]"),
+    ChecklistItem("scope_of_work", "Scope of work and budget [placeholder]"),
+    ChecklistItem("entity_docs", "LLC documents [placeholder]"),
+    ChecklistItem("government_id", "Photo ID for each guarantor [placeholder]"),
+    ChecklistItem("bank_statements", "Last 30 days of bank statements (down payment plus reserves) [placeholder]"),
+)
 LENDER_CHECKLISTS: dict[str, tuple[ChecklistItem, ...]] = {
     "central_lending": (
         ChecklistItem("purchase_agreement", "Signed purchase agreement"),
@@ -53,7 +64,15 @@ LENDER_CHECKLISTS: dict[str, tuple[ChecklistItem, ...]] = {
         ChecklistItem("government_id", "Photo ID for each guarantor"),
         ChecklistItem("bank_statements", "Last 30 days of bank statements (down payment plus reserves)"),
     ),
+    "corevest": _PLACEHOLDER_SECONDARY,
+    "rcn_capital": _PLACEHOLDER_SECONDARY,
+    "temple_view": _PLACEHOLDER_SECONDARY,
+    "abl": _PLACEHOLDER_SECONDARY,
 }
+
+# R1 1.7: pricing_sheet item type. Expiry (max age in days) set via LENDING_PRICING_SHEET_MAX_AGE_DAYS.
+# No lender requires it yet; the validator blocks any pricing_sheet with no readable date.
+PRICING_SHEET_ITEM = ChecklistItem("pricing_sheet", "Pricing sheet")
 
 # P2.2 instant-quote condition codes that add a document.
 CONDITION_ITEMS: dict[str, ChecklistItem] = {

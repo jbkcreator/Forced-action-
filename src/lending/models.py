@@ -1688,6 +1688,11 @@ class LendingPartnerFileUpload(LendingBase):
     content_type: Mapped[str] = mapped_column(String(80), nullable=False)
     size_bytes: Mapped[int] = mapped_column(Integer, nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_now, server_default=text("now()"))
+    # R1 1.7: packet validator quarantine. NULL = not scanned / clean; set to 'quarantined' by the validator.
+    quarantine_status: Mapped[Optional[str]] = mapped_column(String(20))
+    quarantine_reason: Mapped[Optional[str]] = mapped_column(String(300))
+    # R1 1.7: staff-assigned document type (item_code). None = unclassified; blocked from packages until tagged.
+    item_code: Mapped[Optional[str]] = mapped_column(String(40))
 
     __table_args__ = (Index("idx_lending_partner_file_uploads_file", "file_id"),)
 
@@ -2003,6 +2008,9 @@ class LendingDocChaseUpload(LendingBase):
     drive_file_id: Mapped[Optional[str]] = mapped_column(String(100))  # set once copied to Josh's folder (doc_copies)
     drive_attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default=text("0"))
     drive_retry_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))  # next try after a failure
+    # R1 1.7: packet validator quarantine. NULL = not scanned / clean; set to 'quarantined' by the validator.
+    quarantine_status: Mapped[Optional[str]] = mapped_column(String(20))
+    quarantine_reason: Mapped[Optional[str]] = mapped_column(String(300))
 
     __table_args__ = (Index("idx_lending_doc_chase_uploads_chase", "chase_id"),)
 
@@ -2273,4 +2281,44 @@ class LendingSunbizLlcContact(LendingBase):
 
     __table_args__ = (
         CheckConstraint("subject_role IN ('officer', 'agent')", name="ck_lending_sunbiz_llc_contacts_role"),
+    )
+
+
+class LendingLenderPackage(LendingBase):
+    """R1 1.7: one draft lender package per file + secondary lender.
+
+    At most one open (non-dismissed) package per (source_key, lender_key). Status lifecycle:
+    draft → ready (all docs pass) | blocked (a doc fails) → submitted (Josh taps Mark submitted) | dismissed.
+    ``box_confirmed=false`` means the lender's rules box is a placeholder; the package is stamped and
+    Mark submitted is disabled until the client confirms the box (D3 / D15).
+    """
+
+    __tablename__ = "lender_packages"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    # file identity — either a loan_file_id (partner door) or a LendingFlow lead id
+    source_type: Mapped[str] = mapped_column(String(20), nullable=False)  # 'loan_file' | 'lf_lead'
+    source_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    lender_key: Mapped[str] = mapped_column(String(60), nullable=False)
+    status: Mapped[str] = mapped_column(String(20), nullable=False, default="draft", server_default=text("'draft'"))
+    box_confirmed: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default=text("false"))
+    # JSON: {fitting: [...], non_fitting: [...], possible: [...]} from lender_fit
+    fit_result: Mapped[Optional[dict]] = mapped_column(JSONB)
+    # JSON: list of {item_code, label, received, verdict} — the checklist at last compile
+    checklist: Mapped[Optional[dict]] = mapped_column(JSONB)
+    # JSON: {outcome, per_doc: [{upload_id, upload_table, outcome, reasons}]} — validator result at last compile
+    validator_verdict: Mapped[Optional[dict]] = mapped_column(JSONB)
+    # fingerprint used to decide whether a re-screen is needed (hash of file facts + rule snapshot version)
+    screen_fingerprint: Mapped[Optional[str]] = mapped_column(String(64))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_now, server_default=text("now()"))
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_now, server_default=text("now()"), onupdate=_now)
+
+    __table_args__ = (
+        CheckConstraint("status IN ('draft','blocked','ready','submitted','dismissed')",
+                        name="ck_lending_lender_packages_status"),
+        CheckConstraint("source_type IN ('loan_file','lf_lead')",
+                        name="ck_lending_lender_packages_source_type"),
+        Index("idx_lending_lender_packages_source", "source_type", "source_id"),
+        Index("uq_lending_lender_packages_open", "source_type", "source_id", "lender_key",
+              postgresql_where=text("status NOT IN ('submitted','dismissed')"), unique=True),
     )

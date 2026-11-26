@@ -954,6 +954,13 @@ class AppSettings(BaseSettings):
 	# P2.4 closing blocker card (7 AM, LENDING_CORA_CHANNEL) and document chase (src/lending/closing/); both off by default.
 	lending_closing_blockers_enabled: bool = Field(default=False, env="LENDING_CLOSING_BLOCKERS_ENABLED")
 	lending_doc_chase_enabled: bool = Field(default=False, env="LENDING_DOC_CHASE_ENABLED")
+	# R1 1.7: secondary lender screening. Off until Josh is ready. The packet validator (upload-time
+	# injection scan) is ALWAYS on regardless of this flag.
+	lending_secondary_screen_enabled: bool = Field(default=False, env="LENDING_SECONDARY_SCREEN_ENABLED")
+	# R1 1.7: max age (days) of a pricing sheet before it is blocked. Client Q25 for the real value.
+	lending_pricing_sheet_max_age_days: int = Field(default=30, env="LENDING_PRICING_SHEET_MAX_AGE_DAYS")
+	# R1 1.7: max age (days) of a bank statement before it is blocked (D9: 60 days from today).
+	lending_bank_statement_max_age_days: int = Field(default=60, env="LENDING_BANK_STATEMENT_MAX_AGE_DAYS")
 	# Chase texts carry the upload link. Off until the 10DLC campaign declares embedded links (the same condition as
 	# LENDING_TEXT_BACK_BOOKING_LINK_ENABLED); off = the request and reminders go by email, or to Cora's inbox as
 	# "call them" when there is no email.
