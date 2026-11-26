@@ -23,7 +23,7 @@ from zoneinfo import ZoneInfo
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import DBAPIError, IntegrityError
 from sqlalchemy.orm import Session
 
 from config.lending_compliance import DEFAULT_TZ
@@ -44,6 +44,7 @@ from src.lending.attempt_log import (
     summary,
     to_csv,
 )
+from src.lending.closing.doc_access import find_document_borrowers, issue_view_link, latest_upload
 from src.lending.closing.doc_chase import open_chase_summaries, start_chase
 from src.lending.closing.drafts import Recipient
 from src.lending.contracts import BorrowerProfile, LoanRequest
@@ -60,6 +61,17 @@ from src.lending.instant_quote.engine import BorrowerType, Purpose
 from src.lending.instant_quote.store import QuoteStore, SqlQuoteStore, audit_record
 from src.lending.lender_fit import evaluate_lender_fit
 from src.lending.partner_service import PartnerLinkNotConfigured
+from src.lending.security.rbac import (
+    CALLER_DB_ROLE,
+    INSUFFICIENT_PRIVILEGE,
+    SLACK_ISSUER,
+    CallerDbRoleUnavailable,
+    DocumentAccessDenied,
+    Role,
+    assume_caller_db_role,
+    pg_error_code,
+    role_for_slack_user,
+)
 from src.lending.scoreboard import build_scoreboard
 from src.lending.slack_names import name_and_ref, names_by_phone, readable_ref
 from src.services.phone_utils import normalize
@@ -83,7 +95,10 @@ _SQL_START = re.compile(r"^\s*(select|with)\b", re.IGNORECASE)
 _SQL_FORBIDDEN = re.compile(
     r"\b(insert|update|delete|merge|drop|alter|create|grant|revoke|truncate|copy|call|do|vacuum|analyze|"
     r"set|reset|lock|refresh|comment|listen|notify|prepare|execute|discard)\b"
-    r"|\bpg_\w+\s*\(|\bdblink\b|\blo_\w+\s*\(|\binto\b",
+    r"|\bpg_\w+\s*\(|\bdblink\b|\blo_\w+\s*\(|\binto\b"
+    # R1 0.2: set_config('role', ...) would switch a caller back from lending_caller, and the *_to_xml functions run
+    # a query held in a string, out of sight of the table and schema checks.
+    r"|\bset_config\s*\(|\bcurrent_setting\s*\(|\b\w*_to_xml\w*\s*\(",
     re.IGNORECASE,
 )
 _SQL_JOINED = re.compile(r"\bjoin\s+(?:lateral\s+)?([a-zA-Z_\"][\w\".]*)", re.IGNORECASE)
@@ -102,6 +117,10 @@ _SQL_FROM_LIST_END = re.compile(
 CONSENT_TEXT_COLUMNS = frozenset({"consent_text", "call_consent_text", "raw_certificate", "tcpa_disclosure_text"})
 _CONSENT_TEXT = re.compile(r"\b(?:" + "|".join(sorted(CONSENT_TEXT_COLUMNS)) + r")\b", re.IGNORECASE)
 CONSENT_TEXT_HIDDEN = "[consent text not shown]"
+# R1 0.2: where a borrower's file is stored and link token hashes never reach Slack, even for an admin.
+STORAGE_COLUMNS = frozenset({"stored_path", "token_hash"})
+_STORAGE_TEXT = re.compile(r"\b(?:" + "|".join(sorted(STORAGE_COLUMNS)) + r")\b", re.IGNORECASE)
+STORAGE_HIDDEN = "[not shown]"
 
 # Borrower messages never quote a rate, term, point, fee, ratio, payment or any range or ballpark
 # (G4; docs/lending/ghl-conversation-ai.md hard rule 1). Enforced on the draft text itself, not just
@@ -216,6 +235,8 @@ class InstantQuoteInput(_Input):
     rehab: Decimal = Field(..., ge=0, le=MAX_QUOTE_AMOUNT)
     arv: Decimal = Field(..., gt=0, le=MAX_QUOTE_AMOUNT, description="After-repair value.")
     existing_debt: Optional[Decimal] = Field(None, ge=0, le=MAX_QUOTE_AMOUNT, description="Refinance only.")
+    loan_file_id: Optional[int] = Field(None, ge=1, description="The loan file (lending.loan_files.id) this quote is "
+                                                               "for, when known; the quote is then logged on it.")
 
 
 class AttemptLogInput(_Input):
@@ -276,6 +297,15 @@ class StartChaseInput(_Input):
     lead_ref: str = Field(..., pattern=_LEAD_REF.pattern, description="From find_lead, e.g. web_lead:12.")
     quote_id: Optional[str] = Field(default=None, pattern=r"^[0-9a-fA-F-]{36}$",
                                     description="The borrower's instant quote id, when there is one.")
+
+
+class SendDocumentLinkInput(_Input):
+    borrower: str = Field(..., min_length=2, max_length=120,
+                          description="What the user said: a name, the last 4 phone digits, a phone number, or a "
+                                      "lead_ref from an earlier list.")
+    item_code: str = Field(..., max_length=40, pattern=r"^[a-z_]+$",
+                           description="The document: bank_statements, government_id, purchase_agreement, valuation, "
+                                       "scope_of_work, entity_docs or interest_reserve_funds.")
 
 
 class InboxListInput(_Input):
@@ -402,6 +432,9 @@ def check_read_only_sql(sql: str) -> str:
     if _CONSENT_TEXT.search(statement):
         raise ToolInputError("consent wording and certificates are not shown in Slack; use the yes/no consent "
                              "fields (web_leads.sms_consent, web_leads.call_consent, text_consents) instead")
+    if _STORAGE_TEXT.search(statement):
+        raise ToolInputError("file locations and link tokens are not shown in Slack; ask for document status "
+                             "(doc_chase_items.received_at) instead")
     cte_names = {name.lower() for name in re.findall(r"\b(\w+)\s+as\s*\(", statement, re.IGNORECASE)}
     for relation in _named_relations(statement):
         cleaned = relation.replace('"', "").lower()
@@ -467,10 +500,13 @@ class CoraToolkit:
             yield session
 
     @contextmanager
-    def _read_only(self) -> Iterator[Session]:
+    def _read_only(self, db_role: Optional[str] = None) -> Iterator[Session]:
+        """``db_role`` (R1 0.2): run the lookup as that Postgres role, e.g. lending_caller for a non-admin."""
         with Session(self._engine) as session:
             session.execute(text("SET TRANSACTION READ ONLY"))
             session.execute(text(f"SET LOCAL statement_timeout = '{STATEMENT_TIMEOUT}'"))
+            if db_role is not None:
+                assume_caller_db_role(session, db_role)
             try:
                 yield session
             finally:
@@ -628,7 +664,7 @@ class CoraToolkit:
             existing_debt=args.existing_debt)
         result = quote(request, new_construction_exit_rule=settings.lending_instant_quote_exit_rule_enabled)
         try:
-            quote_id = (self._quote_store or SqlQuoteStore()).save(audit_record(request, result, QUOTE_CALLER))
+            quote_id = (self._quote_store or SqlQuoteStore()).save(audit_record(request, result, QUOTE_CALLER, args.loan_file_id))
         except Exception as exc:  # class only: SQL errors embed bound parameters
             logger.error("[cora-tools] instant quote audit write failed (%s); quote withheld", type(exc).__name__)
             raise ToolInputError("the quote could not be saved, so it is not shown; try again") from None
@@ -669,19 +705,33 @@ class CoraToolkit:
             return False
         return True
 
-    def query_lending_data(self, args: QueryInput, _: ToolContext) -> dict[str, Any]:
+    def query_lending_data(self, args: QueryInput, context: ToolContext) -> dict[str, Any]:
         statement = check_read_only_sql(args.sql)
-        with self._read_only() as session:
-            # EXPLAIN plans without executing; the plan names every table the query would really read.
-            plan = session.execute(text(f"EXPLAIN (VERBOSE, FORMAT JSON) {statement}")).scalar()
-            outside = relations_outside_schema(json.loads(plan) if isinstance(plan, str) else plan)
-            if outside:
-                raise ToolInputError(f"only lending.* tables can be queried (the query reads {sorted(outside)})")
-            result = session.execute(text(f"SELECT * FROM ({statement}) AS cora_query LIMIT {MAX_ROWS}"))
-            columns = list(result.keys())
-            hidden = {column for column in columns if column.lower() in CONSENT_TEXT_COLUMNS}
-            rows = [{column: CONSENT_TEXT_HIDDEN if column in hidden and value is not None else _iso(value)
-                     for column, value in zip(columns, row)} for row in result.all()]
+        # R1 0.2: a non-admin's lookup runs as lending_caller, which Postgres keeps out of the document tables.
+        db_role = None if role_for_slack_user(context.user_id) is Role.ADMIN else CALLER_DB_ROLE
+        try:
+            with self._read_only(db_role) as session:
+                return self._run_query(session, statement)
+        except CallerDbRoleUnavailable:
+            raise ToolInputError("document access controls are not set up yet; ask an admin")
+        except DBAPIError as exc:
+            if pg_error_code(exc) == INSUFFICIENT_PRIVILEGE:
+                raise ToolInputError("that table holds borrower documents; only an admin can see it")
+            raise
+
+    @staticmethod
+    def _run_query(session: Session, statement: str) -> dict[str, Any]:
+        # EXPLAIN plans without executing; the plan names every table the query would really read.
+        plan = session.execute(text(f"EXPLAIN (VERBOSE, FORMAT JSON) {statement}")).scalar()
+        outside = relations_outside_schema(json.loads(plan) if isinstance(plan, str) else plan)
+        if outside:
+            raise ToolInputError(f"only lending.* tables can be queried (the query reads {sorted(outside)})")
+        result = session.execute(text(f"SELECT * FROM ({statement}) AS cora_query LIMIT {MAX_ROWS}"))
+        columns = list(result.keys())
+        hidden = {column: CONSENT_TEXT_HIDDEN for column in columns if column.lower() in CONSENT_TEXT_COLUMNS}
+        hidden.update({column: STORAGE_HIDDEN for column in columns if column.lower() in STORAGE_COLUMNS})
+        rows = [{column: hidden[column] if column in hidden and value is not None else _iso(value)
+                 for column, value in zip(columns, row)} for row in result.all()]
         return {"columns": columns, "rows": rows, "row_count": len(rows), "row_cap": MAX_ROWS}
 
     # -- memory --------------------------------------------------------------------------
@@ -750,6 +800,50 @@ class CoraToolkit:
     def document_chases(self, _: NoInput, __: ToolContext) -> dict[str, Any]:
         with self._read_only() as session:
             return {"open_chases": open_chase_summaries(session, datetime.now(timezone.utc))}
+
+    def send_document_link(self, args: SendDocumentLinkInput, context: ToolContext) -> dict[str, Any]:
+        """R1 0.2: an admin gets a private 15-minute link to a borrower's newest upload of one document. Several
+        matching borrowers -> the list comes back and no link is made. The link never goes back to the model."""
+        if role_for_slack_user(context.user_id) is not Role.ADMIN:
+            raise ToolInputError("only an admin can open borrower documents")
+        if self._channels is None:
+            raise ToolInputError("I can't send a private link here")
+        now = datetime.now(timezone.utc)
+        with self._inbox() as session:
+            found = find_document_borrowers(session, args.borrower)
+            if found.too_many:
+                raise ToolInputError("more than 10 borrowers match; ask for a last name or the last 4 phone digits")
+            if not found.matches:
+                raise ToolInputError(f"no borrower matching '{args.borrower}' has uploaded documents")
+            if len(found.matches) > 1:
+                return {"sent_privately": False,
+                        "choose_one": [{"lead_ref": m.lead_ref, "borrower": m.display,
+                                        "chase_started": m.chase_started.isoformat(),
+                                        "has_this_document": args.item_code in m.uploaded_items}
+                                       for m in found.matches],
+                        "note": "several borrowers match: list them and ask the user which one, then call again "
+                                "with that lead_ref; never pick one yourself"}
+            match = found.matches[0]
+            upload = latest_upload(session, match.lead_ref, args.item_code)
+            if upload is None:
+                raise ToolInputError(f"{match.display} has not uploaded {args.item_code}")
+            upload_id, label, uploaded_at = upload
+            try:
+                link = issue_view_link(session, upload_id, f"{SLACK_ISSUER}{context.user_id}", now)
+            except PartnerLinkNotConfigured:
+                raise ToolInputError("document links are not set up (LENDING_PARTNER_LINK_BASE_URL)")
+            except DocumentAccessDenied:
+                raise ToolInputError("only an admin can open borrower documents")
+        message = (f"{match.display} – {label} (uploaded {uploaded_at:%b %d}). Opens for 15 minutes, only you can "
+                   f"see this message: {link.url}")
+        try:
+            self._channels.post_private(context.channel, context.user_id,
+                                        context.thread_ts if context.in_thread else None, message)
+        except Exception as exc:  # class only: Slack errors can echo the request
+            logger.warning("[cora-tools] private document link not posted (%s)", type(exc).__name__)
+            raise ToolInputError("Slack refused the private message; nothing was shared")
+        return {"sent_privately": True, "document": label, "borrower": match.display, "expires_in_minutes": 15,
+                "note": "tell the user it was sent to them privately; never write a link yourself"}
 
     def dismiss_inbox(self, args: InboxDismissInput, context: ToolContext) -> dict[str, Any]:
         with self._inbox() as session:
@@ -929,6 +1023,10 @@ class CoraToolkit:
                  self.start_document_chase, approver_only=True),
             Tool("get_document_chases", "Open document chases: what each borrower has uploaded, what is missing, "
                  "and which reminder went last and goes next.", NoInput, read, self.document_chases),
+            Tool("send_document_link", "When an admin asks to see a borrower's uploaded document: sends them, "
+                 "privately, a link that opens it for 15 minutes. If several borrowers match, it returns them so "
+                 "you can ask which one. Never guess, never repeat or invent a link.", SendDocumentLinkInput, write,
+                 self.send_document_link, approver_only=True),
             Tool("list_channels", "The Slack channels I am in, with their purpose. Someone has to invite me to a "
                  "channel before I can read or post there.", NoInput, read, self.list_channels),
             Tool("read_channel", f"Recent top-level messages in a channel I am in, bot alerts included, oldest "

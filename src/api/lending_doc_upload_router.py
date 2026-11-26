@@ -2,6 +2,12 @@
 
 GET  /api/lending/docs/{token}          the chase's checklist with one upload per document (mobile first)
 POST /api/lending/docs/{token}/upload   one file for one checklist item (multipart: item_code, document)
+GET  /api/lending/docs/view/{token}     R1 0.2: an admin's 15-minute link to view or download one stored upload
+
+R1 0.2 staff API (``Authorization: Bearer <staff token>``; admin tokens only, a caller token gets 403 everywhere):
+POST /api/lending/docs/staff/borrowers/search              {"query": ...} -> matching borrowers, masked; never guesses
+GET  /api/lending/docs/staff/borrowers/{lead_ref}/documents what each chase asked for, what arrived, upload ids
+POST /api/lending/docs/staff/documents/{upload_id}/view-link -> {"url", "expires_at"}: a 15-minute view link
 
 The token in the URL is the borrower's credential (``doc_chase_links`` keeps only its SHA-256; the full link is in
 the drafted message until sent, shown masked on the approval card). An unknown, expired or revoked link,
@@ -18,15 +24,23 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Any, Optional
 
-from fastapi import APIRouter, Depends, File, Form, Request, UploadFile
-from fastapi.responses import HTMLResponse, RedirectResponse
+from fastapi import APIRouter, Depends, File, Form, Header, HTTPException, Request, Response, UploadFile
+from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse
 from jinja2 import ChoiceLoader, Environment, FileSystemLoader
+from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
 from config.lending_partners import (
     MAX_UPLOAD_BYTES,
     RATE_LIMIT_PER_WINDOW,
     RATE_LIMIT_WINDOW_SECONDS,
+)
+from src.lending.closing.doc_access import (
+    ViewRefused,
+    document_list,
+    find_document_borrowers,
+    issue_view_link,
+    resolve_view_token,
 )
 from src.lending.closing.doc_chase import (
     UploadStorageNotConfigured,
@@ -36,7 +50,16 @@ from src.lending.closing.doc_chase import (
     upload_dir,
 )
 from src.lending.db import get_lending_db
+from src.lending.partner_service import PartnerLinkNotConfigured
 from src.lending.partners import InvalidSubmission, Upload
+from src.lending.security.rbac import (
+    TOKEN_ISSUER,
+    CallerDbRoleUnavailable,
+    DocumentAccessDenied,
+    Role,
+    assume_caller_db_role,
+)
+from src.lending.security.staff_tokens import StaffToken, token_for
 from src.services.rate_limit import enforce_or_429
 
 logger = logging.getLogger(__name__)
@@ -45,7 +68,18 @@ router = APIRouter(prefix="/api/lending/docs", tags=["lending-docs"])
 
 _LENDING_DIR = Path(__file__).resolve().parents[1] / "lending"
 RATE_LIMIT_SCOPE = "lending_doc_upload"
-_TOKEN_IN_PATH = re.compile(r"(/api/lending/docs/)[^/\s?\"]+")
+# The borrower's upload token and an admin's view token are both credentials; the staff paths carry none.
+_TOKEN_IN_PATH = re.compile(r"(/api/lending/docs/(?:view/)?)(?!staff/)[^/\s?\"]+")
+VIEW_RATE_LIMIT_SCOPE = "lending_doc_view"
+STAFF_RATE_LIMIT_SCOPE = "lending_staff_api"
+_LEAD_REF = re.compile(r"^(web_lead|lendingflow_lead|contact):(\d+)$")
+_BEARER = "bearer "
+TOO_MANY_DETAIL = "More than 10 borrowers match. Add a last name or the last 4 digits of the phone."
+_VIEW_REFUSED_MESSAGES = {
+    410: "This document link has expired. Ask Cora for a new one.",
+    403: "This document link is not valid.",
+    404: "This document is no longer available.",
+}
 
 
 def redact_upload_tokens(value: str) -> str:
@@ -93,6 +127,22 @@ def _checklist(db: Session, token: str, chase: dict[str, Any], *, errors: Option
                  max_upload_mb=MAX_UPLOAD_BYTES // (1024 * 1024))
 
 
+@router.get("/view/{token}")
+def view_document(token: str, request: Request, db: Session = Depends(get_lending_db)) -> Response:
+    enforce_or_429(request, VIEW_RATE_LIMIT_SCOPE, RATE_LIMIT_PER_WINDOW, RATE_LIMIT_WINDOW_SECONDS)
+    try:
+        found = resolve_view_token(db, token, _now())
+    except ViewRefused as refused:
+        return _page("inactive.html", status_code=refused.status, message=_VIEW_REFUSED_MESSAGES[refused.status])
+    except Exception as exc:  # class only: SQL errors embed bound parameters
+        logger.error("[doc-view] view link failed (%s)", type(exc).__name__)
+        return _page("inactive.html", status_code=404, message=_VIEW_REFUSED_MESSAGES[404])
+    return FileResponse(found.path, media_type=found.content_type, content_disposition_type="inline",
+                        filename=found.download_name,
+                        headers={"Cache-Control": "no-store, private", "X-Content-Type-Options": "nosniff",
+                                 "Referrer-Policy": "no-referrer"})
+
+
 @router.get("/{token}", response_class=HTMLResponse)
 def document_page(token: str, db: Session = Depends(get_lending_db)) -> HTMLResponse:
     chase = chase_for_token(db, token, _now())
@@ -128,3 +178,84 @@ def upload_document(token: str, request: Request, item_code: str = Form(default=
         logger.error("[doc-upload] chase %s upload failed (%s)", chase["id"], type(exc).__name__)
         return _checklist(db, token, chase, errors=["The upload didn't go through. Please try again."], status_code=500)
     return RedirectResponse(f"/api/lending/docs/{token}", status_code=303)
+
+
+# ---- R1 0.2 staff API ------------------------------------------------------------------------------------------------
+
+class BorrowerSearchIn(BaseModel):
+    query: str = Field(..., min_length=2, max_length=120)
+
+
+def staff_admin(request: Request, authorization: Optional[str] = Header(default=None),
+                db: Session = Depends(get_lending_db)) -> StaffToken:
+    """401 without a valid token; 403 for a caller token. A caller's session is switched to the lending_caller DB
+    role before the role check, so a route that forgot this dependency's check still could not read documents."""
+    enforce_or_429(request, STAFF_RATE_LIMIT_SCOPE, RATE_LIMIT_PER_WINDOW, RATE_LIMIT_WINDOW_SECONDS)
+    raw = authorization[len(_BEARER):].strip() if (authorization or "").lower().startswith(_BEARER) else ""
+    token = token_for(db, raw, _now()) if raw else None
+    if token is None:
+        raise HTTPException(status_code=401, detail="invalid or expired token", headers={"WWW-Authenticate": "Bearer"})
+    if token.role is not Role.ADMIN:
+        try:
+            assume_caller_db_role(db)
+        except CallerDbRoleUnavailable:
+            pass  # refused below either way
+        logger.warning("[staff-api] caller token %s refused %s", token.id, request.url.path)
+        raise HTTPException(status_code=403, detail="not permitted")
+    return token
+
+
+def _internal_error(db: Session, what: str, exc: Exception) -> HTTPException:
+    db.rollback()
+    logger.error("[staff-api] %s failed (%s)", what, type(exc).__name__)
+    return HTTPException(status_code=500, detail="internal error")
+
+
+@router.post("/staff/borrowers/search")
+def staff_search(body: BorrowerSearchIn, token: StaffToken = Depends(staff_admin),
+                 db: Session = Depends(get_lending_db)) -> dict[str, Any]:
+    try:
+        found = find_document_borrowers(db, body.query)
+    except Exception as exc:
+        raise _internal_error(db, "search", exc) from exc
+    result: dict[str, Any] = {"matches": [{"lead_ref": m.lead_ref, "borrower": m.display,
+                                           "chase_started": m.chase_started.isoformat(),
+                                           "uploaded_items": list(m.uploaded_items)} for m in found.matches],
+                              "too_many": found.too_many}
+    if found.too_many:
+        result["detail"] = TOO_MANY_DETAIL
+    return result
+
+
+@router.get("/staff/borrowers/{lead_ref}/documents")
+def staff_documents(lead_ref: str, token: StaffToken = Depends(staff_admin),
+                    db: Session = Depends(get_lending_db)) -> dict[str, Any]:
+    if not _LEAD_REF.match(lead_ref):
+        raise HTTPException(status_code=400, detail="lead_ref must look like web_lead:12")
+    try:
+        listed = document_list(db, lead_ref)
+    except Exception as exc:
+        raise _internal_error(db, "document list", exc) from exc
+    if listed is None:
+        raise HTTPException(status_code=404, detail="no documents for this borrower")
+    return listed
+
+
+@router.post("/staff/documents/{upload_id}/view-link", status_code=201)
+def staff_view_link(upload_id: int, token: StaffToken = Depends(staff_admin),
+                    db: Session = Depends(get_lending_db)) -> dict[str, Any]:
+    try:
+        link = issue_view_link(db, upload_id, f"{TOKEN_ISSUER}{token.id}", _now())
+        db.commit()
+    except LookupError:
+        db.rollback()
+        raise HTTPException(status_code=404, detail="no such document")
+    except DocumentAccessDenied:
+        db.rollback()
+        raise HTTPException(status_code=403, detail="not permitted")
+    except PartnerLinkNotConfigured:
+        db.rollback()
+        raise HTTPException(status_code=503, detail="document links are not configured")
+    except Exception as exc:
+        raise _internal_error(db, "view link", exc) from exc
+    return {"url": link.url, "expires_at": link.expires_at.isoformat()}

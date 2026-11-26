@@ -42,7 +42,7 @@ from __future__ import annotations
 from datetime import datetime
 from decimal import Decimal
 from enum import Enum
-from typing import Optional, Protocol, runtime_checkable
+from typing import Literal, Optional, Protocol, runtime_checkable
 from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -389,3 +389,107 @@ class LendingFlowLeadCreated(BaseModel):
 
     # T-05: the lead's GoHighLevel contact, so alerts can link straight to it. None when not yet known.
     ghl_contact_id: Optional[str] = None
+
+
+# ---------------------------------------------------------------------------
+# Release 1 item 0.1 — versioned data contracts + the 8-stage loan lifecycle
+# ---------------------------------------------------------------------------
+# Strict on purpose: no type coercion and no unknown fields, so a blank "rehab budget" can never become 0.
+# An unknown financial input is None (NULL in the database).  Webhook adapters keep only the fields they map
+# and build these models themselves; the strictness applies to our internal contracts, not to raw payloads.
+
+SCHEMA_VERSION = 1
+
+
+class LoanStage(str, Enum):
+    """The 8 loan stages, in order.  A file moves one step forward at a time (``state_machine.transition``)."""
+    INTAKE = "INTAKE"
+    FIT = "FIT"
+    SUBMITTED = "SUBMITTED"
+    ACCEPTED = "ACCEPTED"
+    TERM_SHEET_ISSUED = "TERM_SHEET_ISSUED"
+    CLOSING = "CLOSING"
+    FUNDED = "FUNDED"
+    PAID = "PAID"
+
+
+LOAN_STAGE_ORDER: tuple[LoanStage, ...] = tuple(LoanStage)
+
+
+class _Contract(BaseModel):
+    model_config = ConfigDict(strict=True, extra="forbid", frozen=True)
+
+    schema_version: Literal[1] = SCHEMA_VERSION
+
+
+class BorrowerRecord(_Contract):
+    """The persisted borrower identity (the spec's BorrowerProfile; ``BorrowerProfile`` above stays the lender-fit
+    call facts).  Matched on normalized phone first, then email (``state_machine.ingest_loan_file``)."""
+    first_name: str
+    last_name: str
+    phone: Optional[str] = Field(default=None, repr=False)
+    email: Optional[str] = Field(default=None, repr=False)
+    credit_band: Optional[str] = None
+
+
+class EntitySchema(_Contract):
+    """The borrowing LLC, matched on normalized name.  Sunbiz standing is filled by item 1.8."""
+    name: str
+    state: Optional[str] = None
+    sunbiz_status: Optional[str] = None
+
+
+class PropertySchema(_Contract):
+    """A property, matched on normalized address."""
+    address: str
+    city: Optional[str] = None
+    state: Optional[str] = None
+    zip_code: Optional[str] = None
+
+
+class LoanFile(_Contract):
+    """What an intake supplies for one loan file.  Every financial input is optional: None means unknown."""
+    source: str
+    product: str  # flip / ground_up / dscr / other
+    borrower: BorrowerRecord
+    property: PropertySchema
+    entity: Optional[EntitySchema] = None
+    loan_amount: Optional[int] = None
+    purchase_price: Optional[int] = None
+    rehab_budget: Optional[int] = None
+    arv: Optional[int] = None
+    payoff_balance: Optional[int] = None
+
+
+class LenderSubmission(_Contract):
+    """One attempt to place a file with a lender.  A re-submit to the same lender is a new attempt."""
+    loan_file_id: int
+    lender_key: str
+    attempt_no: int
+    status: str = "submitted"
+
+
+class PartnerSubmission(_Contract):
+    """The partner-door evidence for a file (maps to ``lending.partner_submissions``)."""
+    loan_file_id: int
+    partner_id: int
+    consent_checked: bool
+    consent_text: str
+    consented_at: datetime
+
+
+class ConsentRecord(_Contract):
+    """Text-message consent (maps to ``lending.text_consents``; one consent store, never a second one)."""
+    phone: str = Field(repr=False)
+    source: str
+    captured_at: datetime
+    revoked_at: Optional[datetime] = None
+    loan_file_id: Optional[int] = None
+
+
+class DocumentStipulation(_Contract):
+    """A document a file still needs (maps to ``lending.doc_chase_items``)."""
+    loan_file_id: Optional[int] = None
+    item_code: str
+    label: str
+    received_at: Optional[datetime] = None

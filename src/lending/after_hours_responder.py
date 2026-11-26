@@ -52,7 +52,7 @@ from src.lending.after_hours_conversation import (booked_message, conversations_
                                                   question_message, slot_offer_message)
 from src.lending.compliance import text_window_open
 from src.lending.consent import has_text_consent
-from src.lending.ghl_sms import GhlSendRefused, GhlSmsError
+from src.lending.ghl_sms import GhlChannelPaused, GhlSendRefused, GhlSmsError
 from src.lending.global_halt import is_globally_halted
 from src.lending.lane_guard import backflip_hit
 from src.services.email_suppression import is_email_suppressed
@@ -352,6 +352,9 @@ def _send_one(db, item: DueStep, *, text_sender: Optional[TextSender], email_sen
             message_id = email_sender(item.email, EMAIL_SUBJECT, body, phone=item.phone, first_name=item.first_name)
     except GhlSendRefused:
         return _stop(db, item, CLOSED_SEND_REFUSED, now)
+    except GhlChannelPaused:  # R1 0.4: nothing reached GHL; released for the next pass without using an attempt
+        _write(db, _RELEASE, item, send_attempts=item.send_attempts)
+        return RETRY_LATER
     except GhlSmsError as exc:
         if exc.ambiguous:
             _record_send(db, item, SEND_UNKNOWN, now, offered_slots=offered_slots)

@@ -30,6 +30,7 @@ from typing import Optional
 from config.settings import get_settings
 from src.lending import email_identity
 from src.lending.cold_leads import SendChannel
+from src.lending.dispatch import circuit_breaker
 from src.lending.ghl_sms import GhlAccount, GhlSmsError, GhlSmsSender, Request, lending_ghl_account
 
 logger = logging.getLogger(__name__)
@@ -47,6 +48,7 @@ def _as_html(body: str) -> str:
 
 class GhlEmailSender(GhlSmsSender):
     _log_prefix = "[lending-ghl-email]"
+    _breaker_channel = circuit_breaker.CHANNEL_EMAIL
 
     def __init__(self, account: GhlAccount, from_address: str, request: Optional[Request] = None) -> None:
         super().__init__(account, from_address, request)
@@ -56,6 +58,7 @@ class GhlEmailSender(GhlSmsSender):
         """Upsert the contact by email (and phone when known, so it stays one GHL contact), then send.
         Past ``deadline`` (UTC) nothing is sent and a non-ambiguous GhlSmsError is raised."""
         decision = self._cold_lead_check(phone, SendChannel.EMAIL, email=to)
+        self._admit()
         email_from, bcc = self._sender_for(to, phone)
         contact: dict = {"locationId": self._account.location_id, "email": to}
         if phone:
@@ -74,11 +77,14 @@ class GhlEmailSender(GhlSmsSender):
                          "emailFrom": email_from}
         if bcc:
             message["emailBcc"] = bcc
+        self._recheck()
         sent = self._post(self._http(), "/conversations/messages", message, "email send", version="2021-04-15",
                           is_send=True)
         message_id = sent.get("messageId") or sent.get("emailMessageId") or sent.get("id")
         if not message_id:
+            self._count_failure("no_message_id", ambiguous=True)
             raise GhlSmsError("GHL email send returned no message id", ambiguous=True)
+        self._count_success()
         return str(message_id)
 
     def _sender_for(self, to: str, phone: str | None) -> tuple[str, list[str]]:

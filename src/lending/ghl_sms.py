@@ -28,6 +28,7 @@ from typing import Any, Callable, Optional
 import requests
 
 from config.settings import get_settings
+from src.lending.dispatch import circuit_breaker
 from src.lending.cold_leads import ColdSendBlock, ColdSendDecision, SendChannel, cold_send_decision, split_cold_dnd
 from src.lending.global_halt import is_globally_halted
 from src.lending.ghl_account import GhlAccount, ghl_headers, lending_ghl_account
@@ -53,6 +54,16 @@ class GhlSmsError(RuntimeError):
     def __init__(self, message: str, *, ambiguous: bool = False) -> None:
         super().__init__(message)
         self.ambiguous = ambiguous
+
+
+class GhlChannelPaused(GhlSmsError):
+    """Nothing was sent: this channel's circuit breaker is open (five failures in a row; a person must reopen it) or it
+    already sent its per-minute cap (``rate_limited``; the next minute opens more). Never ambiguous."""
+
+    def __init__(self, cause: circuit_breaker.ChannelPaused) -> None:
+        super().__init__(str(cause))
+        self.channel = cause.channel
+        self.rate_limited = isinstance(cause, circuit_breaker.RateLimited)
 
 
 class GhlSendRefused(GhlSmsError):
@@ -82,6 +93,7 @@ def _single_attempt(method: str, url: str, **kwargs: Any) -> requests.Response:
 
 class GhlSmsSender:
     _log_prefix = "[lending-ghl-sms]"
+    _breaker_channel = circuit_breaker.CHANNEL_SMS
 
     def __init__(self, account: GhlAccount, from_number: str, request: Optional[Request] = None, *,
                  internal_alert: bool = False, sms_gate: Optional[SmsGate] = None) -> None:
@@ -94,6 +106,35 @@ class GhlSmsSender:
 
     def _http(self) -> Request:
         return self._request or _single_attempt
+
+    def _admit(self) -> None:
+        """R1 0.4: the channel's breaker and per-minute cap, before anything is sent. Alerts to the team's own phone
+        skip both, like the emergency halt."""
+        if self._internal_alert:
+            return
+        try:
+            circuit_breaker.admit(self._breaker_channel)
+        except circuit_breaker.ChannelPaused as exc:
+            logger.warning("%s send refused: %s", self._log_prefix, exc.why)
+            raise GhlChannelPaused(exc) from None
+
+    def _recheck(self) -> None:
+        """The breaker again, right before the final send request (it may have tripped during the upsert)."""
+        if self._internal_alert:
+            return
+        try:
+            circuit_breaker.recheck(self._breaker_channel)
+        except circuit_breaker.ChannelPaused as exc:
+            logger.warning("%s send refused before the request: %s", self._log_prefix, exc.why)
+            raise GhlChannelPaused(exc) from None
+
+    def _count_failure(self, error: str, *, ambiguous: bool) -> None:
+        if not self._internal_alert:
+            circuit_breaker.record_failure(self._breaker_channel, error, ambiguous=ambiguous)
+
+    def _count_success(self) -> None:
+        if not self._internal_alert:
+            circuit_breaker.record_success(self._breaker_channel)
 
     def _cold_lead_check(self, phone: Optional[str], channel: SendChannel, *,
                          email: Optional[str] = None) -> ColdSendDecision:
@@ -152,9 +193,12 @@ class GhlSmsSender:
                                      headers=ghl_headers(self._account.api_key, version), json=body)
         except Exception as exc:  # class only: the message can carry request detail
             logger.warning("%s %s request error: %s", self._log_prefix, what, type(exc).__name__)
+            self._count_failure(type(exc).__name__, ambiguous=is_send)
             raise GhlSmsError(f"GHL {what} request error ({type(exc).__name__})", ambiguous=is_send) from None
         if response.status_code >= 400:
             logger.warning("%s %s failed: HTTP %s", self._log_prefix, what, response.status_code)
+            if is_send or response.status_code >= 500:  # a bad contact on an upsert is not the channel's health
+                self._count_failure(f"HTTP {response.status_code}", ambiguous=is_send and response.status_code >= 500)
             raise GhlSmsError(f"GHL {what} failed: HTTP {response.status_code}",
                               ambiguous=is_send and response.status_code >= 500)
         try:
@@ -168,6 +212,7 @@ class GhlSmsSender:
         past it nothing is sent and a non-ambiguous GhlSmsError is raised."""
         decision = self._cold_lead_check(phone, SendChannel.SMS)
         self._line_type_check(phone)
+        self._admit()
         contact: dict[str, Any] = {"locationId": self._account.location_id, "phone": phone}
         if first_name:
             contact["firstName"] = first_name
@@ -181,12 +226,15 @@ class GhlSmsSender:
                                 decision.lift_dnd)
         if deadline is not None and datetime.now(timezone.utc) > deadline:
             raise GhlSmsError("deadline passed before send")
+        self._recheck()
         sent = self._post(self._http(), "/conversations/messages",
                           {"type": "SMS", "contactId": contact_id, "message": body, "fromNumber": self._from},
                           "message send", version="2021-04-15", is_send=True)  # conversations endpoints use this version
         message_id = sent.get("messageId") or sent.get("id")
         if not message_id:
+            self._count_failure("no_message_id", ambiguous=True)
             raise GhlSmsError("GHL message send returned no message id", ambiguous=True)
+        self._count_success()
         return str(message_id)
 
 

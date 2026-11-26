@@ -12,7 +12,7 @@ from types import SimpleNamespace
 import pytest
 from pydantic import SecretStr
 
-from packages.agent_core.relay import SendDeferred
+from packages.agent_core.relay import SendDeferred, SendHold
 from packages.agent_core.pending_actions import ActionStatus, PendingAction
 from src.lending import cora_agent
 
@@ -58,6 +58,15 @@ def test_cora_uses_her_own_slack_app_not_the_lending_app() -> None:
 def _no_real_sigterm_handler(monkeypatch):
     """main() installs a SIGTERM handler; keep it out of the test process."""
     monkeypatch.setattr(cora_agent.signal, "signal", lambda *args: None)
+
+
+@pytest.fixture(autouse=True)
+def startup_revocations(monkeypatch) -> list[frozenset]:
+    """main() revokes former approvers' document links first (R1 0.2); record it instead of touching a database."""
+    calls: list[frozenset] = []
+    monkeypatch.setattr(cora_agent, "revoke_document_links_at_start",
+                        lambda settings, approver_ids: calls.append(approver_ids) or 0)
+    return calls
 
 
 @pytest.fixture
@@ -110,9 +119,34 @@ def test_a_failing_card_check_does_not_block_startup(monkeypatch, socket_runs) -
     assert cora_agent.main(stop=stop) == 0 and len(socket_runs) == 1
 
 
-def test_main_refuses_to_start_without_approvers(monkeypatch) -> None:
+def test_main_refuses_to_start_without_approvers(monkeypatch, startup_revocations) -> None:
     monkeypatch.setattr(cora_agent, "get_settings", lambda: _settings(lending_cora_approver_user_ids=""))
     assert cora_agent.main() == 1
+    # PR #478 re-review: the sole approver removed -> Cora still revokes, with an empty list, before it exits.
+    assert startup_revocations == [frozenset()]
+
+
+def test_main_revokes_before_connecting_to_slack(monkeypatch, socket_runs, startup_revocations) -> None:
+    stop = threading.Event()
+    monkeypatch.setattr(cora_agent, "get_settings", lambda: _settings())
+    monkeypatch.setattr(cora_agent, "build_live_services",
+                        lambda settings: startup_revocations.append("services") or _services())
+    monkeypatch.setattr(cora_agent, "run_sweep", lambda services: stop.set())
+    monkeypatch.setattr(cora_agent, "SWEEP_SECONDS", 0.01)
+    assert cora_agent.main(stop=stop) == 0
+    assert startup_revocations[:2] == [frozenset({"U_JOSH"}), "services"]
+
+
+def test_startup_revocation_never_blocks_the_start(monkeypatch) -> None:
+    monkeypatch.undo()  # the real function, not the autouse stub
+
+    def database_down(engine, approver_ids):
+        def step() -> int:
+            raise RuntimeError("db down")
+        return step
+
+    monkeypatch.setattr(cora_agent, "make_doc_link_revocation", database_down)
+    assert cora_agent.revoke_document_links_at_start(_settings(), frozenset()) == 0
 
 
 def test_main_refuses_to_start_without_the_app_token(monkeypatch) -> None:
@@ -352,9 +386,9 @@ def test_suppressed_recipient_is_blocked() -> None:
     assert reason == "recipient is suppressed or marked do-not-contact"
 
 
-def test_text_without_consent_is_blocked() -> None:
+def test_text_without_consent_is_held_for_review_not_blocked() -> None:
     reason = cora_agent.make_send_check(ScriptedEngine(False, False))(_action())
-    assert reason == "no text consent on record for this number"
+    assert reason == "consent_revoked" and isinstance(reason, SendHold)
 
 
 def test_email_needs_no_text_consent_but_is_checked_for_suppression() -> None:
@@ -535,3 +569,35 @@ def test_send_check_blocks_a_reminder_of_a_closed_document_chase() -> None:
     action = replace(_action(), deal_ref="doc_chase:5")
     reason = cora_agent.make_send_check(ScriptedEngine(False), carrier_approved=True)(action)
     assert reason == "the document chase is closed" and not isinstance(reason, SendDeferred)
+
+
+def test_sweep_revokes_former_approvers_document_links_first_and_survives_a_failure() -> None:
+    """R1 0.2 (PR #478 review finding 1): Cora, which holds the current approver list, revokes each sweep."""
+    order: list[str] = []
+    parts = _SweepParts()
+    original_run = parts.run
+    parts.run = lambda: order.append("relay") or original_run()
+    cora_agent.run_sweep(_sweep_services(parts, None)._replace(doc_link_revocation=lambda: order.append("revoke") or 0))
+    assert order == ["revoke", "relay"]
+
+    def database_down() -> int:
+        raise RuntimeError("db down")
+
+    order.clear()
+    cora_agent.run_sweep(_sweep_services(parts, None)._replace(doc_link_revocation=database_down))
+    assert order == ["relay"]
+
+
+def test_tool_context_marks_requests_inside_a_thread() -> None:
+    """PR #478 review finding 2: the document tool posts into the thread only when the request was in one."""
+    from types import SimpleNamespace
+
+    from packages.agent_core.slack_session import InboundMessage
+
+    conversation = object.__new__(cora_agent.CoraConversation)
+    conversation._config = SimpleNamespace(approver_user_ids=frozenset({"U1"}))
+    top = InboundMessage(user_id="U1", channel="C", text="hi", ts="2.0", thread_ts=None, is_direct=False)
+    reply = InboundMessage(user_id="U1", channel="C", text="hi", ts="2.5", thread_ts="2.0", is_direct=False)
+    top_context, reply_context = conversation._context(top, "t1"), conversation._context(reply, "t2")
+    assert (top_context.thread_ts, top_context.in_thread) == ("2.0", False)
+    assert (reply_context.thread_ts, reply_context.in_thread) == ("2.0", True)

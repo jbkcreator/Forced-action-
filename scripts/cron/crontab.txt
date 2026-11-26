@@ -1385,4 +1385,13 @@ COUNTY_ID=hillsborough
 # reads it whenever the table holds rows, same fail-closed pattern as brokers.
 5 5 1 * * $PROJECT/scripts/cron/run.sh src.tasks.ofr_lo_load
 
+# ── R1 0.7: database backup ──────────────────────────────────
+# Nightly pg_dump of the app database to /var/backups/postgres, seven days kept (scripts/pg_backup.py, 03:20 UTC,
+# before the 04:00 scrapers). A failed run emits a cron mail (configure MAILTO and a working local mail transport). Dumps on this server do not survive losing
+# the disk; the provider's disk backups cover that. Runbook: docs/lending/lender-rules-runbook.md.
+20 3 * * * cd $PROJECT && { PYTHONPATH=. $PROJECT/.venv/bin/python scripts/pg_backup.py >> $PROJECT/logs/cron/pg_backup.log 2>&1 || { echo "Nightly PostgreSQL backup failed; see logs/cron/pg_backup.log"; exit 1; }; }
+# Restore check (weekly): restores the newest dump into a SCRATCH database and compares the audit rows. Uncomment once a
+# scratch database exists (its name must contain "test"); scripts/verify_backup_restore.py refuses anything else.
+# 50 3 * * 1 cd $PROJECT && PYTHONPATH=. $PROJECT/.venv/bin/python scripts/verify_backup_restore.py --scratch-url postgresql://USER:PASSWORD@localhost/restore_check_test >> $PROJECT/logs/cron/pg_backup_verify.log 2>&1
+
 # === END FORCED-ACTION-PLATFORM ===

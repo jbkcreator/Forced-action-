@@ -27,6 +27,7 @@ from config.lending_closing import (
     UPLOAD_LINK_PATH,
 )
 from packages.agent_core.send_gate import SendGate
+from src.lending.audit import deal_ledger
 from src.lending.closing.drafts import Recipient, chase_draft, submit_draft
 from src.lending.closing.rules import build_checklist, due_chase_day
 from src.lending.cora_inbox import add_to_inbox_safely
@@ -76,7 +77,9 @@ _MISSING = text("SELECT label FROM lending.doc_chase_items WHERE chase_id = :c A
 # Only an unambiguous match: a borrower with two deals in GHL is never guessed.
 _OPPORTUNITY = text("SELECT min(ghl_opportunity_id) FROM lending.ghl_opportunity_stage WHERE phone = :phone "
                     "HAVING count(*) = 1")
-_LOAN_FILE = text("SELECT id FROM lending.loan_files WHERE borrower_phone = :phone ORDER BY created_at DESC LIMIT 1")
+# The borrower's loan file, only when the phone names exactly one: with two deals the chase cannot tell which one it
+# is for, so it is tied to neither (and its quote is not put on the wrong deal's history).
+_LOAN_FILE = text("SELECT min(id) FROM lending.loan_files WHERE borrower_phone = :phone HAVING count(*) = 1")
 # P2.2 stores each quote's request and result in lending.instant_quotes; conditions[] carries {"code": ...}.
 _QUOTE_CONDITIONS = text("SELECT c ->> 'code' FROM lending.instant_quotes q, "
                          "jsonb_array_elements(COALESCE(q.result -> 'conditions', '[]'::jsonb)) c "
@@ -143,13 +146,16 @@ def start_chase(db, recipient: Recipient, *, lead_ref: str, accepted_by: str, le
     conditions = _quote_conditions(db, quote_id) if quote_id else []
     checklist = build_checklist(lender_key, conditions)
     phone_params = {"phone": recipient.phone}
+    loan_file = _optional(db, _LOAN_FILE, phone_params) if recipient.phone else None
     chase_id = db.execute(_INSERT_CHASE, {
         "lead_ref": lead_ref, "contact": recipient.ghl_contact_id,
         "opp": _optional(db, _OPPORTUNITY, phone_params) if recipient.phone else None,
-        "loan_file": _optional(db, _LOAN_FILE, phone_params) if recipient.phone else None,
+        "loan_file": loan_file,
         "first_name": recipient.first_name, "phone": recipient.phone, "email": recipient.email,
         "lender": lender_key, "quote": quote_id, "now": now, "by": accepted_by}).scalar_one()
     db.execute(_INSERT_ITEM, [{"c": chase_id, "code": item.code, "label": item.label} for item in checklist])
+    if quote_id and loan_file is not None:
+        deal_ledger.record_quote(db, int(loan_file), quote_id)  # R1 0.8: the quote now belongs to this file
     logger.info("[doc-chase] chase %s started (%s items, lender %s)", chase_id, len(checklist), lender_key)
     return StartedChase(chase_id, tuple(item.label for item in checklist), reused=False)
 

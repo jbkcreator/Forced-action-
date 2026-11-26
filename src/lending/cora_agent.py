@@ -39,13 +39,14 @@ from packages.agent_core.config import AgentCoreConfig, parse_user_ids
 from packages.agent_core.halt import AgentHalted, HaltSwitch
 from packages.agent_core.memory import AgentMemory
 from packages.agent_core.pending_actions import PendingAction, PendingActionQueue
-from packages.agent_core.relay import EgressExecutor, Relay, SendCheck, SendDeferred
+from packages.agent_core.relay import EgressExecutor, Relay, SendCheck, SendDeferred, SendHeld, SendHold, SendRetryLater
 from packages.agent_core.revision import DraftReviser, RevisionFailed
 from packages.agent_core.send_gate import SendGate, lane_checked_enqueue
 from packages.agent_core.slack_session import InboundMessage, SlackSession, run_socket_mode
 from packages.agent_core.store import AgentStore
 from packages.agent_core.thread_history import build_history
 from packages.agent_core.tools import ToolContext, ToolRegistry
+from src.lending.audit import deal_ledger
 from src.lending.agent_jobs.drive import google_job_folders
 from src.lending.agent_jobs.worker import JobQueueWorker, make_check, may_send_without_card
 from src.lending.attempt_log import lending_ghl_readers
@@ -67,12 +68,16 @@ from src.lending.cora_prompt import CORA_BASE_PROMPT, REVISION_PROMPT
 from src.lending.cora_tools import CoraToolkit, draft_content_check
 from src.lending.global_halt import EmergencyHalt
 from src.lending.ghl_crm import GhlCrmWriter, get_crm_writer
+from src.lending.dispatch import circuit_breaker, revalidate
+from src.lending.dispatch.resume_command import ChannelResume, first_handled
 from src.lending.ghl_email import GhlEmailSender, get_email_sender
-from src.lending.ghl_sms import GhlSmsSender, get_sender
+from src.lending.ghl_sms import GhlChannelPaused, GhlSmsError, GhlSmsSender, get_sender
 from src.lending.instantly_blocklist import BlockListSweep
 from src.lending.instantly_ghl_handoff import get_handoff
-from src.lending.instantly_client import InstantlyAccount, block_address, lending_instantly_account, send_reply
-from src.lending.instantly_email import NdlInstantlySender, get_ndl_instantly_sender
+from src.lending.instantly_client import (InstantlyAccount, InstantlyChannelPaused, InstantlyError, block_address,
+                                          lending_instantly_account, send_reply)
+from src.lending.instantly_email import (InstantlySendError, InstantlySendPaused, NdlInstantlySender,
+                                         get_ndl_instantly_sender)
 from src.lending.after_hours_responder import run_send_cycle
 from src.lending.instantly_replies import CHANNEL as INSTANTLY_CHANNEL, ReplyProcessor
 from src.lending.standing_sends import (
@@ -141,6 +146,37 @@ class CoraServices(NamedTuple):
     doc_chase: Optional[Callable[[], int]] = None  # P2.4: queues due document requests and reminders
     block_list: Optional[Callable[[], Any]] = None  # P1.3: sends queued opt-out addresses to Instantly's block list
     backflip_alerts: Optional[Callable[[], int]] = None  # queues each new Backflip block for the inbox digest
+    doc_link_revocation: Optional[Callable[[], int]] = None  # R1 0.2: revokes former approvers' document links
+    deal_ledger_sync: Optional[Callable[[], int]] = None  # R1 0.8: records card drafts, edits and approvals in the deal audit ledger
+
+
+def make_doc_link_revocation(engine: Engine, approver_ids: frozenset[str]) -> Callable[[], int]:
+    """R1 0.2: each sweep, revoke the live document links of Slack users no longer in Cora's approver list. Cora
+    holds the current list (restarted when it changes), so lending-api never relies on its own cached copy."""
+    from src.lending.closing.doc_access import revoke_links_of_removed_approvers
+
+    def step() -> int:
+        with Session(engine) as session, session.begin():
+            return revoke_links_of_removed_approvers(session, approver_ids, datetime.now(timezone.utc))
+
+    return step
+
+
+def revoke_document_links_at_start(settings: AppSettings, approver_ids: frozenset[str]) -> int:
+    """R1 0.2: revoke former approvers' document links before anything else at start. Runs before the settings check
+    on purpose: removing the only approver leaves the list empty, so Cora refuses to start and never sweeps, and an
+    empty list here revokes every live Slack-issued link. A database failure is logged and never blocks the start;
+    the sweep retries every minute once Cora runs."""
+    if not settings.database_url:
+        return 0
+    engine = create_engine(str(settings.database_url), pool_pre_ping=True, connect_args={"connect_timeout": 10})
+    try:
+        return make_doc_link_revocation(engine, approver_ids)()
+    except Exception as exc:  # class only: SQL errors embed bound parameters
+        logger.error("[cora] document link revocation at start failed (%s)", type(exc).__name__)
+        return 0
+    finally:
+        engine.dispose()
 
 
 def lending_channel_ids(settings: AppSettings) -> dict[str, str]:
@@ -227,10 +263,17 @@ def email_window_open(phone: Optional[str], *, now: Optional[datetime] = None) -
     return CALL_WINDOW_START <= local < CALL_WINDOW_END
 
 
+def _ghl_contact_reader() -> Optional[revalidate.GhlReader]:
+    """R1 0.4: the scoped GHL contact read the send check uses for ``ghl:`` cards; None while GHL is not configured."""
+    crm = get_crm_writer()
+    return crm.read_contact if crm is not None else None
+
+
 def make_send_check(engine: Engine, *, carrier_approved: bool = False,
                     text_window: Callable[[str], bool] = text_window_open,
                     email_window: Callable[[Optional[str]], bool] = email_window_open,
-                    wording_ok: Optional[Callable[..., bool]] = None) -> SendCheck:
+                    wording_ok: Optional[Callable[..., bool]] = None,
+                    ghl_reader: Optional[revalidate.GhlReader] = None) -> SendCheck:
     """Lending rule run by the relay right before a send. Returns a reason to block, or None.
 
     A text also waits for the carrier (10DLC) approval (LENDING_SMS_CARRIER_APPROVED) and for the borrower's
@@ -257,8 +300,12 @@ def make_send_check(engine: Engine, *, carrier_approved: bool = False,
                 return "recipient is suppressed or marked do-not-contact"
             if action.channel in INSTANTLY_CHANNELS and conn.execute(_EMAIL_OPTED_OUT, {"e": email}).scalar():
                 return "recipient is suppressed or marked do-not-contact"
+            changed = revalidate.changed_recipient(conn, action, sms_channels=SMS_CHANNELS,
+                                                   email_channels=EMAIL_CHANNELS, ghl_reader=ghl_reader)
+            if changed is not None:
+                return changed  # R1 0.4: the lead's phone/email was edited after approval; held, never sent
             if action.channel in SMS_CHANNELS and not (phone and has_text_consent(conn, phone)):
-                return "no text consent on record for this number"
+                return SendHold(revalidate.HOLD_CONSENT_REVOKED)  # R1 0.4: consent revoked while queued; held for review
             if auto_approval_lapsed(conn, action.decided_by, action.payload.get("template_version"),
                                     channel=action.channel):
                 # P1.4: its template was revoked after the automatic approval. Held, never sent; the next sweep
@@ -283,6 +330,28 @@ def make_send_check(engine: Engine, *, carrier_approved: bool = False,
         return None
 
     return check
+
+
+def breaker_aware(executor: EgressExecutor) -> EgressExecutor:
+    """R1 0.4: an approval-card send through a channel breaker and rate limit. A tripped breaker holds the card for
+    review; the per-minute cap releases it for the next sweep (the drip); a send whose outcome is unknown (timeout,
+    5xx, no message id) is held, never retried. Cards leave ``LIVE_REPLY_RESERVE`` slots free for live replies."""
+
+    def send(payload: Mapping[str, Any]) -> Optional[str]:
+        with circuit_breaker.card_sends():
+            try:
+                return executor(payload)
+            except (GhlChannelPaused, InstantlyChannelPaused, InstantlySendPaused) as exc:
+                if exc.rate_limited:
+                    raise SendRetryLater() from None
+                raise SendHeld(circuit_breaker.HELD_BREAKER_OPEN, str(exc)) from None
+            except (GhlSmsError, InstantlyError, InstantlySendError) as exc:
+                if exc.ambiguous:
+                    raise SendHeld(revalidate.HOLD_UNCERTAIN_OUTCOME,
+                                   f"{type(exc).__name__}: the send may or may not have gone out") from None
+                raise
+
+    return send
 
 
 def email_executor(sender: GhlEmailSender) -> EgressExecutor:
@@ -345,17 +414,17 @@ def build_egress_executors() -> dict[str, EgressExecutor]:
     if email_sender is None:
         logger.warning("[cora] GHL email sender not configured; approved emails will not be sent")
     else:
-        executors["ghl_email"] = email_executor(email_sender)
+        executors["ghl_email"] = breaker_aware(email_executor(email_sender))
     sms_sender = get_sender()
     if sms_sender is None:
         logger.warning("[cora] GHL SMS sender not configured; approved texts will not be sent")
     else:
-        executors["ghl_sms"] = sms_executor(sms_sender)
+        executors["ghl_sms"] = breaker_aware(sms_executor(sms_sender))
     instantly = lending_instantly_account()
     if instantly is None:
         logger.warning("[cora] NDL Instantly account not configured; approved Instantly answers will not be sent")
     else:
-        executors[INSTANTLY_CHANNEL] = instantly_executor(instantly)
+        executors[INSTANTLY_CHANNEL] = breaker_aware(instantly_executor(instantly))
     crm = get_crm_writer()
     if crm is None:
         logger.warning("[cora] GHL account not configured; approved stage moves, tags, notes and tasks will not apply")
@@ -365,7 +434,7 @@ def build_egress_executors() -> dict[str, EgressExecutor]:
     if cold is None:
         logger.warning("[cora] NDL Instantly cold-email campaign not configured; approved cold emails will not be sent")
     else:
-        executors[COLD_EMAIL_CHANNEL] = cold_email_executor(cold)
+        executors[COLD_EMAIL_CHANNEL] = breaker_aware(cold_email_executor(cold))
     return executors
 
 
@@ -431,7 +500,8 @@ class CoraConversation:
 
     def _context(self, message: InboundMessage, tool_use_id: str) -> ToolContext:
         return ToolContext(user_id=message.user_id, is_approver=message.user_id in self._config.approver_user_ids,
-                           channel=message.channel, thread_ts=message.conversation_ts, tool_use_id=tool_use_id)
+                           channel=message.channel, thread_ts=message.conversation_ts, tool_use_id=tool_use_id,
+                           in_thread=message.thread_ts is not None)
 
     def _conversation_so_far(self, message: InboundMessage) -> list[dict[str, Any]]:
         """Inside a thread: that thread. Top level: only the channel's last few messages from the past hour.
@@ -532,8 +602,10 @@ def build_session(config: AgentCoreConfig, store: AgentStore, chat: ChatPort, bo
     session = SlackSession(config=config, chat=chat, queue=queue, halt=halt, relay=relay,
                            on_message=conversation.on_message, on_revision=conversation.on_revision,
                            bot_user_id=bot_user_id,
-                           command_hook=EmergencyHalt(chat=chat, cora_halt=halt, approver_ids=config.approver_user_ids,
-                                                      alert_channel=config.slack_channel_id),
+                           command_hook=first_handled(
+                               EmergencyHalt(chat=chat, cora_halt=halt, approver_ids=config.approver_user_ids,
+                                             alert_channel=config.slack_channel_id),
+                               ChannelResume(chat=chat, approver_ids=config.approver_user_ids)),
                            extension=extension)
     return CoraServices(session, relay, gate, queue=queue)
 
@@ -547,6 +619,11 @@ def run_sweep(services: CoraServices) -> None:
     expired = services.session.expire_stale_actions()
     if expired:
         logger.info("[cora] expired %s stale draft(s)", expired)
+    if services.doc_link_revocation is not None:
+        try:
+            services.doc_link_revocation()
+        except Exception as exc:  # class only: SQL errors embed bound parameters; retried next sweep
+            logger.error("[cora] document link revocation failed (%s); retrying next sweep", type(exc).__name__)
     if services.instantly_replies is not None:
         try:
             replies = services.instantly_replies()
@@ -583,6 +660,11 @@ def run_sweep(services: CoraServices) -> None:
             step()
         except Exception as exc:  # class only: SQL errors embed bound parameters; never skip the sends below
             logger.error("[cora] %s failed (%s); retrying next sweep", name, type(exc).__name__)
+    if services.deal_ledger_sync is not None:
+        try:
+            services.deal_ledger_sync()
+        except Exception as exc:  # class only; the events are found again next sweep (each has a dedupe key)
+            logger.error("[cora] deal ledger catch-up failed (%s); retrying next sweep", type(exc).__name__)
     if services.block_list is not None:
         try:
             services.block_list()
@@ -619,8 +701,13 @@ def run_sweep(services: CoraServices) -> None:
         result = relay.run()
     except AgentHalted:
         return
-    if result.sent or result.failed or result.blocked:
-        logger.info("[cora] relay sweep sent=%s failed=%s blocked=%s", result.sent, result.failed, result.blocked)
+    if result.sent or result.failed or result.blocked or result.held:
+        logger.info("[cora] relay sweep sent=%s failed=%s blocked=%s held=%s", result.sent, result.failed,
+                    result.blocked, result.held)
+    try:
+        services.session.mark_held_cards()
+    except Exception as exc:  # class only: a card that cannot be updated is updated next sweep
+        logger.error("[cora] held card update failed (%s); retrying next sweep", type(exc).__name__)
 
 
 def missing_settings(config: AgentCoreConfig) -> list[str]:
@@ -683,7 +770,8 @@ def build_live_services(settings: AppSettings) -> Optional[CoraServices]:
                              bot_user_id, messages_client=messages_client, send_check=make_send_check(
                                  engine, carrier_approved=settings.lending_sms_carrier_approved,
                                  wording_ok=make_wording_ok(engine)
-                                 if settings.lending_graduated_approved_wording_only else None),
+                                 if settings.lending_graduated_approved_wording_only else None,
+                                 ghl_reader=_ghl_contact_reader()),
                              toolkit_factory=toolkit_factory, inbox_context=make_inbox_context(engine),
                              executors=build_egress_executors(), extension=RoutingSlack(web),
                              record_edits=True)
@@ -699,9 +787,11 @@ def build_live_services(settings: AppSettings) -> Optional[CoraServices]:
                                                                       services.gate),
                              agent_jobs=worker.run_once if worker is not None else None,
                              standing_sends=make_standing_sends_step(engine),
+                             deal_ledger_sync=make_deal_ledger_step(engine),
                              closing_blockers=closing_blockers, doc_chase=doc_chase,
                              block_list=BlockListSweep(engine),
-                             after_hours_responder=run_send_cycle)
+                             after_hours_responder=run_send_cycle,
+                             doc_link_revocation=make_doc_link_revocation(engine, config.approver_user_ids))
 
 
 def build_closing_steps(settings: AppSettings, *, engine: Engine, chat: ChatPort, gate: SendGate,
@@ -765,6 +855,19 @@ def build_closing_steps(settings: AppSettings, *, engine: Engine, chat: ChatPort
             chase_sweep if settings.lending_doc_chase_enabled else None)
 
 
+def make_deal_ledger_step(engine: Engine) -> Callable[[], int]:
+    """R1 0.8 sweep step: ledger the drafts, approvals and edits of cards that belong to a loan file, on its own
+    transaction. Idempotent, so a missed minute is caught up by the next."""
+
+    def step() -> int:
+        with Session(engine) as db:
+            added = deal_ledger.sync_card_events(db)
+            db.commit()
+            return added
+
+    return step
+
+
 def make_standing_sends_step(engine: Engine) -> Callable[[], Any]:
     """P1.4 sweep step: record any card edit the revise handler missed, then graduate templates that meet the rule.
     Incremental (only drafts decided or revised since the last run), with a full pass at start and once a day."""
@@ -824,6 +927,7 @@ def main(stop: Optional[threading.Event] = None) -> int:
         signal.signal(signum, lambda *_: stop.set())
     settings = get_settings()
     config = build_config(settings)
+    revoke_document_links_at_start(settings, config.approver_user_ids)
     missing = missing_settings(config)
     if missing:
         logger.error("[cora] not starting; missing settings: %s", ", ".join(missing))

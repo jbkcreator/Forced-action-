@@ -50,14 +50,14 @@ _COLD_EMAILS = text("""
            count(*) FILTER (WHERE COALESCE(executed_at, created_at) > :window_since) AS in_window
       FROM lending.pending_actions
      WHERE channel = :channel AND recipient_email = :e
-       AND status IN ('pending', 'revising', 'approved', 'sending', 'sent')
+       AND status IN ('pending', 'revising', 'approved', 'sending', 'sent', 'held')
 """)
 
 # Messages Cora sent (or holds for a decision) to this GHL contact in the window, Deal Drops left out.
 _PARTNER_MESSAGES = text("""
     SELECT count(*) FROM lending.pending_actions
      WHERE contact_ref = :contact_ref AND channel IN :channels
-       AND status IN ('pending', 'revising', 'approved', 'sending', 'sent')
+       AND status IN ('pending', 'revising', 'approved', 'sending', 'sent', 'held')
        AND COALESCE(executed_at, created_at) > :since
        AND lower(COALESCE(payload->>'template_version', '')) NOT LIKE :deal_drop
 """).bindparams(bindparam("channels", expanding=True))

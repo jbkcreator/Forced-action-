@@ -18,7 +18,9 @@ on `lending-api`, settings and copy in `config/lending_closing.py`. Both parts r
 4. The upload folder holds borrowers' financial documents: folder `0700`, files `0600`, never served by nginx,
    never sent to Slack. Include it in the server backup. There is no automatic deletion yet: it is built once Josh
    sets the retention period.
-5. So Josh can open them: `LENDING_DOC_UPLOAD_DRIVE_FOLDER_ID` = the id of a **new Shared Drive** "NDL Borrower
+5. R1 0.2: in the app, an admin opens an upload through a 15-minute link (Cora's `send_document_link`, or the
+   staff API); callers cannot open any. See `docs/lending/document-access.md`. The Drive copy below stays as is.
+6. So Josh can open them: `LENDING_DOC_UPLOAD_DRIVE_FOLDER_ID` = the id of a **new Shared Drive** "NDL Borrower
    Documents" whose only members are Josh (Manager), whoever he names, and the lending service account
    (`fa-lending-engine@forcedaction.iam.gserviceaccount.com`, Content manager). Not a folder inside NDL Cora (every
    member of that drive sees it) and not Josh's My Drive (a service account has no storage of its own, so uploads

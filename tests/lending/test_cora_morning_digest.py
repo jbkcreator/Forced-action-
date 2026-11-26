@@ -249,18 +249,20 @@ def test_an_empty_morning_says_so() -> None:
 
 
 def test_sweep_posts_the_digest_and_still_sends_when_it_fails() -> None:
+    from packages.agent_core.relay import RelayResult
+
     calls = []
 
     class Relay:
         def run(self):
             calls.append("relay")
-            return type("R", (), {"sent": (), "failed": (), "blocked": ()})()
+            return RelayResult(sent=(), failed=(), blocked=(), not_claimed=())
 
     def broken_digest():
         calls.append("digest")
         raise RuntimeError("slack down")
 
-    session = type("S", (), {"expire_stale_actions": lambda self: 0})()
+    session = type("S", (), {"expire_stale_actions": lambda self: 0, "mark_held_cards": lambda self: 0})()
     gate = type("G", (), {"retry_missing_cards": lambda self: 0})()
     cora_agent.run_sweep(cora_agent.CoraServices(session=session, relay=Relay(), gate=gate,
                                                  morning_digest=broken_digest))

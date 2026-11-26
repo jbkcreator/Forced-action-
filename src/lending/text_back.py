@@ -23,7 +23,7 @@ from config.lending_text_back import (
 )
 from src.lending.compliance import phone_hash
 from src.lending.consent import has_text_consent
-from src.lending.ghl_sms import GhlSmsError
+from src.lending.ghl_sms import GhlChannelPaused, GhlSmsError
 
 logger = logging.getLogger(__name__)
 
@@ -265,6 +265,11 @@ def _decide_and_send(db, item: PendingText, *, sender: Optional[TextSender], ena
                 try:
                     message_id = sender(item.phone, body, first_name_of(item.borrower_name),
                                         deadline=item.ended_at + timedelta(seconds=MAX_LATE_SECONDS))
+                except GhlChannelPaused:
+                    # R1 0.4: nothing reached GHL. Back to pending: the next poll tries again, and the 60 s window
+                    # still applies (a late event is skipped as before), so a pause never drops a text still in time.
+                    _record(db, item.event_id, "pending")
+                    return "deferred_channel_paused"
                 except GhlSmsError as exc:
                     outcome = "send_unknown" if exc.ambiguous else "failed"
                 else:

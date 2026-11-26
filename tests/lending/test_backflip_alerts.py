@@ -71,8 +71,8 @@ def _services(calls, *, alerts_fail=False):
         return 0
 
     return CoraServices(
-        session=SimpleNamespace(expire_stale_actions=lambda: 0),
-        relay=SimpleNamespace(run=lambda: SimpleNamespace(sent=0, failed=0, blocked=0)),
+        session=SimpleNamespace(expire_stale_actions=lambda: 0, mark_held_cards=lambda: 0),
+        relay=SimpleNamespace(run=lambda: SimpleNamespace(sent=0, failed=0, blocked=0, held=())),
         gate=SimpleNamespace(retry_missing_cards=lambda: 0),
         inbox_digest=digest, backflip_alerts=alerts)
 
