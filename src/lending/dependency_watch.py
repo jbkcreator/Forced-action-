@@ -113,6 +113,29 @@ def lendingflow_silence(last_delivery: Optional[datetime], now: datetime) -> Opt
             f"{last_delivery.astimezone(ZoneInfo(BUSINESS_TZ)):%a %H:%M} ET)")
 
 
+SOURCE_LENDINGFLOW = "lendingflow"
+SOURCE_PR_MATURITY = "pr_maturity"  # the PropertyRadar pool the bridge stages
+
+
+def lead_source_offline_reasons(db, now: datetime, *, lendingflow_on: bool) -> dict[str, str]:
+    """Why a lead source is offline right now (source -> reason), for 1.6's queue post (``SourceCount``): a source
+    listed here is broken, not dry. Read-only."""
+    from src.lending.pool_source import propertyradar_staleness
+
+    reasons: dict[str, str] = {}
+    stale = propertyradar_staleness(db, now)
+    if stale is not None:
+        reasons[SOURCE_PR_MATURITY] = (f"PropertyRadar data {stale.age_hours} h old" if stale.age_hours is not None
+                                       else "no successful PropertyRadar pull")
+    if lendingflow_on:
+        row = dh.read_rows(db, [FEED_LENDINGFLOW_INBOUND]).get(FEED_LENDINGFLOW_INBOUND)
+        last = row.last_success_at if row else db.execute(_LAST_LENDINGFLOW_LEAD).scalar()
+        silence = lendingflow_silence(last, now)
+        if silence:
+            reasons[SOURCE_LENDINGFLOW] = f"LendingFlow silent: {silence}"
+    return reasons
+
+
 def start_message(key: str, detail: str, channels: set[str], *, enforce: bool) -> str:
     if key == KEY_LENDINGFLOW_SILENCE:
         return (f":warning: LendingFlow may be down: {detail}. Check with LendingFlow; the 2 AM reconcile recovers "
