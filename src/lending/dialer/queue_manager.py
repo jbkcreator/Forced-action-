@@ -39,7 +39,7 @@ _POOL_PHONES = text(
     "SELECT pool, phone FROM lending.dialer_load_records WHERE active AND pool IN :pools AND phone IS NOT NULL"
 ).bindparams(bindparam("pools", expanding=True))
 _POOL_RECENT_LOADS = text(
-    "SELECT pool, count(*) AS n FROM lending.dialer_load_records WHERE created_at >= :since GROUP BY pool")
+    "SELECT pool, count(*) AS n FROM lending.dialer_load_records WHERE loaded_at >= :since GROUP BY pool")
 
 
 @dataclass(frozen=True)
@@ -49,7 +49,8 @@ class SourceCount:
     eligible: int
     blocked: Mapping[str, int]  # reason -> count
     available: bool = True
-    staged: int = 0  # PropertyRadar records staged for the 9:05 ET autoload (pools only)
+    staged: int = 0  # PropertyRadar records staged for the 9:05 ET autoload that are not already loaded (pools only)
+    staged_known: bool = True  # False when the staged records could not be read: the pool is then never called dry
     in_use: bool = True  # pools: an active row, a load in the last IN_USE_DAYS, or staged records
 
     @property
@@ -58,7 +59,8 @@ class SourceCount:
 
     @property
     def dry(self) -> bool:
-        return self.is_pool and self.available and self.in_use and self.eligible == 0 and self.staged == 0
+        return (self.is_pool and self.available and self.in_use and self.staged_known
+                and self.eligible == 0 and self.staged == 0)
 
 
 @dataclass(frozen=True)
@@ -87,11 +89,15 @@ def compliance_blocks(db: Session, phones: list[str], now: datetime) -> dict[str
         return {}
     # shortcut: dial_blocks reports one reason per phone, so a phone at the 24h cap that is also out of attempts
     # reads as eligible. on_attempt_recorded deactivates exhausted phones, so this is rare; upgrade if it is not.
-    blocks = {p: r.value for p, r in compliance.dial_blocks(db, phones, now=now).items()
+    blocks = {p: r.value for p, r in compliance.dial_blocks(db, phones, now=now, check_scrub=False).items()
               if r.value not in TRANSIENT_BLOCKS}
-    unscrubbed = [p for p, reason in blocks.items() if reason == ReasonCode.NO_FRESH_SCRUB.value]
-    for phone in compliance.lendingflow_lead_phones(db, unscrubbed) if unscrubbed else ():
-        del blocks[phone]
+    # dial_blocks checks the call window before the scrub, and at 6 AM every phone is outside the window, so the
+    # scrub is asked for separately.
+    unscrubbed = compliance._stale_scrub_phones(db, phones, now)
+    if unscrubbed:
+        unscrubbed -= compliance.lendingflow_lead_phones(db, sorted(unscrubbed))
+    for phone in unscrubbed:
+        blocks.setdefault(phone, ReasonCode.NO_FRESH_SCRUB.value)
     for phone in compliance.suppressed_phones(db, phones):
         blocks.setdefault(phone, SUPPRESSED)
     for phone, reason in compliance.scrub_verdict_blocks(db, phones).items():
@@ -148,13 +154,16 @@ def _recent_loads(db: Session, now: datetime) -> Optional[Mapping[str, int]]:
         return None
 
 
-def _staged_by_pool(db: Session) -> Mapping[str, int]:
+def _staged_by_pool(db: Session, loaded: set[str]) -> Optional[Mapping[str, int]]:
+    """Staged records per pool that the 9:05 autoload could still load: it loads phones not already loaded only.
+    None when they could not be read. The autoload's other gates run at load time, so this is an upper bound."""
     try:
         with db.begin_nested():
-            return Counter(r["pool"] for r in staged_pr_records(db))
+            records = staged_pr_records(db)
     except Exception as exc:
         logger.warning("[queue-check] staged records not available (%s)", type(exc).__name__)
-        return {}
+        return None
+    return Counter(r["pool"] for r in records if normalize(r.get("phone")) and normalize(r.get("phone")) not in loaded)
 
 
 def read_queue(db: Session, now: datetime, *, lead_days: int, blocks: Blocks = compliance_blocks,
@@ -167,7 +176,7 @@ def read_queue(db: Session, now: datetime, *, lead_days: int, blocks: Blocks = c
         seen.update(fresh)
         kept[source] = fresh
     blocked_by_phone = blocks(db, sorted(seen), now) if seen else {}
-    recent, staged = _recent_loads(db, now), _staged_by_pool(db)
+    recent, staged = _recent_loads(db, now), _staged_by_pool(db, seen)
 
     sources = []
     for source in QUEUE_SOURCES:
@@ -176,7 +185,8 @@ def read_queue(db: Session, now: datetime, *, lead_days: int, blocks: Blocks = c
         count = dict(source=source, loaded=len(phones), eligible=len(phones) - sum(reasons.values()),
                      blocked=dict(reasons), available=found.get(source) is not None)
         if source in POOLS:
-            count["staged"] = staged.get(source, 0)
+            count["staged"] = (staged or {}).get(source, 0)
+            count["staged_known"] = staged is not None
             count["in_use"] = bool(phones or count["staged"] or (recent or {}).get(source))
         sources.append(SourceCount(**count))
     return QueueReport(day=now.date(), target=target, sources=tuple(sources))
@@ -190,7 +200,9 @@ def _line(s: SourceCount) -> str:
         top = Counter(s.blocked).most_common(_REASONS_SHOWN)
         parts.append("blocked: " + ", ".join(f"{n} {reason}" for reason, n in top))
     if s.staged:
-        parts.append(f"+{s.staged} load at 9:05")
+        parts.append(f"+{s.staged} may load at 9:05")
+    if s.is_pool and not s.staged_known:
+        parts.append("staged count not available")
     if s.dry:
         parts.append("DRY")
     elif s.is_pool and not s.in_use:
@@ -200,7 +212,9 @@ def _line(s: SourceCount) -> str:
 
 def render_queue_post(report: QueueReport) -> str:
     total = report.eligible_total
-    if total == 0:
+    if not any(s.available for s in report.sources):
+        headline = ":warning: Dialer queue could not be read; no count today"
+    elif total == 0:
         headline = ":no_entry: No eligible work today"
     elif report.short:
         headline = f":warning: Only {total} of {report.target} eligible — replenish:"

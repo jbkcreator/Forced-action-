@@ -32,8 +32,12 @@ Read-only. It counts, alerts, and pushes nothing to BatchDialer; the loaders (`l
 - **Dry** applies to dialer pools only: the pool had a load in the last 14 days (or has active rows), has nothing
   eligible, and has nothing staged for the 9:05 PropertyRadar load. A pool with no recent loads shows "not in use".
   Callbacks and new leads are never dry (zero is a normal day).
+- **Staged for 9:05** ("+N may load at 9:05") counts the PropertyRadar records staged for the autoload whose phone is not
+  already loaded. The autoload's other gates run at load time, so this is an upper bound; the 9:05 run can load fewer.
+  If the staged records cannot be read, no pool is called dry.
 - **Not available** means a source could not be read. It is never reported as dry, and the total is built from the
   sources that did read. The two lead sources share one read, so one failure marks both.
+- If no source can be read the headline says so instead of "No eligible work today".
 - If the whole check fails, ops gets a notice and no count is posted.
 
 **0.6 reuse.** `read_queue(db, now, lead_days=...)` returns a `QueueReport`; 0.6's outage case should call it rather than

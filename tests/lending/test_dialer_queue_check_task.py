@@ -91,3 +91,8 @@ def test_unset_channel_is_reported_and_nothing_posts(run, monkeypatch):
     run.channel = ""
     assert task.main([], now=TUE_6_10) == 1
     assert run.unset == ["David's dialer queue check"] and run.reads == 0
+
+
+def test_dry_run_failure_does_not_ping_ops(run):
+    run.report = RuntimeError("boom")
+    assert run.go(TUE_6_10, ["--dry-run"]) == 1 and run.ops == []

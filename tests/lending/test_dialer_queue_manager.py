@@ -31,7 +31,7 @@ _DDL = (
     " completed_projects_3y TEXT, received_at TIMESTAMP, handled_in_ghl_at TIMESTAMP, ghl_status TEXT,"
     " suppressed BOOLEAN NOT NULL DEFAULT 0, is_test BOOLEAN NOT NULL DEFAULT 0)",
     "CREATE TABLE lending.dialer_load_records (id INTEGER PRIMARY KEY, pool TEXT, phone TEXT, borrower_name TEXT,"
-    " entity_name TEXT, active BOOLEAN, created_at TIMESTAMP)",
+    " entity_name TEXT, active BOOLEAN, loaded_at TIMESTAMP)",
 )
 
 
@@ -57,7 +57,7 @@ def db():
 
 
 def _pool(db, pool, phone, *, active=True, created=RECENT):
-    db.execute(text("INSERT INTO lending.dialer_load_records (pool, phone, active, created_at)"
+    db.execute(text("INSERT INTO lending.dialer_load_records (pool, phone, active, loaded_at)"
                     " VALUES (:pool, :phone, :active, :created)"),
                {"pool": pool, "phone": phone, "active": active, "created": created})
 
@@ -139,34 +139,45 @@ def test_full_queue_headline(db):
     assert render_queue_post(report).startswith("Dialer queue ready: 50 eligible")
 
 
+def _patch_compliance(monkeypatch, *, dial=None, stale=(), lendingflow=(), suppressed=(), verdicts=None):
+    from src.lending import compliance
+    calls = []
+
+    def dial_blocks(db, phones, now=None, check_scrub=True):
+        calls.append(check_scrub)
+        return dict(dial or {})
+
+    monkeypatch.setattr(compliance, "dial_blocks", dial_blocks)
+    monkeypatch.setattr(compliance, "_stale_scrub_phones", lambda db, phones, now: set(stale) & set(phones))
+    monkeypatch.setattr(compliance, "lendingflow_lead_phones", lambda db, phones: set(lendingflow) & set(phones))
+    monkeypatch.setattr(compliance, "suppressed_phones", lambda db, phones: set(suppressed))
+    monkeypatch.setattr(compliance, "scrub_verdict_blocks", lambda db, phones: dict(verdicts or {}))
+    return calls
+
+
 def test_call_window_and_daily_cap_do_not_count_as_ineligible(monkeypatch):
     from config.lending_compliance import ReasonCode as R
-    from src.lending import compliance
-    monkeypatch.setattr(compliance, "dial_blocks", lambda db, phones, now=None: {
-        "p1": R.OUTSIDE_CALL_WINDOW, "p2": R.ATTEMPT_CAP_REACHED, "p3": R.NO_FRESH_SCRUB})
-    monkeypatch.setattr(compliance, "suppressed_phones", lambda db, phones: set())
-    monkeypatch.setattr(compliance, "scrub_verdict_blocks", lambda db, phones: {})
-    monkeypatch.setattr(compliance, "lendingflow_lead_phones", lambda db, phones: set())
+    _patch_compliance(monkeypatch, dial={"p1": R.OUTSIDE_CALL_WINDOW, "p2": R.ATTEMPT_CAP_REACHED}, stale={"p3"})
     assert compliance_blocks(None, ["p1", "p2", "p3"], NOW) == {"p3": "NO_FRESH_SCRUB"}
 
 
-def test_lendingflow_lead_without_scrub_is_eligible(monkeypatch):
+def test_stale_scrub_counts_at_6_am_even_though_the_call_window_is_closed(monkeypatch):
+    # dial_blocks reports one reason per phone and checks the window before the scrub, so at 6 AM it would hide a
+    # stale scrub behind OUTSIDE_CALL_WINDOW. The scrub is therefore asked for separately.
     from config.lending_compliance import ReasonCode as R
-    from src.lending import compliance
-    monkeypatch.setattr(compliance, "dial_blocks", lambda db, phones, now=None: {
-        "p_lf": R.NO_FRESH_SCRUB, "p_cold": R.NO_FRESH_SCRUB})
-    monkeypatch.setattr(compliance, "suppressed_phones", lambda db, phones: set())
-    monkeypatch.setattr(compliance, "scrub_verdict_blocks", lambda db, phones: {})
-    monkeypatch.setattr(compliance, "lendingflow_lead_phones", lambda db, phones: {"p_lf"})
+    calls = _patch_compliance(monkeypatch, dial={"p1": R.OUTSIDE_CALL_WINDOW}, stale={"p1"})
+    assert compliance_blocks(None, ["p1"], NOW) == {"p1": "NO_FRESH_SCRUB"}
+    assert calls == [False]
+
+
+def test_lendingflow_lead_without_scrub_is_eligible(monkeypatch):
+    _patch_compliance(monkeypatch, stale={"p_lf", "p_cold"}, lendingflow={"p_lf"})
     assert compliance_blocks(None, ["p_lf", "p_cold"], NOW) == {"p_cold": "NO_FRESH_SCRUB"}
 
 
 def test_suppression_and_stored_verdict_block_even_when_dial_blocks_is_clear(monkeypatch):
     from config.lending_compliance import ReasonCode as R
-    from src.lending import compliance
-    monkeypatch.setattr(compliance, "dial_blocks", lambda db, phones, now=None: {})
-    monkeypatch.setattr(compliance, "suppressed_phones", lambda db, phones: {"p1"})
-    monkeypatch.setattr(compliance, "scrub_verdict_blocks", lambda db, phones: {"p2": R.LITIGATOR})
+    _patch_compliance(monkeypatch, suppressed={"p1"}, verdicts={"p2": R.LITIGATOR})
     assert compliance_blocks(None, ["p1", "p2"], NOW) == {"p1": "SUPPRESSED", "p2": "LITIGATOR"}
 
 
@@ -186,10 +197,44 @@ def test_pool_with_no_recent_loads_is_not_in_use_not_dry(db):
 
 def test_pool_with_staged_records_is_loading_not_dry(db, monkeypatch):
     _pool(db, "transaction_ready", "+17275550001", active=False)
-    monkeypatch.setattr(queue_manager, "staged_pr_records", lambda db: [{"pool": "transaction_ready"}] * 5)
+    monkeypatch.setattr(queue_manager, "staged_pr_records", lambda db: [
+        {"pool": "transaction_ready", "phone": f"+172755500{n:02d}"} for n in range(5)])
     report = _read(db)
     assert _counts(report)["transaction_ready"].staged == 5 and "transaction_ready" not in report.dry_sources
-    assert "+5 load at 9:05" in render_queue_post(report)
+    assert "+5 may load at 9:05" in render_queue_post(report)
+
+
+def test_staged_phone_already_loaded_is_not_counted(db, monkeypatch):
+    _pool(db, "wholesalers", "+17275550001")  # the autoload loads phones not already loaded only
+    monkeypatch.setattr(queue_manager, "staged_pr_records", lambda db: [
+        {"pool": "transaction_ready", "phone": "+17275550001"}, {"pool": "transaction_ready", "phone": "+17275550002"}])
+    assert _counts(_read(db))["transaction_ready"].staged == 1
+
+
+def test_pool_whose_only_staged_phones_are_already_loaded_is_still_dry(db, monkeypatch):
+    _pool(db, "wholesalers", "+17275550001")
+    _pool(db, "transaction_ready", "+17275550009", active=False)
+    monkeypatch.setattr(queue_manager, "staged_pr_records", lambda db: [
+        {"pool": "transaction_ready", "phone": "+17275550001"}])
+    assert "transaction_ready" in _read(db).dry_sources
+
+
+# ---- F4: honest headlines when reads fail ----
+
+def test_nothing_readable_does_not_claim_no_work():
+    report = QueueReport(day=date(2026, 11, 25), target=50, sources=tuple(
+        SourceCount(s, 0, 0, {}, available=False) for s in ("callbacks", "wholesalers")))
+    assert render_queue_post(report).startswith(":warning: Dialer queue could not be read")
+
+
+def test_unreadable_staged_records_mean_no_pool_is_called_dry(db, monkeypatch):
+    def boom(db):
+        raise RuntimeError("no staging table")
+    _pool(db, "builders", "+17275550001", active=False)
+    monkeypatch.setattr(queue_manager, "staged_pr_records", boom)
+    report = _read(db)
+    assert "builders" not in report.dry_sources and not _counts(report)["builders"].staged_known
+    assert "staged count not available" in render_queue_post(report)
 
 
 def test_zero_callbacks_is_never_dry(db):

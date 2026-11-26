@@ -119,3 +119,8 @@ def test_unreadable_database_alerts_ops_instead_of_posting(run):
     run.card = RuntimeError("db down")
     assert run.go() == 1
     assert run.client.posts == [] and len(run.ops) == 1 and "RuntimeError" in run.ops[0]
+
+
+def test_dry_run_failure_does_not_ping_ops(run):
+    run.card = RuntimeError("db down")
+    assert run.go(TUE_2_10, ["--dry-run"]) == 1 and run.ops == []

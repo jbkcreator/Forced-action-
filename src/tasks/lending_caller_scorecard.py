@@ -70,8 +70,9 @@ def main(argv=None, *, now: Optional[datetime] = None, client: Any = None) -> in
             card = build_scorecard(db, now_et.date(), agent_id=agent_id, as_of=now)
     except Exception as exc:  # class only: SQL errors embed bound parameters
         logger.error("[scorecard] could not build the scorecard (%s)", type(exc).__name__)
-        post_ops_notice(f":rotating_light: David's 2:45 PM scorecard could not be built ({type(exc).__name__}). "
-                        "Nothing was posted; see the lending logs.")
+        if not args.dry_run:  # a dry run sends nothing
+            post_ops_notice(f":rotating_light: David's 2:45 PM scorecard could not be built ({type(exc).__name__}). "
+                            "Nothing was posted; see the lending logs.")
         return 1
     blocks, notes = render_scorecard(card), render_notes_thread(card)
     if args.dry_run:

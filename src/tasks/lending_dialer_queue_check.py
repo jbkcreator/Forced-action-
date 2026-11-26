@@ -67,8 +67,9 @@ def main(argv=None, *, now: Optional[datetime] = None, post: Optional[Callable[[
             report = read_queue(db, now, lead_days=s.lending_morning_list_lead_days)
     except Exception as exc:  # class only: SQL errors embed bound parameters
         logger.error("[queue-check] could not read the queue (%s)", type(exc).__name__)
-        post_ops_notice(f":rotating_light: David's dialer queue check could not run ({type(exc).__name__}). "
-                        "No count was posted; see the lending logs.")
+        if not args.dry_run:  # a dry run sends nothing
+            post_ops_notice(f":rotating_light: David's dialer queue check could not run ({type(exc).__name__}). "
+                            "No count was posted; see the lending logs.")
         return 1
     message = render_queue_post(report)
     if args.dry_run:
