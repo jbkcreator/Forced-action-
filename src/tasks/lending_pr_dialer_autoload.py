@@ -217,6 +217,11 @@ def main(argv: Optional[list[str]] = None) -> int:
         return EXIT_OK
     cap = max(0, settings.lending_pr_dialer_autoload_max_scrub_credits)
     summary, code = _run(now, cap, apply=args.apply)
+    if summary.get("stale_data"):  # R1 0.6: a failed overnight pull; say so plainly, never load the old list
+        logger.warning("[pr-autoload] %s", summary["stale_data"])
+        if args.apply:
+            _notify(summary["stale_data"], failed=True)
+        return code
     message = f"PropertyRadar morning dialer load{'' if args.apply else ' (dry run)'}: {json.dumps(summary, default=str)}"
     logger.info("[pr-autoload] %s", message)
     if args.apply and (summary.get("to_load") or code != EXIT_OK):
@@ -227,8 +232,14 @@ def main(argv: Optional[list[str]] = None) -> int:
 def _run(now: datetime, cap: int, *, apply: bool) -> tuple[dict[str, Any], int]:
     from src.core.database import get_db_context
 
+    from src.lending.pool_source import propertyradar_staleness
+
     day = day_of(now)
     with get_db_context() as db:
+        stale = propertyradar_staleness(db, now)
+        if stale is not None:
+            db.rollback()
+            return {"stale_data": stale.message(), "propertyradar_age_hours": stale.age_hours}, EXIT_REFUSED
         records, counts = plan_load(db, day=day, cap=cap)
         if not apply or not records:
             db.rollback()
