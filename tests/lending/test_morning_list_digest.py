@@ -9,7 +9,7 @@ import pytest
 from sqlalchemy import create_engine, event, text
 from sqlalchemy.pool import StaticPool
 
-from packages.agent_core.chatport import FakeChatPort
+from packages.agent_core.chatport import FakeChatPort, PostResult
 from src.lending.cora_morning_digest import MorningListConfig, digest_day, post_morning_digest
 from src.lending.morning_list.read import LinkConfig
 
@@ -19,7 +19,7 @@ AT_7_47 = datetime(2026, 11, 25, 12, 47, tzinfo=timezone.utc)
 
 _DDL = (
     "CREATE TABLE lending.cora_morning_digests (digest_date DATE PRIMARY KEY, slack_channel TEXT, slack_ts TEXT,"
-    " posted_at TIMESTAMP, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)",
+    " posted_at TIMESTAMP, thread_pending TEXT, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)",
     "CREATE TABLE lending.pending_actions (action_id INTEGER PRIMARY KEY, tool_name TEXT, summary TEXT, status TEXT,"
     " created_at TIMESTAMP)",
     "CREATE TABLE lending.booking_messages (booking_ref TEXT, first_name TEXT, contact_phone TEXT, booked_by TEXT,"
@@ -211,3 +211,40 @@ def test_batched_text_consent_matches_the_single_check(engine) -> None:
     with engine.connect() as conn:
         single = {p for p in phones if has_text_consent(conn, p)}
         assert text_consented_phones(conn, phones) == single == {"+18135550001", "+18135550002"}
+
+
+class FlakyThreadChat(FakeChatPort):
+    """Slack that refuses the n-th thread reply once."""
+
+    def __init__(self, fail_reply: int) -> None:
+        super().__init__(default_channel="C_CORA")
+        self.fail_reply, self.tried = fail_reply, 0
+
+    def post(self, *, text, blocks=None, channel=None, thread_ts=None):
+        if thread_ts:
+            self.tried += 1
+            if self.tried == self.fail_reply:
+                return PostResult(ok=False, channel=channel, error="ratelimited")
+        return super().post(text=text, blocks=blocks, channel=channel, thread_ts=thread_ts)
+
+
+def test_a_refused_thread_reply_is_posted_by_the_next_sweep_without_repeats(engine, monkeypatch) -> None:
+    import src.lending.cora_morning_digest as digest
+
+    _seed(engine)
+    replies = [[{"type": "section", "text": {"type": "mrkdwn", "text": f"part {n}"}}] for n in (1, 2, 3)]
+    monkeypatch.setattr(digest, "render_thread", lambda items: replies)
+    chat = FlakyThreadChat(fail_reply=2)
+    assert post_morning_digest(engine, chat, "C_CORA", halted=False, now=AT_7_47, morning_list=_config())
+    assert [p["blocks"][0]["text"]["text"] for p in chat.posts[1:]] == ["part 1"]
+
+    assert not post_morning_digest(engine, chat, "C_CORA", halted=False, now=AT_7_47 + timedelta(minutes=1),
+                                   morning_list=_config())
+    parent = chat.posts[0]
+    assert [p for p in chat.posts if p["thread_ts"] is None] == [parent]
+    thread = [p for p in chat.posts if p["thread_ts"] == parent["ts"]]
+    assert [p["blocks"][0]["text"]["text"] for p in thread] == ["part 1", "part 2", "part 3"]
+
+    post_morning_digest(engine, chat, "C_CORA", halted=False, now=AT_7_47 + timedelta(minutes=2),
+                        morning_list=_config())
+    assert len(chat.posts) == 4  # nothing left to send

@@ -1173,6 +1173,8 @@ class LendingCoraMorningDigest(LendingBase):
     slack_channel: Mapped[Optional[str]] = mapped_column(String(32))
     slack_ts: Mapped[Optional[str]] = mapped_column(String(64))
     posted_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    # R1 1.3: David's thread replies Slack has not accepted yet (JSON list of block lists); NULL when all posted.
+    thread_pending: Mapped[Optional[str]] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_now, server_default=text("now()"))
 
 

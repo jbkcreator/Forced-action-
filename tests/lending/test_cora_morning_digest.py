@@ -20,7 +20,7 @@ AT_NOON = datetime(2026, 10, 19, 16, 0, tzinfo=timezone.utc)
 
 _DDL = (
     "CREATE TABLE lending.cora_morning_digests (digest_date DATE PRIMARY KEY, slack_channel TEXT, slack_ts TEXT,"
-    " posted_at TIMESTAMP, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)",
+    " posted_at TIMESTAMP, thread_pending TEXT, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)",
     "CREATE TABLE lending.pending_actions (action_id INTEGER PRIMARY KEY, tool_name TEXT, summary TEXT,"
     " contact_ref TEXT, status TEXT, created_at TIMESTAMP)",
     "CREATE TABLE lending.booking_messages (booking_ref TEXT, first_name TEXT, contact_phone TEXT, booked_by TEXT,"

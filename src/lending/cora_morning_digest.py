@@ -24,7 +24,9 @@ borrowers). It shows first names and last-4 digits only: no emails, phone number
 
 R1 1.3 (``LENDING_MORNING_LIST_ENABLED``, ``MorningListConfig``): "Today's list" replaces the new-leads and
 today's-calls sections (confirmation calls stay under "Needs your action") with one ranked list of up to 50 items in a Josh block and a David block
-(``src/lending/morning_list``). ``on_listed`` receives the posted items after the commit, for the morning drafts.
+(``src/lending/morning_list``). David's full list goes in thread replies stored in ``thread_pending`` with the post;
+each sweep posts what Slack has not yet accepted, in order, so a refused reply is retried without repeats.
+``on_listed`` receives the posted items after the commit, for the morning drafts.
 """
 from __future__ import annotations
 
@@ -61,9 +63,16 @@ _CLAIM = text("""
     ON CONFLICT (digest_date) DO NOTHING RETURNING digest_date
 """)
 _RECORD_POST = text("""
-    UPDATE lending.cora_morning_digests SET slack_channel = :channel, slack_ts = :ts, posted_at = CURRENT_TIMESTAMP
+    UPDATE lending.cora_morning_digests SET slack_channel = :channel, slack_ts = :ts, posted_at = CURRENT_TIMESTAMP,
+           thread_pending = :thread
      WHERE digest_date = :day
 """)
+# David's thread replies not yet accepted by Slack (JSON list of Block Kit block lists), posted in order.
+_THREAD_PENDING = text("""
+    SELECT slack_channel, slack_ts, thread_pending FROM lending.cora_morning_digests
+     WHERE digest_date = :day AND posted_at IS NOT NULL AND thread_pending IS NOT NULL
+""")
+_THREAD_LEFT = text("UPDATE lending.cora_morning_digests SET thread_pending = :thread WHERE digest_date = :day")
 _PENDING_DRAFTS = text("""
     SELECT action_id, tool_name, summary, created_at, count(*) OVER () AS total
       FROM lending.pending_actions WHERE status = 'pending' ORDER BY created_at LIMIT :limit
@@ -394,18 +403,29 @@ def render(day: date, data: DigestData, *, now: Optional[datetime] = None,
     return header, render_brief_blocks(header, sections)
 
 
-def _post_thread(chat: ChatPort, channel: str, ts: Optional[str], items: list[ListItem]) -> None:
-    """David's full list as replies under the digest. A failed reply is logged, never raised: raising would roll
-    back the day's claim and post the whole digest again."""
-    for blocks in render_thread(items):
+def _post_thread(engine: Engine, chat: ChatPort, day: date) -> None:
+    """Posts today's pending thread replies (David's full list) under the digest, in order. Each accepted reply is
+    removed from ``thread_pending`` at once; a failed one stops the pass and is posted by the next sweep, so the
+    parent and accepted replies are never posted twice. A failure is logged, never raised."""
+    with Session(engine) as db, db.begin():
+        row = db.execute(_THREAD_PENDING, {"day": day}).first()
+    if row is None:
+        return
+    pending = json.loads(row.thread_pending)
+    while pending:
         try:
-            reply = chat.post(text="Today's list for David", blocks=blocks, channel=channel, thread_ts=ts)
+            reply = chat.post(text="Today's list for David", blocks=pending[0], channel=row.slack_channel,
+                              thread_ts=row.slack_ts)
         except Exception as exc:  # class only
-            logger.error("[cora] morning list thread reply failed (%s)", type(exc).__name__)
+            logger.error("[cora] morning list thread reply failed (%s); retrying next sweep", type(exc).__name__)
             return
         if not reply.ok:
-            logger.error("[cora] morning list thread reply not posted (%s)", reply.error or "no Slack response")
+            logger.error("[cora] morning list thread reply not posted (%s); retrying next sweep",
+                         reply.error or "no Slack response")
             return
+        pending = pending[1:]
+        with Session(engine) as db, db.begin():
+            db.execute(_THREAD_LEFT, {"day": day, "thread": json.dumps(pending) if pending else None})
 
 
 def post_morning_digest(engine: Engine, chat: ChatPort, channel: Optional[str], *, halted: bool,
@@ -418,18 +438,21 @@ def post_morning_digest(engine: Engine, chat: ChatPort, channel: Optional[str], 
     day = digest_day(now, at)
     if day is None or not channel:
         return False
+    data: Optional[DigestData] = None
     with Session(engine) as db, db.begin():
-        if db.execute(_CLAIM, {"day": day}).scalar() is None:
-            return False
-        data = gather(db, day, now, halted=halted, halt_reason=halt_reason, morning_list=morning_list)
-        header, blocks = render(day, data, now=now, approvals_channel=approvals_channel)
-        result = chat.post(text=header, blocks=blocks, channel=channel)
-        if not result.ok:
-            # Raising rolls the claim back, so the next minute's sweep tries again.
-            raise RuntimeError(f"morning digest not posted ({result.error or 'no Slack response'})")
-        db.execute(_RECORD_POST, {"channel": result.channel or channel, "ts": result.ts, "day": day})
-        if data.today_list:
-            _post_thread(chat, result.channel or channel, result.ts, data.today_list)
+        if db.execute(_CLAIM, {"day": day}).scalar() is not None:
+            data = gather(db, day, now, halted=halted, halt_reason=halt_reason, morning_list=morning_list)
+            header, blocks = render(day, data, now=now, approvals_channel=approvals_channel)
+            result = chat.post(text=header, blocks=blocks, channel=channel)
+            if not result.ok:
+                # Raising rolls the claim back, so the next minute's sweep tries again.
+                raise RuntimeError(f"morning digest not posted ({result.error or 'no Slack response'})")
+            thread = render_thread(data.today_list) if data.today_list else []
+            db.execute(_RECORD_POST, {"channel": result.channel or channel, "ts": result.ts, "day": day,
+                                      "thread": json.dumps(thread) if thread else None})
+    _post_thread(engine, chat, day)  # today's new replies, or the ones a refused pass left
+    if data is None:
+        return False
     logger.info("[cora] morning digest posted for %s", day.isoformat())
     if on_listed is not None and data.today_list:
         try:
