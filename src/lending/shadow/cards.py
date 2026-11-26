@@ -92,6 +92,13 @@ def revisions_of(card: dict) -> list:
     return json.loads(revisions) if isinstance(revisions, str) else revisions
 
 
+def original_payload(card: dict) -> dict:
+    """The draft as Cora first wrote it: a Revise moves it to ``revisions[0]`` and puts Josh's text in ``payload``."""
+    revisions = revisions_of(card)
+    first = revisions[0].get("payload") if revisions and isinstance(revisions[0], dict) else None
+    return first or payload_of(card)
+
+
 def _first_name(db: Session, card: dict) -> Optional[str]:
     contact_ref = card.get("contact_ref") or ""
     name = None
@@ -108,7 +115,7 @@ class SqlCardReader:
 
     def features(self, db: Session, card: dict) -> CardFeatures:
         """Every input as it stood at card creation: no peeking at anything after it."""
-        payload = payload_of(card)
+        payload = original_payload(card)
         created = card["created_at"]
         template_version = payload.get("template_version")
         history = db.execute(_TEMPLATE_HISTORY, {"template_version": template_version, "before": created,

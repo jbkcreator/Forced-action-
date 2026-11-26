@@ -81,8 +81,21 @@ class TestDecisions:
         shadow_store.update_match(db, "db-test-class", "action:-1", actual="approve", decision_match=True,
                                   decided_at=NOW, decision_seconds=1.0, edit_distance=None, send_result="sent")
         assert shadow_store.open_rows(db, "db-test-class", NOW - timedelta(days=90))
-        shadow_store.fill_outcome(db, "db-test-class", "action:-1", "funded", NOW)
+        shadow_store.set_outcome(db, "db-test-class", "action:-1", "funded", NOW)
         assert shadow_store.open_rows(db, "db-test-class", NOW - timedelta(days=90)) == []
+
+    def test_funded_deal_before_the_send_keeps_the_row_open(self, db):
+        _decision(db)
+        shadow_store.update_match(db, "db-test-class", "action:-1", actual="approve", decision_match=True,
+                                  decided_at=NOW, decision_seconds=1.0, edit_distance=None, send_result=None)
+        shadow_store.set_outcome(db, "db-test-class", "action:-1", "funded", NOW)
+        assert len(shadow_store.open_rows(db, "db-test-class", NOW - timedelta(days=90))) == 1
+
+    def test_declined_can_become_funded_but_funded_never_changes(self, db):
+        _decision(db)
+        assert shadow_store.set_outcome(db, "db-test-class", "action:-1", "declined", NOW) == 1
+        assert shadow_store.set_outcome(db, "db-test-class", "action:-1", "funded", NOW) == 1
+        assert shadow_store.set_outcome(db, "db-test-class", "action:-1", None, None) == 0
 
     def test_rows_for_digest_runs_and_drops_the_phone(self, db):
         _decision(db)

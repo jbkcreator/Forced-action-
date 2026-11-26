@@ -17,6 +17,7 @@ from src.lending import ops_alerts
 from src.lending.ghl_email import GhlEmailSender
 from src.lending.ghl_sms import GhlSmsSender
 from src.lending.instantly_email import NdlInstantlySender
+from src.lending.shadow.cards import original_payload
 from src.lending.shadow.judge import CardFeatures
 from src.lending.shadow.shadow_runner import ShadowRunnerStep, edit_distance
 
@@ -60,7 +61,7 @@ class FakeStore:
 
     def open_rows(self, db, class_name, since):
         def settled(r):
-            return (r["deal_outcome"] is not None and r["actual"] in ("approve", "edit", "reject")
+            return (r["deal_outcome"] == "funded" and r["actual"] in ("approve", "edit", "reject")
                     and (r["actual"] == "reject" or r["send_result"] in ("sent", "failed")))
         return [dict(r) for (cls, _), r in self.rows.items()
                 if cls == class_name and r["created_at"] >= since and not settled(r)]
@@ -72,9 +73,9 @@ class FakeStore:
         row.update(fields)
         return 1
 
-    def fill_outcome(self, db, class_name, subject_ref, deal_outcome, outcome_at) -> int:
+    def set_outcome(self, db, class_name, subject_ref, deal_outcome, outcome_at) -> int:
         row = self.rows[(class_name, subject_ref)]
-        if row["deal_outcome"] is not None:
+        if row["deal_outcome"] == "funded" or row["deal_outcome"] == deal_outcome:
             return 0
         row.update(deal_outcome=deal_outcome, outcome_at=outcome_at)
         return 1
@@ -124,9 +125,13 @@ class FakeInbox:
     def __init__(self) -> None:
         self.calls: list[dict] = []
         self._keys: set[str] = set()
+        self.fail_next = False
 
     def __call__(self, db, **event) -> Optional[int]:
         self.calls.append(event)
+        if self.fail_next:
+            self.fail_next = False
+            raise RuntimeError("inbox write failed")
         if event["dedup_key"] in self._keys:
             return None
         self._keys.add(event["dedup_key"])
@@ -243,6 +248,19 @@ class TestActualDecision:
         assert (row["actual"], row["send_result"]) == (actual, send_result)
         assert row["decision_match"] is (None if actual == "no_decision" else actual == "approve")
 
+    def test_card_withdrawn_before_a_decision_is_no_decision(self, step, reader, store, clock):
+        card = reader.add(_card(1))
+        step()
+        card.update(status="blocked")  # a closed document chase withdraws its pending drafts
+        clock.now += timedelta(minutes=5)
+        step()
+        assert store.row("auto-send-judge-v1", 1)["actual"] == "no_decision"
+
+    def test_send_time_block_after_approval_stays_approve(self, step, reader, store):
+        reader.add(_card(1, status="blocked", decided_at=START + timedelta(minutes=1), decided_by="josh"))
+        step()
+        assert store.row("auto-send-judge-v1", 1)["actual"] == "approve"
+
     def test_pending_card_decided_later_is_updated(self, step, reader, store, clock):
         card = reader.add(_card(1))
         step()
@@ -267,6 +285,13 @@ class TestActualDecision:
         assert step().updated == 2
         clock.now += timedelta(minutes=1)
         assert step().updated == 0
+
+
+def test_features_read_the_draft_as_cora_wrote_it_not_the_revision():
+    card = _card(1, revisions=[{"payload": {"template_version": "T-1", "body": "See https://x.co"}}],
+                 body="Hi Alex, see you soon.")
+    assert original_payload(card)["body"] == "See https://x.co"
+    assert original_payload(_card(2))["body"] == "Hi Alex, your term sheet is ready."
 
 
 def test_edit_distance_compares_first_draft_with_final_body():
@@ -295,6 +320,32 @@ class TestDealOutcome:
         assert step().outcomes == 0
         assert store.row("auto-send-judge-v1", 1)["deal_outcome"] is None
 
+    def test_declined_deal_that_reopens_and_funds_ends_funded(self, step, reader, store, clock):
+        reader.add(_card(1, status="sent", decided_at=START + timedelta(minutes=1), decided_by="josh",
+                         deal_ref="loan_file:5"))
+        reader.outcomes["loan_file:5"] = ("declined", START + timedelta(days=5))
+        clock.now = START + timedelta(days=5, minutes=1)
+        step()
+        assert store.row("auto-send-judge-v1", 1)["deal_outcome"] == "declined"
+        del reader.outcomes["loan_file:5"]  # rerouted: the decline is cleared
+        clock.now = START + timedelta(days=10)
+        step()
+        assert store.row("auto-send-judge-v1", 1)["deal_outcome"] is None
+        reader.outcomes["loan_file:5"] = ("funded", START + timedelta(days=40))
+        clock.now = START + timedelta(days=40, minutes=1)
+        step()
+        assert store.row("auto-send-judge-v1", 1)["deal_outcome"] == "funded"
+
+    def test_send_result_still_filled_after_the_deal_funds(self, step, reader, store, clock):
+        card = reader.add(_card(1, status="approved", decided_at=START + timedelta(minutes=1), decided_by="josh",
+                                deal_ref="loan_file:5"))
+        reader.outcomes["loan_file:5"] = ("funded", START + timedelta(minutes=1))
+        step()
+        card.update(status="sent")
+        clock.now += timedelta(minutes=5)
+        step()
+        assert store.row("auto-send-judge-v1", 1)["send_result"] == "sent"
+
     def test_card_without_deal_ref_gets_no_outcome(self, step, reader, store, clock):
         reader.add(_card(1, status="sent", decided_at=START + timedelta(minutes=1), decided_by="josh"))
         reader.outcomes["loan_file:5"] = ("funded", START)
@@ -315,6 +366,15 @@ class TestDay14:
         clock.now = START + timedelta(days=13, hours=23)
         step()
         assert inbox.calls == []
+
+    def test_failed_inbox_write_is_retried_next_sweep(self, step, inbox, clock):
+        clock.now = START + timedelta(days=14)
+        inbox.fail_next = True
+        first = step().day14_alerts
+        clock.now += timedelta(minutes=1)
+        second = step().day14_alerts
+        assert len(first) == 1  # one class failed, the other was queued
+        assert sorted(first + second) == sorted(CLASSES)
 
     def test_restart_raises_a_new_item(self, step, store, inbox, clock):
         clock.now = START + timedelta(days=14)

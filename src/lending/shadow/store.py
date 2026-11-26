@@ -42,14 +42,14 @@ _INSERT_DECISION = text("""
     RETURNING id
 """)
 
-# Settled = a real decision whose send and deal outcomes can no longer change what the digest reports.
+# Settled = a real decision, sent or rejected, on a funded deal. A declined deal stays open: the file can reopen and fund.
 _OPEN_ROWS = text("""
     SELECT subject_ref, proposed, actual, send_result, deal_outcome, created_at
       FROM lending.shadow_decisions
      WHERE class_name = :class_name
        AND created_at >= CAST(:since AS timestamptz)
-       AND NOT (deal_outcome IS NOT NULL AND actual IN ('approve', 'edit', 'reject')
-                AND (actual = 'reject' OR send_result IN ('sent', 'failed')))
+       AND NOT (COALESCE(deal_outcome, '') = 'funded' AND COALESCE(actual, '') IN ('approve', 'edit', 'reject')
+                AND (actual = 'reject' OR COALESCE(send_result, '') IN ('sent', 'failed')))
      ORDER BY created_at
 """)
 
@@ -63,9 +63,10 @@ _UPDATE_MATCH = text("""
             OR edit_distance IS DISTINCT FROM CAST(:edit_distance AS numeric))
 """)
 
-_FILL_OUTCOME = text("""
+_SET_OUTCOME = text("""
     UPDATE lending.shadow_decisions SET deal_outcome = :deal_outcome, outcome_at = :outcome_at
-     WHERE class_name = :class_name AND subject_ref = :subject_ref AND deal_outcome IS NULL
+     WHERE class_name = :class_name AND subject_ref = :subject_ref
+       AND COALESCE(deal_outcome, '') <> 'funded' AND deal_outcome IS DISTINCT FROM :deal_outcome
 """)
 
 _DISCARD = text("DELETE FROM lending.shadow_decisions WHERE class_name = :class_name AND subject_ref = :subject_ref")
@@ -135,8 +136,10 @@ def update_match(db: Session, class_name: str, subject_ref: str, *, actual: str,
     }).rowcount
 
 
-def fill_outcome(db: Session, class_name: str, subject_ref: str, deal_outcome: str, outcome_at: datetime) -> int:
-    return db.execute(_FILL_OUTCOME, {"class_name": class_name, "subject_ref": subject_ref,
+def set_outcome(db: Session, class_name: str, subject_ref: str, deal_outcome: Optional[str],
+                outcome_at: Optional[datetime]) -> int:
+    """Record funded or declined; a decline can later become funded, or clear (None) when the file reopens."""
+    return db.execute(_SET_OUTCOME, {"class_name": class_name, "subject_ref": subject_ref,
                                       "deal_outcome": deal_outcome, "outcome_at": outcome_at}).rowcount
 
 

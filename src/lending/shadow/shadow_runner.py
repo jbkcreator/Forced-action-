@@ -22,7 +22,7 @@ from sqlalchemy.orm import Session
 
 from config.lending_standing_sends import AUTO_GRADUATED_ACTOR
 from config.settings import get_settings
-from src.lending.cora_inbox import add_to_inbox_safely
+from src.lending.cora_inbox import add_to_inbox
 from src.lending.shadow import registry
 from src.lending.shadow import store as shadow_store
 from src.lending.shadow.cards import (
@@ -43,11 +43,12 @@ NEW_CARD_OVERLAP = timedelta(minutes=5)  # a card committed late is still caught
 _SEND_RESULTS = ("sent", "failed", "held")
 
 
-def derive_actual(status: str, revisions: list) -> str:
-    """approve / edit (approved after a Revise) / reject; expired, held, pending and revising are no_decision."""
+def derive_actual(status: str, revisions: list, decided_at: Optional[datetime]) -> str:
+    """approve / edit (approved after a Revise) / reject; expired, held, pending, revising and a card withdrawn before
+    anyone decided it (blocked with no decision time) are no_decision."""
     if status == "rejected":
         return "reject"
-    if status in APPROVED_STATUSES:
+    if status in APPROVED_STATUSES and decided_at is not None:
         return "edit" if revisions else "approve"
     return NO_DECISION
 
@@ -93,7 +94,7 @@ class ShadowRunnerStep:
     """Cora's minute-sweep step. It is never given a send gate, queue or sender, so it can only log."""
 
     def __init__(self, engine: Optional[Engine], *, reader: Optional[CardReader] = None,
-                 store: ModuleType | Any = shadow_store, inbox: Callable[..., Optional[int]] = add_to_inbox_safely,
+                 store: ModuleType | Any = shadow_store, inbox: Callable[..., Optional[int]] = add_to_inbox,
                  clock: Callable[[], datetime] = lambda: datetime.now(timezone.utc)) -> None:
         self._engine = engine
         self._reader = reader or SqlCardReader()
@@ -158,7 +159,7 @@ class ShadowRunnerStep:
                 result.discarded += self._store.discard(db, cls.name, ref)
                 continue
             revisions = revisions_of(card)
-            actual = derive_actual(card["status"], revisions)
+            actual = derive_actual(card["status"], revisions, card.get("decided_at"))
             decided_at = card["decided_at"] if actual != NO_DECISION else None
             result.updated += self._store.update_match(
                 db, cls.name, ref, actual=actual, decision_match=cls.compare(row["proposed"], actual),
@@ -166,20 +167,25 @@ class ShadowRunnerStep:
                 decision_seconds=round((decided_at - card["created_at"]).total_seconds(), 2) if decided_at else None,
                 edit_distance=edit_distance(revisions, payload_of(card).get("body") or ""),
                 send_result=derive_send_result(card["status"]))
-            if row["deal_outcome"] is None and card.get("deal_ref"):
-                outcome = self._reader.deal_outcome(db, card["deal_ref"])
-                if outcome is not None:
-                    result.outcomes += self._store.fill_outcome(db, cls.name, ref, *outcome)
+            if row["deal_outcome"] != "funded" and card.get("deal_ref"):
+                outcome, outcome_at = self._reader.deal_outcome(db, card["deal_ref"]) or (None, None)
+                result.outcomes += self._store.set_outcome(db, cls.name, ref, outcome, outcome_at)
 
     def _day14(self, db: Session, cls: ShadowClassDef, started_at: datetime, now: datetime,
                result: ShadowRunResult) -> bool:
-        """True once the day-14 item was raised (or found already raised) for this run of the class."""
+        """True once the day-14 item is queued or found already queued; False on an error, so the next sweep retries."""
         if (cls.name, started_at) in self._alerted or now - started_at < timedelta(days=SHADOW_WINDOW_DAYS):
             return False
-        new_id = self._inbox(
-            db, event_type="shadow_window_complete", dedup_key=f"shadow_day14:{cls.name}:{started_at.isoformat()}",
-            summary=f"Shadow class {cls.name} has run 14 days. It stays in shadow until someone runs --stop.",
-            payload={"class_name": cls.name, "started_at": started_at.isoformat()})
+        try:
+            with db.begin_nested():
+                new_id = self._inbox(
+                    db, event_type="shadow_window_complete",
+                    dedup_key=f"shadow_day14:{cls.name}:{started_at.isoformat()}",
+                    summary=f"Shadow class {cls.name} has run 14 days. It stays in shadow until someone runs --stop.",
+                    payload={"class_name": cls.name, "started_at": started_at.isoformat()})
+        except Exception as exc:  # class only: SQL errors embed bound parameters; retried next sweep
+            logger.error("[shadow] day-14 alert for %s not queued (%s)", cls.name, type(exc).__name__)
+            return False
         if new_id is not None:
             result.day14_alerts.append(cls.name)
         return True
