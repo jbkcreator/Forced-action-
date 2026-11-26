@@ -38,17 +38,23 @@ LLC_OWNER = "llc_owner"
 DEFAULT_STATE = "FL"
 _STATE = re.compile(r"\b([A-Z]{2})\s+\d{5}\b")
 
-_PENDING = text("SELECT lead_ref, field, run_id FROM lending.clay_enrichments WHERE status = 'pending'")
+# A reserved row whose run id never came back (Clay timed out after maybe accepting it) stays pending with no run id:
+# it keeps its place in the cap and the cache, so it is never paid for again inside the TTL.
+_PENDING = text("""
+    SELECT lead_ref, field, run_id FROM lending.clay_enrichments WHERE status = 'pending' AND run_id IS NOT NULL
+""")
 _KNOWN = text("""
     SELECT lead_ref, field FROM lending.clay_enrichments WHERE lead_ref IN :refs AND requested_at >= :fresh
 """).bindparams(bindparam("refs", expanding=True))
 _TODAY = text("SELECT count(*) FROM lending.clay_enrichments WHERE requested_at >= :start")
 _FORGET = text("DELETE FROM lending.clay_enrichments WHERE field = :field AND lead_ref IN :refs"
                ).bindparams(bindparam("refs", expanding=True))
-_REQUEST = text("""
+_RESERVE = text("""
     INSERT INTO lending.clay_enrichments (lead_ref, field, run_id, status, requested_at)
-    VALUES (:ref, :field, :run_id, 'pending', :now)
+    VALUES (:ref, :field, NULL, 'pending', :now)
 """)
+_STARTED = text("UPDATE lending.clay_enrichments SET run_id = :run_id WHERE field = :field AND lead_ref IN :refs"
+                ).bindparams(bindparam("refs", expanding=True))
 _SETTLE = text("""
     UPDATE lending.clay_enrichments SET status = :status, value = :value, enriched_at = :now
      WHERE lead_ref = :ref AND field = :field AND status = 'pending'
@@ -122,6 +128,7 @@ class FakeClay:
     """Records what would be sent; ``answers`` maps an item id to its ``result`` (unknown ids get no match)."""
     answers: dict[str, dict] = field(default_factory=dict)
     fail: bool = False
+    timeout_after_accept: bool = False  # Clay took the run, then the response timed out
     submitted: list[tuple[str, list[dict]]] = field(default_factory=list)
     _runs: dict[str, list[str]] = field(default_factory=dict)
 
@@ -129,6 +136,8 @@ class FakeClay:
         if self.fail:
             raise ClayError("fake failure")
         self.submitted.append((routine, items))
+        if self.timeout_after_accept:
+            raise ClayError("fake timeout after accept")
         run_id = f"run_{len(self._runs) + 1}"
         self._runs[run_id] = [item["id"] for item in items]
         return run_id
@@ -216,11 +225,12 @@ def _submit(db: Session, port: ClayPort, items: Sequence[ListItem], settings: Cl
             known.add((item.ref, name))
             room -= 1
     for name, (routine, batch) in batches.items():
-        run_id = port.run(routine, batch)
         refs = [entry["id"] for entry in batch]
         db.execute(_FORGET, {"field": name, "refs": refs})  # stale rows past their TTL
-        db.execute(_REQUEST, [{"ref": ref, "field": name, "run_id": run_id, "now": now} for ref in refs])
+        # Reserved before the paid call: a timeout after Clay accepted the run still counts toward the cap.
+        db.execute(_RESERVE, [{"ref": ref, "field": name, "now": now} for ref in refs])
         stats.submitted += len(batch)
+        db.execute(_STARTED, {"run_id": port.run(routine, batch), "field": name, "refs": refs})
 
 
 def enrich_gaps(db: Session, items: Sequence[ListItem], port: ClayPort, settings: ClaySettings, *,

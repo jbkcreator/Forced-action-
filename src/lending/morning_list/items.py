@@ -18,7 +18,7 @@ from urllib.parse import quote
 
 from config.lending_morning_list import (
     ACTIVE_DEAL, BOOKED_TODAY, BRIEF_MAX_CHARS, CALLBACK, CLOSING_BLOCKER, COLD_TOP, JOSH, JOSH_CALLER_PREFIXES,
-    MOBILE_LINE_TYPE, MOBILE_REQUIRED, NEW_WARM_LEAD, OWNER, REASON_LABELS, TIER,
+    KNOWN_NON_MOBILE_DROPPED, MOBILE_LINE_TYPE, MOBILE_REQUIRED, NEW_WARM_LEAD, OWNER, REASON_LABELS, TIER,
 )
 from packages.agent_core.briefing import BriefSection
 from packages.agent_core.redaction import slack_safe
@@ -55,6 +55,10 @@ class ListItem:
         return (self.line_type or "").strip().lower() == MOBILE_LINE_TYPE
 
     @property
+    def line_type_known(self) -> bool:
+        return bool((self.line_type or "").strip())
+
+    @property
     def first_name(self) -> Optional[str]:
         return (self.name or "").strip().split(" ")[0] or None
 
@@ -72,7 +76,8 @@ def _owner(item: ListItem) -> str:
 
 def build(candidates: Iterable[ListItem], *, size: int) -> list[ListItem]:
     """The ranked list: tier, then sort key; one entry per phone (its highest tier); at most ``size``."""
-    eligible = [c for c in candidates if c.has_mobile or c.reason not in MOBILE_REQUIRED]
+    eligible = [c for c in candidates if c.has_mobile or not (
+        c.reason in MOBILE_REQUIRED or (c.reason in KNOWN_NON_MOBILE_DROPPED and c.line_type_known))]
     ranked = sorted(eligible, key=lambda c: (c.tier, c.sort_key))
     seen: set[str] = set()
     picked: list[ListItem] = []
@@ -103,7 +108,7 @@ def _line(item: ListItem) -> str:
     briefs are escaped; links are built from our own ids, never from borrower text."""
     flags = [f"…{item.last4}"] if item.last4 else []
     if not item.has_mobile:
-        flags.append("no mobile")
+        flags.append("no mobile" if item.line_type_known else "mobile not checked")
     who = f"*{slack_safe(item.first_name or item.entity_name or 'Lead')}*" + (f" ({', '.join(flags)})" if flags else "")
     parts = [slack_safe(item.brief[:BRIEF_MAX_CHARS])] if item.brief else []
     if item.email_source == "clay":

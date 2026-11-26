@@ -33,8 +33,11 @@ OWNER: dict[str, str] = {
 # Caller names (lower-cased prefix) whose callbacks belong to Josh; everyone else's go to David.
 JOSH_CALLER_PREFIXES: tuple[str, ...] = ("josh",)
 
-# Reasons that must carry a Mobile line type to be listed at all (D7, D5). Others are listed and flagged.
-MOBILE_REQUIRED = frozenset({NEW_WARM_LEAD, COLD_TOP})
+# Calling-queue fill must carry a Mobile line type to be listed (D5).
+MOBILE_REQUIRED = frozenset({COLD_TOP})
+# Warm leads are left out only when their number is KNOWN not to be a mobile. Most LendingFlow numbers have no line
+# type (no Tracerfy scrub), so unknown stays listed, flagged; 0.11's send gate still checks before any text.
+KNOWN_NON_MOBILE_DROPPED = frozenset({NEW_WARM_LEAD})
 MOBILE_LINE_TYPE = "mobile"  # lending.contacts.line_type, compared lower-cased (Tracerfy writes "Mobile")
 
 # Reasons that can get a morning draft (D8): consented warm leads and callbacks only.

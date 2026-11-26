@@ -115,3 +115,11 @@ def test_fifty_long_lines_fit_slack_limits_and_none_is_cut() -> None:
     assert all(len(message) <= 50 for message in messages)
     assert all(len(t) <= 3000 for t in texts)
     assert sum(t.count(":small_blue_diamond:") for t in texts) == 50
+
+
+def test_a_warm_lead_with_no_line_type_yet_is_kept_and_flagged() -> None:
+    items = build([item("lf:1", NEW_WARM_LEAD, line_type=None, phone="+18135550001", brief="DSCR"),
+                   item("lf:2", NEW_WARM_LEAD, line_type="Landline", phone="+18135550002"),
+                   item("dlr:1", COLD_TOP, line_type=None, phone="+18135550003")], size=50)
+    assert [i.ref for i in items] == ["lf:1"]
+    assert "(…0001, mobile not checked)" in _thread_text(items)

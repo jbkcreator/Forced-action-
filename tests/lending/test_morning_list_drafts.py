@@ -106,3 +106,98 @@ def test_submit_sends_each_draft_to_the_gate_with_its_key() -> None:
     drafts = morning_drafts([lead()], writer("Hi Ann"), ctx())
     assert submit_all(gate, drafts, approvals_channel="C_APPROVALS") == 1
     assert gate.calls[0][1] == "morning_list" and gate.calls[0][2] == "morning:2026-11-25:lf:1"
+
+
+def test_a_draft_quoting_a_loan_term_falls_back_to_the_template() -> None:
+    drafts = morning_drafts([lead()], writer("Hi Ann, let's talk about the 12-month term"), ctx())
+    assert drafts[0].draft.payload["body"].startswith("Hi Ann, this is Josh with Next Deal Lending.")
+
+
+def _queue_engine():
+    from sqlalchemy import create_engine, event, text
+    from sqlalchemy.pool import StaticPool
+
+    eng = create_engine("sqlite://", poolclass=StaticPool, connect_args={"check_same_thread": False})
+
+    @event.listens_for(eng, "connect")
+    def _attach(dbapi_conn, _):
+        dbapi_conn.execute("ATTACH DATABASE ':memory:' AS lending")
+
+    with eng.begin() as conn:
+        conn.execute(text("CREATE TABLE lending.pending_actions (action_id INTEGER PRIMARY KEY, channel TEXT,"
+                          " status TEXT, recipient_phone TEXT, executed_at TIMESTAMP, idempotency_key TEXT,"
+                          " payload TEXT, revised_by TEXT)"))
+    return eng
+
+
+def test_open_and_recent_contact_follow_the_real_queue_statuses() -> None:
+    from sqlalchemy import text
+    from sqlalchemy.orm import Session
+
+    from src.lending.morning_list.drafts import touched_phones
+
+    eng = _queue_engine()
+    recent = NOW - timedelta(days=1)
+    with eng.begin() as conn:
+        conn.execute(text("INSERT INTO lending.pending_actions (channel, status, recipient_phone, executed_at) VALUES"
+                          " ('ghl_sms', 'revising', '+1001', NULL),"
+                          " ('ghl_tag', 'sent', '+1002', :t),"
+                          " ('ghl_sms', 'blocked', '+1003', :t),"
+                          " ('ghl_sms', 'sent', '+1004', :t)"), {"t": recent})
+    with Session(eng) as db:
+        contacted, open_drafts = touched_phones(db, ["+1001", "+1002", "+1003", "+1004"], NOW)
+    assert open_drafts == {"+1001"}
+    assert contacted == {"+1001", "+1004"}
+
+
+def test_drafts_step_waits_for_the_posted_digest_and_never_drafts_twice() -> None:
+    from types import SimpleNamespace
+
+    from sqlalchemy import text
+
+    from src.lending.morning_list.step import make_morning_drafts
+
+    eng = _queue_engine()
+    with eng.begin() as conn:
+        conn.execute(text("CREATE TABLE lending.cora_morning_digests (digest_date DATE PRIMARY KEY,"
+                          " posted_at TIMESTAMP)"))
+        for ddl in ("CREATE TABLE lending.text_consents (phone TEXT, revoked_at TIMESTAMP)",
+                    "CREATE TABLE lending.lendingflow_leads (id INTEGER PRIMARY KEY, phone TEXT)",
+                    "CREATE TABLE lending.suppression_list (phone TEXT)",
+                    "CREATE TABLE lending.contacts (phone TEXT, do_not_contact BOOLEAN)"):
+            conn.execute(text(ddl))
+        conn.execute(text("INSERT INTO lending.text_consents VALUES ('+18135551111', NULL)"))
+
+    class Gate:
+        def __init__(self):
+            self.keys = []
+
+        def submit(self, draft, *, tool_name, context, ttl):
+            self.keys.append(context.tool_use_id)
+            with eng.begin() as conn:
+                conn.execute(text("INSERT INTO lending.pending_actions (channel, status, recipient_phone,"
+                                  " idempotency_key) VALUES (:c, 'rejected', :p, :k)"),
+                             {"c": draft.channel, "p": draft.recipient_phone, "k": context.tool_use_id})
+
+    settings = SimpleNamespace(lending_morning_list_enabled=True, lending_morning_drafts_enabled=True,
+                               lending_morning_digest_time="07:47", lending_morning_list_size=50,
+                               lending_morning_list_lead_days=14, lending_david_slack_user_id="",
+                               lending_ghl_app_url="", lending_ghl_location_id="")
+    gate, clock = Gate(), [NOW]
+    step = make_morning_drafts(eng, settings, gate=gate, writer=writer("Hi Ann"), clock=lambda: clock[0])
+    import src.lending.morning_list.step as step_module
+
+    original = step_module.read_candidates
+    step_module.read_candidates = lambda *a, **k: ([lead()], [])
+    try:
+        assert step() is None  # digest not posted yet
+        with eng.begin() as conn:
+            conn.execute(text("INSERT INTO lending.cora_morning_digests VALUES (:d, :t)"),
+                         {"d": NOW.date(), "t": NOW})
+        clock[0] = NOW + timedelta(minutes=15)
+        assert step() == 1
+        clock[0] = NOW + timedelta(minutes=30)
+        assert step() == 0  # already drafted today (even though Josh rejected it)
+    finally:
+        step_module.read_candidates = original
+    assert gate.keys == ["morning:2026-11-25:lf:1"]

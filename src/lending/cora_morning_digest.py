@@ -22,8 +22,8 @@ started after noon skips that day rather than posting a stale morning digest.
 The digest goes to Cora's internal channel only and is posted while Cora is halted (the halt stops sends to
 borrowers). It shows first names and last-4 digits only: no emails, phone numbers or consent text.
 
-R1 1.3 (``LENDING_MORNING_LIST_ENABLED``, ``MorningListConfig``): "Today's list" replaces the new-leads, today's-calls
-and confirmation-calls sections with one ranked list of up to 50 items in a Josh block and a David block
+R1 1.3 (``LENDING_MORNING_LIST_ENABLED``, ``MorningListConfig``): "Today's list" replaces the new-leads and
+today's-calls sections (confirmation calls stay under "Needs your action") with one ranked list of up to 50 items in a Josh block and a David block
 (``src/lending/morning_list``). ``on_listed`` receives the posted items after the commit, for the morning drafts.
 """
 from __future__ import annotations
@@ -213,7 +213,7 @@ def gather(db: Session, day: date, now: datetime, *, halted: bool, halt_reason: 
         {**row, "created_at": _as_datetime(row["created_at"])}
         for row in _rows(db, _PENDING_DRAFTS, {"limit": LIST_LIMIT})], [], missing)
     listing = morning_list is not None
-    confirmations = [] if listing else _section(db, "confirmation calls", lambda: [
+    confirmations = _section(db, "confirmation calls", lambda: [
         {**row, "due_date": _as_date(row["due_date"]), "slot_start": _as_datetime(row["slot_start"])}
         for row in _rows(db, _DUE_CONFIRMATIONS, {"day": day, "limit": LIST_LIMIT})],
         [], missing)

@@ -25,7 +25,7 @@ from packages.agent_core.send_gate import SendGate
 from packages.agent_core.tools import EgressDraft, ToolContext
 from src.lending.morning_list.items import ListItem
 from src.lending.morning_list.time import et_date
-from src.lending.reply_guard import quotes_numbers
+from src.lending.cora_tools import BORROWER_MESSAGE_CHANNELS, borrower_draft_problem
 
 logger = logging.getLogger(__name__)
 
@@ -33,13 +33,19 @@ SMS_MAX_CHARS = 320
 WRITER_VERSION = "morning_list_llm_v1"
 _CONTACT_REF = {"lf": "lendingflow_lead", "web": "web_lead"}
 
-# Phones we messaged (sent, or a draft still open) in the no-touch window, from Cora's drafts table.
+# Drafts not yet decided or still in flight (agent_core ActionStatus; "held" is 0.4's review state).
+_OPEN = ("pending", "revising", "approved", "sending", "held")
+# Phones with an open draft, or a borrower message actually sent to them in the no-touch window. CRM updates
+# (stage, tag, note, task) and blocked or failed messages are not contact.
 _TOUCHED = text("""
     SELECT recipient_phone, status FROM lending.pending_actions
      WHERE recipient_phone IN :phones
-       AND (status IN ('pending', 'approved', 'sending', 'held') OR (executed_at IS NOT NULL AND executed_at >= :since))
-""").bindparams(bindparam("phones", expanding=True))
-_OPEN = ("pending", "approved", "sending", "held")
+       AND (status IN :open
+            OR (status = 'sent' AND channel IN :channels AND executed_at >= :since))
+""").bindparams(bindparam("phones", expanding=True), bindparam("open", expanding=True),
+               bindparam("channels", expanding=True))
+_DRAFTED = text("SELECT idempotency_key FROM lending.pending_actions WHERE idempotency_key IN :keys"
+                ).bindparams(bindparam("keys", expanding=True))
 
 
 @dataclass(frozen=True)
@@ -86,7 +92,7 @@ def _written(writer: DraftWriter, request: DraftRequest) -> Optional[str]:
     except Exception as exc:  # any writer failure: the template goes instead
         logger.warning("[morning-list] draft writer failed (%s)", type(exc).__name__)
         return None
-    if not body or quotes_numbers(body) or (request.channel == "sms" and len(body) > SMS_MAX_CHARS):
+    if not body or borrower_draft_problem({"body": body}) or (request.channel == "sms" and len(body) > SMS_MAX_CHARS):
         return None
     return body
 
@@ -119,22 +125,31 @@ def _draft(item: ListItem, writer: DraftWriter, ctx: DraftContext) -> Optional[E
 
 def morning_drafts(items: Iterable[ListItem], writer: DraftWriter, ctx: DraftContext) -> list[MorningDraft]:
     """The drafts to hold for approval, in list order."""
-    day = et_date(ctx.now).isoformat()
     out = []
     for item in items:
         if not _eligible(item, ctx):
             continue
         draft = _draft(item, writer, ctx)
         if draft is not None:
-            out.append(MorningDraft(item=item, draft=draft, key=f"morning:{day}:{item.ref}"))
+            out.append(MorningDraft(item=item, draft=draft, key=draft_key(ctx.now, item)))
     return out
+
+
+def draft_key(now: datetime, item: ListItem) -> str:
+    """One morning draft per item per ET day (the gate's idempotency key)."""
+    return f"morning:{et_date(now).isoformat()}:{item.ref}"
+
+
+def already_drafted(db: Session, keys: list[str]) -> set[str]:
+    return set(db.execute(_DRAFTED, {"keys": keys}).scalars()) if keys else set()
 
 
 def touched_phones(db: Session, phones: list[str], now: datetime) -> tuple[set[str], set[str]]:
     """(phones messaged by us inside the no-touch window, phones with an open draft)."""
     if not phones:
         return set(), set()
-    rows = db.execute(_TOUCHED, {"phones": phones, "since": now - NO_TOUCH_WINDOW}).mappings().all()
+    rows = db.execute(_TOUCHED, {"phones": phones, "open": list(_OPEN), "channels": sorted(BORROWER_MESSAGE_CHANNELS),
+                                 "since": now - NO_TOUCH_WINDOW}).mappings().all()
     return ({r["recipient_phone"] for r in rows},
             {r["recipient_phone"] for r in rows if r["status"] in _OPEN})
 
@@ -142,7 +157,7 @@ def touched_phones(db: Session, phones: list[str], now: datetime) -> tuple[set[s
 # Recent texts Josh approved without edits through Cora: examples of his voice for the writer (D8).
 _EXAMPLES = text("""
     SELECT payload FROM lending.pending_actions
-     WHERE channel = 'ghl_sms' AND status = 'executed' AND revised_by IS NULL
+     WHERE channel = 'ghl_sms' AND status = 'sent' AND revised_by IS NULL
      ORDER BY executed_at DESC LIMIT :limit
 """)
 
@@ -152,7 +167,7 @@ def voice_examples(db: Session, limit: int = 5) -> tuple[str, ...]:
     for row in db.execute(_EXAMPLES, {"limit": limit}).mappings():
         payload = row["payload"]
         body = payload.get("body") if isinstance(payload, dict) else None
-        if body and not quotes_numbers(body):
+        if body and not borrower_draft_problem({"body": body}):
             bodies.append(str(body)[:SMS_MAX_CHARS])
     return tuple(bodies)
 

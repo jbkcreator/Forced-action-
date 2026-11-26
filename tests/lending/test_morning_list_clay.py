@@ -119,10 +119,19 @@ def test_llc_owner_is_kept_only_when_ownership_is_verified(engine) -> None:
     assert rows(engine) == [("dlr:9", "llc_owner", "found", "Bo Fox")]
 
 
-def test_clay_failure_is_logged_and_nothing_breaks(engine) -> None:
+def test_clay_failure_is_logged_and_the_lookup_stays_reserved(engine) -> None:
     clay = FakeClay(fail=True)
     stats = run(engine, clay, [person("dlr:1")])
-    assert stats.failed and rows(engine) == []
+    assert stats.failed and rows(engine) == [("dlr:1", "email", "pending", None)]
+
+
+def test_a_run_clay_accepted_but_timed_out_is_never_paid_for_again(engine) -> None:
+    clay = FakeClay(timeout_after_accept=True)
+    run(engine, clay, [person("dlr:1")], daily_cap=1)
+    clay.timeout_after_accept = False
+    run(engine, clay, [person("dlr:1"), person("dlr:2")], daily_cap=1, now=NOW + timedelta(minutes=5))
+    assert len(clay.submitted) == 1  # dlr:1 still reserved, and the cap of 1 is used up
+    assert rows(engine) == [("dlr:1", "email", "pending", None)]
 
 
 def test_email_switch_off_sends_nothing(engine) -> None:

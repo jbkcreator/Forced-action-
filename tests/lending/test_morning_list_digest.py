@@ -140,6 +140,18 @@ def test_list_on_ranks_real_rows_and_replaces_the_lead_and_call_sections(engine)
     assert "pat@baylending.com" not in everything
 
 
+def test_due_confirmation_calls_stay_in_needs_your_action_with_the_list_on(engine) -> None:
+    _seed(engine)
+    with engine.begin() as conn:
+        conn.execute(text("INSERT INTO lending.confirmation_tasks (booking_ref, due_date) VALUES ('b1', :d)"),
+                     {"d": AT_7_47.date()})
+        conn.execute(text("INSERT INTO lending.booking_messages (booking_ref, first_name, contact_phone, slot_start_utc)"
+                          " VALUES ('b1', 'Fri', '+18135559999', :s)"), {"s": AT_7_47 + timedelta(days=1)})
+    chat = FakeChatPort(default_channel="C_CORA")
+    post_morning_digest(engine, chat, "C_CORA", halted=False, now=AT_7_47, morning_list=_config())
+    assert "Confirmation calls to make: 1" in _text(chat)
+
+
 def test_list_size_caps_padding(engine) -> None:
     _seed(engine)
     chat = FakeChatPort(default_channel="C_CORA")
