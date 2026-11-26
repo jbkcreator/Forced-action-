@@ -84,19 +84,20 @@ def _utc(now: Optional[datetime]) -> datetime:
 
 # ── Pure rule ─────────────────────────────────────────────────────────────────
 
+def feed_staleness(feed: FeedPolicy, row: Optional[HealthRow], now: datetime) -> Optional[StaleFeed]:
+    """``feed`` is stale when it never recorded a success or its last one is older than its limit."""
+    last = row.last_success_at if row else None
+    if last is None:
+        return StaleFeed(feed.key, feed.label, None)
+    age = now - last
+    if age > timedelta(seconds=feed.stale_after_s or 0):
+        return StaleFeed(feed.key, feed.label, age)
+    return None
+
+
 def stale_feeds(channel: str, rows: Mapping[str, HealthRow], now: datetime) -> list[StaleFeed]:
     """The timed opt-out feeds protecting ``channel`` whose last success is older than their limit (or missing)."""
-    stale: list[StaleFeed] = []
-    for feed in feeds_protecting(channel):
-        row = rows.get(feed.key)
-        last = row.last_success_at if row else None
-        if last is None:
-            stale.append(StaleFeed(feed.key, feed.label, None))
-            continue
-        age = now - last
-        if age > timedelta(seconds=feed.stale_after_s or 0):
-            stale.append(StaleFeed(feed.key, feed.label, age))
-    return stale
+    return [s for s in (feed_staleness(f, rows.get(f.key), now) for f in feeds_protecting(channel)) if s]
 
 
 def unverified_reason(channel: str, rows: Optional[Mapping[str, HealthRow]], now: datetime, *,
