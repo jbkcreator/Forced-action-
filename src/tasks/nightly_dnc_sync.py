@@ -13,7 +13,7 @@ Instantly block-list sweep). This run is the backstop that makes every platform'
 Only ever adds suppression, never removes it. Each step runs in its own transaction, so one platform being down does
 not stop the others; any failure posts to the ops notice channel. National DNC is not re-checked here (weekly scrub).
 
-Usage (cron 07:30 UTC = 2:30 AM ET):
+Usage (cron 07:37 UTC = 2:37 AM ET, off the */15 GHL backstop minutes):
     python -m src.tasks.nightly_dnc_sync
 """
 from __future__ import annotations
@@ -50,6 +50,14 @@ _QUEUE_MISSING = text("""
      WHERE s.reason = :opt_out AND s.email IS NOT NULL AND trim(s.email) <> ''
        AND NOT EXISTS (SELECT 1 FROM lending.instantly_block_queue q WHERE q.email = lower(s.email))
     ON CONFLICT (email) DO NOTHING
+""")
+
+
+_STILL_PENDING = text("""
+    SELECT
+      (SELECT count(*) FROM lending.opt_out_events e JOIN lending.contacts c ON c.phone_hash = e.phone_hash
+        WHERE e.ghl_dnd_at IS NULL) AS ghl,
+      (SELECT count(*) FROM lending.opt_out_events WHERE status = :dialer_pending) AS dialer
 """)
 
 
@@ -128,6 +136,14 @@ def _instantly_entries() -> Iterator[dict[str, Any]]:
             return
 
 
+def still_pending(db) -> dict[str, int]:
+    """Opt-outs a platform refused or could not take tonight: they stay pending and retry, but ops is told."""
+    from config.lending_compliance import OptOutStatus
+
+    row = db.execute(_STILL_PENDING, {"dialer_pending": OptOutStatus.DIALER_PENDING.value}).one()
+    return {"ghl_pending": int(row[0] or 0), "dialer_pending": int(row[1] or 0)}
+
+
 def _step(report: SyncReport, name: str, run: Callable[[], int]) -> None:
     try:
         report.counts[name] = run()
@@ -160,6 +176,15 @@ def run_sync(db_factory: SessionFactory, *, fetch_ghl_dnd_page: Optional[Callabl
     _step(report, "ghl_pushed", lambda: push_ghl(db_factory, ghl_dnd))
     _step(report, "dialer_pushed", in_tx(lambda db: compliance._retry_pending_dialer_removals(db, dialer_remover)))
     _step(report, "instantly_queued", in_tx(push_instantly))
+    try:
+        with db_factory() as db:
+            pending = still_pending(db)
+    except Exception as exc:  # class only
+        logger.error("%s pending count failed (%s)", _LOG, type(exc).__name__)
+        report.failures.append("pending_count")
+    else:
+        report.counts.update(pending)
+        report.failures.extend(name for name, n in pending.items() if n)
     return report
 
 

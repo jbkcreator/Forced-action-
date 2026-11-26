@@ -9,7 +9,7 @@ import pytest
 from config.settings import get_settings
 from src.lending import compliance
 from src.lending.compliance import SmsBlock, sms_block_reason, sms_eligible
-from src.lending.ghl_sms import GhlAccount, GhlSendRefused, GhlSmsSender
+from src.lending.ghl_sms import GhlAccount, GhlSendRefused, GhlSmsError, GhlSmsSender
 
 PHONE = "+18135558601"
 NOW = datetime(2026, 11, 25, 15, 0, tzinfo=timezone.utc)
@@ -126,13 +126,14 @@ def test_sender_refuses_a_landline_before_any_ghl_call():
     assert refused.value.reason == "landline" and request.calls == 0
 
 
-def test_sender_refuses_when_the_gate_itself_fails():
+def test_gate_failure_is_a_retryable_error_not_a_refusal():
     def broken(phone):
         raise RuntimeError("db down")
 
-    with pytest.raises(GhlSendRefused) as refused:
-        GhlSmsSender(ACCOUNT, "+18135550100", request=NoHttp(), sms_gate=broken)(PHONE, "hi")
-    assert refused.value.reason == SmsBlock.UNKNOWN
+    request = NoHttp()
+    with pytest.raises(GhlSmsError) as failed:
+        GhlSmsSender(ACCOUNT, "+18135550100", request=request, sms_gate=broken)(PHONE, "hi")
+    assert not isinstance(failed.value, GhlSendRefused) and not failed.value.ambiguous and request.calls == 0
 
 
 def test_internal_alerts_skip_the_line_type_gate():

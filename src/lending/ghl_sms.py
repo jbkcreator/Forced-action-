@@ -112,11 +112,9 @@ class GhlSmsSender:
             return
         try:
             reason = (self._sms_gate or _line_type_gate)(phone)
-        except Exception as exc:  # class only: fail closed, nothing sent
-            from src.lending.compliance import SmsBlock
-
-            logger.warning("%s line-type check failed (%s); send refused", self._log_prefix, type(exc).__name__)
-            reason = SmsBlock.UNKNOWN
+        except Exception as exc:  # class only: nothing sent, and the caller may retry (not a refusal)
+            logger.warning("%s line-type check failed (%s); nothing sent", self._log_prefix, type(exc).__name__)
+            raise GhlSmsError(f"line-type check unavailable ({type(exc).__name__}); nothing sent") from None
         if reason is not None:
             reason = getattr(reason, "value", reason)
             logger.warning("%s send refused: %s", self._log_prefix, reason)

@@ -24,6 +24,11 @@ class FakeDb:
         return Result(rows)
 
 
+@pytest.fixture(autouse=True)
+def _nothing_left_pending(monkeypatch):
+    monkeypatch.setattr(nightly_dnc_sync, "still_pending", lambda db: {"ghl_pending": 0, "dialer_pending": 0})
+
+
 def _factory(db):
     @contextmanager
     def session():
@@ -110,3 +115,15 @@ def test_main_alerts_ops_only_on_failure(monkeypatch):
     assert nightly_dnc_sync.main() == 0 and posted == []
     report.failures.append("ghl_pushed")
     assert nightly_dnc_sync.main() == 1 and len(posted) == 1
+
+
+def test_opt_outs_still_pending_after_the_push_are_reported_as_failures(monkeypatch):
+    """A GHL or BatchDialer refusal leaves the row pending: the run must not report success."""
+    monkeypatch.setattr(compliance, "sync_ghl_dnd", lambda db, ghl_dnd=None: 0)
+    monkeypatch.setattr(compliance, "_retry_pending_dialer_removals", lambda db, remover: 0)
+    monkeypatch.setattr(nightly_dnc_sync, "push_instantly", lambda db: 0)
+    monkeypatch.setattr(nightly_dnc_sync, "still_pending", lambda db: {"ghl_pending": 3, "dialer_pending": 0})
+
+    report = run_sync(_factory(FakeDb()), fetch_ghl_dnd_page=lambda page: [], fetch_instantly=lambda: iter([]))
+
+    assert report.failures == ["ghl_pending"] and report.counts["ghl_pending"] == 3
