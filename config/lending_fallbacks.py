@@ -60,7 +60,7 @@ DEPENDENCIES: tuple[DependencyPolicy, ...] = (
     DependencyPolicy("sunbiz", "Sunbiz SFTP", 60,
                      fallback="The job exits and the --retry cron run plus the 3-day catch-up fetch it later."),
     DependencyPolicy("lendingflow", "LendingFlow", None,
-                     fallback="Inbound only: the lead is stored before anything else. No lead in 4 business hours "
+                     fallback="Inbound only: the lead is stored before anything else. No lead for one business day (8 business hours) "
                               "raises an alert; 0.5's nightly reconcile recovers failed deliveries."),
     DependencyPolicy("tracerfy", "Tracerfy DNC scrub", 30,
                      fallback="A failed scrub blocks every phone in it (SCRUB_FAILED): nothing unscrubbed loads."),
@@ -149,8 +149,9 @@ def feeds_protecting(channel: str) -> tuple[FeedPolicy, ...]:
 # A PropertyRadar pull older than this is never loaded into the dialer (one daily pull + 2 h slack).
 PROPERTYRADAR_MAX_AGE_HOURS = 26
 
-# No LendingFlow lead for this many business hours = alert (client question 28 confirms the window).
-LENDINGFLOW_SILENCE_BUSINESS_HOURS = 4
+# No LendingFlow lead for this many business hours = alert. One business day: 30 days of real volume (about 2 leads a
+# day, median gap 4 h, half of all gaps over 4 h) make a shorter window fire on normal quiet days.
+LENDINGFLOW_SILENCE_BUSINESS_HOURS = 8
 BUSINESS_TZ = "America/New_York"
 BUSINESS_DAY_START_HOUR = 9
-BUSINESS_DAY_END_HOUR = 17  # Monday-Friday, 9:00-17:00 ET
+BUSINESS_DAY_END_HOUR = 17  # Monday-Friday, 9:00-17:00 ET, US federal holidays skipped

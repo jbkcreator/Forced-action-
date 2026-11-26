@@ -34,10 +34,10 @@ class _SourcesDb:
 
 
 def test_outage_on_lendingflow_and_propertyradar_reports_both_sources_offline():
-    db = _SourcesDb(pr_finished=NOW - timedelta(hours=31), lf_last=NOW - timedelta(hours=5))
+    db = _SourcesDb(pr_finished=NOW - timedelta(hours=31), lf_last=NOW - timedelta(hours=25))
     reasons = dw.lead_source_offline_reasons(db, NOW, lendingflow_on=True)
     assert reasons[dw.SOURCE_PR_MATURITY] == "PropertyRadar data 31 h old"
-    assert reasons[dw.SOURCE_LENDINGFLOW].startswith("LendingFlow silent: no LendingFlow lead for 5.0 business hours")
+    assert reasons[dw.SOURCE_LENDINGFLOW].startswith("LendingFlow silent: no LendingFlow lead for 9.0 business hours")
 
 
 def test_healthy_sources_report_nothing_offline():

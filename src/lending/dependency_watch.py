@@ -8,7 +8,7 @@ Each pass:
    episode. Approval cards held as ``suppression_unverified`` on a channel that may send again go back for a fresh
    approval (never auto-sent).
 2. LendingFlow silence: no LendingFlow delivery for ``LENDINGFLOW_SILENCE_BUSINESS_HOURS`` business hours (Mon-Fri
-   9:00-17:00 ET) raises one alert, cleared by the next delivery. LendingFlow pushes to us, so an outage is silence.
+   9:00-17:00 ET, US federal holidays skipped) raises one alert, cleared by the next delivery. LendingFlow pushes to us, so an outage is silence.
 3. Exhausted phones: every phone over the total attempt cap is marked (``src.lending.exhausted``), so the mark exists
    before its attempts age out even when a call was recorded without the after-call hook.
 
@@ -20,7 +20,7 @@ from __future__ import annotations
 import argparse
 import logging
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import Callable, Mapping, Optional
 from zoneinfo import ZoneInfo
 
@@ -83,8 +83,47 @@ def paused_channels(rows: Optional[Mapping[str, dh.HealthRow]], now: datetime, *
             if dh.unverified_reason(c, rows, now, suppression_readable=suppression_readable) is not None}
 
 
+def _nth_weekday(year: int, month: int, weekday: int, n: int) -> date:
+    """The n-th ``weekday`` (Mon=0) of the month; n=-1 is the last one."""
+    if n > 0:
+        first = date(year, month, 1)
+        return first + timedelta(days=(weekday - first.weekday()) % 7 + 7 * (n - 1))
+    last = date(year, month + 1, 1) - timedelta(days=1) if month < 12 else date(year, 12, 31)
+    return last - timedelta(days=(last.weekday() - weekday) % 7)
+
+
+def _observed(day: date) -> date:
+    """A fixed-date holiday on a Saturday is observed Friday, on a Sunday the Monday after."""
+    if day.weekday() == 5:
+        return day - timedelta(days=1)
+    if day.weekday() == 6:
+        return day + timedelta(days=1)
+    return day
+
+
+def us_federal_holidays(year: int) -> set[date]:
+    """The eleven US federal holidays as observed in ``year``."""
+    return {
+        _observed(date(year, 1, 1)),
+        _nth_weekday(year, 1, 0, 3),     # Martin Luther King Jr. Day
+        _nth_weekday(year, 2, 0, 3),     # Washington's Birthday
+        _nth_weekday(year, 5, 0, -1),    # Memorial Day
+        _observed(date(year, 6, 19)),
+        _observed(date(year, 7, 4)),
+        _nth_weekday(year, 9, 0, 1),     # Labor Day
+        _nth_weekday(year, 10, 0, 2),    # Columbus Day
+        _observed(date(year, 11, 11)),
+        _nth_weekday(year, 11, 3, 4),    # Thanksgiving
+        _observed(date(year, 12, 25)),
+    }
+
+
+def is_business_day(day: date) -> bool:
+    return day.weekday() < 5 and day not in us_federal_holidays(day.year)
+
+
 def business_seconds(start: datetime, end: datetime) -> float:
-    """Seconds of Mon-Fri 9:00-17:00 ET between ``start`` and ``end``."""
+    """Seconds of Mon-Fri 9:00-17:00 ET between ``start`` and ``end``, US federal holidays skipped."""
     if end <= start:
         return 0.0
     tz = ZoneInfo(BUSINESS_TZ)
@@ -92,7 +131,7 @@ def business_seconds(start: datetime, end: datetime) -> float:
     total = 0.0
     day = local_start.date()
     while day <= local_end.date():
-        if day.weekday() < 5:
+        if is_business_day(day):
             open_at = datetime(day.year, day.month, day.day, BUSINESS_DAY_START_HOUR, tzinfo=tz)
             close_at = datetime(day.year, day.month, day.day, BUSINESS_DAY_END_HOUR, tzinfo=tz)
             lo, hi = max(open_at, local_start), min(close_at, local_end)

@@ -3,7 +3,7 @@ off, held cards reopen once the feeds are fresh, LendingFlow silence in business
 from __future__ import annotations
 
 from contextlib import contextmanager
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from types import SimpleNamespace
 
 from config import lending_fallbacks as fb
@@ -117,10 +117,23 @@ def test_business_seconds_skip_nights_and_weekends():
     assert dw.business_seconds(friday_4pm, monday_11am) == 3 * 3600  # Fri 16-17 + Mon 9-11
 
 
-def test_lendingflow_silent_four_business_hours_alerts():
-    last = NOW - timedelta(hours=5)  # 09:00 ET -> 14:00 ET
+def test_lendingflow_silent_one_business_day_alerts():
+    last = NOW - timedelta(hours=25)  # Tue 13:00 ET -> Wed 14:00 ET = 4 + 5 = 9 business hours
     result, posted, _ = _run(_Db(lf_last=last), lendingflow_on=True)
     assert dw.KEY_LENDINGFLOW_SILENCE in result.started and "LendingFlow may be down" in posted[0]
+
+
+def test_lendingflow_quiet_morning_is_not_an_outage():
+    last = NOW - timedelta(hours=5)  # 09:00 ET -> 14:00 ET: 5 business hours, a normal gap at ~2 leads a day
+    assert dw.lendingflow_silence(last, NOW) is None
+
+
+def test_business_seconds_skip_federal_holidays():
+    wednesday_4pm = datetime(2026, 11, 25, 21, 0, tzinfo=timezone.utc)
+    friday_10am = datetime(2026, 11, 27, 15, 0, tzinfo=timezone.utc)
+    assert dw.business_seconds(wednesday_4pm, friday_10am) == 2 * 3600  # Wed 16-17 + Fri 9-10; Thanksgiving skipped
+    assert dw.us_federal_holidays(2026) >= {date(2026, 11, 26), date(2026, 7, 3), date(2026, 12, 25)}
+    assert dw.is_business_day(date(2026, 11, 27)) and not dw.is_business_day(date(2026, 11, 26))
 
 
 def test_lendingflow_quiet_overnight_is_not_an_outage():
