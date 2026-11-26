@@ -57,6 +57,9 @@ def _ghl_fetch_dnd_page(page: int) -> list[dict[str, Any]]:
     return list(response.json().get("contacts") or [])
 
 
+fetch_ghl_dnd_page = _ghl_fetch_dnd_page  # public name for the nightly opt-out sync (src.tasks.nightly_dnc_sync)
+
+
 def main() -> None:
     from src.core.database import get_db_context
 

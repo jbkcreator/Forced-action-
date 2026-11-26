@@ -1018,6 +1018,10 @@ class AppSettings(BaseSettings):
 	lending_after_hours_calendar_id: Optional[str] = Field(default=None, env="LENDING_AFTER_HOURS_CALENDAR_ID")
 	# Carrier (10DLC) approval for lending texts Cora sends after Approve; until true an approved text waits (then blocks at expiry)
 	lending_sms_carrier_approved: bool = Field(default=False, env="LENDING_SMS_CARRIER_APPROVED")
+	# R1 0.11 SMS line-type gate: a lending phone with no stored line type is looked up with Telnyx (TELNYX_API_KEY),
+	# at most this many lookups per ET day; off, or over the cap, the number is not texted.
+	line_type_telnyx_fallback_enabled: bool = Field(default=True, env="LINE_TYPE_TELNYX_FALLBACK_ENABLED")
+	line_type_max_lookups_per_day: int = Field(default=200, env="LINE_TYPE_MAX_LOOKUPS_PER_DAY")
 	# R1 0.4: per-minute send caps per channel (10DLC throughput for SMS), shared by every sender on that channel; approval cards keep 10 slots free for live replies
 	lending_sms_per_minute: int = Field(default=60, ge=1, env="LENDING_SMS_PER_MINUTE")
 	lending_email_per_minute: int = Field(default=30, ge=1, env="LENDING_EMAIL_PER_MINUTE")

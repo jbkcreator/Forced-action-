@@ -1346,6 +1346,11 @@ COUNTY_ID=hillsborough
 # lending, in case the GHL "DND changed" workflow webhook is missing or down. Idempotent.
 */15 * * * * $PROJECT/scripts/cron/run.sh src.lending.ghl_dnd_backstop
 
+# R1 0.11 nightly opt-out sync (2:37 AM ET, off the */15 GHL backstop minutes): pulls GHL DND + NDL's Instantly block list into lending opt-outs, then
+# pushes anything not yet done to GHL DND, BatchDialer removals and the Instantly block-list queue. Adds only, never
+# removes. A failed step posts to LENDING_OPS_NOTICE_CHANNEL and retries the next night.
+37 7 * * * $PROJECT/scripts/cron/run.sh src.tasks.nightly_dnc_sync
+
 # Lending opt-out mailbox: email sent to LENDING_OPTOUT_ADDRESS is suppressed (address + any phone in it) and
 # posted to LENDING_OPS_CHANNEL. Reads the mailbox read-only over IMAP; idle until LENDING_OPTOUT_IMAP_USER/_PASSWORD are set.
 */5 * * * * $PROJECT/scripts/cron/run.sh src.lending.email_opt_out
