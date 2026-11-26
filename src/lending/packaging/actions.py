@@ -43,6 +43,8 @@ def mark_submitted(db: Session, package_id: int, *, actor: str, today: date) -> 
     result = _open(db, package_id, today)
     if not result.box_confirmed:
         raise ActionRefused("This lender's box is not confirmed. Do not submit.")
+    if result.fit_needs:
+        raise ActionRefused("The fit is not confirmed yet: " + "; ".join(result.fit_needs) + ".")
     if result.verdict.outcome is not Outcome.PASS:
         raise ActionRefused("A document is blocked or quarantined. Override or replace it first.")
     if result.source_type != LOAN_FILE:

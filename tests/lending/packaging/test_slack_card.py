@@ -18,14 +18,14 @@ FIT = {"misses": [{"lender_key": "abl", "lender_name": "Asset Based Lending (ABL
        "possible": []}
 
 
-def _result(*, confirmed=True, docs=(), status=None) -> CompileResult:
+def _result(*, confirmed=True, docs=(), status=None, fit=FIT) -> CompileResult:
     outcomes = {d.outcome for d in docs}
     worst = Outcome.QUARANTINE if Outcome.QUARANTINE in outcomes else (
         Outcome.BLOCK if Outcome.BLOCK in outcomes else Outcome.PASS)
     status = status or ("blocked" if worst is not Outcome.PASS else ("ready" if confirmed else "draft"))
     return CompileResult(11, "loan_file", 7, "corevest", status, confirmed,
                          [{"item_code": "bank_statements", "label": "Bank statements", "received": False}],
-                         Verdict(worst, tuple(docs)), FIT, None)
+                         Verdict(worst, tuple(docs)), fit, None)
 
 
 def _text(blocks) -> str:
@@ -166,3 +166,9 @@ def test_post_card_remembers_the_card_and_attaches_the_pdf(tmp_path):
     assert slack_card.post_card(db, slack, "C1", result) == "1.2"
     assert db.ran("SET card_channel = :c")[0] == {"c": "C1", "ts": "1.2", "id": 11}
     assert [c[0] for c in slack.calls] == ["chat_postMessage", "files_upload_v2"]
+
+
+def test_possible_fit_is_flagged_and_mark_submitted_is_not_on_the_card():
+    blocks = slack_card.card_blocks(_result(fit={**FIT, "needs": ["ARV unknown — cannot verify LTV"]}))
+    assert "Fit not confirmed" in _text(blocks) and "ARV unknown" in _text(blocks)
+    assert ACTION_SUBMIT not in _action_ids(blocks)

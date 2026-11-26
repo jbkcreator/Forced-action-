@@ -108,3 +108,19 @@ def test_upsert_targets_the_open_package_index_and_casts_json():
     sql = str(screen._UPSERT)
     assert "ON CONFLICT (source_type, source_id, lender_key) WHERE status NOT IN ('submitted', 'dismissed')" in sql
     assert "CAST(:fit AS jsonb)" in sql and "::jsonb" not in sql
+
+
+def test_possible_fit_gets_a_draft_that_names_the_missing_fact():
+    db = _db(facts={**FILE, "arv": None, "purchase_price": None, "rehab_budget": None})
+    ids = screen_file(db, FileRef("loan_file", 7), matrix=SECONDARY, rules_version="v1")
+    upserts = db.ran("INSERT INTO lending.lender_packages")
+    assert ids and len(upserts) == len(SECONDARY)
+    for upsert in upserts:
+        fit = json.loads(upsert["fit"])
+        assert fit["needs"] and all(p["lender_key"] != upsert["lk"] for p in fit["possible"])
+
+
+def test_confirmed_fit_has_no_needs():
+    db = _db()
+    screen_file(db, FileRef("loan_file", 7), matrix=SECONDARY, rules_version="v1")
+    assert all(json.loads(u["fit"])["needs"] == [] for u in db.ran("INSERT INTO lending.lender_packages"))

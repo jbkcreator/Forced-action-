@@ -124,15 +124,18 @@ def fingerprint(facts: dict, rules_version: str) -> str:
 
 
 def fit_summary(fit: LenderFitResult, lender_key: str) -> dict:
-    """What the card shows: this lender's fit, and every secondary lender that missed or is undetermined, with why."""
-    mine = next(f for f in fit.fitting if f.lender_key == lender_key)
+    """What the card shows: this lender's fit (``needs`` = the facts still missing when the fit is only possible), and
+    every other secondary lender that missed or is undetermined, with why."""
+    fits = {f.lender_key: f for f in fit.fitting}
+    maybe = {p.lender_key: p for p in fit.possible}
     return {
         "lender_key": lender_key,
-        "subject_to_confirmation": mine.subject_to_confirmation,
+        "subject_to_confirmation": fits[lender_key].subject_to_confirmation if lender_key in fits else True,
+        "needs": list(maybe[lender_key].why_unknown) if lender_key in maybe else [],
         "misses": [{"lender_key": m.lender_key, "lender_name": m.lender_name, "reasons": list(m.reasons)}
                    for m in fit.non_fitting],
-        "possible": [{"lender_key": p.lender_key, "lender_name": p.lender_name, "why": p.why_unknown}
-                     for p in fit.possible],
+        "possible": [{"lender_key": p.lender_key, "lender_name": p.lender_name, "why": "; ".join(p.why_unknown)}
+                     for p in fit.possible if p.lender_key != lender_key],
         "other_fits": [f.lender_key for f in fit.fitting if f.lender_key != lender_key],
     }
 
@@ -169,7 +172,7 @@ def screen_file(db: Session, ref: FileRef, *, matrix: tuple[LenderRules, ...], r
             for row in db.execute(_EXISTING, {"st": ref.source_type, "sid": ref.source_id})}
     rules_by_key = {r.key: r for r in matrix}
     changed: list[int] = []
-    for lender in fit.fitting:
+    for lender in (*fit.fitting, *fit.possible):
         if (lender.lender_key, fp) in seen:
             continue  # same facts, same rules: already drafted (or dismissed / submitted)
         rules = rules_by_key.get(lender.lender_key)

@@ -56,6 +56,8 @@ def blocked_reasons(result: CompileResult) -> list[str]:
     reasons = []
     if not result.box_confirmed:
         reasons.append("the lender's box is not confirmed")
+    if result.fit_needs:
+        reasons.append("the fit is not confirmed")
     if result.verdict.quarantined:
         reasons.append(f"{len(result.verdict.quarantined)} document(s) quarantined")
     if result.verdict.blocked:
@@ -87,6 +89,9 @@ def card_blocks(result: CompileResult, *, note: str = "") -> list[dict]:
     blocks = [_section(head)]
     if not result.box_confirmed:
         blocks.append(_section(":warning: *Box not confirmed — do not submit.* This lender's rules are placeholders."))
+    if result.fit_needs:
+        blocks.append(_section(":grey_question: *Fit not confirmed — get the missing facts first.*\n"
+                               + "\n".join(f"• {need}" for need in result.fit_needs)))
     blocks.append(_section("*Other secondary lenders*\n" + _fit_text(result.fit_result)))
     checklist = "\n".join(f"{':white_check_mark:' if i['received'] else ':x:'} {i['label']}" for i in result.checklist)
     blocks.append(_section("*Checklist*\n" + (checklist or "_No required documents configured._")))

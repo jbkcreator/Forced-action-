@@ -16,6 +16,7 @@
 {% block body %}
 <p class="muted">{{ generated_date }} · Ref {{ package_ref }} · Prepared for {{ lender_name }}</p>
 {% if not box_confirmed %}<p class="stamp">Box not confirmed — do not submit</p>{% endif %}
+{% if fit_needs %}<p class="stamp">Fit not confirmed — {{ fit_needs | join('; ') }}</p>{% endif %}
 <h1>Deal facts</h1>
 <p class="address">{{ address }}</p>
 

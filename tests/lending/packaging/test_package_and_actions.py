@@ -32,11 +32,12 @@ def _doc_row(path, upload_id=1, item_code="bank_statements", table="doc_chase_up
             "quarantine_status": status, "quarantine_reason": reason}
 
 
-def _db(docs, *, confirmed=False, status="draft", overrides=None, source_type="loan_file", guarantors=None):
+def _db(docs, *, confirmed=False, status="draft", overrides=None, source_type="loan_file", guarantors=None,
+        fit=None):
     return FakeSession({
         "SELECT id, source_type, source_id, lender_key, status, box_confirmed": [{
             "id": 11, "source_type": source_type, "source_id": 7, "lender_key": "corevest", "status": status,
-            "box_confirmed": confirmed, "fit_result": {"misses": []}, "overrides": overrides or {}}],
+            "box_confirmed": confirmed, "fit_result": fit or {"misses": []}, "overrides": overrides or {}}],
         "SELECT source_type, source_id, lender_key, status FROM lending.lender_packages": [{
             "source_type": source_type, "source_id": 7, "lender_key": "corevest", "status": status}],
         "FROM lending.loan_files f LEFT JOIN lending.entities": [FACTS],
@@ -159,6 +160,7 @@ def test_mark_submitted_revalidates_then_records_the_submission(tmp_path, submis
     ({"confirmed": False}, "Alice Smith", "box is not confirmed"),
     ({"confirmed": True}, "Bob Jones", "blocked or quarantined"),
     ({"confirmed": True, "source_type": "lf_lead"}, "Alice Smith", "no loan file"),
+    ({"confirmed": True, "fit": {"misses": [], "needs": ["ARV unknown"]}}, "Alice Smith", "fit is not confirmed"),
 ])
 def test_mark_submitted_refuses(tmp_path, submissions, kwargs, docs_who, message):
     db = _db([_doc_row(_statement(tmp_path, who=docs_who))], **kwargs)
@@ -218,3 +220,9 @@ def test_release_only_a_quarantined_document_and_ledger_it():
     clean = FakeSession({"SELECT quarantine_status FROM lending.doc_chase_uploads": [{"s": None}]})
     with pytest.raises(actions.ActionRefused, match="not quarantined"):
         actions.release_document(clean, "doc_chase_uploads", 5, reason="x", actor="human:U1")
+
+
+def test_possible_fit_stays_draft_even_with_a_confirmed_box_and_clean_documents(tmp_path):
+    db = _db([_doc_row(_statement(tmp_path))], confirmed=True, fit={"misses": [], "needs": ["ARV unknown"]})
+    result = package.compile_package(db, 11, today=TODAY, renderer=None)
+    assert result.status == "draft" and result.fit_needs == ["ARV unknown"] and not result.submittable

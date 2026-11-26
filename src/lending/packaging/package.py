@@ -104,6 +104,11 @@ class CompileResult:
     def submittable(self) -> bool:
         return self.status == READY
 
+    @property
+    def fit_needs(self) -> list[str]:
+        """Facts still missing before this lender's fit is confirmed; empty for a confirmed fit."""
+        return list(self.fit_result.get("needs") or [])
+
 
 def lead_ref(lead_id: int) -> str:
     return f"lendingflow_lead:{lead_id}"
@@ -174,10 +179,10 @@ def build_checklist(lender_key: str, verdict: Verdict) -> list[dict]:
             for item in LENDER_CHECKLISTS.get(lender_key, ())]
 
 
-def status_for(verdict: Verdict, box_confirmed: bool) -> str:
+def status_for(verdict: Verdict, box_confirmed: bool, fit_confirmed: bool = True) -> str:
     if verdict.outcome is not Outcome.PASS:
         return BLOCKED
-    return READY if box_confirmed else DRAFT
+    return READY if box_confirmed and fit_confirmed else DRAFT
 
 
 def _money(value: Any) -> str:
@@ -185,7 +190,7 @@ def _money(value: Any) -> str:
 
 
 def deal_facts_context(package_id: int, lender_key: str, box_confirmed: bool, facts: dict, ctx: FileContext,
-                       checklist: list[dict], today: date) -> dict:
+                       checklist: list[dict], today: date, fit_needs: Optional[list[str]] = None) -> dict:
     address = ", ".join(p for p in (facts.get("property_address"), facts.get("property_city"),
                                     " ".join(x for x in (facts.get("property_state"), facts.get("property_zip")) if x))
                         if p) or "Address not given"
@@ -201,7 +206,7 @@ def deal_facts_context(package_id: int, lender_key: str, box_confirmed: bool, fa
         rows.insert(0, ("Borrowing entity", facts["entity_name"]))
     return {"generated_date": today.strftime("%B %d, %Y"), "package_ref": f"PKG-{package_id}",
             "lender_name": lender_name(lender_key), "box_confirmed": box_confirmed, "address": address,
-            "deal_rows": rows, "parties": list(ctx.persons), "checklist": checklist}
+            "deal_rows": rows, "parties": list(ctx.persons), "checklist": checklist, "fit_needs": fit_needs or []}
 
 
 def render_deal_facts_pdf(template: str, context: dict) -> bytes:
@@ -247,12 +252,14 @@ def compile_package(db: Session, package_id: int, *, today: date,
             quarantine.quarantine_and_alert(db, found.upload_table, found.upload_id, found.reasons)
 
     checklist = build_checklist(lender_key, verdict)
-    status = status_for(verdict, row["box_confirmed"])
+    fit = row["fit_result"]
+    fit = json.loads(fit) if isinstance(fit, str) else dict(fit or {})
+    status = status_for(verdict, row["box_confirmed"], fit_confirmed=not fit.get("needs"))
     pdf_path = None
     if renderer is not None:
         try:
             pdf_path = _store_pdf(package_id, renderer(DEAL_FACTS_TEMPLATE, deal_facts_context(
-                package_id, lender_key, row["box_confirmed"], facts, ctx, checklist, today)))
+                package_id, lender_key, row["box_confirmed"], facts, ctx, checklist, today, fit.get("needs"))))
         except Exception as exc:
             logger.error("[packaging] package %s: deal facts PDF failed (%s)", package_id, type(exc).__name__)
     db.execute(_SAVE, {"id": package_id, "status": status, "checklist": json.dumps(checklist),
@@ -262,6 +269,5 @@ def compile_package(db: Session, package_id: int, *, today: date,
                            detail={"lender_key": lender_key, "blocked": [d.key for d in verdict.blocked],
                                    "quarantined": [d.key for d in verdict.quarantined]},
                            ref_table="lender_packages", ref_id=package_id)
-    fit = row["fit_result"]
     return CompileResult(package_id, source_type, source_id, lender_key, status, row["box_confirmed"], checklist,
-                         verdict, json.loads(fit) if isinstance(fit, str) else dict(fit or {}), pdf_path)
+                         verdict, fit, pdf_path)
