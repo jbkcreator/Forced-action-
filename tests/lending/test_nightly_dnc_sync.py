@@ -8,7 +8,7 @@ import pytest
 from config.lending_compliance import OptOutChannel
 from src.lending import compliance
 from src.tasks import nightly_dnc_sync
-from src.tasks.nightly_dnc_sync import pull_instantly, push_ghl, run_sync
+from src.tasks.nightly_dnc_sync import pull_instantly, push_ghl, retry_instantly_phones, run_sync
 
 
 class FakeDb:
@@ -27,6 +27,7 @@ class FakeDb:
 @pytest.fixture(autouse=True)
 def _nothing_left_pending(monkeypatch):
     monkeypatch.setattr(nightly_dnc_sync, "still_pending", lambda db: {"ghl_pending": 0, "dialer_pending": 0})
+    monkeypatch.setattr(nightly_dnc_sync, "retry_instantly_phones", lambda db: 0)
 
 
 def _factory(db):
@@ -127,3 +128,35 @@ def test_opt_outs_still_pending_after_the_push_are_reported_as_failures(monkeypa
     report = run_sync(_factory(FakeDb()), fetch_ghl_dnd_page=lambda page: [], fetch_instantly=lambda: iter([]))
 
     assert report.failures == ["ghl_pending"] and report.counts["ghl_pending"] == 3
+
+
+class RowsDb:
+    def __init__(self, rows):
+        self.rows = rows
+
+    def execute(self, statement, params=None):
+        class Result:
+            def __init__(self, rows):
+                self._rows = rows
+
+            def fetchall(self):
+                return self._rows
+        return Result(self.rows)
+
+
+def test_email_only_instantly_opt_out_gets_its_phone_on_a_later_run(monkeypatch):
+    """Finding 1: the first lookup failed (email-only opt-out); GHL is back, so the next run finds and opts out the phone."""
+    recorded = []
+    monkeypatch.setattr(compliance, "propagate_opt_out", lambda db, **kw: recorded.append(kw))
+    db = RowsDb([("stop@example.com", "instantly:e9")])
+
+    found = retry_instantly_phones(db, lookup=lambda db, emails: {"stop@example.com": {"+18135550111"}})
+
+    assert found == 1
+    assert recorded[0]["phone"] == "+18135550111" and recorded[0]["email"] == "stop@example.com"
+    assert recorded[0]["source_ref"].startswith("instantly:e9:p:") and recorded[0]["channel"] == OptOutChannel.EMAIL
+
+
+def test_phone_retry_does_nothing_when_no_email_only_opt_outs(monkeypatch):
+    monkeypatch.setattr(compliance, "propagate_opt_out", lambda db, **kw: pytest.fail("no opt-out expected"))
+    assert retry_instantly_phones(RowsDb([]), lookup=lambda db, emails: pytest.fail("no lookup")) == 0

@@ -53,6 +53,18 @@ _QUEUE_MISSING = text("""
 """)
 
 
+PHONE_RETRY_DAYS = 30
+# Instantly opt-outs recorded email-only (no phone found then, e.g. the GHL search failed) in the last
+# PHONE_RETRY_DAYS, whose phone has not been found by a later run yet.
+_EMAIL_ONLY_INSTANTLY = text("""
+    SELECT DISTINCT lower(s.email), s.source_ref FROM lending.suppression_list s
+      JOIN lending.opt_out_events e ON e.source_ref = s.source_ref AND e.channel = :email_channel
+     WHERE s.source_ref LIKE 'instantly:%' AND s.email IS NOT NULL
+       AND e.received_at > now() - make_interval(days => :days)
+       AND NOT EXISTS (SELECT 1 FROM lending.opt_out_events p
+                        WHERE (p.source_ref = s.source_ref AND p.phone_hash IS NOT NULL)
+                           OR p.source_ref LIKE s.source_ref || ':p:%')
+""")
 _STILL_PENDING = text("""
     SELECT
       (SELECT count(*) FROM lending.opt_out_events e JOIN lending.contacts c ON c.phone_hash = e.phone_hash
@@ -90,6 +102,28 @@ def pull_instantly(db, entries: Iterator[dict[str, Any]]) -> int:
         propagate_opt_out(db, email=email, source_ref=f"instantly:{entry_id}"[:100], channel=OptOutChannel.EMAIL)
         new += 1
     return new
+
+
+def retry_instantly_phones(db, lookup: Optional[Callable[..., dict[str, set[str]]]] = None) -> int:
+    """Look up the phone of each recent email-only Instantly opt-out again (GHL may have been down the first time) and
+    opt each phone found out on every channel. One event per phone, ``<source_ref>:p:<hash>``, so a later run skips it.
+    Returns how many phones were opted out. Does not commit."""
+    from src.lending.compliance import phone_hash, propagate_opt_out
+
+    if lookup is None:
+        from src.lending.ghl_email_lookup import phones_for_emails as lookup
+    rows = db.execute(_EMAIL_ONLY_INSTANTLY, {"email_channel": OptOutChannel.EMAIL.value,
+                                              "days": PHONE_RETRY_DAYS}).fetchall()
+    refs = {email: ref for email, ref in rows}
+    if not refs:
+        return 0
+    found = 0
+    for email, phones in lookup(db, sorted(refs)).items():
+        for phone in sorted(phones):
+            propagate_opt_out(db, phone=phone, email=email, channel=OptOutChannel.EMAIL,
+                              source_ref=f"{refs[email]}:p:{phone_hash(phone)[:12]}"[:100])
+            found += 1
+    return found
 
 
 def push_instantly(db) -> int:
@@ -173,6 +207,8 @@ def run_sync(db_factory: SessionFactory, *, fetch_ghl_dnd_page: Optional[Callabl
         _step(report, "ghl_pulled", in_tx(lambda db: run_backstop(db, fetch_dnd_page=fetch_ghl_dnd_page or live_ghl_page)))
     if fetch_instantly is not None or lending_instantly_account() is not None:
         _step(report, "instantly_pulled", in_tx(lambda db: pull_instantly(db, (fetch_instantly or _instantly_entries)())))
+    if lending_ghl_account() is not None:
+        _step(report, "instantly_phones_found", in_tx(retry_instantly_phones))
     _step(report, "ghl_pushed", lambda: push_ghl(db_factory, ghl_dnd))
     _step(report, "dialer_pushed", in_tx(lambda db: compliance._retry_pending_dialer_removals(db, dialer_remover)))
     _step(report, "instantly_queued", in_tx(push_instantly))
