@@ -39,7 +39,9 @@ def save_call_extraction(
             ON CONFLICT (dialer_call_id) DO UPDATE SET
                 phone = EXCLUDED.phone,
                 fields = EXCLUDED.fields,
-                extracted_at = EXCLUDED.extracted_at
+                extracted_at = EXCLUDED.extracted_at,
+                source = 'transcript',
+                entered_by = NULL
             """
         ),
         {
