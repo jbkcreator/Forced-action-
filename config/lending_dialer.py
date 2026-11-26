@@ -1,5 +1,8 @@
 """Lending dialer load: queue -> BatchDialer campaign names, hook lines and endpoints."""
 
+from config.lending_fallbacks import quick_timeout, timeout
+
+
 # Pool (launch queue) -> dialer campaign name (Go Live Brief 2.5). The campaigns must
 # exist in BatchDialer with these exact names; a live load refuses any unmapped pool.
 POOL_CAMPAIGN_TAGS: dict[str, str] = {
@@ -35,8 +38,8 @@ CAMPAIGN_HOOKS: dict[str, str] = {
 # an unset endpoint raises UnconfirmedCapability and removals stay pending.
 # Confirmed 2026-09-30 with the client key (GET /campaigns, /contacts, /cdrs, /lists -> 200).
 BATCHDIALER_BASE_URL: str = "https://app.batchdialer.com/api"
-BATCHDIALER_TIMEOUT_SECONDS: float = 20.0
-BATCHDIALER_QUICK_TIMEOUT_SECONDS: float = 5.0  # single attempt, no retry: the on-call consent read
+BATCHDIALER_TIMEOUT_SECONDS: float = timeout("batchdialer")  # R1 0.6 policy table (config/lending_fallbacks.py)
+BATCHDIALER_QUICK_TIMEOUT_SECONDS: float = quick_timeout("batchdialer")  # single attempt, no retry: the on-call consent read
 BATCHDIALER_ENDPOINTS: dict[str, "tuple[str, str] | None"] = {
     # Confirmed live 2026-09-30: create/read/update/delete on a test contact.
     "contact_upsert": ("POST", "/contact"),

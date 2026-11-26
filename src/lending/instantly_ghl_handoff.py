@@ -36,6 +36,8 @@ from config.settings import get_settings
 from src.lending.ghl_account import GhlAccount, lending_ghl_account
 from src.lending.ghl_crm import GhlContact, _contact_from
 from src.lending.global_halt import is_globally_halted
+from config.lending_fallbacks import CHANNEL_GHL_CRM
+from src.lending.dependency_health import outbound_paused
 from src.lending.web_lead_ghl import GhlLeadSink
 from src.lending.instantly_replies import new_reply_text
 from src.lending.web_leads import DeliveryError
@@ -62,6 +64,8 @@ class InstantlyGhlHandoff(GhlLeadSink):
     def __call__(self, row: Mapping[str, Any]) -> str:
         if is_globally_halted():  # a tag or card can start a GHL workflow that messages the lead
             raise DeliveryError("lending emergency halt is on; nothing changed in GHL")
+        if outbound_paused(CHANNEL_GHL_CRM):
+            raise DeliveryError("opt-outs can't be verified (a feed is stale); nothing changed in GHL")
         email = str(row["lead_email"]).strip().lower()
         contact_id, duplicates = self._contact_for_email(row, email)
         contact = self._read_contact(contact_id)

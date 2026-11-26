@@ -43,6 +43,8 @@ from config.lending_lendingflow import (
 from config.settings import get_settings
 from src.lending.call_note_lock import BD_TO_GHL_LOCK_SPACE, lock_phone_and_check_latest
 from src.lending.global_halt import is_globally_halted
+from config.lending_fallbacks import CHANNEL_GHL_CRM
+from src.lending.dependency_health import outbound_paused
 
 logger = logging.getLogger(__name__)
 
@@ -221,7 +223,8 @@ def _live_writer() -> Optional[GhlNoteWriter]:
 
 
 def _enabled() -> bool:
-    return get_settings().lending_bd_result_to_ghl_enabled and not is_globally_halted()
+    return (get_settings().lending_bd_result_to_ghl_enabled and not is_globally_halted()
+            and not outbound_paused(CHANNEL_GHL_CRM))  # R1 0.6: a GHL tag can start a workflow
 
 
 def _default_sessions() -> AbstractContextManager[Session]:

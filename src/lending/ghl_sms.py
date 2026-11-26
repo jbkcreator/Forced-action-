@@ -28,6 +28,7 @@ from typing import Any, Callable, Optional
 import requests
 
 from config.settings import get_settings
+from config.lending_fallbacks import timeout
 from src.lending.dispatch import circuit_breaker
 from src.lending.cold_leads import ColdSendBlock, ColdSendDecision, SendChannel, cold_send_decision, split_cold_dnd
 from src.lending.global_halt import is_globally_halted
@@ -39,7 +40,7 @@ logger = logging.getLogger(__name__)
 
 Request = Callable[..., Any]
 
-_SEND_TIMEOUT = 15  # seconds, same as the shared GHL helper
+_SEND_TIMEOUT = timeout("ghl")  # seconds, same as the shared GHL helper (R1 0.6 policy table)
 
 
 class GhlSmsError(RuntimeError):
@@ -63,6 +64,7 @@ class GhlChannelPaused(GhlSmsError):
         super().__init__(str(cause))
         self.channel = cause.channel
         self.rate_limited = isinstance(cause, circuit_breaker.RateLimited)
+        self.held_reason = cause.held_reason
 
 
 class GhlSendRefused(GhlSmsError):

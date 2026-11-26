@@ -34,6 +34,8 @@ from config.lending_compliance import ReasonCode, RemovalReason
 from config.lending_dialer import POOL_CAMPAIGN_TAGS
 from config.settings import get_settings
 from src.lending.global_halt import is_globally_halted
+from config.lending_fallbacks import CHANNEL_DIALER
+from src.lending.dependency_health import outbound_paused
 from src.lending.backflip_conflict import (
     BorrowerRecord,
     find_borrower_conflicts,
@@ -505,6 +507,8 @@ def run_dialer_load(
         raise ValueError("a live load needs a scrubber and a dialer")
     if not dry_run and is_globally_halted():
         raise LoadRefused("lending emergency halt is on; nothing loaded into the dialer")
+    if not dry_run and outbound_paused(CHANNEL_DIALER):
+        raise LoadRefused("opt-outs can't be verified (an opt-out feed is stale); nothing loaded into the dialer")
     phones = [normalize_phone(r.get("normalized_phone") or r.get("phone") or "") for r in records]
     if not dry_run:
         _refuse_before_scrub(records, phones, db, campaign_tags, backflip_check)
@@ -587,6 +591,11 @@ def run_dialer_load(
             if is_globally_halted():  # rechecked per push: an approver can halt while a long run is loading
                 report.halted_mid_run = len(loadable) - position
                 logger.warning("[dialer-load] live run %s stopped by the lending emergency halt; %d not loaded",
+                               run_id, report.halted_mid_run)
+                break
+            if outbound_paused(CHANNEL_DIALER):  # R1 0.6: an opt-out feed went stale during the run
+                report.halted_mid_run = len(loadable) - position
+                logger.warning("[dialer-load] live run %s stopped: opt-outs can't be verified; %d not loaded",
                                run_id, report.halted_mid_run)
                 break
             if _suppressed_phones(db, [item.phone]):  # one indexed lookup per push (a push is 3 HTTP calls)

@@ -9,6 +9,8 @@ states are filled. The state posts each day's file at about 11:30 PM ET that nig
 """
 from __future__ import annotations
 
+from config.lending_fallbacks import timeout
+
 # The brief's keywords, matched as whole words in the entity name, case-insensitive ("REI" does not match "REIGN").
 # More can be added here once the client confirms the list.
 KEYWORDS: tuple[str, ...] = ("REI", "HOMES", "INVESTMENTS", "CAPITAL")
@@ -26,7 +28,7 @@ CATCH_UP_DAYS = 3
 SFTP_DIR = "doc/cor"
 SFTP_FILE = "{day:%Y%m%d}c.txt"
 SFTP_PORT = 22
-SFTP_TIMEOUT_SECONDS = 60
+SFTP_TIMEOUT_SECONDS = timeout("sunbiz")  # R1 0.6 policy table (config/lending_fallbacks.py)
 # The state server's SSH host key, checked on every connection so a spoofed server cannot feed a fake file into the
 # outreach CSV. Read from sftp.floridados.gov on Nov 16, 2026 (SHA256:xTpc6X81is5Nyh2QXR6hIRhS7ayx5/BMr162zB73xyQ).
 # If the state changes its key the export fails (alert on the --retry run); set SUNBIZ_SFTP_HOST_KEY to the new key.

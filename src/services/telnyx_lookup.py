@@ -33,11 +33,12 @@ from typing import Optional
 import requests
 
 from config.settings import get_settings
+from config.lending_fallbacks import timeout
 
 logger = logging.getLogger(__name__)
 
 _API_BASE = "https://api.telnyx.com/v2/number_lookup"
-_TIMEOUT_SECONDS = 10
+_TIMEOUT_SECONDS = timeout("telnyx")  # R1 0.6 policy table
 
 
 class TelnyxLookupError(Exception):

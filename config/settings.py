@@ -1022,6 +1022,8 @@ class AppSettings(BaseSettings):
 	lending_sms_per_minute: int = Field(default=60, ge=1, env="LENDING_SMS_PER_MINUTE")
 	lending_email_per_minute: int = Field(default=30, ge=1, env="LENDING_EMAIL_PER_MINUTE")
 	lending_instantly_per_minute: int = Field(default=30, ge=1, env="LENDING_INSTANTLY_PER_MINUTE")
+	# R1 0.6: pause automated outbound while an opt-out feed is past its freshness limit (config/lending_fallbacks.py). Off: the watch only posts "would have paused"
+	lending_failclosed_pause_enabled: bool = Field(default=False, env="LENDING_FAILCLOSED_PAUSE_ENABLED")
 	lending_ghl_cf_intro_name: Optional[str] = Field(default=None, env="LENDING_GHL_CF_INTRO_NAME")
 	# GHL contact custom field "lead_id": every LendingFlow push writes our lendingflow_leads.lead_uuid; unset = not written
 	lending_ghl_cf_lead_id: Optional[str] = Field(default=None, env="LENDING_GHL_CF_LEAD_ID")

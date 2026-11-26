@@ -2274,3 +2274,45 @@ class LendingSunbizLlcContact(LendingBase):
     __table_args__ = (
         CheckConstraint("subject_role IN ('officer', 'agent')", name="ck_lending_sunbiz_llc_contacts_role"),
     )
+
+
+class LendingDependencyHealth(LendingBase):
+    """R1 0.6: when each outside service or feed last worked (``src.lending.dependency_health``). One row per
+    dependency key from ``config/lending_fallbacks.py``; a success clears ``failing_since``. An opt-out feed whose
+    ``last_success_at`` is older than its limit means suppression cannot be verified for the channels it protects."""
+
+    __tablename__ = "dependency_health"
+
+    dependency: Mapped[str] = mapped_column(String(40), primary_key=True)
+    last_success_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    failing_since: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    detail: Mapped[Optional[str]] = mapped_column(String(200))
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_now, server_default=text("now()"))
+
+
+class LendingDependencyAlert(LendingBase):
+    """R1 0.6: one row per alert episode key (a stale feed, LendingFlow silence), so each episode posts once when it
+    starts and once when it clears."""
+
+    __tablename__ = "dependency_alerts"
+
+    alert_key: Mapped[str] = mapped_column(String(60), primary_key=True)
+    active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default=text("false"))
+    since: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    detail: Mapped[Optional[str]] = mapped_column(String(300))
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_now, server_default=text("now()"))
+
+
+class LendingExhaustedPhone(LendingBase):
+    """R1 0.6: a phone that reached the total attempt history cap (6 attempts in 10 business days). The mark stays
+    after the attempts age out, so the phone never reloads from a calling list; only a new inbound (a LendingFlow lead
+    or a website form for that phone) clears it (``cleared_at``)."""
+
+    __tablename__ = "exhausted_phones"
+
+    phone: Mapped[str] = mapped_column(String(20), primary_key=True)
+    exhausted_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_now, server_default=text("now()"))
+    attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default=text("0"))
+    cleared_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    cleared_reason: Mapped[Optional[str]] = mapped_column(String(40))
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_now, server_default=text("now()"))

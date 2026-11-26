@@ -23,6 +23,7 @@ from typing import Iterator, Optional, Protocol, Sequence
 import requests
 
 from config.settings import settings
+from config.lending_fallbacks import timeout
 
 logger = logging.getLogger(__name__)
 
@@ -208,7 +209,7 @@ class LivePropertyRadarPort:
                 f"{_BASE_URL}/v1/properties",
                 params=params,
                 json=body,
-                timeout=90,
+                timeout=timeout("propertyradar"),
             )
             if resp.status_code not in _RETRYABLE:
                 break

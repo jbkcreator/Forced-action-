@@ -20,6 +20,8 @@ from requests.exceptions import ConnectTimeout, RequestException
 from src.lending.email_identity import lending_email_identity
 from src.lending.ghl_account import ghl_headers, ghl_multipart_headers, lending_ghl_account
 from src.lending.global_halt import is_globally_halted
+from config.lending_fallbacks import CHANNEL_GHL_EMAIL
+from src.lending.dependency_health import outbound_paused
 from src.lending.prequal import PrequalSink
 from src.lending.web_lead_ghl import GhlLeadSink
 from src.lending.web_leads import DeliveryError
@@ -49,6 +51,9 @@ def _refuse_if_halted() -> None:
     if is_globally_halted():
         logger.warning("[prequal] email refused: lending emergency halt is on")
         raise DeliveryError("prequal email: lending emergency halt is on; nothing sent", config_error=True)
+    if outbound_paused(CHANNEL_GHL_EMAIL):  # R1 0.6: kept as a setup failure so the letter keeps its attempts
+        logger.warning("[prequal] email refused: opt-outs can't be verified")
+        raise DeliveryError("prequal email: opt-outs can't be verified; nothing sent", config_error=True)
 
 
 def with_lending_sender(body: dict) -> dict:

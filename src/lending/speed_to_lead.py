@@ -108,6 +108,8 @@ from config.settings import get_settings
 from src.lending.compliance import text_window_open
 from src.lending.consent import has_text_consent
 from src.lending.global_halt import is_globally_halted
+from config.lending_fallbacks import CHANNEL_GHL_CRM
+from src.lending.dependency_health import outbound_paused
 
 logger = logging.getLogger(__name__)
 
@@ -514,7 +516,7 @@ def start(db, source: str, lead_id: int, *, tags: TagClient, scrubber: Optional[
                            "received_at": lead["received_at"], "now": now})
     if row_id is None:
         return None
-    halted = is_globally_halted()
+    halted = is_globally_halted() or outbound_paused(CHANNEL_GHL_CRM)  # R1 0.6: stale opt-out feed
     if source == SOURCE_LENDINGFLOW:
         text_status, text_at = TEXT_BY_LENDINGFLOW, lead["intro_sms_tagged_at"]
     else:
@@ -613,7 +615,7 @@ _TEXT_DONE = text("UPDATE lending.speed_to_lead SET text_status = :status, text_
 def release_held_web_intro(db, tags: Optional[TagClient], *, now: Optional[datetime] = None) -> int:
     """Web-lead sweep: tag the website intro texts held for the send window once it opens. Re-checks consent (an
     opt-out since arrival withholds it for good). Returns how many were tagged. Does not commit."""
-    if tags is None or not intro_sms_on() or is_globally_halted():
+    if tags is None or not intro_sms_on() or is_globally_halted() or outbound_paused(CHANNEL_GHL_CRM):
         return 0
     now = now or datetime.now(timezone.utc)
     tagged = 0
@@ -912,7 +914,7 @@ def _try_release(db, row: Mapping[str, Any], *, tags: TagClient, scrubber: Optio
     if db.execute(_STILL_QUEUED, {"id": row["row_id"]}).first() is None:
         db.commit()
         return NEXT
-    if is_globally_halted() or db.execute(_CASCADE_RUNNING, {"spacing_since": at - CASCADE_SPACING}).scalar():
+    if is_globally_halted() or outbound_paused(CHANNEL_GHL_CRM) or db.execute(_CASCADE_RUNNING, {"spacing_since": at - CASCADE_SPACING}).scalar():
         db.commit()
         return STOP
     stop, voice = _admit(db, lead, at)
@@ -972,7 +974,7 @@ def release_queue(db, *, tags: Optional[TagClient], scrubber: Optional[Scrubber]
     if tags is None or read_calls is None:
         logger.warning("[speed-to-lead] queue: GHL is not configured, nothing released")
         return run
-    if is_globally_halted():
+    if is_globally_halted() or outbound_paused(CHANNEL_GHL_CRM):
         return run
     if db.execute(_CASCADE_RUNNING, {"spacing_since": start_at - CASCADE_SPACING}).scalar():
         return run

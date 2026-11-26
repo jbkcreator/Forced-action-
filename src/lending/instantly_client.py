@@ -19,11 +19,12 @@ from typing import Optional
 import requests
 
 from config.settings import get_settings
+from config.lending_fallbacks import timeout
 from src.lending.dispatch import circuit_breaker
 
 logger = logging.getLogger(__name__)
 
-TIMEOUT_SECONDS = 20
+TIMEOUT_SECONDS = timeout("instantly")  # R1 0.6 policy table
 
 
 class InstantlyError(RuntimeError):
@@ -45,6 +46,7 @@ class InstantlyChannelPaused(InstantlyError):
         super().__init__(str(cause))
         self.channel = cause.channel
         self.rate_limited = isinstance(cause, circuit_breaker.RateLimited)
+        self.held_reason = cause.held_reason
 
 
 @dataclass(frozen=True)
