@@ -110,6 +110,8 @@ def retry_instantly_phones(db, lookup: Optional[Callable[..., dict[str, set[str]
     Returns how many phones were opted out. Does not commit."""
     from src.lending.compliance import phone_hash, propagate_opt_out
 
+    from src.lending.ghl_email_lookup import MAX_LOOKUPS_PER_BATCH
+
     if lookup is None:
         from src.lending.ghl_email_lookup import phones_for_emails as lookup
     rows = db.execute(_EMAIL_ONLY_INSTANTLY, {"email_channel": OptOutChannel.EMAIL.value,
@@ -117,8 +119,12 @@ def retry_instantly_phones(db, lookup: Optional[Callable[..., dict[str, set[str]
     refs = {email: ref for email, ref in rows}
     if not refs:
         return 0
-    found = 0
-    for email, phones in lookup(db, sorted(refs)).items():
+    found, emails = 0, sorted(refs)
+    # The lookup takes at most MAX_LOOKUPS_PER_BATCH emails per call: walk every batch so none is skipped.
+    results: dict[str, set[str]] = {}
+    for start in range(0, len(emails), MAX_LOOKUPS_PER_BATCH):
+        results.update(lookup(db, emails[start:start + MAX_LOOKUPS_PER_BATCH]))
+    for email, phones in results.items():
         for phone in sorted(phones):
             propagate_opt_out(db, phone=phone, email=email, channel=OptOutChannel.EMAIL,
                               source_ref=f"{refs[email]}:p:{phone_hash(phone)[:12]}"[:100])

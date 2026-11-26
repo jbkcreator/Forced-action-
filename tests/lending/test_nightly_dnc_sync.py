@@ -160,3 +160,17 @@ def test_email_only_instantly_opt_out_gets_its_phone_on_a_later_run(monkeypatch)
 def test_phone_retry_does_nothing_when_no_email_only_opt_outs(monkeypatch):
     monkeypatch.setattr(compliance, "propagate_opt_out", lambda db, **kw: pytest.fail("no opt-out expected"))
     assert retry_instantly_phones(RowsDb([]), lookup=lambda db, emails: pytest.fail("no lookup")) == 0
+
+
+def test_phone_retry_looks_up_every_address_in_batches_of_ten(monkeypatch):
+    """Re-review: more than ten email-only opt-outs are all looked up, ten per call, none skipped."""
+    monkeypatch.setattr(compliance, "propagate_opt_out", lambda db, **kw: None)
+    emails = [f"u{i:02d}@example.com" for i in range(23)]
+    calls = []
+
+    def lookup(db, batch):
+        calls.append(list(batch))
+        return {e: {"+1813555%04d" % i} for i, e in enumerate(batch)}
+
+    assert retry_instantly_phones(RowsDb([(e, f"instantly:{e}") for e in emails]), lookup=lookup) == 23
+    assert [len(c) for c in calls] == [10, 10, 3] and sorted(sum(calls, [])) == emails
