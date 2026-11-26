@@ -1,0 +1,10 @@
+[Unit]
+Description=Forced Action — secondary lender package screening, 07:30 Eastern daily
+
+[Timer]
+OnCalendar=*-*-* 07:30:00 America/New_York
+Persistent=true
+Unit=fa-lending-secondary-screen.service
+
+[Install]
+WantedBy=timers.target

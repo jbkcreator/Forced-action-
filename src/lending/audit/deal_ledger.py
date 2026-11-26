@@ -39,6 +39,8 @@ logger = logging.getLogger(__name__)
 EVENT_TYPES = frozenset({
     "file_created", "stage_transition", "stage_rejected", "closed", "status_change", "lender_submission",
     "quote_generated", "field_update", "payment_recorded", "cora_draft", "human_edit", "card_approved", "card_rejected",
+    "doc_quarantined", "doc_released", "doc_type_tagged", "doc_block_override", "package_blocked", "package_submitted",
+    "package_dismissed",
 })
 
 ACTOR_CORA = "cora"

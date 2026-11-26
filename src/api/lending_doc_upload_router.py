@@ -36,6 +36,7 @@ from config.lending_partners import (
     RATE_LIMIT_WINDOW_SECONDS,
 )
 from src.lending.closing.doc_access import (
+    DocumentQuarantined,
     ViewRefused,
     document_list,
     find_document_borrowers,
@@ -49,7 +50,11 @@ from src.lending.closing.doc_chase import (
     record_upload,
     upload_dir,
 )
+from src.lending.audit import deal_ledger
 from src.lending.db import get_lending_db
+from src.lending.packaging.actions import ActionRefused, override_block, release_document, tag_document_type
+from src.lending.packaging.packet_validator import DOC_CHASE_UPLOADS, UPLOAD_TABLES
+from src.lending.packaging.quarantine import scan_new_uploads
 from src.lending.partner_service import PartnerLinkNotConfigured
 from src.lending.partners import InvalidSubmission, Upload
 from src.lending.security.rbac import (
@@ -178,46 +183,9 @@ def upload_document(token: str, request: Request, item_code: str = Form(default=
         logger.error("[doc-upload] chase %s upload failed (%s)", chase["id"], type(exc).__name__)
         return _checklist(db, token, chase, errors=["The upload didn't go through. Please try again."], status_code=500)
 
-    # R1 1.7: injection scan at upload time — always on (D22, D6, D10)
-    # Look up the upload row id from the stored path (record_upload wrote it just above).
     if stored:
-        _run_injection_scan_by_path(db, stored, item_code, chase["id"])
-
+        scan_new_uploads(db, DOC_CHASE_UPLOADS, stored_path=stored)
     return RedirectResponse(f"/api/lending/docs/{token}", status_code=303)
-
-
-def _run_injection_scan(db: Session, upload_id: int, stored_path: str,
-                        item_code: Optional[str], chase_id: int) -> None:
-    """Injection scan immediately after upload. Quarantines and alerts on hit; never raises."""
-    try:
-        from src.lending.packaging.packet_validator import DocInput, Outcome, validate_injection_only
-        from src.lending.packaging.quarantine import record_quarantine, alert_quarantine
-
-        doc = DocInput(upload_id=upload_id, upload_table="doc_chase_uploads",
-                       item_code=item_code, stored_path=stored_path)
-        dv = validate_injection_only(doc)
-        if dv.outcome is Outcome.QUARANTINE:
-            record_quarantine(db, upload_id, "doc_chase_uploads", "; ".join(dv.reasons))
-            db.commit()
-            alert_quarantine(chase_id=chase_id, upload_id=upload_id, reasons=dv.reasons)
-    except Exception as exc:
-        logger.error("[doc-upload] injection scan failed for upload %s (%s)", upload_id, type(exc).__name__)
-
-
-def _run_injection_scan_by_path(db: Session, stored_path: str,
-                                item_code: Optional[str], chase_id: int) -> None:
-    """Look up the upload row by stored_path, then run the injection scan. Never raises."""
-    try:
-        from sqlalchemy import text as _text
-        row = db.execute(_text("""
-            SELECT id FROM lending.doc_chase_uploads
-            WHERE stored_path = :path ORDER BY id DESC LIMIT 1
-        """), {"path": stored_path}).fetchone()
-        if row is None:
-            return
-        _run_injection_scan(db, row[0], stored_path, item_code, chase_id)
-    except Exception as exc:
-        logger.error("[doc-upload] scan path lookup failed (%s)", type(exc).__name__)
 
 
 # ---- R1 0.2 staff API ------------------------------------------------------------------------------------------------
@@ -293,6 +261,9 @@ def staff_view_link(upload_id: int, token: StaffToken = Depends(staff_admin),
     except DocumentAccessDenied:
         db.rollback()
         raise HTTPException(status_code=403, detail="not permitted")
+    except DocumentQuarantined:
+        db.rollback()
+        raise HTTPException(status_code=403, detail="this document is quarantined; an admin must release it first")
     except PartnerLinkNotConfigured:
         db.rollback()
         raise HTTPException(status_code=503, detail="document links are not configured")
@@ -301,38 +272,61 @@ def staff_view_link(upload_id: int, token: StaffToken = Depends(staff_admin),
     return {"url": link.url, "expires_at": link.expires_at.isoformat()}
 
 
-# ---- R1 1.7 staff doc-type endpoint (D20) -------------------------------------------------------------------------
+# ---- staff package and document actions ----------------------------------------------------------------------------
 
 class DocTypeIn(BaseModel):
-    item_code: str = Field(..., min_length=1, max_length=40,
-                            description="ChecklistItem.code (e.g. bank_statements, pricing_sheet, government_id)")
+    item_code: str = Field(..., min_length=1, max_length=40)
 
 
-@router.post("/staff/documents/{upload_id}/type", status_code=200)
-def staff_set_doc_type(upload_id: int, body: DocTypeIn,
-                       token: StaffToken = Depends(staff_admin),
-                       db: Session = Depends(get_lending_db)) -> dict[str, Any]:
-    """Set the item_code (document type) on a partner_file_uploads row. Admin only. Logged."""
-    from sqlalchemy import text as _text
-    row = db.execute(_text("""
-        SELECT id, file_id, item_code FROM lending.partner_file_uploads WHERE id = :id
-    """), {"id": upload_id}).mappings().first()
-    if row is None:
-        raise HTTPException(status_code=404, detail="no such document")
+class OverrideIn(BaseModel):
+    upload_table: str = Field(..., pattern="^(doc_chase_uploads|partner_file_uploads)$")
+    upload_id: int
+    reason: str = Field(..., min_length=3, max_length=300)
+
+
+class ReleaseIn(BaseModel):
+    reason: str = Field(..., min_length=3, max_length=300)
+
+
+def _staff_actor(token: StaffToken) -> str:
+    return deal_ledger.human(f"staff_token:{token.id}")
+
+
+def _apply(db: Session, what: str, fn: Any) -> Any:
     try:
-        db.execute(_text("""
-            UPDATE lending.partner_file_uploads
-            SET item_code = :item_code
-            WHERE id = :id
-        """), {"id": upload_id, "item_code": body.item_code})
-        # log in deal_ledger
-        from src.lending.audit import deal_ledger
-        deal_ledger.record(
-            db, row["file_id"], "field_update",
-            actor=f"token:{token.id}",
-            detail={"field": "item_code", "new_value": body.item_code, "upload_id": upload_id},
-        )
+        result = fn()
         db.commit()
+        return result
+    except ActionRefused as refused:
+        db.rollback()
+        raise HTTPException(status_code=409, detail=str(refused))
     except Exception as exc:
-        raise _internal_error(db, "set doc type", exc) from exc
+        raise _internal_error(db, what, exc) from exc
+
+
+@router.post("/staff/documents/{upload_id}/type")
+def staff_set_doc_type(upload_id: int, body: DocTypeIn, token: StaffToken = Depends(staff_admin),
+                       db: Session = Depends(get_lending_db)) -> dict[str, Any]:
+    """Set the type of a partner-door upload (the borrower upload page already knows its type)."""
+    _apply(db, "set document type",
+           lambda: tag_document_type(db, upload_id, body.item_code, actor=_staff_actor(token)))
     return {"upload_id": upload_id, "item_code": body.item_code}
+
+
+@router.post("/staff/packages/{package_id}/override")
+def staff_override(package_id: int, body: OverrideIn, token: StaffToken = Depends(staff_admin),
+                   db: Session = Depends(get_lending_db)) -> dict[str, Any]:
+    result = _apply(db, "override", lambda: override_block(
+        db, package_id, body.upload_table, body.upload_id, reason=body.reason, actor=_staff_actor(token),
+        today=_now().date()))
+    return {"package_id": package_id, "status": result.status}
+
+
+@router.post("/staff/documents/{upload_table}/{upload_id}/release")
+def staff_release(upload_table: str, upload_id: int, body: ReleaseIn, token: StaffToken = Depends(staff_admin),
+                  db: Session = Depends(get_lending_db)) -> dict[str, Any]:
+    if upload_table not in UPLOAD_TABLES:
+        raise HTTPException(status_code=404, detail="no such document table")
+    _apply(db, "release", lambda: release_document(db, upload_table, upload_id, reason=body.reason,
+                                                    actor=_staff_actor(token)))
+    return {"upload_table": upload_table, "upload_id": upload_id, "quarantine_status": "released"}

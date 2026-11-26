@@ -1,52 +1,41 @@
-"""R1 1.7 — Packet validator (D6-D12, D19).
+"""The packet validator: one check every borrower document passes before it can reach a lender package.
 
-Single entry point: ``validate(file_ctx, docs) -> Verdict``.
-
-Three outcome levels (fail-closed):
-  pass       — all checks passed; doc may go in a package
-  block      — a name, age or readability check failed; admin can override per doc per package
-  quarantine — injection-like content detected; only an explicit admin release clears it
-
-The validator is ALWAYS ON.  The injection scan runs at upload time.
-Name + age checks run at package compile and again before surfacing (card, view link).
+``validate`` runs every check (type, injection, readability, names, age); ``validate_injection_only`` is the
+upload-time scan. Outcomes: pass, block (an admin may override per document per package) and quarantine (released
+only by an explicit admin action). Text comes from pdfplumber only: no OCR, no LLM. Any scan error quarantines.
 """
 from __future__ import annotations
 
-import hashlib
 import re
 from dataclasses import dataclass, field
-from datetime import date, datetime
+from datetime import date
 from enum import Enum
 from pathlib import Path
-from typing import Optional
+from typing import Any, Iterable, Optional
 
-# ---------------------------------------------------------------------------
-# Config knobs (tuneable without code changes — D33)
-# ---------------------------------------------------------------------------
-
-# Phrases that trigger quarantine when found anywhere in the extracted text.
-# Lower-cased before comparison.
-_DEFAULT_INJECTION_PHRASES: tuple[str, ...] = (
-    "ignore previous instructions",
-    "you are an ai",
-    "system prompt",
-    "approve this loan",
-    "disregard the above",
-    "forget everything",
-    "act as if",
-    "new instructions",
+from config.lending_packaging import (
+    AGED_ITEM_CODES,
+    HIDDEN_FONT_PT,
+    INJECTION_PHRASES,
+    NEAR_WHITE,
+    SUSPICIOUS_PDF_MARKERS,
 )
+from src.services.fa_max_backflip_feed import normalize_entity_name
 
-# Font size below which text is considered hidden (points).
-_HIDDEN_FONT_PT_THRESHOLD = 2.0
+DOC_CHASE_UPLOADS = "doc_chase_uploads"
+PARTNER_FILE_UPLOADS = "partner_file_uploads"
+UPLOAD_TABLES = frozenset({DOC_CHASE_UPLOADS, PARTNER_FILE_UPLOADS})
 
-# Near-white fill RGB components (each 0-1); above this is considered visible.
-_NEAR_WHITE_THRESHOLD = 0.9
+_MIN_HIDDEN_CHARS = 3  # a stray invisible glyph is common in generated PDFs; a hidden sentence is not
+_LEGAL_SUFFIXES = frozenset({"LLC", "LLLP", "LLP", "LP", "INC", "INCORPORATED", "CORP", "CORPORATION", "CO",
+                             "COMPANY", "LTD", "LIMITED", "PLLC", "PA", "PC"})
+_MONTHS = {m: i for i, m in enumerate(
+    ("jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"), start=1)}
+_NUMERIC_DATE = re.compile(r"\b(\d{1,2})[/\-.](\d{1,2})[/\-.](\d{2}|\d{4})\b")
+_ISO_DATE = re.compile(r"\b(\d{4})-(\d{1,2})-(\d{1,2})\b")
+_NAMED_DATE = re.compile(r"\b(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\.?\s+(\d{1,2}),?\s+(\d{4})\b",
+                         re.IGNORECASE)
 
-
-# ---------------------------------------------------------------------------
-# Public types
-# ---------------------------------------------------------------------------
 
 class Outcome(str, Enum):
     PASS = "pass"
@@ -55,370 +44,310 @@ class Outcome(str, Enum):
 
 
 @dataclass(frozen=True)
+class DocInput:
+    upload_id: int
+    upload_table: str
+    item_code: Optional[str]  # None: an untagged partner upload
+    stored_path: str
+    quarantined: Optional[str] = None  # the stored quarantine reason: the file is never opened again
+    released: bool = False  # an admin released it from quarantine: the injection scan is not repeated
+
+    @property
+    def key(self) -> str:
+        return doc_key(self.upload_table, self.upload_id)
+
+
+@dataclass(frozen=True)
 class DocVerdict:
     upload_id: int
-    upload_table: str  # 'doc_chase_uploads' | 'partner_file_uploads'
+    upload_table: str
     item_code: Optional[str]
     outcome: Outcome
-    reasons: tuple[str, ...] = field(default_factory=tuple)
+    reasons: tuple[str, ...] = ()
+    overridden: bool = False
+
+    @property
+    def key(self) -> str:
+        return doc_key(self.upload_table, self.upload_id)
+
+    @property
+    def counts_as_received(self) -> bool:
+        return self.outcome is Outcome.PASS and self.item_code is not None
 
 
 @dataclass(frozen=True)
 class Verdict:
-    """Aggregate verdict for all docs in a package or a single upload."""
-    outcome: Outcome  # worst of all per-doc outcomes
+    outcome: Outcome
     per_doc: tuple[DocVerdict, ...]
-
-    @property
-    def quarantined(self) -> list[DocVerdict]:
-        return [d for d in self.per_doc if d.outcome is Outcome.QUARANTINE]
 
     @property
     def blocked(self) -> list[DocVerdict]:
         return [d for d in self.per_doc if d.outcome is Outcome.BLOCK]
 
+    @property
+    def quarantined(self) -> list[DocVerdict]:
+        return [d for d in self.per_doc if d.outcome is Outcome.QUARANTINE]
+
+    def to_json(self) -> dict[str, Any]:
+        return {"outcome": self.outcome.value, "per_doc": [
+            {"upload_id": d.upload_id, "upload_table": d.upload_table, "item_code": d.item_code,
+             "outcome": d.outcome.value, "reasons": list(d.reasons), "overridden": d.overridden}
+            for d in self.per_doc]}
+
 
 @dataclass(frozen=True)
 class FileContext:
-    """Names we expect to find in documents belonging to this file."""
-    file_id: int
-    source_type: str  # 'loan_file' | 'lf_lead'
-    borrower_names: tuple[str, ...]  # first+last, entity names, guarantors
-    # names from OTHER files in the system (to catch cross-contamination — D19)
-    other_known_names: tuple[str, ...] = field(default_factory=tuple)
+    persons: tuple[str, ...]  # full names of the borrower and guarantors
+    entities: tuple[str, ...] = ()
+    other_persons: tuple[str, ...] = ()  # full names on other files we hold
+    other_entities: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
-class DocInput:
-    upload_id: int
-    upload_table: str
-    item_code: Optional[str]  # None = unclassified partner upload
-    stored_path: str
+class AgeLimits:
+    bank_statement_days: int = 60
+    pricing_sheet_days: int = 30
 
 
-# ---------------------------------------------------------------------------
-# Internal helpers
-# ---------------------------------------------------------------------------
+@dataclass(frozen=True)
+class _Scan:
+    text: str
+    is_pdf: bool
+    hidden_chars: int = 0
+    side_text: str = ""  # annotation, form-field and metadata strings
+    markers: tuple[str, ...] = field(default_factory=tuple)
+    hidden_layer: bool = False
+
 
 class _ScanError(Exception):
-    """Raised when pdfplumber cannot open or parse the file (fail-closed path)."""
+    pass
 
 
-def _extract_text(path: str) -> tuple[str, bool]:
-    """Return (full_text, readable).  readable=False when pdfplumber finds no text at all.
-    Raises _ScanError when the file cannot be opened (missing, corrupt, permission denied)."""
-    try:
-        import pdfplumber  # lazy import — not every caller has it in the hot path
-    except ImportError:
-        raise _ScanError("pdfplumber not installed")
-
-    if not __import__("os.path", fromlist=["exists"]).exists(path):
-        raise _ScanError(f"file not found: {path}")
-
-    text_parts: list[str] = []
-    try:
-        with pdfplumber.open(path) as pdf:
-            for page in pdf.pages:
-                t = page.extract_text() or ""
-                text_parts.append(t)
-    except _ScanError:
-        raise
-    except Exception as exc:
-        raise _ScanError(str(exc)) from exc
-
-    full = "\n".join(text_parts)
-    return full, bool(full.strip())
+def doc_key(upload_table: str, upload_id: int) -> str:
+    return f"{upload_table}:{upload_id}"
 
 
-def _has_hidden_text(path: str) -> bool:
-    """True when the PDF has white/near-white, tiny-font or off-page text (D10)."""
-    try:
-        import pdfplumber
-    except ImportError:
+def _verdict(doc: DocInput, outcome: Outcome, reasons: Iterable[str] = (), *, overridden: bool = False) -> DocVerdict:
+    return DocVerdict(doc.upload_id, doc.upload_table, doc.item_code, outcome, tuple(reasons), overridden)
+
+
+# ── scanning ──────────────────────────────────────────────────────────────────
+
+def _is_white(color: Any) -> bool:
+    if not isinstance(color, (list, tuple)) or not color:
         return False
-
     try:
-        with pdfplumber.open(path) as pdf:
-            for page in pdf.pages:
-                width = float(page.width or 612)
-                height = float(page.height or 792)
-                words = page.extract_words(extra_attrs=["fontname", "size", "non_stroking_color"])
-                for w in words:
-                    # tiny font
-                    size = w.get("size") or 0
-                    if float(size) < _HIDDEN_FONT_PT_THRESHOLD and size != 0:
-                        return True
-                    # off-page
-                    x0 = w.get("x0", 0)
-                    top = w.get("top", 0)
-                    if x0 < 0 or top < 0 or x0 > width or top > height:
-                        return True
-                    # near-white fill
-                    color = w.get("non_stroking_color")
-                    if color and isinstance(color, (list, tuple)) and len(color) >= 3:
-                        r, g, b = float(color[0]), float(color[1]), float(color[2])
-                        if r >= _NEAR_WHITE_THRESHOLD and g >= _NEAR_WHITE_THRESHOLD and b >= _NEAR_WHITE_THRESHOLD:
-                            return True
-    except Exception:
+        values = [float(c) for c in color]
+    except (TypeError, ValueError):
         return False
-    return False
+    if len(values) == 4:  # CMYK: white is no ink
+        return all(v <= 1 - NEAR_WHITE for v in values)
+    return all(v >= NEAR_WHITE for v in values)
 
 
-def _has_suspicious_pdf_structure(path: str) -> bool:
-    """True when the raw PDF bytes contain JavaScript, embedded files or suspicious annotations."""
-    try:
-        raw = Path(path).read_bytes()
-    except OSError:
+def _is_hidden(char: dict, width: float, height: float) -> bool:
+    if not str(char.get("text") or "").strip():
         return False
-
-    indicators = (
-        b"/JS ",
-        b"/JavaScript",
-        b"/EmbeddedFile",
-        b"/Launch",
-        b"/SubmitForm",
-        b"/GoToR",
-        b"/RichMedia",
-        b"/XFA",
-    )
-    for ind in indicators:
-        if ind in raw:
-            return True
-    return False
+    size = float(char.get("size") or 0)
+    if 0 < size < HIDDEN_FONT_PT:
+        return True
+    x0, top = float(char.get("x0") or 0), float(char.get("top") or 0)
+    if x0 < 0 or top < 0 or x0 > width or top > height:
+        return True
+    return _is_white(char.get("non_stroking_color"))
 
 
-def _normalize(name: str) -> str:
-    """Strip entity suffixes, punctuation and extra whitespace for fuzzy comparison (reuse D8)."""
-    name = name.lower()
-    for suffix in ("llc", "inc", "corp", "ltd", "lp", "l.l.c.", "incorporated"):
-        name = name.replace(suffix, " ")
-    name = re.sub(r"[^a-z0-9 ]+", " ", name)
-    return re.sub(r"\s+", " ", name).strip()
-
-
-def _names_match(text_lower: str, names: tuple[str, ...]) -> bool:
-    """True when at least one normalized name appears in the text."""
-    for name in names:
-        normalized = _normalize(name)
-        if normalized and normalized in text_lower:
-            return True
-    return False
-
-
-def _extract_latest_date(text: str) -> Optional[date]:
-    """Return the most recent calendar date found in the text (simple regex, no LLM)."""
-    patterns = [
-        r"\b(\d{1,2})[/\-\.](\d{1,2})[/\-\.](\d{2,4})\b",  # MM/DD/YYYY etc.
-        r"\b(\d{4})[/\-\.](\d{1,2})[/\-\.](\d{1,2})\b",    # YYYY-MM-DD
-    ]
-    found: list[date] = []
-    for pat in patterns:
-        for m in re.finditer(pat, text):
-            g = m.groups()
-            try:
-                if len(g[0]) == 4:  # YYYY-MM-DD
-                    d = date(int(g[0]), int(g[1]), int(g[2]))
-                else:
-                    year = int(g[2])
-                    if year < 100:
-                        year += 2000
-                    d = date(year, int(g[0]), int(g[1]))
-                if 2000 <= d.year <= 2100:
-                    found.append(d)
-            except ValueError:
-                pass
-    return max(found) if found else None
-
-
-# ---------------------------------------------------------------------------
-# Core checks
-# ---------------------------------------------------------------------------
-
-def _injection_scan(path: str, text: str, phrases: tuple[str, ...]) -> list[str]:
-    """Return list of quarantine reasons (empty = clean)."""
-    reasons: list[str] = []
-    text_lower = text.lower()
-    for phrase in phrases:
-        if phrase in text_lower:
-            reasons.append(f"injection phrase: {phrase!r}")
-    if _has_hidden_text(path):
-        reasons.append("hidden text detected")
-    if _has_suspicious_pdf_structure(path):
-        reasons.append("suspicious PDF structure (JS/embedded/launch)")
-    return reasons
-
-
-def _name_check(
-    text: str,
-    file_ctx: FileContext,
-) -> list[str]:
-    """Return block reasons for name mismatches."""
-    reasons: list[str] = []
-    text_lower = text.lower()
-    if not _names_match(text_lower, file_ctx.borrower_names):
-        reasons.append("name not found: document does not name the file's borrower or entity")
-    elif _names_match(text_lower, file_ctx.other_known_names):
-        reasons.append("names another borrower: document also names a different file's party")
-    return reasons
-
-
-def _age_check(text: str, item_code: Optional[str], today: date, *, bank_max_days: int, pricing_max_days: int) -> list[str]:
-    """Return block reasons for stale date, or [] when the item type has no age rule."""
-    if item_code not in ("bank_statements", "pricing_sheet"):
-        return []
-    latest = _extract_latest_date(text)
-    if latest is None:
-        return [f"no readable date found in {item_code}"]
-    age = (today - latest).days
-    if item_code == "bank_statements" and age > bank_max_days:
-        return [f"bank statement dated {latest} is {age} days old (max {bank_max_days})"]
-    if item_code == "pricing_sheet" and age > pricing_max_days:
-        return [f"pricing sheet dated {latest} is {age} days old (max {pricing_max_days})"]
+def _strings(value: Any) -> list[str]:
+    if isinstance(value, bytes):
+        return [value.decode("latin-1", "ignore")]
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, dict):
+        return [s for v in value.values() for s in _strings(v)]
+    if isinstance(value, (list, tuple)):
+        return [s for v in value for s in _strings(v)]
     return []
 
 
-# ---------------------------------------------------------------------------
-# Public entry point
-# ---------------------------------------------------------------------------
+def _hidden_layer(raw: bytes) -> bool:
+    """An optional-content layer switched off by default (``/OCProperties`` ... ``/OFF [ refs ]``)."""
+    if b"/OCProperties" not in raw:
+        return False
+    return re.search(rb"/OFF\s*\[\s*\d", raw) is not None
 
-def validate_injection_only(doc: DocInput, *, phrases: Optional[tuple[str, ...]] = None) -> DocVerdict:
-    """Upload-time scan: injection check only. Fail-closed on scan error."""
-    _phrases = phrases or _DEFAULT_INJECTION_PHRASES
+
+def _scan(path: str) -> _Scan:
     try:
-        text, readable = _extract_text(doc.stored_path)
-    except _ScanError as exc:
-        return DocVerdict(
-            upload_id=doc.upload_id,
-            upload_table=doc.upload_table,
-            item_code=doc.item_code,
-            outcome=Outcome.QUARANTINE,
-            reasons=(f"scan failed: {exc}",),
-        )
+        raw = Path(path).read_bytes()
+    except OSError as exc:
+        raise _ScanError(type(exc).__name__) from exc
+    if b"%PDF" not in raw[:1024]:
+        return _Scan(text="", is_pdf=False)
+    try:
+        import pdfplumber
+    except ImportError as exc:
+        raise _ScanError("pdfplumber unavailable") from exc
+    texts: list[str] = []
+    side: list[str] = []
+    hidden = 0
+    try:
+        with pdfplumber.open(path) as pdf:
+            side.extend(_strings(pdf.metadata))
+            for page in pdf.pages:
+                texts.append(page.extract_text() or "")
+                width, height = float(page.width), float(page.height)
+                hidden += sum(1 for char in page.chars if _is_hidden(char, width, height))
+                for annot in page.annots or []:
+                    side.extend(_strings(annot.get("contents")))
+                    data = annot.get("data") or {}
+                    for name in ("V", "TU", "T", "Contents"):
+                        side.extend(_strings(data.get(name)))
     except Exception as exc:
-        return DocVerdict(
-            upload_id=doc.upload_id,
-            upload_table=doc.upload_table,
-            item_code=doc.item_code,
-            outcome=Outcome.QUARANTINE,
-            reasons=(f"scan failed: {exc}",),
-        )
-
-    q_reasons = _injection_scan(doc.stored_path, text, _phrases)
-    if q_reasons:
-        return DocVerdict(
-            upload_id=doc.upload_id,
-            upload_table=doc.upload_table,
-            item_code=doc.item_code,
-            outcome=Outcome.QUARANTINE,
-            reasons=tuple(q_reasons),
-        )
-    return DocVerdict(
-        upload_id=doc.upload_id,
-        upload_table=doc.upload_table,
-        item_code=doc.item_code,
-        outcome=Outcome.PASS,
-        reasons=(),
-    )
+        raise _ScanError(type(exc).__name__) from exc
+    markers = tuple(m.decode() for m in SUSPICIOUS_PDF_MARKERS if re.search(re.escape(m) + rb"(?![A-Za-z])", raw))
+    return _Scan(text="\n".join(texts), is_pdf=True, hidden_chars=hidden, side_text="\n".join(side), markers=markers,
+                 hidden_layer=_hidden_layer(raw))
 
 
-def validate(
-    file_ctx: FileContext,
-    docs: list[DocInput],
-    *,
-    today: Optional[date] = None,
-    bank_max_days: int = 60,
-    pricing_max_days: int = 30,
-    phrases: Optional[tuple[str, ...]] = None,
-) -> Verdict:
-    """Full validation: injection + name + age checks.
+def _injection_reasons(scan: _Scan) -> list[str]:
+    reasons: list[str] = []
+    haystack = f"{scan.text}\n{scan.side_text}".lower()
+    reasons.extend(f"instruction phrase: {phrase!r}" for phrase in INJECTION_PHRASES if phrase in haystack)
+    if scan.hidden_chars >= _MIN_HIDDEN_CHARS:
+        reasons.append(f"hidden text ({scan.hidden_chars} invisible, tiny or off-page characters)")
+    if scan.hidden_layer:
+        reasons.append("hidden layer (optional content switched off)")
+    if scan.markers:
+        reasons.append("active or embedded content: " + ", ".join(scan.markers))
+    return reasons
 
-    Called at package compile and before surfacing (Slack card, view link).
-    Unclassified docs (item_code=None) are BLOCKED from packages as 'unclassified'.
-    A scan error quarantines the doc (fail-closed, D10).
-    """
-    _today = today or date.today()
-    _phrases = phrases or _DEFAULT_INJECTION_PHRASES
-    per_doc: list[DocVerdict] = []
 
-    for doc in docs:
-        # unclassified partner uploads are blocked (D7)
-        if doc.item_code is None:
-            per_doc.append(DocVerdict(
-                upload_id=doc.upload_id,
-                upload_table=doc.upload_table,
-                item_code=None,
-                outcome=Outcome.BLOCK,
-                reasons=("unclassified: document type not set by staff",),
-            ))
-            continue
+# ── names ─────────────────────────────────────────────────────────────────────
 
-        # scan
+def _norm(value: Optional[str]) -> str:
+    return normalize_entity_name(value) or ""
+
+
+def _entity_forms(name: str) -> set[str]:
+    full = _norm(name)
+    tokens = full.split()
+    while tokens and tokens[-1] in _LEGAL_SUFFIXES:
+        tokens.pop()
+    forms = {full} if full else set()
+    if len(tokens) >= 2 or (len(tokens) == 1 and len(tokens[0]) >= 4):
+        forms.add(" ".join(tokens))
+    return forms
+
+
+def _person_forms(name: str) -> set[str]:
+    full = _norm(name)
+    return {full} if len(full.split()) >= 2 else set()  # a bare first or last name never identifies anyone
+
+
+def _phrases(persons: Iterable[str], entities: Iterable[str]) -> set[str]:
+    out: set[str] = set()
+    for person in persons:
+        out |= _person_forms(person)
+    for entity in entities:
+        out |= _entity_forms(entity)
+    return out
+
+
+def _mentions(norm_text: str, phrases: set[str]) -> list[str]:
+    padded = f" {norm_text} "
+    return sorted(p for p in phrases if f" {p} " in padded)
+
+
+def name_reasons(text: str, ctx: FileContext) -> list[str]:
+    norm_text = _norm(text)
+    own = _phrases(ctx.persons, ctx.entities)
+    others = _phrases(ctx.other_persons, ctx.other_entities) - own
+    reasons: list[str] = []
+    if not _mentions(norm_text, own):
+        reasons.append("name not found: the document does not name the file's borrower, entity or a guarantor")
+    if _mentions(norm_text, others):
+        reasons.append("names another borrower: the document names a party on a different file")
+    return reasons
+
+
+# ── dates ─────────────────────────────────────────────────────────────────────
+
+def _year(raw: str) -> int:
+    year = int(raw)
+    return year + 2000 if year < 100 else year
+
+
+def latest_date(text: str, *, not_after: date) -> Optional[date]:
+    """The latest calendar date in ``text`` that is not after ``not_after`` (a due date ahead is not a statement date)."""
+    found: list[date] = []
+    candidates: list[tuple[int, int, int]] = []
+    candidates += [(_year(y), int(m), int(d)) for m, d, y in _NUMERIC_DATE.findall(text)]
+    candidates += [(int(y), int(m), int(d)) for y, m, d in _ISO_DATE.findall(text)]
+    candidates += [(int(y), _MONTHS[m.lower()[:3]], int(d)) for m, d, y in _NAMED_DATE.findall(text)]
+    for year, month, day in candidates:
         try:
-            text, readable = _extract_text(doc.stored_path)
-        except (_ScanError, Exception) as exc:
-            per_doc.append(DocVerdict(
-                upload_id=doc.upload_id,
-                upload_table=doc.upload_table,
-                item_code=doc.item_code,
-                outcome=Outcome.QUARANTINE,
-                reasons=(f"scan failed: {exc}",),
-            ))
+            value = date(year, month, day)
+        except ValueError:
             continue
+        if 2000 <= value.year and value <= not_after:
+            found.append(value)
+    return max(found) if found else None
 
-        # injection (quarantine)
-        q_reasons = _injection_scan(doc.stored_path, text, _phrases)
-        if q_reasons:
-            per_doc.append(DocVerdict(
-                upload_id=doc.upload_id,
-                upload_table=doc.upload_table,
-                item_code=doc.item_code,
-                outcome=Outcome.QUARANTINE,
-                reasons=tuple(q_reasons),
-            ))
-            continue
 
-        # no readable text → block
-        if not readable:
-            per_doc.append(DocVerdict(
-                upload_id=doc.upload_id,
-                upload_table=doc.upload_table,
-                item_code=doc.item_code,
-                outcome=Outcome.BLOCK,
-                reasons=("unreadable: no text found (scanned document without OCR)",),
-            ))
-            continue
+def age_reasons(text: str, item_code: Optional[str], today: date, limits: AgeLimits) -> list[str]:
+    if item_code not in AGED_ITEM_CODES:
+        return []
+    dated = latest_date(text, not_after=today)
+    if dated is None:
+        return [f"no readable date in the {item_code.replace('_', ' ')}"]
+    age = (today - dated).days
+    limit = limits.bank_statement_days if item_code == "bank_statements" else limits.pricing_sheet_days
+    if age > limit:
+        return [f"{item_code.replace('_', ' ')} dated {dated} is {age} days old (limit {limit})"]
+    return []
 
-        # name check
-        block_reasons: list[str] = _name_check(text, file_ctx)
 
-        # age check (bank statements and pricing sheets)
-        block_reasons.extend(_age_check(text, doc.item_code, _today,
-                                        bank_max_days=bank_max_days,
-                                        pricing_max_days=pricing_max_days))
+# ── entry points ──────────────────────────────────────────────────────────────
 
-        if block_reasons:
-            per_doc.append(DocVerdict(
-                upload_id=doc.upload_id,
-                upload_table=doc.upload_table,
-                item_code=doc.item_code,
-                outcome=Outcome.BLOCK,
-                reasons=tuple(block_reasons),
-            ))
-        else:
-            per_doc.append(DocVerdict(
-                upload_id=doc.upload_id,
-                upload_table=doc.upload_table,
-                item_code=doc.item_code,
-                outcome=Outcome.PASS,
-                reasons=(),
-            ))
+def validate_injection_only(doc: DocInput) -> DocVerdict:
+    """The upload-time scan: quarantine on injection-like content or any scan error, else pass."""
+    try:
+        scan = _scan(doc.stored_path)
+    except _ScanError as exc:
+        return _verdict(doc, Outcome.QUARANTINE, [f"scan failed ({exc})"])
+    reasons = _injection_reasons(scan)
+    return _verdict(doc, Outcome.QUARANTINE, reasons) if reasons else _verdict(doc, Outcome.PASS)
 
-    # aggregate
-    if any(d.outcome is Outcome.QUARANTINE for d in per_doc):
-        agg = Outcome.QUARANTINE
-    elif any(d.outcome is Outcome.BLOCK for d in per_doc):
-        agg = Outcome.BLOCK
-    else:
-        agg = Outcome.PASS
 
-    return Verdict(outcome=agg, per_doc=tuple(per_doc))
+def _check(doc: DocInput, ctx: FileContext, today: date, limits: AgeLimits) -> DocVerdict:
+    if doc.quarantined is not None:
+        return _verdict(doc, Outcome.QUARANTINE, [f"quarantined: {doc.quarantined}"])
+    if doc.item_code is None:
+        return _verdict(doc, Outcome.BLOCK, ["unclassified: staff have not set the document type"])
+    try:
+        scan = _scan(doc.stored_path)
+    except _ScanError as exc:
+        return _verdict(doc, Outcome.QUARANTINE, [f"scan failed ({exc})"])
+    injection = [] if doc.released else _injection_reasons(scan)
+    if injection:
+        return _verdict(doc, Outcome.QUARANTINE, injection)
+    if not scan.text.strip():
+        why = "an image" if not scan.is_pdf else "a PDF with no text layer"
+        return _verdict(doc, Outcome.BLOCK, [f"unreadable: {why} (no OCR)"])
+    reasons = name_reasons(scan.text, ctx) + age_reasons(scan.text, doc.item_code, today, limits)
+    return _verdict(doc, Outcome.BLOCK, reasons) if reasons else _verdict(doc, Outcome.PASS)
+
+
+def validate(ctx: FileContext, docs: Iterable[DocInput], *, today: date, limits: AgeLimits = AgeLimits(),
+             overrides: frozenset[str] = frozenset()) -> Verdict:
+    """Every check on every document. ``overrides`` holds the doc keys an admin has cleared for this package; an
+    override turns a block into a pass (reasons kept) and never touches a quarantine."""
+    per_doc: list[DocVerdict] = []
+    for doc in docs:
+        checked = _check(doc, ctx, today, limits)
+        if checked.outcome is Outcome.BLOCK and doc.key in overrides:
+            checked = _verdict(doc, Outcome.PASS, checked.reasons, overridden=True)
+        per_doc.append(checked)
+    outcomes = {d.outcome for d in per_doc}
+    worst = next((o for o in (Outcome.QUARANTINE, Outcome.BLOCK) if o in outcomes), Outcome.PASS)
+    return Verdict(worst, tuple(per_doc))

@@ -1,252 +1,181 @@
-"""R1 1.7 — Secondary lender screening (D2, D4).
+"""Screen declined and unassigned files against the secondary lenders and draft one package per lender that fits.
 
-A separate pass from the router waterfall.  Runs over Backflip-declined or
-unassigned files, evaluates each against the four secondary lender boxes via
-``evaluate_lender_fit``, and upserts one ``lending.lender_packages`` row per
-fitting lender.  Never touches ``router.py`` or ``decline.py``.
-
-Eligible files (D4):
-  (a) files with a ``declined`` routing event from the ``is_primary`` lender
-  (b) files with routing status in ('held', 'unrouted', 'exhausted') excluding
-      ``suppressed`` and owner-occupied holds
-
-Re-screen: a file is screened again only when its facts or a lender box change
-(fingerprint of key facts + lender matrix snapshot version — D4).
+Separate from the router: it never routes a file. Every fitting lender gets a package (an unconfirmed box still
+drafts, flagged); every lender that misses is listed with why. A file is re-drafted only when its facts or the
+lender rules change (the fingerprint).
 """
 from __future__ import annotations
 
 import hashlib
 import json
-from datetime import date
+import logging
+from dataclasses import dataclass
+from decimal import Decimal
 from typing import Optional
 
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
-from config.lender_matrix import LENDER_MATRIX, SECONDARY_LENDER_KEYS, has_placeholder_rules
+from config.lender_matrix import SECONDARY_LENDER_KEYS, LenderRules, has_placeholder_rules
+from config.lending_occupancy import HOMESTEAD_HOLD_REASON, OWNER_OCCUPIED
+from config.lending_partners import CREDIT_BAND_MAX_FICO, CREDIT_BANDS, PRODUCTS
+from src.lending.contracts import BorrowerProfile, LenderFitResult, LoanRequest, LoanType
+from src.lending.enrichment.fit_card import parse_band_bounds
 from src.lending.lender_fit import evaluate_lender_fit
-from src.lending.contracts import BorrowerProfile, LoanRequest, LoanType
+from src.lending.lender_rules_store import current_matrix_with_version
+from src.lending.packaging.package import LF_LEAD, LOAN_FILE, file_facts
 
+logger = logging.getLogger(__name__)
 
-# ---------------------------------------------------------------------------
-# Fingerprint helpers
-# ---------------------------------------------------------------------------
+EXCLUDED_HOLDS = ["suppressed", HOMESTEAD_HOLD_REASON]
+UNASSIGNED_STATUSES = ["held", "unrouted", "exhausted"]
 
-def _matrix_version() -> str:
-    """A short hash of the SECONDARY_LENDER_KEYS + their rule keys — changes when Josh updates a box."""
-    keys = sorted(SECONDARY_LENDER_KEYS)
-    rules_repr = json.dumps({k: repr(next((r for r in LENDER_MATRIX if r.key == k), None)) for k in keys},
-                             sort_keys=True)
-    return hashlib.sha256(rules_repr.encode()).hexdigest()[:16]
-
-
-def _file_fingerprint(file_facts: dict) -> str:
-    """Hash of the file facts that affect lender fit (loan amount, state, product, credit)."""
-    relevant = {
-        "loan_amount": file_facts.get("loan_amount"),
-        "property_state": file_facts.get("property_state"),
-        "product": file_facts.get("product"),
-        "credit_band": file_facts.get("credit_band"),
-        "completed_projects": file_facts.get("completed_projects"),
-    }
-    blob = json.dumps(relevant, sort_keys=True, default=str)
-    return hashlib.sha256(blob.encode()).hexdigest()[:32]
-
-
-def build_fingerprint(file_facts: dict) -> str:
-    return f"{_file_fingerprint(file_facts)}:{_matrix_version()}"
-
-
-# ---------------------------------------------------------------------------
-# File eligibility
-# ---------------------------------------------------------------------------
-
-_SUPPRESSED_HOLD_REASONS = frozenset({"suppressed", "owner_occupied"})
-
-_ELIGIBLE_STATUSES_SQL = text("""
-    SELECT
-        lf.id              AS loan_file_id,
-        lf.loan_amount,
-        lf.property_state,
-        lf.product,
-        lf.credit_band,
-        lf.completed_projects,
-        lf.borrower_first_name,
-        lf.borrower_last_name,
-        'loan_file'        AS source_type,
-        NULL               AS lead_id
-    FROM lending.loan_files lf
-    JOIN lending.file_routing fr ON fr.loan_file_id = lf.id
-    WHERE fr.status IN ('held', 'unrouted', 'exhausted')
-      AND NOT EXISTS (
-          SELECT 1 FROM lending.file_routing_events fre
-          WHERE fre.routing_id = fr.id
-            AND fre.event = 'hold'
-            AND fre.reason IN ('suppressed', 'owner_occupied')
-      )
-    UNION ALL
-    SELECT
-        lf.id              AS loan_file_id,
-        lf.loan_amount,
-        lf.property_state,
-        lf.product,
-        lf.credit_band,
-        lf.completed_projects,
-        lf.borrower_first_name,
-        lf.borrower_last_name,
-        'loan_file'        AS source_type,
-        NULL               AS lead_id
-    FROM lending.loan_files lf
-    WHERE EXISTS (
-        SELECT 1 FROM lending.lender_submissions ls
-        JOIN lending.lender_routing_rules lrr ON lrr.name = ls.lender_key OR
-             (lrr.rule_keys IS NOT NULL AND ls.lender_key = ANY(lrr.rule_keys))
-        WHERE ls.loan_file_id = lf.id
-          AND ls.status = 'submitted'
-          AND lrr.is_primary = true
-        -- declined = a submission exists from the primary lender (closest proxy available)
-    )
+# (a) a decline from the primary lender (by id), or (b) unassigned; never a test file, a suppressed or
+# owner-occupied hold, or a file a lender already approved or funded.
+ELIGIBLE_SQL = text("""
+    SELECT fr.lead_id, fr.loan_file_id
+      FROM lending.file_routing fr
+     WHERE NOT fr.is_test
+       AND NOT (COALESCE(fr.hold_reason, '') = ANY(:excluded_holds))
+       AND (fr.status = ANY(:unassigned)
+            OR EXISTS (SELECT 1 FROM lending.file_routing_events e
+                        WHERE e.action = 'declined'
+                          AND e.lender_id = (SELECT id FROM lending.lender_routing_rules WHERE is_primary LIMIT 1)
+                          AND (e.lead_id = fr.lead_id OR e.loan_file_id = fr.loan_file_id)))
+       AND NOT EXISTS (SELECT 1 FROM lending.file_routing_events e
+                        WHERE e.action IN ('approved', 'funded')
+                          AND (e.lead_id = fr.lead_id OR e.loan_file_id = fr.loan_file_id))
+     ORDER BY fr.id
 """)
+_EXISTING = text("SELECT lender_key, screen_fingerprint FROM lending.lender_packages "
+                 "WHERE source_type = :st AND source_id = :sid")
+_UPSERT = text("""
+    INSERT INTO lending.lender_packages
+        (source_type, source_id, lender_key, status, box_confirmed, fit_result, screen_fingerprint)
+    VALUES (:st, :sid, :lk, 'draft', :confirmed, CAST(:fit AS jsonb), :fp)
+    ON CONFLICT (source_type, source_id, lender_key) WHERE status NOT IN ('submitted', 'dismissed')
+    DO UPDATE SET box_confirmed = EXCLUDED.box_confirmed, fit_result = EXCLUDED.fit_result,
+                  screen_fingerprint = EXCLUDED.screen_fingerprint, updated_at = now()
+    RETURNING id
+""")
+_LEAD_FLAGS = text("SELECT suppressed, is_test FROM lending.lendingflow_leads WHERE id = :id")
+_FILE_FLAGS = text("SELECT occupancy, is_test FROM lending.loan_files WHERE id = :id")
 
 
-def load_eligible_files(db: Session) -> list[dict]:
-    rows = db.execute(_ELIGIBLE_STATUSES_SQL).mappings().all()
-    return [dict(r) for r in rows]
+@dataclass(frozen=True)
+class FileRef:
+    source_type: str
+    source_id: int
 
 
-# ---------------------------------------------------------------------------
-# Profile builder
-# ---------------------------------------------------------------------------
-
-_CREDIT_BAND_TO_FICO: dict[str, int] = {
-    "excellent": 760,
-    "good": 720,
-    "fair": 680,
-    "below_fair": 640,
-    "poor": 580,
-}
+class NotScreenable(ValueError):
+    """The file lacks a fact the lender boxes need; it is skipped, never filled in with a guess."""
 
 
-def _loan_type_from_product(product: Optional[str]) -> Optional[LoanType]:
-    mapping = {
-        "flip": LoanType.FIX_AND_FLIP,
-        "ground_up": LoanType.GROUND_UP_CONSTRUCTION,
-        "dscr": LoanType.DSCR_RENTAL,
-        "other": None,
-    }
-    return mapping.get(product or "", None)
+def eligible_files(db: Session) -> list[FileRef]:
+    rows = db.execute(ELIGIBLE_SQL, {"excluded_holds": EXCLUDED_HOLDS, "unassigned": UNASSIGNED_STATUSES}).all()
+    return [FileRef(LOAN_FILE, row.loan_file_id) if row.loan_file_id is not None else FileRef(LF_LEAD, row.lead_id)
+            for row in rows]
 
 
-def _build_profile(facts: dict) -> tuple[BorrowerProfile, LoanRequest]:
-    from decimal import Decimal
-    fico = _CREDIT_BAND_TO_FICO.get(facts.get("credit_band") or "", 0)
-    loan_type = _loan_type_from_product(facts.get("product"))
-    if loan_type is None:
-        loan_type = LoanType.FIX_AND_FLIP  # safe fallback for unclassified products
-    profile = BorrowerProfile(
-        credit_band_min_fico=fico or None,
-        completed_projects=facts.get("completed_projects") or 0,
-        state=facts.get("property_state"),
-    )
-    amount = facts.get("loan_amount")
-    request = LoanRequest(
-        loan_amount=Decimal(amount) if amount else Decimal("100000"),
-        state=facts.get("property_state"),
-        loan_type=loan_type,
-    )
-    return profile, request
+def fit_inputs(source_type: str, facts: dict) -> tuple[BorrowerProfile, LoanRequest]:
+    """Borrower and loan for the fit evaluator. Raises NotScreenable when loan type, amount or state is unknown."""
+    state, amount = facts.get("property_state"), facts.get("loan_amount")
+    if source_type == LOAN_FILE:
+        loan_type = PRODUCTS.get(facts.get("product") or "")
+        band = facts.get("credit_band") or ""
+        low, high = CREDIT_BANDS.get(band), CREDIT_BAND_MAX_FICO.get(band)
+    else:
+        try:
+            loan_type = LoanType(facts.get("product") or "")
+        except ValueError:
+            loan_type = None
+        bounds = parse_band_bounds(facts.get("credit_band"))
+        low, high = (bounds if bounds else (facts.get("credit_band_min_fico"), None))
+    missing = [name for name, value in (("loan type", loan_type), ("loan amount", amount), ("state", state))
+               if value in (None, "")]
+    if missing:
+        raise NotScreenable(", ".join(missing))
+    borrower = BorrowerProfile(credit_band_min_fico=low, credit_band_max_fico=high,
+                               completed_projects=facts.get("completed_projects"), state=state)
+    loan = LoanRequest(loan_type=loan_type, loan_amount=Decimal(amount), state=state,
+                       purchase_price=_money(facts.get("purchase_price")),
+                       rehab_budget=_money(facts.get("rehab_budget")), arv=_money(facts.get("arv")),
+                       property_address=facts.get("property_address"))
+    return borrower, loan
 
 
-# ---------------------------------------------------------------------------
-# Package upsert
-# ---------------------------------------------------------------------------
+def _money(value) -> Optional[Decimal]:
+    return Decimal(value) if value is not None else None
 
-def _upsert_package(db: Session, source_type: str, source_id: int, lender_key: str,
-                    fit_result: dict, box_confirmed: bool, fingerprint: str) -> int:
-    """Insert or update a lender_packages row. Returns the package id."""
-    result = db.execute(text("""
-        INSERT INTO lending.lender_packages
-            (source_type, source_id, lender_key, status, box_confirmed, fit_result, screen_fingerprint)
-        VALUES
-            (:source_type, :source_id, :lender_key, 'draft', :box_confirmed, :fit_result::jsonb, :fingerprint)
-        ON CONFLICT ON CONSTRAINT uq_lending_lender_packages_open
-        DO UPDATE SET
-            fit_result         = EXCLUDED.fit_result,
-            box_confirmed      = EXCLUDED.box_confirmed,
-            screen_fingerprint = EXCLUDED.screen_fingerprint,
-            updated_at         = now()
-        RETURNING id
-    """), {
-        "source_type": source_type,
-        "source_id": source_id,
+
+def secondary_matrix() -> tuple[tuple[LenderRules, ...], str]:
+    """The secondary lenders' current rules and a version string that changes whenever they do."""
+    matrix, version = current_matrix_with_version()
+    secondary = tuple(r for r in matrix if r.key in SECONDARY_LENDER_KEYS)
+    if version is not None:
+        return secondary, f"v{version}"
+    return secondary, hashlib.sha256(repr(secondary).encode()).hexdigest()[:16]
+
+
+def fingerprint(facts: dict, rules_version: str) -> str:
+    blob = json.dumps({k: facts.get(k) for k in sorted(facts)}, sort_keys=True, default=str)
+    return hashlib.sha256(f"{blob}|{rules_version}".encode()).hexdigest()[:64]
+
+
+def fit_summary(fit: LenderFitResult, lender_key: str) -> dict:
+    """What the card shows: this lender's fit, and every secondary lender that missed or is undetermined, with why."""
+    mine = next(f for f in fit.fitting if f.lender_key == lender_key)
+    return {
         "lender_key": lender_key,
-        "box_confirmed": box_confirmed,
-        "fit_result": json.dumps(fit_result),
-        "fingerprint": fingerprint,
-    })
-    row = result.fetchone()
-    return row[0] if row else 0
+        "subject_to_confirmation": mine.subject_to_confirmation,
+        "misses": [{"lender_key": m.lender_key, "lender_name": m.lender_name, "reasons": list(m.reasons)}
+                   for m in fit.non_fitting],
+        "possible": [{"lender_key": p.lender_key, "lender_name": p.lender_name, "why": p.why_unknown}
+                     for p in fit.possible],
+        "other_fits": [f.lender_key for f in fit.fitting if f.lender_key != lender_key],
+    }
 
 
-# ---------------------------------------------------------------------------
-# Main screening function
-# ---------------------------------------------------------------------------
+def _excluded(db: Session, ref: FileRef) -> Optional[str]:
+    if ref.source_type == LF_LEAD:
+        flags = db.execute(_LEAD_FLAGS, {"id": ref.source_id}).first()
+        if flags is None:
+            return "lead not found"
+        return "suppressed" if flags.suppressed else ("test" if flags.is_test else None)
+    flags = db.execute(_FILE_FLAGS, {"id": ref.source_id}).first()
+    if flags is None:
+        return "file not found"
+    return "owner occupied" if flags.occupancy == OWNER_OCCUPIED else ("test" if flags.is_test else None)
 
-def screen_file(db: Session, facts: dict) -> list[int]:
-    """Screen one file against all secondary lenders. Returns list of package ids created/updated."""
-    fingerprint = build_fingerprint(facts)
-    source_type = facts.get("source_type", "loan_file")
-    source_id = facts.get("loan_file_id") or facts.get("lead_id")
-    if source_id is None:
+
+def screen_file(db: Session, ref: FileRef, *, matrix: tuple[LenderRules, ...], rules_version: str) -> list[int]:
+    """Draft or refresh this file's packages; returns the ids of packages that are new or changed."""
+    excluded = _excluded(db, ref)
+    if excluded:
+        logger.info("[packaging] %s %s not screened: %s", ref.source_type, ref.source_id, excluded)
         return []
-
-    # check if fingerprint changed
-    existing = db.execute(text("""
-        SELECT id, screen_fingerprint, status
-        FROM lending.lender_packages
-        WHERE source_type = :source_type AND source_id = :source_id
-          AND status NOT IN ('submitted', 'dismissed')
-    """), {"source_type": source_type, "source_id": source_id}).mappings().all()
-
-    if existing and all(r["screen_fingerprint"] == fingerprint for r in existing):
-        # no change — skip (D4 re-screen guard)
-        return [r["id"] for r in existing]
-
-    # build borrower profile from facts
+    facts = file_facts(db, ref.source_type, ref.source_id)
+    if facts is None:
+        return []
     try:
-        profile, request = _build_profile(facts)
-    except Exception:
+        borrower, loan = fit_inputs(ref.source_type, facts)
+    except NotScreenable as missing:
+        logger.info("[packaging] %s %s not screened: missing %s", ref.source_type, ref.source_id, missing)
         return []
-
-    secondary_matrix = tuple(r for r in LENDER_MATRIX if r.key in SECONDARY_LENDER_KEYS)
-    try:
-        fit = evaluate_lender_fit(profile, request, matrix=secondary_matrix)
-    except Exception:
-        return []
-
-    package_ids: list[int] = []
-
-    for lender_fit_row in fit.fitting:
-        lk = lender_fit_row.lender_key
-        rules = next((r for r in secondary_matrix if r.key == lk), None)
-        box_confirmed = not has_placeholder_rules(rules) if rules else False
-        fit_summary = {
-            "fitting": [{"lender_key": lk, "subject_to_confirmation": lender_fit_row.subject_to_confirmation}],
-            "non_fitting": [{"lender_key": r.lender_key, "reasons": r.reasons}
-                             for r in fit.non_fitting if r.lender_key == lk],
-        }
-        pid = _upsert_package(db, source_type, source_id, lk, fit_summary, box_confirmed, fingerprint)
-        if pid:
-            package_ids.append(pid)
-
-    return package_ids
-
-
-def screen_eligible_files(db: Session) -> int:
-    """Screen all eligible files. Returns count of packages created/updated."""
-    files = load_eligible_files(db)
-    total = 0
-    for facts in files:
-        ids = screen_file(db, facts)
-        total += len(ids)
-    return total
+    fit = evaluate_lender_fit(borrower, loan, matrix=matrix)
+    fp = fingerprint(facts, rules_version)
+    seen = {(row.lender_key, row.screen_fingerprint)
+            for row in db.execute(_EXISTING, {"st": ref.source_type, "sid": ref.source_id})}
+    rules_by_key = {r.key: r for r in matrix}
+    changed: list[int] = []
+    for lender in fit.fitting:
+        if (lender.lender_key, fp) in seen:
+            continue  # same facts, same rules: already drafted (or dismissed / submitted)
+        rules = rules_by_key.get(lender.lender_key)
+        confirmed = rules is not None and not has_placeholder_rules(rules)
+        package_id = db.execute(_UPSERT, {
+            "st": ref.source_type, "sid": ref.source_id, "lk": lender.lender_key, "confirmed": confirmed,
+            "fit": json.dumps(fit_summary(fit, lender.lender_key)), "fp": fp}).scalar_one()
+        changed.append(package_id)
+    return changed

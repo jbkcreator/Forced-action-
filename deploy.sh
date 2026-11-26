@@ -52,6 +52,9 @@ LENDING_CDR_UNIT_DST="/etc/systemd/system/fa-lending-cdr-poller.service"
 # until P0.4, so deploys never cycled her and she kept running stale code. Warn-only like the workers: a Cora problem
 # never rolls back the FA platform; check journalctl -u fa-lending-cora.
 # ndl-watchdog (R1 0.3) idles until LENDING_WATCHDOG_ENABLED=true, so installing it is safe; it must not depend on lending-api or Cora.
+# Scheduled lending jobs: a oneshot .service started by its .timer (never restarted by the loops below). Installed
+# warn-only like LENDING_UNITS. fa-lending-secondary-screen exits at once until LENDING_SECONDARY_SCREEN_ENABLED=true.
+LENDING_TIMERS=(fa-lending-secondary-screen)
 LENDING_UNITS=(fa-lending-opt-out-poller fa-lending-dialer-sweep fa-lending-uncalled-alarm-worker fa-lending-transcript-worker fa-lending-reminder-worker lending-api fa-lending-cora ndl-watchdog)
 
 cd "$PROJECT_DIR"
@@ -247,6 +250,21 @@ for unit in "${LENDING_UNITS[@]}"; do
         fi
     fi
     systemctl enable "$unit" || echo "WARNING: systemctl enable $unit failed" >&2
+done
+
+for timer in "${LENDING_TIMERS[@]}"; do
+    for kind in service timer; do
+        unit_src="$PROJECT_DIR/deploy/systemd/$timer.$kind"
+        unit_dst="/etc/systemd/system/$timer.$kind"
+        if [ ! -f "$unit_src" ]; then
+            echo "WARNING: $timer.$kind not found at $unit_src — skipping" >&2
+            continue 2
+        fi
+        if ! cmp -s "$unit_src" "$unit_dst" 2>/dev/null; then
+            cp "$unit_src" "$unit_dst" && systemctl daemon-reload || echo "WARNING: install of $timer.$kind failed" >&2
+        fi
+    done
+    systemctl enable --now "$timer.timer" || echo "WARNING: systemctl enable --now $timer.timer failed" >&2
 done
 
 # fa-api stops serving /webhooks/lending/* the moment it restarts, so nginx must already route that

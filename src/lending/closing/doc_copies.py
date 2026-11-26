@@ -41,6 +41,7 @@ _PENDING = text("""
     SELECT id, chase_id, item_code, stored_path, content_type
       FROM lending.doc_chase_uploads
      WHERE drive_file_id IS NULL AND (drive_retry_at IS NULL OR drive_retry_at <= :now)
+       AND quarantine_status IS DISTINCT FROM 'quarantined'
      ORDER BY drive_retry_at NULLS FIRST, id
      LIMIT :batch
        FOR UPDATE SKIP LOCKED
@@ -53,7 +54,7 @@ _FAILED = text("UPDATE lending.doc_chase_uploads SET drive_attempts = drive_atte
                "WHERE id = :id RETURNING drive_attempts")
 _RETRY_CAP_MINUTES = int(RETRY_MAX / RETRY_FIRST)
 _STUCK = text("SELECT count(*) FROM lending.doc_chase_uploads WHERE drive_file_id IS NULL "
-              "AND drive_attempts >= :attempts")
+              "AND drive_attempts >= :attempts AND quarantine_status IS DISTINCT FROM 'quarantined'")
 
 
 def live_copier() -> DriveCopier:

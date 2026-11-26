@@ -1,0 +1,17 @@
+[Unit]
+Description=Forced Action — secondary lender package screening (oneshot, run by its timer)
+After=network.target
+
+[Service]
+Type=oneshot
+User=root
+WorkingDirectory=/root/Forced-action-
+Environment="PYTHONPATH=/root/Forced-action-"
+EnvironmentFile=/root/Forced-action-/.env
+ExecStart=/root/Forced-action-/.venv/bin/python -m src.tasks.secondary_screen_job
+TimeoutStartSec=1500
+NoNewPrivileges=true
+PrivateTmp=true
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=fa-lending-secondary-screen

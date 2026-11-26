@@ -1,121 +1,110 @@
-"""Seam 3 — screening (fake DB / session, no live DB).
-
-Prior art: tests/lending/test_lender_fit.py, tests/lending/test_doc_chase_start.py.
-"""
+"""Screening: who is screened, the fit inputs (never guessed), one package per fit, miss reasons, the fingerprint."""
 from __future__ import annotations
 
+import dataclasses
 import json
-from datetime import date
-from unittest.mock import MagicMock, patch
 
 import pytest
 
-from src.lending.packaging.screen import (
-    build_fingerprint,
-    screen_file,
-)
+from config.lender_matrix import LENDER_MATRIX, SECONDARY_LENDER_KEYS
+from config.lending_occupancy import HOMESTEAD_HOLD_REASON
+from src.lending.contracts import LoanType
+from src.lending.packaging import screen
+from src.lending.packaging.screen import ELIGIBLE_SQL, FileRef, NotScreenable, fingerprint, fit_inputs, screen_file
+from tests.lending.packaging.fakes import FakeSession
+
+SECONDARY = tuple(r for r in LENDER_MATRIX if r.key in SECONDARY_LENDER_KEYS)
+FILE = {"id": 7, "first_name": "Alice", "last_name": "Smith", "phone": "+18135550101", "product": "flip",
+        "loan_amount": 250_000, "purchase_price": 300_000, "rehab_budget": 50_000, "arv": 420_000,
+        "property_address": "1 Main St", "property_city": "Tampa", "property_state": "FL", "property_zip": "33601",
+        "credit_band": "680-719", "credit_band_min_fico": None, "completed_projects": 4, "entity_name": None}
 
 
-def _facts(*, loan_amount=200_000, state="FL", product="flip", credit_band="fair",
-           projects=5, loan_file_id=1, source_type="loan_file"):
-    return {
-        "loan_file_id": loan_file_id,
-        "source_type": source_type,
-        "loan_amount": loan_amount,
-        "property_state": state,
-        "product": product,
-        "credit_band": credit_band,
-        "completed_projects": projects,
-    }
+def _db(*, facts=FILE, flags=None, existing=()):
+    return FakeSession({
+        "SELECT occupancy, is_test FROM lending.loan_files": [flags or {"occupancy": None, "is_test": False}],
+        "SELECT suppressed, is_test FROM lending.lendingflow_leads": [flags or {"suppressed": False, "is_test": False}],
+        "FROM lending.loan_files f LEFT JOIN lending.entities": [facts],
+        "FROM lending.lendingflow_leads WHERE id": [facts],
+        "SELECT lender_key, screen_fingerprint FROM lending.lender_packages": list(existing),
+        "INSERT INTO lending.lender_packages": lambda p: [{"id": 100 + len(p["lk"])}],
+    })
 
 
-class _FakeSession:
-    """Minimal fake SQLAlchemy session for seam 3."""
-
-    def __init__(self, existing_packages=None):
-        self._packages: list[dict] = existing_packages or []
-        self._upserted: list[dict] = []
-
-    def execute(self, stmt, params=None):
-        # Return empty existing for the fingerprint-check query
-        result = MagicMock()
-        result.mappings.return_value.all.return_value = self._packages
-        result.fetchone.return_value = (len(self._upserted) + 100,)
-        return result
-
-    def commit(self):
-        pass
+def test_eligibility_reads_primary_declines_by_id_and_unassigned_files():
+    sql = str(ELIGIBLE_SQL)
+    assert "e.action = 'declined'" in sql and "is_primary" in sql and "e.lender_id =" in sql
+    assert "lender_name" not in sql and "lender_key" not in sql  # never matched by name
+    assert "NOT fr.is_test" in sql and "fr.status = ANY(:unassigned)" in sql
+    assert "fr.lead_id" in sql and "fr.loan_file_id" in sql  # leads and partner files
+    assert set(screen.EXCLUDED_HOLDS) == {"suppressed", HOMESTEAD_HOLD_REASON}
+    assert set(screen.UNASSIGNED_STATUSES) == {"held", "unrouted", "exhausted"}
 
 
-def test_fitting_file_creates_package():
-    """A file that fits two placeholder secondary lenders → two package upserts."""
-    db = _FakeSession()
-    facts = _facts()
-
-    # patch evaluate_lender_fit to return two fits
-    mock_fit = MagicMock()
-    mock_fit.fitting = [
-        MagicMock(lender_key="corevest", subject_to_confirmation=True),
-        MagicMock(lender_key="rcn_capital", subject_to_confirmation=True),
-    ]
-    mock_fit.non_fitting = []
-
-    with patch("src.lending.packaging.screen.evaluate_lender_fit", return_value=mock_fit):
-        ids = screen_file(db, facts)
-
-    assert len(ids) >= 2
+def test_eligible_files_maps_rows_to_file_refs():
+    db = FakeSession({"FROM lending.file_routing fr": [{"lead_id": None, "loan_file_id": 7},
+                                                      {"lead_id": 3, "loan_file_id": None}]})
+    assert screen.eligible_files(db) == [FileRef("loan_file", 7), FileRef("lf_lead", 3)]
 
 
-def test_unchanged_fingerprint_skips_rescreen():
-    """When fingerprint matches all existing packages, screen_file returns existing IDs without re-screening."""
-    facts = _facts()
-    fp = build_fingerprint(facts)
-    existing = [
-        {"id": 10, "screen_fingerprint": fp, "status": "draft"},
-        {"id": 11, "screen_fingerprint": fp, "status": "draft"},
-    ]
-    db = _FakeSession(existing_packages=existing)
-
-    with patch("src.lending.packaging.screen.evaluate_lender_fit") as mock_fit:
-        ids = screen_file(db, facts)
-        # evaluate_lender_fit should NOT be called (fingerprint unchanged)
-        mock_fit.assert_not_called()
-
-    assert set(ids) == {10, 11}
+def test_partner_file_fit_inputs_use_the_partner_band_vocabulary():
+    borrower, loan = fit_inputs("loan_file", FILE)
+    assert (borrower.credit_band_min_fico, borrower.credit_band_max_fico) == (680, 719)
+    assert loan.loan_type is LoanType.FIX_AND_FLIP and loan.state == "FL" and int(loan.loan_amount) == 250_000
 
 
-def test_suppressed_file_has_no_packages():
-    """screen_eligible_files should not return suppressed or owner-occupied files; tested via load_eligible_files mock."""
-    # This seam tests that screen_file given a suppressed-flagged file never calls evaluate_lender_fit.
-    # In production the SQL WHERE clause excludes them; here we confirm screen_file itself does not crash
-    # when given incomplete facts (simulating a file that slipped through).
-    db = _FakeSession()
-    facts = {
-        "loan_file_id": None,  # no id → screen_file returns []
-        "source_type": "loan_file",
-        "loan_amount": None,
-        "property_state": None,
-        "product": None,
-        "credit_band": None,
-        "completed_projects": 0,
-    }
-    ids = screen_file(db, facts)
-    assert ids == []
+def test_lead_fit_inputs_use_its_loan_type_and_band():
+    lead = {**FILE, "product": "BRIDGE", "credit_band": "620-679"}
+    borrower, loan = fit_inputs("lf_lead", lead)
+    assert loan.loan_type is LoanType.BRIDGE and borrower.credit_band_min_fico == 620
 
 
-def test_checklist_excludes_blocked_docs():
-    """Checklist missing-item logic: a blocked doc does not count as received."""
-    from src.lending.packaging.package import _build_checklist
-    from src.lending.packaging.packet_validator import DocInput, DocVerdict, Outcome, Verdict
+@pytest.mark.parametrize("change", [{"product": "other"}, {"loan_amount": None}, {"property_state": None}])
+def test_missing_facts_are_never_guessed(change):
+    with pytest.raises(NotScreenable):
+        fit_inputs("loan_file", {**FILE, **change})
 
-    # all docs blocked
-    verdict = Verdict(
-        outcome=Outcome.BLOCK,
-        per_doc=(
-            DocVerdict(1, "doc_chase_uploads", "bank_statements", Outcome.BLOCK, ("name not found",)),
-        ),
-    )
-    checklist = _build_checklist("corevest", [], verdict)
-    # bank_statements should NOT be received
-    received = {item["item_code"]: item["received"] for item in checklist}
-    assert received.get("bank_statements") is False
+
+def test_each_fitting_lender_gets_an_unconfirmed_draft_with_every_miss_listed():
+    matrix = tuple(dataclasses.replace(r, approved_states=frozenset({"GA"}))
+                   if r.key in ("temple_view", "abl") else r for r in SECONDARY)
+    db = _db()
+    ids = screen_file(db, FileRef("loan_file", 7), matrix=matrix, rules_version="v1")
+    upserts = db.ran("INSERT INTO lending.lender_packages")
+    assert len(ids) == 2 and {u["lk"] for u in upserts} == {"corevest", "rcn_capital"}
+    assert all(u["confirmed"] is False for u in upserts)
+    fit = json.loads(upserts[0]["fit"])
+    assert {m["lender_key"] for m in fit["misses"]} == {"temple_view", "abl"}
+    assert all(m["reasons"] for m in fit["misses"])
+
+
+@pytest.mark.parametrize("flags", [{"occupancy": "owner_occupied", "is_test": False},
+                                   {"occupancy": None, "is_test": True}])
+def test_owner_occupied_and_test_files_are_not_screened(flags):
+    db = _db(flags=flags)
+    assert screen_file(db, FileRef("loan_file", 7), matrix=SECONDARY, rules_version="v1") == []
+    assert not db.ran("INSERT INTO lending.lender_packages")
+
+
+def test_suppressed_lead_is_not_screened():
+    db = _db(flags={"suppressed": True, "is_test": False})
+    assert screen_file(db, FileRef("lf_lead", 3), matrix=SECONDARY, rules_version="v1") == []
+
+
+def test_unchanged_facts_and_rules_draft_nothing_new():
+    fp = fingerprint(FILE, "v1")
+    db = _db(existing=[{"lender_key": r.key, "screen_fingerprint": fp} for r in SECONDARY])
+    assert screen_file(db, FileRef("loan_file", 7), matrix=SECONDARY, rules_version="v1") == []
+    assert not db.ran("INSERT INTO lending.lender_packages")
+
+
+def test_a_rule_change_redrafts():
+    fp = fingerprint(FILE, "v1")
+    db = _db(existing=[{"lender_key": r.key, "screen_fingerprint": fp} for r in SECONDARY])
+    assert screen_file(db, FileRef("loan_file", 7), matrix=SECONDARY, rules_version="v2")
+
+
+def test_upsert_targets_the_open_package_index_and_casts_json():
+    sql = str(screen._UPSERT)
+    assert "ON CONFLICT (source_type, source_id, lender_key) WHERE status NOT IN ('submitted', 'dismissed')" in sql
+    assert "CAST(:fit AS jsonb)" in sql and "::jsonb" not in sql

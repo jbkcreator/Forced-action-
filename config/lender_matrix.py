@@ -262,7 +262,7 @@ _CENTRAL_LENDING = LenderRules(
                           LoanType.BRIDGE, LoanType.DSCR_RENTAL}),
 )
 
-# CoreVest Finance — NOT VERIFIED, shell only (R1 1.7: added as secondary lender; client Q23 for real values).
+# CoreVest Finance — NOT VERIFIED, shell only (secondary lender; awaiting values from the client).
 _COREVEST = LenderRules(
     key="corevest",
     name="CoreVest Finance",
@@ -271,7 +271,7 @@ _COREVEST = LenderRules(
                           LoanType.BRIDGE, LoanType.DSCR_RENTAL}),
 )
 
-# Temple View Capital — NOT VERIFIED, shell only (R1 1.7: added as secondary lender; client Q23 for real values).
+# Temple View Capital — NOT VERIFIED, shell only (secondary lender; awaiting values from the client).
 _TEMPLE_VIEW = LenderRules(
     key="temple_view",
     name="Temple View Capital",
@@ -295,7 +295,7 @@ LENDER_MATRIX: tuple[LenderRules, ...] = (
     _TEMPLE_VIEW,
 )
 
-# Secondary lender keys targeted by R1 1.7 screening (excludes Easy Street and Kiavi per D1).
+# Lenders a declined or unassigned file is screened against for a drafted package (not Easy Street or Kiavi).
 SECONDARY_LENDER_KEYS: frozenset[str] = frozenset({
     "corevest",
     "rcn_capital",
@@ -312,7 +312,7 @@ RULES_EFFECTIVE_FROM: dict[str, date] = {
     "kiavi_affiliate": date(2026, 11, 3),
     "abl": date(2026, 11, 3),
     "central_lending": date(2026, 11, 3),
-    "corevest": date(2026, 11, 26),                      # R1 1.7 shells — client Q23 for real values
+    "corevest": date(2026, 11, 26),                      # unverified shells
     "temple_view": date(2026, 11, 26),
 }
 

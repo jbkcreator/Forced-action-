@@ -44,9 +44,7 @@ class ChecklistItem:
 
 # Josh's Term Sheet Intake Checklist (Nov 2), "what can wait until after the term sheet". Central Lending only:
 # Backflip stays blocked until Josh approves it in writing.
-# R1 1.7: pricing_sheet is a new item type (client Q25 for expiry); required by no lender yet.
-# Secondary lenders (corevest / rcn_capital / temple_view / abl) start as a copy of Central Lending's 6 items,
-# marked placeholder until the client answers Q24 (required documents per secondary lender).
+# Secondary lenders start as a copy of Central Lending's items, marked placeholder until the client confirms them.
 _PLACEHOLDER_SECONDARY: tuple[ChecklistItem, ...] = (
     ChecklistItem("purchase_agreement", "Signed purchase agreement [placeholder]"),
     ChecklistItem("valuation", "Valuation or appraisal [placeholder]"),
@@ -70,14 +68,22 @@ LENDER_CHECKLISTS: dict[str, tuple[ChecklistItem, ...]] = {
     "abl": _PLACEHOLDER_SECONDARY,
 }
 
-# R1 1.7: pricing_sheet item type. Expiry (max age in days) set via LENDING_PRICING_SHEET_MAX_AGE_DAYS.
-# No lender requires it yet; the validator blocks any pricing_sheet with no readable date.
+# Required by no lender yet; its maximum age is LENDING_PRICING_SHEET_MAX_AGE_DAYS.
 PRICING_SHEET_ITEM = ChecklistItem("pricing_sheet", "Pricing sheet")
+
 
 # P2.2 instant-quote condition codes that add a document.
 CONDITION_ITEMS: dict[str, ChecklistItem] = {
     "INTEREST_RESERVE_FULL_TERM": ChecklistItem("interest_reserve_funds",
                                                 "Proof of funds for the full-term interest reserve"),
+}
+
+# Every document type a staff member may tag an upload with.
+DOCUMENT_TYPES: dict[str, str] = {
+    **{item.code: item.label for items in LENDER_CHECKLISTS.values() for item in items
+       if not item.label.endswith("[placeholder]")},
+    **{item.code: item.label for item in CONDITION_ITEMS.values()},
+    PRICING_SHEET_ITEM.code: PRICING_SHEET_ITEM.label,
 }
 
 

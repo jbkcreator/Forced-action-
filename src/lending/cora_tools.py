@@ -44,7 +44,12 @@ from src.lending.attempt_log import (
     summary,
     to_csv,
 )
-from src.lending.closing.doc_access import find_document_borrowers, issue_view_link, latest_upload
+from src.lending.closing.doc_access import (
+    DocumentQuarantined,
+    find_document_borrowers,
+    issue_view_link,
+    latest_upload,
+)
 from src.lending.closing.doc_chase import open_chase_summaries, start_chase
 from src.lending.closing.drafts import Recipient
 from src.lending.contracts import BorrowerProfile, LoanRequest
@@ -834,6 +839,9 @@ class CoraToolkit:
                 raise ToolInputError("document links are not set up (LENDING_PARTNER_LINK_BASE_URL)")
             except DocumentAccessDenied:
                 raise ToolInputError("only an admin can open borrower documents")
+            except DocumentQuarantined:
+                raise ToolInputError("that document is quarantined (suspicious hidden content); an admin must "
+                                     "release it before anyone can open it")
         message = (f"{match.display} – {label} (uploaded {uploaded_at:%b %d}). Opens for 15 minutes, only you can "
                    f"see this message: {link.url}")
         try:

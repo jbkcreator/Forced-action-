@@ -76,7 +76,14 @@ _LATEST = text("""
      ORDER BY u.uploaded_at DESC, u.id DESC
      LIMIT 1
 """)
-_UPLOAD_EXISTS = text("SELECT 1 FROM lending.doc_chase_uploads WHERE id = :id")
+_UPLOAD = text("SELECT stored_path, quarantine_status FROM lending.doc_chase_uploads WHERE id = :id")
+_PACKAGES_TABLE = text("SELECT to_regclass('lending.lender_packages')")
+_IN_OPEN_PACKAGE = text("""
+    SELECT 1 FROM lending.lender_packages
+     WHERE status NOT IN ('submitted', 'dismissed')
+       AND validator_verdict -> 'per_doc' @> CAST(:doc AS jsonb)
+     LIMIT 1
+""")
 _INSERT_LINK = text("INSERT INTO lending.doc_view_links (token_hash, upload_id, issued_to, expires_at, created_at) "
                     "VALUES (:hash, :upload, :issued_to, :expires, :now) RETURNING id")
 # Live Slack-issued links whose issuer is not in the approver list Cora holds now.
@@ -87,7 +94,8 @@ _REVOKE_SLACK_LINKS = text("""
 """)
 _LINKS_TABLE = text("SELECT to_regclass('lending.doc_view_links')")
 _LINK = text("""
-    SELECT l.id, l.upload_id, l.issued_to, l.expires_at, l.revoked_at, u.stored_path, u.content_type, u.item_code
+    SELECT l.id, l.upload_id, l.issued_to, l.expires_at, l.revoked_at, u.stored_path, u.content_type, u.item_code,
+           u.quarantine_status
       FROM lending.doc_view_links l JOIN lending.doc_chase_uploads u ON u.id = l.upload_id
      WHERE l.token_hash = :hash
 """)
@@ -118,6 +126,10 @@ class ViewableFile:
     path: str
     content_type: str
     download_name: str
+
+
+class DocumentQuarantined(Exception):
+    """The upload is quarantined (hidden or injected content): no link to it is made or opened."""
 
 
 class ViewRefused(Exception):
@@ -201,11 +213,15 @@ def latest_upload(db, lead_ref: str, item_code: str) -> Optional[tuple[int, str,
 
 def issue_view_link(db, upload_id: int, issued_to: str, now: datetime) -> IssuedLink:
     """A 15-minute link to one upload for an admin (``slack:<user id>`` or ``token:<id>``). Only the token's hash is
-    stored. Raises DocumentAccessDenied, LookupError (no such upload) or PartnerLinkNotConfigured."""
+    stored. Raises DocumentAccessDenied, LookupError (no such upload), DocumentQuarantined or
+    PartnerLinkNotConfigured."""
     if role_of_issuer(db, issued_to, now) is not Role.ADMIN:
         raise DocumentAccessDenied(issued_to)
-    if db.execute(_UPLOAD_EXISTS, {"id": upload_id}).first() is None:
+    upload = db.execute(_UPLOAD, {"id": upload_id}).first()
+    if upload is None:
         raise LookupError(upload_id)
+    if upload.quarantine_status == "quarantined" or _quarantined_on_rescan(db, upload_id, upload.stored_path):
+        raise DocumentQuarantined(upload_id)
     base = link_base_url()
     if base is None:
         raise PartnerLinkNotConfigured("LENDING_PARTNER_LINK_BASE_URL is not set: document links cannot be made")
@@ -215,6 +231,21 @@ def issue_view_link(db, upload_id: int, issued_to: str, now: datetime) -> Issued
                                         "expires": expires_at, "now": now}).scalar_one()
     logger.info("[doc-access] view link %s issued for upload %s", link_id, upload_id)
     return IssuedLink(base + DOC_VIEW_LINK_PATH.format(token=token), expires_at)
+
+
+def _quarantined_on_rescan(db, upload_id: int, stored_path: str) -> bool:
+    """An upload in an open lender package is scanned again before a link to it is made."""
+    import json
+
+    from src.lending.packaging.packet_validator import DOC_CHASE_UPLOADS
+    from src.lending.packaging.quarantine import scan_upload
+
+    if db.execute(_PACKAGES_TABLE).scalar() is None:
+        return False
+    doc = json.dumps([{"upload_table": DOC_CHASE_UPLOADS, "upload_id": upload_id}])
+    if db.execute(_IN_OPEN_PACKAGE, {"doc": doc}).first() is None:
+        return False
+    return scan_upload(db, DOC_CHASE_UPLOADS, upload_id, stored_path)
 
 
 def resolve_view_token(db, token: str, now: datetime) -> ViewableFile:
@@ -234,6 +265,9 @@ def resolve_view_token(db, token: str, now: datetime) -> ViewableFile:
         logger.warning("[doc-access] view link %s refused: its token is no longer an admin token", row.id)
         raise ViewRefused(403)
     if not row.issued_to.startswith((TOKEN_ISSUER, SLACK_ISSUER)):
+        raise ViewRefused(403)
+    if row.quarantine_status == "quarantined":
+        logger.warning("[doc-access] view link %s refused: upload %s is quarantined", row.id, row.upload_id)
         raise ViewRefused(403)
     if not os.path.isfile(row.stored_path):
         logger.error("[doc-access] view link %s: upload %s is missing on disk", row.id, row.upload_id)
