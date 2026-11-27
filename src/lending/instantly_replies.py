@@ -404,11 +404,30 @@ _MODEL_STOP = text("""
            summary = :summary
      WHERE id = :id
 """)
+_HANDOFF_PENDING = text("""
+    UPDATE lending.instantly_replies SET ghl_handoff_pending_at = COALESCE(ghl_handoff_pending_at, now()) WHERE id = :id
+""")
+_HANDOFF_SETTLED = text("UPDATE lending.instantly_replies SET ghl_handoff_pending_at = NULL WHERE id = :id")
+_CLAIM_PENDING_HANDOFFS = text("""
+    SELECT id, lead_email, first_name, campaign_name, email_account, reply_to_uuid, reply_subject, reply_text,
+           status, stop_request, intent, summary, action_id, attempts, dedup_key
+      FROM lending.instantly_replies
+     WHERE ghl_handoff_pending_at IS NOT NULL
+     ORDER BY ghl_handoff_pending_at
+     LIMIT :limit
+       FOR UPDATE SKIP LOCKED
+""")
 _DONE = text("""
     UPDATE lending.instantly_replies SET status = 'done', intent = :intent, summary = :summary, action_id = :action_id,
            triage_posted_at = CASE WHEN :posted THEN now() END, processed_at = now(), last_error = :error
      WHERE id = :id
 """)
+
+
+class HandoffPaused(DeliveryError):
+    """R1 0.6: the GHL handoff waited out a dependency pause (nothing changed in GHL); it stays pending and the sweep
+    retries it once the opt-out feeds are fresh."""
+
 
 Enqueue = Callable[..., int]  # PendingActionQueue.enqueue
 PostCard = Callable[[int], bool]  # SendGate.post_card
@@ -453,6 +472,11 @@ class ReplyProcessor:
                 else:
                     self._triage(db, row, result)
                 db.commit()
+            if self._hand_off is not None:
+                for row in [dict(r) for r in db.execute(_CLAIM_PENDING_HANDOFFS, {"limit": limit}).mappings()]:
+                    if self._hand_off_deal(db, row):  # the handoff only: the answer was drafted on the first pass
+                        db.execute(_HANDOFF_SETTLED, {"id": row["id"]})
+                    db.commit()
         return result
 
     def _fail(self, db, row: Mapping[str, Any], error: str, result: SweepResult) -> None:
@@ -518,17 +542,23 @@ class ReplyProcessor:
             self._hand_off_deal(db, row)
         self._finish(db, row, triage, action_id, error, result)
 
-    def _hand_off_deal(self, db, row: Mapping[str, Any]) -> None:
+    def _hand_off_deal(self, db, row: Mapping[str, Any]) -> bool:
         """A Deal reply becomes a GHL contact and pipeline card. Best effort: a failure never stops the reply being
-        triaged and answered; it is raised to Cora's inbox so the team adds the contact by hand."""
+        triaged and answered; it is raised to Cora's inbox so the team adds the contact by hand. A dependency pause
+        (``HandoffPaused``) is not a failure: the handoff stays pending and the sweep retries it. Returns False only
+        then (the handoff is settled otherwise: done, skipped for an opt-out, or raised for the team)."""
         try:
             with db.begin_nested():  # a failed read must not abort the sweep's transaction
                 opted_out = bool(db.execute(_EMAIL_SUPPRESSED, {"e": row["lead_email"].strip().lower()}).scalar())
             if opted_out:
                 logger.info("[instantly-replies] reply %s not handed to GHL: the address has opted out", row["id"])
-                return
+                return True
             if self._hand_off is not None:
                 self._hand_off(row)
+        except HandoffPaused:
+            logger.warning("[instantly-replies] reply %s GHL handoff pending: opt-outs can't be verified", row["id"])
+            db.execute(_HANDOFF_PENDING, {"id": row["id"]})
+            return False
         except Exception as exc:  # the step name and status carry no address; the class alone for anything else
             detail = str(exc)[:120] if isinstance(exc, DeliveryError) else type(exc).__name__
             logger.error("[instantly-replies] reply %s not handed to GHL (%s)", row["id"], detail)
@@ -538,6 +568,7 @@ class ReplyProcessor:
                         "check the contact, its tag and the pipeline card, and finish by hand",
                 payload={"instantly_reply_id": row["id"], "email_masked": mask_emails(row["lead_email"]),
                          "error": detail})
+        return True
 
     def _suppress_model_stop(self, db, row: Mapping[str, Any], triage: Triage, result: SweepResult) -> None:
         """A stop request in wording the phrase check missed: marked as a STOP first, so a failed opt-out is retried

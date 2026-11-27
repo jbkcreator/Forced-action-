@@ -213,7 +213,13 @@ def admit(channel: str) -> None:
 
 def recheck(channel: str) -> None:
     """Raise ``ChannelPaused`` when the breaker opened since ``admit`` (another worker recorded the fifth failure while
-    this send was preparing). Takes no rate-limit slot. Called right before the final provider request."""
+    this send was preparing), or ``SuppressionUnverified`` when an opt-out feed went stale meanwhile (R1 0.6). Takes no
+    rate-limit slot. Called right before the final provider request."""
+    from src.lending.dependency_health import outbound_allowed
+
+    decision = outbound_allowed(channel)
+    if not decision.allowed:
+        raise SuppressionUnverified(channel, decision.reason or "opt-outs can't be verified")
     paused: Optional[str] = None
     try:
         with lending_session() as db:

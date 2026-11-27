@@ -23,7 +23,8 @@ address that opted out is not handed over (the caller checks).
 Known limits (documented in docs/lending/instantly-replies.md): the contact is matched by email only, so a cold
 contact loaded into GHL by phone with no email on file is not found and a second contact is created; a failure part-way
 leaves a partly built contact and raises an inbox item (the reply is not retried). Refused while the lending emergency
-halt is on.
+halt is on. During an R1 0.6 dependency pause nothing is changed and the handoff stays pending: the reply sweep
+retries it once the opt-out feeds are fresh (never drafting a second answer).
 """
 from __future__ import annotations
 
@@ -39,7 +40,7 @@ from src.lending.global_halt import is_globally_halted
 from config.lending_fallbacks import CHANNEL_GHL_CRM
 from src.lending.dependency_health import outbound_paused
 from src.lending.web_lead_ghl import GhlLeadSink
-from src.lending.instantly_replies import new_reply_text
+from src.lending.instantly_replies import HandoffPaused, new_reply_text
 from src.lending.web_leads import DeliveryError
 from src.services.phone_utils import normalize
 
@@ -64,8 +65,8 @@ class InstantlyGhlHandoff(GhlLeadSink):
     def __call__(self, row: Mapping[str, Any]) -> str:
         if is_globally_halted():  # a tag or card can start a GHL workflow that messages the lead
             raise DeliveryError("lending emergency halt is on; nothing changed in GHL")
-        if outbound_paused(CHANNEL_GHL_CRM):
-            raise DeliveryError("opt-outs can't be verified (a feed is stale); nothing changed in GHL")
+        if outbound_paused(CHANNEL_GHL_CRM):  # the reply sweep keeps it pending and hands it over once fresh
+            raise HandoffPaused("opt-outs can't be verified (a feed is stale); nothing changed in GHL")
         email = str(row["lead_email"]).strip().lower()
         contact_id, duplicates = self._contact_for_email(row, email)
         contact = self._read_contact(contact_id)

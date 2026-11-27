@@ -1822,7 +1822,8 @@ class LendingInstantlyReply(LendingBase):
     suppressed (a STOP or unsubscribe: no answer is ever drafted; ``suppressed_at`` is set once the opt-out is
     recorded, and the sweep retries one that failed) or failed (gave up after ``attempts``). ``reply_text`` is kept
     so the answer can be drafted; it is never logged or put in the inbox payload. ``action_id`` is the approval card
-    in ``pending_actions``; ``triage_posted_at`` the post in the replies channel."""
+    in ``pending_actions``; ``triage_posted_at`` the post in the replies channel. ``ghl_handoff_pending_at``: a Deal
+    reply whose GHL handoff waited out an R1 0.6 dependency pause; the sweep retries it until it is handed over."""
 
     __tablename__ = "instantly_replies"
 
@@ -1849,6 +1850,7 @@ class LendingInstantlyReply(LendingBase):
     last_error: Mapped[Optional[str]] = mapped_column(String(200))  # exception class or a fixed reason only
     received_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_now, server_default=text("now()"))
     processed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    ghl_handoff_pending_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
 
     __table_args__ = (
         CheckConstraint("status IN ('new', 'suppressed', 'done', 'failed')", name="ck_instantly_replies_status"),
@@ -1857,6 +1859,8 @@ class LendingInstantlyReply(LendingBase):
         Index("uq_instantly_replies_dedup", "dedup_key", unique=True),
         Index("ix_instantly_replies_open", "received_at",
               postgresql_where=text("status = 'new' OR (status = 'suppressed' AND suppressed_at IS NULL)")),
+        Index("ix_instantly_replies_handoff_pending", "ghl_handoff_pending_at",
+              postgresql_where=text("ghl_handoff_pending_at IS NOT NULL")),
     )
 
 

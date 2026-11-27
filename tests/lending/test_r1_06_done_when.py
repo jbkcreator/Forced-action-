@@ -23,8 +23,8 @@ class _SourcesDb:
         self.pr_finished, self.lf_last = pr_finished, lf_last
 
     def execute(self, stmt, params=None):
-        if stmt is pool_source._NEWEST_PULL:
-            return SimpleNamespace(scalar=lambda: self.pr_finished)
+        if stmt is pool_source._SCHEDULED_SEGMENTS:
+            return iter([("FL", "maturity_target_lender", self.pr_finished)])
         if stmt is dh._READ:
             return iter([SimpleNamespace(dependency=fb.FEED_LENDINGFLOW_INBOUND, last_success_at=self.lf_last,
                                          failing_since=None, detail=None)])
@@ -36,7 +36,7 @@ class _SourcesDb:
 def test_outage_on_lendingflow_and_propertyradar_reports_both_sources_offline():
     db = _SourcesDb(pr_finished=NOW - timedelta(hours=31), lf_last=NOW - timedelta(hours=25))
     reasons = dw.lead_source_offline_reasons(db, NOW, lendingflow_on=True)
-    assert reasons[dw.SOURCE_PR_MATURITY] == "PropertyRadar data 31 h old"
+    assert reasons[dw.SOURCE_PR_MATURITY] == "PropertyRadar FL maturity_target_lender data is 31 h old — not loaded"
     assert reasons[dw.SOURCE_LENDINGFLOW].startswith("LendingFlow silent: no LendingFlow lead for 9.0 business hours")
 
 

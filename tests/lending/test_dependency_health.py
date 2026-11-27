@@ -37,10 +37,11 @@ def test_the_instantly_reply_webhook_is_a_push_feed_with_no_timer():
     assert feed.kind == fb.FEED_PUSH and feed.stale_after_s is None and not feed.timed
 
 
-def test_the_email_inbox_protects_email_channels_only():
-    assert fb.FEEDS_BY_KEY[fb.FEED_IMAP_OPT_OUT].protects == (fb.CHANNEL_GHL_EMAIL, fb.CHANNEL_INSTANTLY)
+def test_the_email_inbox_protects_every_channel():
+    # It suppresses the phone numbers written in an opt-out email too, so calls, texts and the dialer depend on it.
+    assert fb.FEEDS_BY_KEY[fb.FEED_IMAP_OPT_OUT].protects == fb.ALL_CHANNELS
     sms_feeds = {f.key for f in fb.feeds_protecting(fb.CHANNEL_GHL_SMS)}
-    assert sms_feeds == {fb.FEED_GHL_DND_BACKSTOP, fb.FEED_FA_OPT_OUT_POLLER}
+    assert sms_feeds == {fb.FEED_GHL_DND_BACKSTOP, fb.FEED_FA_OPT_OUT_POLLER, fb.FEED_IMAP_OPT_OUT}
 
 
 def test_every_policy_row_is_complete():
@@ -81,12 +82,11 @@ def test_one_slow_ghl_run_does_not_pause():
                                 suppression_readable=True) is None
 
 
-def test_a_stale_email_inbox_pauses_email_only():
+def test_a_stale_email_inbox_pauses_every_channel_while_the_other_feeds_are_fresh():
     rows = _fresh_rows(**{fb.FEED_IMAP_OPT_OUT: 16})
-    assert dh.unverified_reason(fb.CHANNEL_GHL_EMAIL, rows, NOW, suppression_readable=True)
-    assert dh.unverified_reason(fb.CHANNEL_INSTANTLY, rows, NOW, suppression_readable=True)
-    for channel in (fb.CHANNEL_GHL_SMS, fb.CHANNEL_GHL_CRM, fb.CHANNEL_DIALER):
-        assert dh.unverified_reason(channel, rows, NOW, suppression_readable=True) is None
+    for channel in fb.ALL_CHANNELS:  # SMS, CRM outreach and dialer loads included
+        reason = dh.unverified_reason(channel, rows, NOW, suppression_readable=True)
+        assert reason and "Opt-out mailbox reader" in reason
 
 
 def test_a_feed_that_never_succeeded_counts_as_stale():

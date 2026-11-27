@@ -159,13 +159,12 @@ SOURCE_PR_MATURITY = "pr_maturity"  # the PropertyRadar pool the bridge stages
 def lead_source_offline_reasons(db, now: datetime, *, lendingflow_on: bool) -> dict[str, str]:
     """Why a lead source is offline right now (source -> reason), for 1.6's queue post (``SourceCount``): a source
     listed here is broken, not dry. Read-only."""
-    from src.lending.pool_source import propertyradar_staleness
+    from src.lending.pool_source import stale_message, stale_segments
 
     reasons: dict[str, str] = {}
-    stale = propertyradar_staleness(db, now)
-    if stale is not None:
-        reasons[SOURCE_PR_MATURITY] = (f"PropertyRadar data {stale.age_hours} h old" if stale.age_hours is not None
-                                       else "no successful PropertyRadar pull")
+    stale = stale_segments(db, now)
+    if stale:
+        reasons[SOURCE_PR_MATURITY] = stale_message(stale)
     if lendingflow_on:
         row = dh.read_rows(db, [FEED_LENDINGFLOW_INBOUND]).get(FEED_LENDINGFLOW_INBOUND)
         last = row.last_success_at if row else db.execute(_LAST_LENDINGFLOW_LEAD).scalar()
@@ -204,8 +203,9 @@ class WatchResult:
 
 def run_watch(db, now: datetime, *, post: Callable[[str], object], reopen: Callable[[str], int],
               lendingflow_on: bool, enforce: bool, dry_run: bool = False) -> WatchResult:
-    """One pass on ``db`` (the caller commits). ``post`` sends an ops alert, ``reopen(channel)`` sends the cards held
-    for an unverified opt-out check back for approval and returns how many."""
+    """One pass on ``db`` (the caller commits). ``post`` sends an ops alert and returns whether Slack took it;
+    ``reopen(channel)`` sends the cards held for an unverified opt-out check back for approval and returns how many.
+    A database that cannot be reached at all is alerted by the external watchdog (R1 0.3), not here."""
     rows: Optional[dict[str, dh.HealthRow]]
     suppression_readable = True
     try:
@@ -238,12 +238,13 @@ def run_watch(db, now: datetime, *, post: Callable[[str], object], reopen: Calla
         logger.info("[dependency-watch] dry run: start=%s clear=%s paused=%s", result.started, result.cleared,
                     sorted(paused))
         return result
+    # The episode changes only once ops has the post: a refused post is tried again on the next pass.
     for key, detail in plan.starts.items():
-        db.execute(_SET_ALERT, {"k": key, "active": True, "now": now, "detail": detail[:300]})
-        post(start_message(key, detail, paused, enforce=enforce))
+        if post(start_message(key, detail, paused, enforce=enforce)):
+            db.execute(_SET_ALERT, {"k": key, "active": True, "now": now, "detail": detail[:300]})
     for key in plan.clears:
-        db.execute(_SET_ALERT, {"k": key, "active": False, "now": now, "detail": None})
-        post(clear_message(key))
+        if post(clear_message(key)):
+            db.execute(_SET_ALERT, {"k": key, "active": False, "now": now, "detail": None})
 
     from src.lending.dispatch.circuit_breaker import CHANNELS as BREAKER_CHANNELS
 

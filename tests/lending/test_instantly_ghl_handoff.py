@@ -250,8 +250,8 @@ def test_the_handoff_needs_the_ghl_account(monkeypatch):
 # ── in Cora's reply sweep ───────────────────────────────────────────────────
 
 class Session(FakeSession):
-    def __init__(self, rows, opted_out: bool = False) -> None:
-        super().__init__(rows)
+    def __init__(self, rows, opted_out: bool = False, pending_handoffs=()) -> None:
+        super().__init__(rows, pending_handoffs)
         self._opted_out = opted_out
 
     def execute(self, stmt, params=None):
@@ -357,3 +357,62 @@ def test_the_first_answer_is_still_a_draft_in_the_same_instantly_thread():
     proc.run()
     assert drafts[0]["channel"] == "instantly_email" and drafts[0]["payload"]["reply_to_uuid"] == "em-1"
     assert drafts[0]["payload"]["from_inbox"] == "josh@ndl-mail.com"
+
+
+# ── Review F8: a Deal reply during an R1 0.6 dependency pause ───────────────
+
+def test_a_paused_handoff_raises_handoff_paused_and_changes_nothing(pipeline, monkeypatch):
+    from src.lending.instantly_replies import HandoffPaused
+
+    monkeypatch.setattr(ho, "outbound_paused", lambda channel: True)
+    handoff = RecordingHandoff(contacts=[LEAD_CONTACT])
+    with pytest.raises(HandoffPaused):
+        handoff(row())
+    assert handoff.calls == []
+
+
+def test_a_deal_reply_during_a_pause_is_answered_and_its_handoff_kept_pending_not_raised():
+    from src.lending.instantly_replies import HandoffPaused
+
+    def paused(_):
+        raise HandoffPaused("opt-outs can't be verified")
+
+    session = Session([row()])
+    result = sweep(session, DEAL, paused)
+    assert result.drafted == 1 and result.triaged == 1
+    assert session.params("SET ghl_handoff_pending_at = COALESCE") == [{"id": 7}]
+    assert all(e["event_type"] != "instantly_ghl_handoff_failed" for e in session.params("INSERT INTO lending.cora_inbox"))
+
+
+def test_after_recovery_the_pending_handoff_creates_one_card_without_a_second_answer():
+    drafts, handed = [], []
+    session = Session([], pending_handoffs=[row(status="done", intent="deal", action_id=99)])
+    proc = ReplyProcessor(session_factory=lambda: session, client=FakeModel(DEAL), model="m",
+                          enqueue=lambda **kw: drafts.append(kw) or 100, post_card=lambda a: True,
+                          post_triage=lambda t: True, post_notice=lambda t: True,
+                          hand_off=lambda r: handed.append(r["id"]) or "c-1")
+    proc.run()
+    assert handed == [7] and drafts == []
+    assert session.params("SET ghl_handoff_pending_at = NULL") == [{"id": 7}]
+
+
+def test_a_pending_handoff_still_paused_stays_pending():
+    from src.lending.instantly_replies import HandoffPaused
+
+    def paused(_):
+        raise HandoffPaused("still stale")
+
+    session = Session([], pending_handoffs=[row(status="done", intent="deal")])
+    sweep(session, DEAL, paused)
+    assert session.params("SET ghl_handoff_pending_at = NULL") == []
+    assert session.params("SET ghl_handoff_pending_at = COALESCE") == [{"id": 7}]
+
+
+def test_a_pending_handoff_that_fails_for_another_reason_goes_to_the_team_once():
+    def boom(_):
+        raise DeliveryError("add tags: HTTP 502")
+
+    session = Session([], pending_handoffs=[row(status="done", intent="deal")])
+    sweep(session, DEAL, boom)
+    assert [e["event_type"] for e in session.params("INSERT INTO lending.cora_inbox")] == ["instantly_ghl_handoff_failed"]
+    assert session.params("SET ghl_handoff_pending_at = NULL") == [{"id": 7}]

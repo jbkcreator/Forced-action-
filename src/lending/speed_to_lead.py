@@ -271,7 +271,8 @@ def _night_responder_texts(db, lead_id: int) -> bool:
     return db.execute(_NIGHT_CONVERSATION, {"key": f"after_hours:{SOURCE_WEB_FORM}:{lead_id}"}).first() is not None
 
 
-def _web_text(db, lead: Mapping[str, Any], tags: TagClient, *, halted: bool, now: datetime) -> tuple[str, Optional[datetime]]:
+def _web_text(db, lead: Mapping[str, Any], tags: TagClient, *, halted: bool, paused: bool,
+              now: datetime) -> tuple[str, Optional[datetime]]:
     if not intro_sms_on():
         return TEXT_OFF, None
     if _night_responder_texts(db, lead["id"]):
@@ -280,6 +281,9 @@ def _web_text(db, lead: Mapping[str, Any], tags: TagClient, *, halted: bool, now
         return TEXT_TOO_LATE, None
     if halted or not lead["sms_consent"] or lead["suppressed"] or not has_text_consent(db, lead["phone"]):
         return TEXT_NOT_ALLOWED, None
+    if paused:  # R1 0.6: the release sweep sends it once the opt-out feeds are fresh (consent, window, age rechecked)
+        logger.info("[speed-to-lead] web intro text held while opt-outs can't be verified lead=%s", lead["id"])
+        return TEXT_HELD, None
     if not text_window_open(lead["phone"], property_state=lead["property_state"], now=now):
         logger.info("[speed-to-lead] web intro text held for the send window lead=%s", lead["id"])
         return TEXT_HELD, None
@@ -516,12 +520,13 @@ def start(db, source: str, lead_id: int, *, tags: TagClient, scrubber: Optional[
                            "received_at": lead["received_at"], "now": now})
     if row_id is None:
         return None
-    halted = is_globally_halted() or outbound_paused(CHANNEL_GHL_CRM)  # R1 0.6: stale opt-out feed
+    global_halt, paused = is_globally_halted(), outbound_paused(CHANNEL_GHL_CRM)  # R1 0.6: stale opt-out feed
+    halted = global_halt or paused
     if source == SOURCE_LENDINGFLOW:
         text_status, text_at = TEXT_BY_LENDINGFLOW, lead["intro_sms_tagged_at"]
     else:
         try:
-            text_status, text_at = _web_text(db, lead, tags, halted=halted, now=now)
+            text_status, text_at = _web_text(db, lead, tags, halted=global_halt, paused=paused, now=now)
         except Exception as exc:  # class only
             logger.error("[speed-to-lead] web intro tag failed lead=%s: %s", lead_id, type(exc).__name__)
             text_status, text_at = TEXT_NOT_ALLOWED, None

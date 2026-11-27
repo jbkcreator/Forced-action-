@@ -23,7 +23,7 @@ import logging
 import re
 import uuid
 from decimal import Decimal, InvalidOperation
-from typing import Any, Iterator, Mapping, Optional
+from typing import Any, Iterable, Iterator, Mapping, Optional
 
 from sqlalchemy import text
 from sqlalchemy.orm import Session
@@ -67,6 +67,16 @@ def _source_tag(campaign: Optional[str], state: Optional[str]) -> Optional[str]:
     if campaign == "maturity_target_lender":
         return "list_5" if (state or "").strip().upper() == "GA" else "list_1"
     return CAMPAIGN_SOURCE_TAG.get(campaign, campaign)
+
+
+_TAG_CAMPAIGN = {**{tag: campaign for campaign, tag in CAMPAIGN_SOURCE_TAG.items()},
+                 "list_1": "maturity_target_lender", "list_5": "maturity_target_lender"}
+
+
+def segment_of(record: Mapping[str, Any]) -> tuple[str, str]:
+    """The (state, campaign) PropertyRadar segment a staged row came from (``_source_tag`` reversed)."""
+    tag = record.get("source_tag")
+    return ((record.get("state") or "").strip().upper(), _TAG_CAMPAIGN.get(tag, tag))
 
 # entity_status values the staging CHECK accepts. GA-allowed business types are
 # LLC / CORPORATION (config.lending_compliance.GEORGIA_ALLOWED_ENTITY_TYPES minus
@@ -183,6 +193,7 @@ _RECORDS_SQL = """
            est_maturity_date, property_id
     FROM property_radar_records
     WHERE status = 'active' AND id > :after_id AND campaign = ANY(:dialed)
+      AND NOT (state || '|' || campaign = ANY(:stale))
     {state_filter}
     ORDER BY id
     LIMIT :limit
@@ -190,14 +201,17 @@ _RECORDS_SQL = """
 
 
 def _iter_record_pages(
-    session: Session, *, state: Optional[str], page_size: int = RECORD_PAGE_SIZE
+    session: Session, *, state: Optional[str], page_size: int = RECORD_PAGE_SIZE,
+    exclude: Iterable[tuple[str, str]] = (),
 ) -> Iterator[list[dict[str, Any]]]:
-    """Yield active PropertyRadar records in id order, one bounded page at a time."""
+    """Yield active PropertyRadar records in id order, one bounded page at a time, minus the ``exclude`` segments."""
+    stale = [f"{seg_state}|{campaign}" for seg_state, campaign in exclude]
     clause = "AND state = :state" if state else ""
     sql = text(_RECORDS_SQL.format(state_filter=clause))
     after_id = 0
     while True:
-        params: dict[str, Any] = {"after_id": after_id, "limit": page_size, "dialed": list(DIALED_CAMPAIGNS)}
+        params: dict[str, Any] = {"after_id": after_id, "limit": page_size, "dialed": list(DIALED_CAMPAIGNS),
+                                  "stale": stale}
         if state:
             params["state"] = state.upper()
         rows = session.execute(sql, params).mappings().all()
@@ -283,7 +297,8 @@ def _is_ga_dialable(row: Mapping[str, Any]) -> bool:
 
 
 def extract_pr_maturity_pool(
-    session: Session, *, dry_run: bool = False, state: Optional[str] = None
+    session: Session, *, dry_run: bool = False, state: Optional[str] = None,
+    exclude: Iterable[tuple[str, str]] = (),
 ) -> dict[str, Any]:
     """Build the pr_maturity pool from PropertyRadar records + traced contacts.
 
@@ -297,6 +312,8 @@ def extract_pr_maturity_pool(
     later trace can be joined without a re-extract (WP-W0-1 O15 convention).
     Each phone goes to one row only: a phone already in the run (any pool) is skipped
     and the record gets its next traced phone, or none.
+    ``exclude`` = (state, campaign) segments left out (R1 0.6: their nightly pull is stale); their earlier rows in the
+    run are cleared with the rest, so old data is never re-staged.
     """
     run_id = latest_run_id(session) or str(uuid.uuid4())
     if not dry_run:
@@ -304,7 +321,7 @@ def extract_pr_maturity_pool(
     taken = _phones_in_other_pools(session, run_id, state)
     total = with_phone = ga = ga_dialable = written = 0
 
-    for records in _iter_record_pages(session, state=state):
+    for records in _iter_record_pages(session, state=state, exclude=exclude):
         contacts = load_trace_contacts(session, [r["radar_id"] for r in records])
         rows: list[dict[str, Any]] = []
         for r in records:

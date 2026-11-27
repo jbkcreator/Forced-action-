@@ -61,15 +61,15 @@ class _Db:
         raise AssertionError(f"unexpected SQL {stmt}")
 
 
-def _run(db, *, enforce=True, lendingflow_on=False, now=NOW):
+def _run(db, *, enforce=True, lendingflow_on=False, now=NOW, slack_up=True):
     posted, reopened = [], []
 
     def reopen(channel):
         reopened.append(channel)
         return 2
 
-    result = dw.run_watch(db, now, post=posted.append, reopen=reopen, lendingflow_on=lendingflow_on,
-                          enforce=enforce)
+    result = dw.run_watch(db, now, post=lambda message: posted.append(message) or slack_up, reopen=reopen,
+                          lendingflow_on=lendingflow_on, enforce=enforce)
     return result, posted, reopened
 
 
@@ -93,10 +93,26 @@ def test_with_the_switch_off_it_says_would_have_paused():
     assert "Would have paused" in posted[0] and "LENDING_FAILCLOSED_PAUSE_ENABLED" in posted[0]
 
 
-def test_a_stale_mailbox_pauses_email_only_and_sms_cards_still_reopen():
+def test_a_stale_mailbox_pauses_every_channel_and_reopens_nothing():
     _, posted, reopened = _run(_Db(ages={fb.FEED_IMAP_OPT_OUT: 20}))
-    assert "ghl_email" in posted[0] and "ghl_sms" not in posted[0]
-    assert reopened == [cb.CHANNEL_SMS]
+    assert all(channel in posted[0] for channel in fb.ALL_CHANNELS)
+    assert reopened == []
+
+
+def test_a_refused_alert_is_posted_again_on_the_next_pass():
+    db = _Db(ages={fb.FEED_GHL_DND_BACKSTOP: 50})
+    _, posted, _ = _run(db, slack_up=False)
+    assert len(posted) == 1 and "stale:ghl_dnd_backstop" not in db.alerts  # Slack refused: episode not recorded
+    _, posted, _ = _run(db)
+    assert len(posted) == 1 and db.alerts["stale:ghl_dnd_backstop"] is True
+
+
+def test_a_refused_recovery_notice_is_posted_again_on_the_next_pass():
+    db = _Db(alerts={"stale:ghl_dnd_backstop": True})
+    _run(db, slack_up=False)
+    assert db.alerts["stale:ghl_dnd_backstop"] is True
+    _, posted, _ = _run(db)
+    assert posted == [dw.clear_message("stale:ghl_dnd_backstop")] and db.alerts["stale:ghl_dnd_backstop"] is False
 
 
 def test_the_episode_clears_once_when_the_feed_is_fresh_again():

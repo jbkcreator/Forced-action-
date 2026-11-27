@@ -4,9 +4,11 @@ The staging table accumulates every extraction run, so readers always name a
 run (default: the newest) and never mix runs. Output matches the JSON the dialer
 load and queue report take.
 
-R1 0.6: PropertyRadar records are loaded only while the newest successful PropertyRadar pull is younger than
-``PROPERTYRADAR_MAX_AGE_HOURS`` (``propertyradar_staleness``): after a failed overnight pull the morning load loads
-nothing and says how old the data is, instead of re-loading an old list as if it were new.
+R1 0.6: PropertyRadar freshness is judged per (state, campaign) segment, because the nightly runner pulls each one
+separately: a segment with a nightly (``daily``) pull whose newest successful pull is older than
+``PROPERTYRADAR_MAX_AGE_HOURS`` is left out of staging and loading and reported (``stale_segments``), while the fresh
+segments still load. A segment only ever pulled as a one-time backlog has no nightly feed that can fail, so its age is
+not judged.
 """
 from __future__ import annotations
 
@@ -19,31 +21,46 @@ from sqlalchemy import text
 from config.lending_fallbacks import PROPERTYRADAR_MAX_AGE_HOURS
 
 # Both pull paths (property_radar_maturity_pull and property_radar_runner) close their run row 'done' on success.
-_NEWEST_PULL = text("SELECT max(finished_at) FROM property_radar_pull_runs WHERE status = 'done'")
+_SCHEDULED_SEGMENTS = text("""
+    SELECT state, campaign, max(finished_at) FILTER (WHERE status = 'done') AS newest
+      FROM property_radar_pull_runs
+     GROUP BY state, campaign
+    HAVING bool_or(run_type = 'daily')
+""")
+
+Segment = tuple[str, str]  # (state, campaign)
 
 
 @dataclass(frozen=True)
 class Staleness:
-    """Why PropertyRadar data may not be loaded: its age in whole hours (None = no successful pull at all)."""
+    """Why one PropertyRadar segment may not be loaded: its age in whole hours (None = no successful pull)."""
 
+    state: str
+    campaign: str
     age_hours: Optional[int]
 
     def message(self) -> str:
+        name = f"PropertyRadar {self.state} {self.campaign}"
         if self.age_hours is None:
-            return "PropertyRadar data: no successful pull on record — nothing loaded"
-        return f"PropertyRadar data is {self.age_hours} h old — nothing loaded"
+            return f"{name}: no successful pull on record — not loaded"
+        return f"{name} data is {self.age_hours} h old — not loaded"
 
 
-def propertyradar_staleness(db, now: Optional[datetime] = None, *,
-                            max_age_hours: int = PROPERTYRADAR_MAX_AGE_HOURS) -> Optional[Staleness]:
-    """None when the newest successful PropertyRadar pull is fresh enough to load; otherwise why not."""
-    finished = db.execute(_NEWEST_PULL).scalar()
-    if finished is None:
-        return Staleness(None)
-    age = (now or datetime.now(timezone.utc)) - finished
-    if age > timedelta(hours=max_age_hours):
-        return Staleness(int(age.total_seconds() // 3600))
-    return None
+def stale_segments(db, now: Optional[datetime] = None, *,
+                   max_age_hours: int = PROPERTYRADAR_MAX_AGE_HOURS) -> dict[Segment, Staleness]:
+    """The nightly-pulled segments whose newest successful pull is too old (or missing) to load."""
+    now = now or datetime.now(timezone.utc)
+    stale: dict[Segment, Staleness] = {}
+    for state, campaign, newest in db.execute(_SCHEDULED_SEGMENTS):
+        if newest is None:
+            stale[(state, campaign)] = Staleness(state, campaign, None)
+        elif now - newest > timedelta(hours=max_age_hours):
+            stale[(state, campaign)] = Staleness(state, campaign, int((now - newest).total_seconds() // 3600))
+    return stale
+
+
+def stale_message(stale: dict[Segment, Staleness]) -> str:
+    return "; ".join(s.message() for _, s in sorted(stale.items()))
 
 _COLUMNS = (
     "id, run_id, pool_name, source_tag, normalized_phone, email, borrower_name, entity_name, "

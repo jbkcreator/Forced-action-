@@ -94,6 +94,24 @@ def test_a_new_inbound_clears_the_mark_with_its_reason():
     assert stmt is ex._CLEAR and params == {"phone": ANA, "now": NOW, "reason": ex.CLEARED_BY_WEBSITE}
 
 
+def test_an_inbound_reset_is_recorded_even_with_no_mark_yet():
+    """Review F6: a phone over the cap the watch has not marked yet still keeps the inquiry's reset."""
+    sql = " ".join(str(ex._CLEAR).split())
+    assert sql.startswith("INSERT INTO lending.exhausted_phones") and "ON CONFLICT (phone) DO UPDATE" in sql
+    assert "cleared_at < EXCLUDED.cleared_at" in sql  # a late older inbound never moves the reset backwards
+
+
+def test_a_mark_is_written_only_when_calls_since_the_latest_reset_reach_the_cap():
+    """Review F6: an inquiry between the watch's count and its write wins; the WHERE recounts on the locked row."""
+    sql = " ".join(str(ex._MARK).split())
+    assert "COALESCE(lending.exhausted_phones.cleared_at" in sql and ">= :cap" in sql
+    db = _Db()
+    ex.mark(db, {ANA: 6}, NOW)
+    (_, params), = db.writes
+    assert params["cap"] == ex.MAX_ATTEMPTS_TOTAL
+    assert params["since"] == ex.business_days_ago(NOW, ex.ATTEMPT_HISTORY_BUSINESS_DAYS)
+
+
 def test_clearing_never_raises_and_ignores_a_missing_phone():
     assert ex.clear_for_new_inbound(_Db(fail=True), ANA, ex.CLEARED_BY_LENDINGFLOW, NOW) is False
     assert ex.clear_for_new_inbound(_Db(), None, ex.CLEARED_BY_LENDINGFLOW, NOW) is False

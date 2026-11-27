@@ -25,7 +25,6 @@ CHANNEL_INSTANTLY = "instantly"
 CHANNEL_GHL_CRM = "ghl_crm"
 CHANNEL_DIALER = "dialer"
 ALL_CHANNELS: tuple[str, ...] = (CHANNEL_GHL_SMS, CHANNEL_GHL_EMAIL, CHANNEL_INSTANTLY, CHANNEL_GHL_CRM, CHANNEL_DIALER)
-EMAIL_CHANNELS: tuple[str, ...] = (CHANNEL_GHL_EMAIL, CHANNEL_INSTANTLY)
 
 # Every lending systemd unit restarts itself; a guard test keeps it that way.
 RESTART_POLICY = "systemd Restart=always (RestartSec=10-15) on every lending unit in deploy/systemd"
@@ -55,8 +54,9 @@ DEPENDENCIES: tuple[DependencyPolicy, ...] = (
     DependencyPolicy("clay", "Clay", 20, enforced=False,
                      fallback="Email gap-fill skipped on error (client on PR #480; enforced once it merges)."),
     DependencyPolicy("propertyradar", "PropertyRadar", 90,
-                     fallback="A failed pull is retried by the next run; a pull older than 26 h loads nothing and "
-                              "posts the data's age. Old rows are never re-staged."),
+                     fallback="A failed pull is retried by the next run; a segment (state, campaign) whose nightly pull "
+                              "is older than 26 h is neither staged nor loaded and its age is posted; the other "
+                              "segments still load. Old rows are never re-staged."),
     DependencyPolicy("sunbiz", "Sunbiz SFTP", 60,
                      fallback="The job exits and the --retry cron run plus the 3-day catch-up fetch it later."),
     DependencyPolicy("lendingflow", "LendingFlow", None,
@@ -129,8 +129,9 @@ OPT_OUT_FEEDS: tuple[FeedPolicy, ...] = (
                "A STOP made inside GHL reaches lending only through this pull (and GHL's webhook)."),
     FeedPolicy(FEED_FA_OPT_OUT_POLLER, "FA opt-out poller", FEED_PULL, 15, ALL_CHANNELS,
                "FA-side opt-outs (texts, calls, emails) mirrored into lending."),
-    FeedPolicy(FEED_IMAP_OPT_OUT, "Opt-out mailbox reader", FEED_PULL, 5 * 60, EMAIL_CHANNELS,
-               "Email opt-outs only, so only email channels pause."),
+    FeedPolicy(FEED_IMAP_OPT_OUT, "Opt-out mailbox reader", FEED_PULL, 5 * 60, ALL_CHANNELS,
+               "Suppresses the sender and every phone number in the message, so every channel pauses. An opt-out "
+               "it could not record keeps it unhealthy until recorded or resolved by hand."),
     FeedPolicy(FEED_GHL_DND_PUSH, "Lending opt-outs pushed to GHL DND", FEED_PULL, 15, (),
                "Recorded for visibility; the GHL senders re-read DND themselves before a cold send."),
     FeedPolicy(FEED_INSTANTLY_REPLIES, "Instantly reply webhook", FEED_PUSH, None, (),
