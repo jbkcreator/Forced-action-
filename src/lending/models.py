@@ -2331,7 +2331,8 @@ class LendingDependencyHealth(LendingBase):
 
 class LendingDependencyAlert(LendingBase):
     """R1 0.6: one row per alert episode key (a stale feed, LendingFlow silence), so each episode posts once when it
-    starts and once when it clears."""
+    starts and once when it clears. The episode is saved before it is posted; ``unposted`` names the post Slack has
+    not accepted yet, retried every pass until it is."""
 
     __tablename__ = "dependency_alerts"
 
@@ -2339,6 +2340,7 @@ class LendingDependencyAlert(LendingBase):
     active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default=text("false"))
     since: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
     detail: Mapped[Optional[str]] = mapped_column(String(300))
+    unposted: Mapped[Optional[str]] = mapped_column(String(12))  # start / clear / clear_missed: Slack has not taken it
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_now, server_default=text("now()"))
 
 

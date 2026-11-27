@@ -366,7 +366,7 @@ def run(now: Optional[datetime] = None, *, log: Optional[MessageLog] = None) -> 
         return 1
     if unrecorded:  # a known opt-out is missing from suppression: the feed is not healthy (R1 0.6)
         logger.error("[lending-email-opt-out] %d opt-out(s) not recorded; feed kept unhealthy", unrecorded)
-        dependency_health.record_failure(FEED_IMAP_OPT_OUT, f"{unrecorded} opt-out(s) not recorded")
+        dependency_health.record_unverified(FEED_IMAP_OPT_OUT, f"{unrecorded} opt-out(s) not recorded")
         return 1
     dependency_health.record_success(FEED_IMAP_OPT_OUT)
     logger.info("[lending-email-opt-out] examined %d message(s), %d new opt-out(s), %d failed", result.examined,

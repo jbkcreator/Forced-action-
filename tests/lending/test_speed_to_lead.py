@@ -361,6 +361,17 @@ def test_a_consented_intro_text_during_a_dependency_pause_is_held_for_release(ga
     assert outcome.text_status == TEXT_HELD and ("add", "c-7", GHL_TAG_WEB_INTRO_READY) not in tags.calls
 
 
+def test_an_unreadable_suppression_table_holds_the_text_and_still_records_the_lead(gates, monkeypatch):
+    """Review (round 2) F3: the consent read fails after the lead is claimed; the held text must still be saved."""
+    def unreadable(db, phone):
+        raise RuntimeError("suppression_list unreadable")
+
+    monkeypatch.setattr(speed_to_lead, "has_text_consent", unreadable)
+    outcome, tags, db = run(web_lead())
+    assert outcome.text_status == TEXT_HELD and ("add", "c-7", GHL_TAG_WEB_INTRO_READY) not in tags.calls
+    assert db.records and db.records[-1]["text_status"] == TEXT_HELD
+
+
 @pytest.mark.parametrize("over,consent", [({"sms_consent": False}, True), ({"suppressed": True}, True), ({}, False)])
 def test_a_dependency_pause_never_holds_a_text_that_is_not_allowed(gates, monkeypatch, over, consent):
     monkeypatch.setattr(speed_to_lead, "outbound_paused", lambda channel: True)
@@ -375,6 +386,10 @@ def test_a_text_held_during_a_pause_is_released_once_the_feeds_are_fresh(gates, 
     class HeldDb:
         def __init__(self):
             self.done = []
+
+        @contextmanager
+        def begin_nested(self):
+            yield
 
         def execute(self, stmt, params):
             if stmt is speed_to_lead._HELD_WEB:

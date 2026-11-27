@@ -150,6 +150,10 @@ def feeds_protecting(channel: str) -> tuple[FeedPolicy, ...]:
 # A PropertyRadar pull older than this is never loaded into the dialer (one daily pull + 2 h slack).
 PROPERTYRADAR_MAX_AGE_HOURS = 26
 
+# The campaigns the nightly runner pulls for every enabled state (the property_radar_runner lines in
+# scripts/cron/crontab.txt). The legacy single-line pull covers only FL maturity_target_lender.
+PROPERTYRADAR_NIGHTLY_CAMPAIGNS = ("maturity_target_lender", "cash_purchase", "investor_portfolio")
+
 # No LendingFlow lead for this many business hours = alert. One business day: 30 days of real volume (about 2 leads a
 # day, median gap 4 h, half of all gaps over 4 h) make a shorter window fire on normal quiet days.
 LENDINGFLOW_SILENCE_BUSINESS_HOURS = 8

@@ -6,6 +6,8 @@ from contextlib import contextmanager
 from datetime import date, datetime, timedelta, timezone
 from types import SimpleNamespace
 
+import pytest
+
 from config import lending_fallbacks as fb
 from src.lending import dependency_health as dh
 from src.lending import dependency_watch as dw
@@ -28,7 +30,7 @@ class _Db:
         if lf_last is not None:
             self.rows.append(SimpleNamespace(dependency=fb.FEED_LENDINGFLOW_INBOUND, last_success_at=lf_last,
                                              failing_since=None, detail=None))
-        self.alerts = dict(alerts or {})
+        self.alerts = {k: {"active": v, "detail": None, "unposted": None} for k, v in (alerts or {}).items()}
         self.fail_suppression, self.fail_health = fail_suppression, fail_health
         self.over_cap = over_cap or {}
         self.marked: list[str] = []
@@ -49,9 +51,14 @@ class _Db:
         if stmt is dw._LAST_LENDINGFLOW_LEAD:
             return SimpleNamespace(scalar=lambda: None)
         if stmt is dw._ALERTS:
-            return iter([SimpleNamespace(alert_key=k, active=v) for k, v in self.alerts.items()])
+            return iter([SimpleNamespace(alert_key=k, **v) for k, v in self.alerts.items()])
         if stmt is dw._SET_ALERT:
-            self.alerts[params["k"]] = params["active"]
+            self.alerts[params["k"]] = {"active": params["active"], "detail": params["detail"],
+                                        "unposted": params["unposted"]}
+            return None
+        if stmt is dw._POSTED:
+            if self.alerts[params["k"]]["unposted"] == params["kind"]:
+                self.alerts[params["k"]]["unposted"] = None
             return None
         if stmt is ex._OVER_CAP_NOW:
             return SimpleNamespace(fetchall=lambda: list(self.over_cap.items()))
@@ -99,27 +106,56 @@ def test_a_stale_mailbox_pauses_every_channel_and_reopens_nothing():
     assert reopened == []
 
 
-def test_a_refused_alert_is_posted_again_on_the_next_pass():
+def test_a_refused_alert_is_saved_and_posted_again_on_the_next_pass():
     db = _Db(ages={fb.FEED_GHL_DND_BACKSTOP: 50})
     _, posted, _ = _run(db, slack_up=False)
-    assert len(posted) == 1 and "stale:ghl_dnd_backstop" not in db.alerts  # Slack refused: episode not recorded
+    saved = db.alerts["stale:ghl_dnd_backstop"]
+    assert len(posted) == 1 and saved["active"] is True and saved["unposted"] == dw.POST_START
     _, posted, _ = _run(db)
-    assert len(posted) == 1 and db.alerts["stale:ghl_dnd_backstop"] is True
+    assert len(posted) == 1 and "PAUSED" in posted[0] and db.alerts["stale:ghl_dnd_backstop"]["unposted"] is None
+    _, posted, _ = _run(db)
+    assert posted == []  # accepted once: not posted again
+
+
+def test_an_outage_that_ends_before_slack_took_the_start_is_still_reported():
+    """Review (round 2) F5: the start post is refused, the feed recovers before the next pass: ops still hears of it."""
+    db = _Db(ages={fb.FEED_GHL_DND_BACKSTOP: 50})
+    _run(db, slack_up=False)
+    db.rows = _Db().rows  # the feed is fresh again
+    result, posted, _ = _run(db)
+    assert result.cleared == ["stale:ghl_dnd_backstop"] and len(posted) == 1
+    assert "was stale" in posted[0] and "GHL opt-out sync" in posted[0] and "fresh again" in posted[0]
+    assert db.alerts["stale:ghl_dnd_backstop"] == {"active": False, "detail": db.alerts["stale:ghl_dnd_backstop"]["detail"],
+                                                   "unposted": None}
 
 
 def test_a_refused_recovery_notice_is_posted_again_on_the_next_pass():
     db = _Db(alerts={"stale:ghl_dnd_backstop": True})
     _run(db, slack_up=False)
-    assert db.alerts["stale:ghl_dnd_backstop"] is True
+    assert db.alerts["stale:ghl_dnd_backstop"]["active"] is False
+    assert db.alerts["stale:ghl_dnd_backstop"]["unposted"] == dw.POST_CLEAR
     _, posted, _ = _run(db)
-    assert posted == [dw.clear_message("stale:ghl_dnd_backstop")] and db.alerts["stale:ghl_dnd_backstop"] is False
+    assert posted == [dw.clear_message("stale:ghl_dnd_backstop")]
+    assert db.alerts["stale:ghl_dnd_backstop"]["unposted"] is None
 
 
 def test_the_episode_clears_once_when_the_feed_is_fresh_again():
     db = _Db(alerts={"stale:ghl_dnd_backstop": True})
     result, posted, _ = _run(db)
     assert result.cleared == ["stale:ghl_dnd_backstop"] and posted == [dw.clear_message("stale:ghl_dnd_backstop")]
-    assert db.alerts["stale:ghl_dnd_backstop"] is False
+    assert db.alerts["stale:ghl_dnd_backstop"]["active"] is False
+
+
+@pytest.mark.parametrize("fail", [{"fail_health": True}, {"fail_suppression": True}])
+def test_a_stale_feed_episode_is_not_cleared_while_its_status_cannot_be_read(fail):
+    """Review (round 2) F7: an unreadable health table says nothing about the feed; it must not read as recovery."""
+    db = _Db(alerts={"stale:ghl_dnd_backstop": True}, **fail)
+    result, posted, _ = _run(db)
+    assert result.cleared == [] and all("fresh again" not in message for message in posted)
+    assert db.alerts["stale:ghl_dnd_backstop"]["active"] is True
+    db.fail_health = db.fail_suppression = False
+    result, posted, _ = _run(db)  # a successful read confirms recovery
+    assert "stale:ghl_dnd_backstop" in result.cleared and any("fresh again" in message for message in posted)
 
 
 def test_an_unreadable_health_table_is_its_own_episode_and_reopens_nothing():

@@ -404,6 +404,12 @@ def save_lead(db, parsed: ParsedLendingFlowLead, raw_payload: Any, *, now: Optio
     duplicate = _record_duplicate(db, parsed, digest, now)
     if duplicate is not None:
         return duplicate
+    # R1 0.6: a new request from this person lifts an exhausted mark (savepoint, never raises). It runs before the
+    # contact is locked: the after-call hook locks the exhausted row, then the contact, and the opposite order here
+    # can deadlock and lose the reset.
+    from src.lending.exhausted import CLEARED_BY_LENDINGFLOW, clear_for_new_inbound
+
+    clear_for_new_inbound(db, parsed.phone, CLEARED_BY_LENDINGFLOW, now)
     contact_id = _upsert_contact(db, parsed.phone, parsed.email)
     reason = _suppression_reason(db, parsed.phone, parsed.email)
     row = db.execute(text(_INSERT_LEAD), {
@@ -425,10 +431,6 @@ def save_lead(db, parsed: ParsedLendingFlowLead, raw_payload: Any, *, now: Optio
         return raced
     if parsed.certificate:
         store_certificate(db, row.id, parsed.certificate, duplicate=False, now=now)
-    # R1 0.6: a new request from this person lifts an exhausted mark (savepoint, never raises).
-    from src.lending.exhausted import CLEARED_BY_LENDINGFLOW, clear_for_new_inbound
-
-    clear_for_new_inbound(db, parsed.phone, CLEARED_BY_LENDINGFLOW, now)
     if is_missing_lead_id(parsed.vendor_lead_id):
         logger.warning("[lendingflow] lead created id=%s without a LendingFlow lead id suppressed=%s",
                        row.id, reason is not None)

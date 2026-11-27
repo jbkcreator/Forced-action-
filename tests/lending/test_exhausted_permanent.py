@@ -6,6 +6,8 @@ from contextlib import contextmanager
 from datetime import datetime, timezone
 from types import SimpleNamespace
 
+import pytest
+
 from config.lending_compliance import MAX_ATTEMPTS_TOTAL
 from src.lending import compliance
 from src.lending import exhausted as ex
@@ -127,3 +129,26 @@ def test_the_after_call_hook_writes_the_mark_when_the_history_cap_is_reached(mon
     monkeypatch.setattr(ex, "mark_one", lambda db, phone, now: marked.append(phone) or True)
     compliance.on_attempt_recorded(object(), ANA, now=NOW, dialer_remover=lambda p, *, reason: None)
     assert marked == [ANA]
+
+
+def test_a_lendingflow_intake_lifts_the_mark_before_it_locks_the_contact(monkeypatch):
+    """Review (round 2) F4: the after-call hook locks the exhausted row, then the contact. Intake must take them in the
+    same order, or a deadlock can abort the reset and the new inquiry saves with the phone still blocked."""
+    from src.lending import lendingflow
+
+    order = []
+
+    class Stop(Exception):
+        pass
+
+    def contact(db, phone, email):
+        order.append("contact")
+        raise Stop
+
+    monkeypatch.setattr(lendingflow, "_record_duplicate", lambda *a, **k: None)
+    monkeypatch.setattr(lendingflow, "_upsert_contact", contact)
+    monkeypatch.setattr(ex, "clear_for_new_inbound", lambda *a, **k: order.append("clear"))
+    parsed = SimpleNamespace(phone=ANA, email=None, vendor_lead_id="v1")
+    with pytest.raises(Stop):
+        lendingflow.save_lead(object(), parsed, {}, now=NOW)
+    assert order == ["clear", "contact"]

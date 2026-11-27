@@ -37,6 +37,13 @@ _FAILURE = text("""
     ON CONFLICT (dependency) DO UPDATE
        SET failing_since = COALESCE(lending.dependency_health.failing_since, :now), detail = :detail, updated_at = :now
 """)
+_UNVERIFIED = text("""
+    INSERT INTO lending.dependency_health (dependency, last_success_at, failing_since, detail, updated_at)
+    VALUES (:d, NULL, :now, :detail, :now)
+    ON CONFLICT (dependency) DO UPDATE
+       SET last_success_at = NULL, failing_since = COALESCE(lending.dependency_health.failing_since, :now),
+           detail = :detail, updated_at = :now
+""")
 
 
 @dataclass(frozen=True)
@@ -186,6 +193,16 @@ def record_failure(dependency: str, detail: str, now: Optional[datetime] = None)
             db.execute(_FAILURE, {"d": dependency, "now": _utc(now), "detail": detail[:200]})
     except Exception as exc:
         logger.error("[dependency-health] %s failure not recorded (%s)", dependency, type(exc).__name__)
+
+
+def record_unverified(dependency: str, detail: str, now: Optional[datetime] = None) -> None:
+    """A known gap in what the feed delivers (an opt-out seen but not saved): drop the last success so the feed counts
+    as stale at once instead of after its limit. Only ``record_success`` brings it back. Never raises."""
+    try:
+        with _session_factory() as db:
+            db.execute(_UNVERIFIED, {"d": dependency, "now": _utc(now), "detail": detail[:200]})
+    except Exception as exc:
+        logger.error("[dependency-health] %s unverified state not recorded (%s)", dependency, type(exc).__name__)
 
 
 def freshness(dependency: str, now: Optional[datetime] = None) -> Optional[timedelta]:

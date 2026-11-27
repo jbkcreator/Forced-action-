@@ -5,10 +5,10 @@ run (default: the newest) and never mix runs. Output matches the JSON the dialer
 load and queue report take.
 
 R1 0.6: PropertyRadar freshness is judged per (state, campaign) segment, because the nightly runner pulls each one
-separately: a segment with a nightly (``daily``) pull whose newest successful pull is older than
-``PROPERTYRADAR_MAX_AGE_HOURS`` is left out of staging and loading and reported (``stale_segments``), while the fresh
-segments still load. A segment only ever pulled as a one-time backlog has no nightly feed that can fail, so its age is
-not judged.
+separately. The judged segments come from the configured nightly schedule (``scheduled_segments``), not from run
+history, so a segment seeded by an old backlog pull whose first nightly pull failed is still stale. One whose newest
+successful pull is older than ``PROPERTYRADAR_MAX_AGE_HOURS``, or that has none, is left out of staging and loading and
+reported (``stale_segments``); the fresh segments still load. Segments outside the schedule are not judged.
 """
 from __future__ import annotations
 
@@ -18,14 +18,14 @@ from typing import Any, Optional
 
 from sqlalchemy import text
 
-from config.lending_fallbacks import PROPERTYRADAR_MAX_AGE_HOURS
+from config.lending_fallbacks import PROPERTYRADAR_MAX_AGE_HOURS, PROPERTYRADAR_NIGHTLY_CAMPAIGNS
 
 # Both pull paths (property_radar_maturity_pull and property_radar_runner) close their run row 'done' on success.
-_SCHEDULED_SEGMENTS = text("""
-    SELECT state, campaign, max(finished_at) FILTER (WHERE status = 'done') AS newest
+_NEWEST_PULLS = text("""
+    SELECT state, campaign, max(finished_at) AS newest
       FROM property_radar_pull_runs
+     WHERE status = 'done'
      GROUP BY state, campaign
-    HAVING bool_or(run_type = 'daily')
 """)
 
 Segment = tuple[str, str]  # (state, campaign)
@@ -46,16 +46,33 @@ class Staleness:
         return f"{name} data is {self.age_hours} h old — not loaded"
 
 
-def stale_segments(db, now: Optional[datetime] = None, *,
-                   max_age_hours: int = PROPERTYRADAR_MAX_AGE_HOURS) -> dict[Segment, Staleness]:
-    """The nightly-pulled segments whose newest successful pull is too old (or missing) to load."""
+def scheduled_segments() -> frozenset[Segment]:
+    """The (state, campaign) pairs the nightly cron pulls under the current switches, from configuration, not from
+    run history: a segment whose first nightly pull failed has no history yet and must still be judged."""
+    from config.property_radar_campaigns import ENABLED_STATES
+    from config.settings import get_settings
+
+    settings = get_settings()
+    if not settings.property_radar_enabled:
+        return frozenset()
+    if not settings.property_radar_statewide_enabled:
+        return frozenset({("FL", "maturity_target_lender")})
+    return frozenset((state, campaign) for state in ENABLED_STATES for campaign in PROPERTYRADAR_NIGHTLY_CAMPAIGNS)
+
+
+def stale_segments(db, now: Optional[datetime] = None, *, max_age_hours: int = PROPERTYRADAR_MAX_AGE_HOURS,
+                   scheduled: Optional[frozenset[Segment]] = None) -> dict[Segment, Staleness]:
+    """The scheduled segments whose newest successful pull is too old, or that never had one, to load."""
     now = now or datetime.now(timezone.utc)
+    scheduled = scheduled_segments() if scheduled is None else scheduled
+    newest = {(state, campaign): at for state, campaign, at in db.execute(_NEWEST_PULLS)}
     stale: dict[Segment, Staleness] = {}
-    for state, campaign, newest in db.execute(_SCHEDULED_SEGMENTS):
-        if newest is None:
-            stale[(state, campaign)] = Staleness(state, campaign, None)
-        elif now - newest > timedelta(hours=max_age_hours):
-            stale[(state, campaign)] = Staleness(state, campaign, int((now - newest).total_seconds() // 3600))
+    for segment in scheduled:
+        at = newest.get(segment)
+        if at is None:
+            stale[segment] = Staleness(*segment, None)
+        elif now - at > timedelta(hours=max_age_hours):
+            stale[segment] = Staleness(*segment, int((now - at).total_seconds() // 3600))
     return stale
 
 

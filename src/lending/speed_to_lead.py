@@ -271,6 +271,17 @@ def _night_responder_texts(db, lead_id: int) -> bool:
     return db.execute(_NIGHT_CONVERSATION, {"key": f"after_hours:{SOURCE_WEB_FORM}:{lead_id}"}).first() is not None
 
 
+def _read_text_consent(db, phone: str) -> Optional[bool]:
+    """``has_text_consent`` in a savepoint: a failed read (the suppression table unreadable) must not abort the lead's
+    transaction, because the held text has to be saved after it. None = could not be read."""
+    try:
+        with db.begin_nested():
+            return has_text_consent(db, phone)
+    except Exception as exc:  # class only
+        logger.error("[speed-to-lead] text consent unreadable: %s", type(exc).__name__)
+        return None
+
+
 def _web_text(db, lead: Mapping[str, Any], tags: TagClient, *, halted: bool, paused: bool,
               now: datetime) -> tuple[str, Optional[datetime]]:
     if not intro_sms_on():
@@ -279,7 +290,12 @@ def _web_text(db, lead: Mapping[str, Any], tags: TagClient, *, halted: bool, pau
         return TEXT_BY_NIGHT_RESPONDER, None
     if now - lead["received_at"] > TEXT_LAST_CHANCE:
         return TEXT_TOO_LATE, None
-    if halted or not lead["sms_consent"] or lead["suppressed"] or not has_text_consent(db, lead["phone"]):
+    if halted or not lead["sms_consent"] or lead["suppressed"]:
+        return TEXT_NOT_ALLOWED, None
+    consent = _read_text_consent(db, lead["phone"])
+    if consent is None:  # unreadable now: keep the text for the release sweep, which reads consent again
+        return TEXT_HELD, None
+    if not consent:
         return TEXT_NOT_ALLOWED, None
     if paused:  # R1 0.6: the release sweep sends it once the opt-out feeds are fresh (consent, window, age rechecked)
         logger.info("[speed-to-lead] web intro text held while opt-outs can't be verified lead=%s", lead["id"])
@@ -627,7 +643,13 @@ def release_held_web_intro(db, tags: Optional[TagClient], *, now: Optional[datet
     rows = db.execute(_HELD_WEB, {"held": TEXT_HELD, "limit": WEB_INTRO_RELEASE_BATCH,
                                   "cutoff": now - TEXT_LAST_CHANCE}).mappings().all()
     for lead in rows:
-        if lead["suppressed"] or not lead["sms_consent"] or not has_text_consent(db, lead["phone"]):
+        if lead["suppressed"] or not lead["sms_consent"]:
+            db.execute(_TEXT_DONE, {"status": TEXT_NOT_ALLOWED, "at": None, "id": lead["row_id"]})
+            continue
+        consent = _read_text_consent(db, lead["phone"])
+        if consent is None:  # unreadable: stays held, read again next sweep
+            continue
+        if not consent:
             db.execute(_TEXT_DONE, {"status": TEXT_NOT_ALLOWED, "at": None, "id": lead["row_id"]})
             continue
         if not text_window_open(lead["phone"], property_state=lead["property_state"], now=now):

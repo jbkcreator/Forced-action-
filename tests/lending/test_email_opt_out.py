@@ -339,17 +339,19 @@ def _live_run(monkeypatch, mailbox, log, record):
     health: list[str] = []
     monkeypatch.setattr(email_opt_out.dependency_health, "record_success", lambda feed: health.append("success"))
     monkeypatch.setattr(email_opt_out.dependency_health, "record_failure", lambda feed, detail: health.append("failure"))
+    monkeypatch.setattr(email_opt_out.dependency_health, "record_unverified",
+                        lambda feed, detail: health.append("unverified"))
     return health
 
 
-def test_a_failed_opt_out_write_records_a_feed_failure_not_a_success(monkeypatch):
+def test_a_failed_opt_out_write_makes_the_feed_unverified_at_once_not_a_success(monkeypatch):
     def failing(db, opt_out):
         raise RuntimeError("database unavailable")
 
     log = MemoryLog()
     health = _live_run(monkeypatch, FakeMailbox([_raw()]), log, failing)
     assert email_opt_out.run(log=log) == 1
-    assert health == ["failure"]
+    assert health == ["unverified"]
 
 
 def test_an_opt_out_given_up_keeps_the_feed_unhealthy_until_resolved(monkeypatch):
@@ -361,7 +363,7 @@ def test_an_opt_out_given_up_keeps_the_feed_unhealthy_until_resolved(monkeypatch
     health = _live_run(monkeypatch, FakeMailbox([_raw()]), log, failing)
     for _ in range(4):  # retries run out on the second; later sweeps skip the message
         assert email_opt_out.run(log=log) == 1
-    assert health == ["failure"] * 4
+    assert health == ["unverified"] * 4
     assert [row["outcome"] for row in log.rows.values()] == ["gave_up"]
     for row in log.rows.values():  # recorded by hand, then --resolve
         row["outcome"] = "recorded"
@@ -382,4 +384,4 @@ def test_an_opt_out_recorded_on_retry_makes_the_feed_healthy_again(monkeypatch):
     health = _live_run(monkeypatch, FakeMailbox([_raw()]), log, flaky)
     assert email_opt_out.run(log=log) == 1
     assert email_opt_out.run(log=log) == 0
-    assert health == ["failure", "success"]
+    assert health == ["unverified", "success"]

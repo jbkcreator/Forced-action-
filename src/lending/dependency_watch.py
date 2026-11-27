@@ -36,13 +36,17 @@ KEY_HEALTH_UNREADABLE = "health_unreadable"
 KEY_LENDINGFLOW_SILENCE = "lendingflow_silence"
 STALE_PREFIX = "stale:"
 
-_ALERTS = text("SELECT alert_key, active FROM lending.dependency_alerts")
+POST_START, POST_CLEAR, POST_CLEAR_MISSED = "start", "clear", "clear_missed"  # clear_missed: its start never reached ops
+
+_ALERTS = text("SELECT alert_key, active, detail, unposted FROM lending.dependency_alerts")
 _SET_ALERT = text("""
-    INSERT INTO lending.dependency_alerts (alert_key, active, since, detail, updated_at)
-    VALUES (:k, :active, :now, :detail, :now)
+    INSERT INTO lending.dependency_alerts (alert_key, active, since, detail, unposted, updated_at)
+    VALUES (:k, :active, :now, :detail, :unposted, :now)
     ON CONFLICT (alert_key) DO UPDATE SET active = EXCLUDED.active, since = EXCLUDED.since,
-                                          detail = EXCLUDED.detail, updated_at = EXCLUDED.updated_at
+                                          detail = EXCLUDED.detail, unposted = EXCLUDED.unposted,
+                                          updated_at = EXCLUDED.updated_at
 """)
+_POSTED = text("UPDATE lending.dependency_alerts SET unposted = NULL WHERE alert_key = :k AND unposted = :kind")
 _LAST_LENDINGFLOW_LEAD = text("SELECT max(received_at) FROM lending.lendingflow_leads")
 
 
@@ -185,10 +189,13 @@ def start_message(key: str, detail: str, channels: set[str], *, enforce: bool) -
             "(LENDING_FAILCLOSED_PAUSE_ENABLED is off).")
 
 
-def clear_message(key: str) -> str:
+def clear_message(key: str, missed_detail: Optional[str] = None) -> str:
+    """``missed_detail`` = the episode's start never reached ops, so say what it was."""
     if key == KEY_LENDINGFLOW_SILENCE:
-        return ":white_check_mark: LendingFlow leads are arriving again."
-    return f":white_check_mark: Opt-out check is fresh again ({key.removeprefix(STALE_PREFIX)})."
+        was = f" (it was silent: {missed_detail})" if missed_detail else ""
+        return f":white_check_mark: LendingFlow leads are arriving again{was}."
+    was = f"; it was stale ({missed_detail}) and automated sends were paused meanwhile" if missed_detail else ""
+    return f":white_check_mark: Opt-out check is fresh again ({key.removeprefix(STALE_PREFIX)}){was}."
 
 
 # ── One pass ──────────────────────────────────────────────────────────────────
@@ -231,20 +238,37 @@ def run_watch(db, now: datetime, *, post: Callable[[str], object], reopen: Calla
         if silence:
             conditions[KEY_LENDINGFLOW_SILENCE] = silence
 
-    active = {r.alert_key: bool(r.active) for r in db.execute(_ALERTS)}
+    saved = {r.alert_key: r for r in db.execute(_ALERTS)}
+    active = {k: bool(r.active) for k, r in saved.items()}
+    if rows is None or not suppression_readable:
+        # Nothing was verified this pass: an open stale-feed episode stays open until a read confirms the feed is fresh.
+        for key, on in active.items():
+            if on and key.startswith(STALE_PREFIX):
+                conditions.setdefault(key, saved[key].detail or "last known state: stale")
     plan = plan_alerts(conditions, active)
     result = WatchResult(started=sorted(plan.starts), cleared=plan.clears)
     if dry_run:
         logger.info("[dependency-watch] dry run: start=%s clear=%s paused=%s", result.started, result.cleared,
                     sorted(paused))
         return result
-    # The episode changes only once ops has the post: a refused post is tried again on the next pass.
+    # The episode is saved before it is posted; ``unposted`` keeps the post until Slack takes it, even if the
+    # condition has cleared by then.
+    unposted = {k: r.unposted for k, r in saved.items() if r.unposted}
+    details = {k: r.detail for k, r in saved.items()}
     for key, detail in plan.starts.items():
-        if post(start_message(key, detail, paused, enforce=enforce)):
-            db.execute(_SET_ALERT, {"k": key, "active": True, "now": now, "detail": detail[:300]})
+        unposted[key], details[key] = POST_START, detail[:300]
+        db.execute(_SET_ALERT, {"k": key, "active": True, "now": now, "detail": details[key], "unposted": POST_START})
     for key in plan.clears:
-        if post(clear_message(key)):
-            db.execute(_SET_ALERT, {"k": key, "active": False, "now": now, "detail": None})
+        unposted[key] = POST_CLEAR_MISSED if unposted.get(key) == POST_START else POST_CLEAR
+        db.execute(_SET_ALERT, {"k": key, "active": False, "now": now, "detail": details.get(key),
+                                "unposted": unposted[key]})
+    for key, kind in sorted(unposted.items()):
+        if kind == POST_START:
+            message = start_message(key, conditions.get(key) or details.get(key) or "", paused, enforce=enforce)
+        else:
+            message = clear_message(key, details.get(key) if kind == POST_CLEAR_MISSED else None)
+        if post(message):
+            db.execute(_POSTED, {"k": key, "kind": kind})
 
     from src.lending.dispatch.circuit_breaker import CHANNELS as BREAKER_CHANNELS
 

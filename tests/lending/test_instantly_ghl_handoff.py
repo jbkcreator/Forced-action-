@@ -9,7 +9,7 @@ import pytest
 from config.lending_compliance import GHL_TAG_COLD_LEAD, GHL_TAG_INSTANTLY_INTERESTED
 from src.lending import instantly_ghl_handoff as ho
 from src.lending.ghl_account import GhlAccount
-from src.lending.instantly_replies import ReplyProcessor
+from src.lending.instantly_replies import HandoffPaused, ReplyProcessor
 from src.lending.web_leads import DeliveryError
 from tests.lending.test_instantly_replies import DEAL, FakeModel, FakeSession, _Result, row
 
@@ -231,7 +231,7 @@ def test_a_contact_already_opted_out_in_ghl_is_not_handed_over(pipeline, contact
 def test_nothing_is_written_while_the_emergency_halt_is_on(pipeline, monkeypatch):
     monkeypatch.setattr(ho, "is_globally_halted", lambda: True)
     handoff = RecordingHandoff(contacts=[LEAD_CONTACT])
-    with pytest.raises(DeliveryError, match="halt"):
+    with pytest.raises(HandoffPaused, match="halt"):
         handoff(row())
     assert handoff.calls == []
 
@@ -406,6 +406,25 @@ def test_a_pending_handoff_still_paused_stays_pending():
     sweep(session, DEAL, paused)
     assert session.params("SET ghl_handoff_pending_at = NULL") == []
     assert session.params("SET ghl_handoff_pending_at = COALESCE") == [{"id": 7}]
+
+
+def test_a_pending_handoff_survives_a_halt_that_overlaps_the_dependency_pause_and_runs_once_after(pipeline, monkeypatch):
+    """Review (round 2) F6: queued during a dependency pause, an emergency halt then covers the next attempt. It stays
+    pending (no manual item) and creates exactly one card once both are lifted."""
+    state = {"halt": True, "paused": True}
+    monkeypatch.setattr(ho, "is_globally_halted", lambda: state["halt"])
+    monkeypatch.setattr(ho, "outbound_paused", lambda channel: state["paused"])
+    handoff = RecordingHandoff(contacts=[LEAD_CONTACT])
+    session = Session([], pending_handoffs=[row(status="done", intent="deal")])
+    sweep(session, DEAL, handoff)
+    assert session.params("SET ghl_handoff_pending_at = NULL") == [] and session.params("INSERT INTO lending.cora_inbox") == []
+    state["halt"] = False
+    sweep(session, DEAL, handoff)  # the dependency pause alone still holds it
+    assert session.params("SET ghl_handoff_pending_at = NULL") == []
+    state["paused"] = False
+    sweep(session, DEAL, handoff)
+    assert session.params("SET ghl_handoff_pending_at = NULL") == [{"id": 7}]
+    assert handoff.steps().count("opportunity create") == 1
 
 
 def test_a_pending_handoff_that_fails_for_another_reason_goes_to_the_team_once():

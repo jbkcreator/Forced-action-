@@ -200,6 +200,23 @@ def test_record_success_and_failure_write_and_never_raise(monkeypatch):
     dh.record_failure(fb.FEED_IMAP_OPT_OUT, "x")
 
 
+def test_a_known_unrecorded_opt_out_stops_trusting_the_last_success_at_once(monkeypatch):
+    """Feed healthy 5 min ago, then an opt-out is seen but not saved: the next gate read must already pause."""
+    db = _Db()
+    _use(monkeypatch, db)
+    dh.record_unverified(fb.FEED_IMAP_OPT_OUT, "1 opt-out(s) not recorded", now=NOW)
+    ((stmt, params),) = db.writes
+    assert stmt is dh._UNVERIFIED and "last_success_at = NULL" in str(stmt) and params["now"] == NOW
+    stale = dh.stale_feeds(fb.CHANNEL_GHL_SMS, {fb.FEED_IMAP_OPT_OUT: dh.HealthRow(fb.FEED_IMAP_OPT_OUT, None, NOW)}, NOW)
+    assert fb.FEED_IMAP_OPT_OUT in [s.feed for s in stale]
+
+    def broken():
+        raise RuntimeError("database down")
+
+    monkeypatch.setattr(dh, "_session_factory", broken)
+    dh.record_unverified(fb.FEED_IMAP_OPT_OUT, "x")
+
+
 def test_freshness_returns_age_or_none(monkeypatch):
     _use(monkeypatch, _Db(_rows_list(**{fb.FEED_IMAP_OPT_OUT: 7})))
     assert dh.freshness(fb.FEED_IMAP_OPT_OUT, now=NOW) == timedelta(minutes=7)

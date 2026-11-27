@@ -102,7 +102,7 @@ hands the lead to the Next Deal Lending GHL account (`src/lending/instantly_ghl_
   other GHL contact owns that number and this contact has no phone of its own; otherwise it is left off and the note says why (a
   shared office line can never redirect the hand-over to another contact). That number is not consent to text;
 - nothing is written while the lending emergency halt is on.
-- during an R1 0.6 dependency pause (an opt-out feed is stale) nothing is written either, but the handoff stays pending (`ghl_handoff_pending_at`): the sweep retries it once the feeds are fresh, creates the contact and card once, and never drafts a second answer. Run `migrations/apply_lending_dependency_health.py` before deploying (it adds the column).
+- during an R1 0.6 dependency pause (an opt-out feed is stale) or the emergency halt nothing is written either, but the handoff stays pending (`ghl_handoff_pending_at`), also when the two overlap: the sweep retries it once both are lifted, creates the contact and card once, and never drafts a second answer. Run `migrations/apply_lending_dependency_health.py` before deploying (it adds the column).
 
 An address that opted out is never handed over, and neither is a GHL contact that already carries the `lending-opt-out` tag or Call do-not-disturb. Do-not-disturb is never lifted: texts still need consent. A failed hand-over
 never blocks the triage or the answer; it raises a `instantly_ghl_handoff_failed` item in Cora's inbox (no address in it) so

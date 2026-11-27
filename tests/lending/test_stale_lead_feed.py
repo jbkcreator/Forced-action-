@@ -28,7 +28,7 @@ class _Db:
     def execute(self, stmt, params=None):
         if stmt is autoload._ACTIVE_PHONES_SQL:
             return iter([])
-        assert stmt is pool_source._SCHEDULED_SEGMENTS
+        assert stmt is pool_source._NEWEST_PULLS
         return iter([(state, campaign, newest) for (state, campaign), newest in self.segments.items()])
 
     def rollback(self):
@@ -38,13 +38,48 @@ class _Db:
         pass
 
 
-def test_the_segment_query_judges_nightly_pulled_segments_only():
-    sql = str(pool_source._SCHEDULED_SEGMENTS)
-    assert "GROUP BY state, campaign" in sql and "bool_or(run_type = 'daily')" in sql and "status = 'done'" in sql
+@pytest.fixture(autouse=True)
+def _schedule(monkeypatch):
+    monkeypatch.setattr(pool_source, "scheduled_segments", lambda: frozenset({GA_MATURITY, FL_CASH}))
+
+
+def test_the_pull_query_reads_successful_pulls_per_segment():
+    sql = str(pool_source._NEWEST_PULLS)
+    assert "GROUP BY state, campaign" in sql and "status = 'done'" in sql
+
+
+def test_a_scheduled_segment_whose_first_nightly_pull_failed_is_stale_even_with_an_old_backlog_pull():
+    """The nightly run writes its run row only after its first request: a segment seeded by a backlog pull and never
+    pulled nightly has an old 'done' row (or none) and is still judged, because it is in the schedule."""
+    old_backlog = {FL_CASH: NOW - timedelta(hours=7), GA_MATURITY: NOW - timedelta(days=30)}
+    assert list(pool_source.stale_segments(_Db(old_backlog), NOW)) == [GA_MATURITY]
+    assert pool_source.stale_segments(_Db({FL_CASH: NOW - timedelta(hours=7)}), NOW)[GA_MATURITY].age_hours is None
+
+
+def test_a_segment_outside_the_schedule_is_not_judged():
+    assert pool_source.stale_segments(_Db({("GA", "stalled_flip"): NOW - timedelta(days=90)}), NOW,
+                                      scheduled=frozenset()) == {}
+
+
+@pytest.mark.parametrize("enabled,statewide,expected", [
+    (False, False, set()),
+    (False, True, set()),
+    (True, False, {("FL", "maturity_target_lender")}),
+    (True, True, {(s, c) for s in ("FL", "GA") for c in ("maturity_target_lender", "cash_purchase", "investor_portfolio")}),
+])
+def test_the_schedule_follows_the_pull_switches(monkeypatch, enabled, statewide, expected):
+    from config.settings import get_settings
+
+    monkeypatch.undo()  # drop the autouse schedule patch so the real function runs
+    settings = get_settings()
+    monkeypatch.setattr(settings, "property_radar_enabled", enabled, raising=False)
+    monkeypatch.setattr(settings, "property_radar_statewide_enabled", statewide, raising=False)
+    assert pool_source.scheduled_segments() == expected
 
 
 def test_a_pull_from_last_night_is_fresh():
-    assert pool_source.stale_segments(_Db({FL_CASH: NOW - timedelta(hours=7)}), NOW) == {}
+    assert pool_source.stale_segments(_Db({FL_CASH: NOW - timedelta(hours=7)}), NOW,
+                                      scheduled=frozenset({FL_CASH})) == {}
 
 
 def test_a_failed_ga_maturity_pull_is_not_masked_by_a_fresh_fl_cash_purchase_pull():
@@ -113,6 +148,7 @@ def test_the_morning_load_posts_the_plain_alert(monkeypatch):
 
 
 def test_all_fresh_plans_the_load(monkeypatch):
+    monkeypatch.setattr(pool_source, "scheduled_segments", lambda: frozenset({FL_CASH}))
     _patch_db(monkeypatch, _Db({FL_CASH: NOW - timedelta(hours=7)}))
     monkeypatch.setattr(autoload, "plan_load", lambda db, **k: ([], {"to_load": 0}))
     summary, code = autoload._run(NOW, 10, apply=False)

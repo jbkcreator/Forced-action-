@@ -63,9 +63,10 @@ class InstantlyGhlHandoff(GhlLeadSink):
     """Call it with an ``lending.instantly_replies`` row; it returns the GHL contact id."""
 
     def __call__(self, row: Mapping[str, Any]) -> str:
+        # Either pause holds the handoff: the reply sweep keeps it pending and hands it over once both are lifted.
         if is_globally_halted():  # a tag or card can start a GHL workflow that messages the lead
-            raise DeliveryError("lending emergency halt is on; nothing changed in GHL")
-        if outbound_paused(CHANNEL_GHL_CRM):  # the reply sweep keeps it pending and hands it over once fresh
+            raise HandoffPaused("lending emergency halt is on; nothing changed in GHL")
+        if outbound_paused(CHANNEL_GHL_CRM):
             raise HandoffPaused("opt-outs can't be verified (a feed is stale); nothing changed in GHL")
         email = str(row["lead_email"]).strip().lower()
         contact_id, duplicates = self._contact_for_email(row, email)

@@ -23,7 +23,7 @@ class _SourcesDb:
         self.pr_finished, self.lf_last = pr_finished, lf_last
 
     def execute(self, stmt, params=None):
-        if stmt is pool_source._SCHEDULED_SEGMENTS:
+        if stmt is pool_source._NEWEST_PULLS:
             return iter([("FL", "maturity_target_lender", self.pr_finished)])
         if stmt is dh._READ:
             return iter([SimpleNamespace(dependency=fb.FEED_LENDINGFLOW_INBOUND, last_success_at=self.lf_last,
@@ -31,6 +31,11 @@ class _SourcesDb:
         if stmt is dw._LAST_LENDINGFLOW_LEAD:
             return SimpleNamespace(scalar=lambda: self.lf_last)
         raise AssertionError(stmt)
+
+
+@pytest.fixture(autouse=True)
+def _fl_maturity_scheduled(monkeypatch):
+    monkeypatch.setattr(pool_source, "scheduled_segments", lambda: frozenset({("FL", "maturity_target_lender")}))
 
 
 def test_outage_on_lendingflow_and_propertyradar_reports_both_sources_offline():
