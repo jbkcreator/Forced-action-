@@ -75,10 +75,11 @@ def test_call_without_phone_is_skipped(db):
     assert "call_dispositions:c2" not in records
 
 
-def test_known_landlines_reads_non_mobile_line_types(db):
-    db.execute(text("INSERT INTO lending.contacts (id, phone, line_type) VALUES (1, '+18135550101', 'landline'),"
-                    " (2, '+18135550102', 'Mobile'), (3, '+18135550103', NULL), (4, '+18135550104', 'voip')"))
-    assert known_landlines(db) == frozenset({PHONE_A, "+18135550104"})
+def test_known_landlines_reads_only_landline_line_types(db):
+    db.execute(text("INSERT INTO lending.contacts (id, phone, line_type) VALUES (1, '+18135550101', ' Landline'),"
+                    " (2, '+18135550102', 'Mobile'), (3, '+18135550103', NULL), (4, '+18135550104', 'voip'),"
+                    " (5, '+18135550105', 'unknown')"))
+    assert known_landlines(db) == frozenset({PHONE_A})
 
 
 def test_failed_source_is_reported_and_others_still_read(db):

@@ -20,9 +20,7 @@ from src.lending.ghl_calls import message_time
 
 logger = logging.getLogger(__name__)
 
-# GHL TYPE_CALL messages are already rows in call_dispositions (ghl_call_import stores them as "ghl:<message id>").
-_GHL_KINDS = {"TYPE_SMS": "text", "TYPE_EMAIL": "email", "TYPE_CAMPAIGN_CALL": "call"}
-_GHL_SKIPPED = {"TYPE_CALL"}
+_GHL_KINDS = {"TYPE_SMS": "text", "TYPE_EMAIL": "email", "TYPE_CAMPAIGN_CALL": "call", "TYPE_CALL": "call"}
 _INSTANTLY_RECEIVED = 2  # Instantly v2 email ue_type: 2 = received from the lead
 
 
@@ -101,13 +99,16 @@ _BRANCHES: tuple[tuple[dict[str, str], tuple[tuple[str, str, str], ...]], ...] =
           system="CASE WHEN channel LIKE 'instantly%' THEN 'instantly' WHEN channel LIKE 'ghl%' THEN 'ghl' "
                  "ELSE 'ndl' END",
           kind="CASE WHEN channel = 'ghl_sms' THEN 'text' WHEN channel LIKE '%email' THEN 'email' "
-               "WHEN channel = 'ghl_note' THEN 'note' WHEN channel = 'ghl_stage' THEN 'stage' ELSE 'message' END",
+               "WHEN channel = 'ghl_note' THEN 'note' ELSE 'message' END",
           direction="'outbound'", outcome=_NULL,
           ref="CASE WHEN provider_ref IS NULL THEN 'pending_actions:' || id "
               "WHEN channel IN ('ghl_sms', 'ghl_email') THEN 'ghl_msg:' || provider_ref "
               "WHEN channel = 'ghl_note' THEN 'ghl_note:' || provider_ref "
               "WHEN channel LIKE 'instantly%' THEN 'instantly:' || provider_ref "
-              "ELSE 'pending_actions:' || id END", base="status = 'sent'"),
+              "ELSE 'pending_actions:' || id END",
+          # a cold email's provider ref is an Instantly lead id (the live email list has it) and a stage move has its
+          # own ghl_stage_events row: either would show twice
+          base="status = 'sent' AND channel NOT IN ('instantly_cold_email', 'ghl_stage')"),
      (("recipient_phone IN :phones", "phones", "phones"), ("lower(recipient_email) IN :emails", "emails", "emails"))),
     (dict(table="instantly_replies", at="received_at", system="'instantly'", kind="'email'", direction="'inbound'",
           outcome="intent",
@@ -175,10 +176,12 @@ class GhlTouches:
 
 def _ghl_message_touch(message: Mapping[str, Any]) -> Optional[Touch]:
     message_type = message.get("messageType") or ""
-    if message_type in _GHL_SKIPPED or not message.get("id"):
+    if not message.get("id"):
         return None
+    # ghl_call_import stores a GHL call as call_dispositions "ghl:<message id>": the same ref, so it shows once
+    ref = f"call:ghl:{message['id']}" if message_type == "TYPE_CALL" else f"ghl_msg:{message['id']}"
     return Touch(message_time(message), "ghl", _GHL_KINDS.get(message_type, "message"), message.get("direction"),
-                 message.get("status"), f"ghl_msg:{message['id']}")
+                 message.get("status"), ref)
 
 
 def _ghl_notes_reader(account: Any) -> Callable[[str], list]:

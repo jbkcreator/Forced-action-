@@ -66,7 +66,7 @@ def _load_current(db: Session) -> _Current:
 
 @dataclass(frozen=True)
 class _Changes:
-    demote: list[Identifier]                   # merge-key phones now known as landlines
+    demote: list[Identifier]                   # merge keys that now only link (landline phones, their GHL/BD ids)
     promote: list[Identifier]                  # landline rows whose phone is a merge key again
     merge_rows: list[tuple[Identifier, str]]   # merge-key identifier -> owner, new or moved
     link_rows: list[tuple[Identifier, str]]    # landline link -> owner, new
@@ -87,7 +87,9 @@ def _diff(plan: ResolvePlan, current: _Current, landlines: frozenset[str]) -> _C
     def changed(owner: str, existing: Optional[int]) -> bool:
         return existing is None or _owner_id(owner) != now_owned(existing)
 
-    demote = sorted(i for i in current.merge_keys if i.kind == PHONE and i.value in landlines)
+    # merge keys that now only link: a phone known as a landline, or a GHL/BatchDialer id seen only on landline records
+    links_only = {i for i, _ in plan.landline_links} - set(plan.identifier_owner)
+    demote = sorted(i for i in current.merge_keys if (i.kind == PHONE and i.value in landlines) or i in links_only)
     links = {(i, now_owned(c)) for i, c in current.links}
     links.update((i, now_owned(current.merge_keys[i])) for i in demote)
     promote = sorted({i for i, _ in current.links if i.kind == PHONE and i.value not in landlines})

@@ -45,6 +45,8 @@ def merge_touches(local: Iterable[Touch], keys: ContactKeys, *, remote: Sequence
             logger.warning("contact timeline: %s unavailable (%s)", source.system, type(exc).__name__)
             unavailable.append(source.system)
             continue
-        by_ref.update((touch.ref, touch) for touch in found)
+        for touch in found:  # the provider's record wins, except a call: the local row has the disposition
+            if not (touch.ref.startswith("call:") and touch.ref in by_ref):
+                by_ref[touch.ref] = touch
     ordered = sorted(by_ref.values(), key=_newest_first)
     return Timeline(touches=tuple(ordered[:limit]), unavailable=tuple(unavailable))

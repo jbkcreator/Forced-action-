@@ -123,3 +123,16 @@ def test_no_message_text_or_full_phone_in_touches(db):
     dumped = repr(timeline(db, _contact(db), remote=[ghl]))
     for secret in ("call me", "private note", "8135550101"):
         assert secret not in dumped
+
+
+def test_cold_email_and_stage_drafts_are_left_to_their_own_records(db):
+    db.execute(text("INSERT INTO lending.pending_actions (id, channel, status, provider_ref, recipient_phone, "
+                    "recipient_email, executed_at) VALUES (1, 'instantly_cold_email', 'sent', 'lead-9', NULL, "
+                    "'ann@x.com', :at), (2, 'ghl_stage', 'sent', 'opp-1', :p, NULL, :at)"), {"p": PHONE, "at": _at(2)})
+    assert timeline(db, _contact(db), remote=[]).touches == ()
+
+
+def test_ghl_call_not_imported_still_shows(db):
+    ghl = _ghl([{"id": "c10", "messageType": "TYPE_CALL", "direction": "inbound", "dateAdded": _at(1)}])
+    touches = timeline(db, _contact(db), remote=[ghl]).touches
+    assert [(t.ref, t.system, t.kind, t.direction) for t in touches] == [("call:ghl:c10", "ghl", "call", "inbound")]

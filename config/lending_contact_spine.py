@@ -18,6 +18,10 @@ SOURCE_NAMES: tuple[str, ...] = (
     "instantly_replies", "sunbiz_llc_contacts", "call_dispositions", "contacts",
 )
 NAME_RANK: dict[str, int] = {name: rank for rank, name in enumerate(SOURCE_NAMES)}
+# Rows with no name that only echo a phone: with no merge key (a landline only) they make no contact of their own.
+NAMELESS_SOURCES = frozenset({"call_dispositions", "contacts"})
+# Ids GHL and BatchDialer can key on the phone itself: on a record with a landline they link, never merge.
+PHONE_KEYED_KINDS = frozenset({GHL_CONTACT, BATCHDIALER_CONTACT})
 
 MIN_ENTITY_CHARS = 3
 GHL_HISTORY_DAYS = 365

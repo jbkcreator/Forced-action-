@@ -8,7 +8,7 @@ from collections import defaultdict
 from dataclasses import dataclass
 from typing import Hashable, Iterable, Mapping
 
-from config.lending_contact_spine import NAME_RANK, PHONE
+from config.lending_contact_spine import NAME_RANK, NAMELESS_SOURCES, PHONE, PHONE_KEYED_KINDS
 from src.lending.spine.identity import Identifier, SourceRecord
 
 
@@ -41,20 +41,30 @@ class _UnionFind:
             self.parent[ra] = rb
 
 
-def _is_merge_key(identifier: Identifier, landlines: frozenset[str]) -> bool:
-    return not (identifier.kind == PHONE and identifier.value in landlines)
+def _merge_keys(record: SourceRecord, landlines: frozenset[str]) -> frozenset[Identifier]:
+    """A known landline never merges; on a record with one, a GHL or BatchDialer id may stand for that line."""
+    on_landline = any(i.kind == PHONE and i.value in landlines for i in record.identifiers)
+    return frozenset(i for i in record.identifiers
+                     if not (i.kind == PHONE and i.value in landlines)
+                     and not (on_landline and i.kind in PHONE_KEYED_KINDS))
 
 
 def resolve(records: Iterable[SourceRecord], *, owners: Mapping[Identifier, int],
             source_owners: Mapping[str, int], landlines: frozenset[str]) -> ResolvePlan:
-    records = list(records)
+    merge_keys = {}
+    kept: list[SourceRecord] = []
+    for record in records:
+        keys = _merge_keys(record, landlines)
+        # a nameless row with only a landline would be one more empty contact per call to that line
+        if keys or record.key in source_owners or record.source not in NAMELESS_SOURCES:
+            merge_keys[record.key] = keys
+            kept.append(record)
+    records = kept
     uf = _UnionFind()
     for record in records:
         node = ("r", record.key)
         uf.find(node)
-        for identifier in record.identifiers:
-            if not _is_merge_key(identifier, landlines):
-                continue
+        for identifier in merge_keys[record.key]:
             uf.union(node, ("i", identifier))
             if identifier in owners:
                 uf.union(node, ("c", owners[identifier]))
@@ -87,7 +97,7 @@ def resolve(records: Iterable[SourceRecord], *, owners: Mapping[Identifier, int]
         owner = owner_of_root[uf.find(("r", record.key))]
         source_owner[record.key] = owner
         for identifier in record.identifiers:
-            if _is_merge_key(identifier, landlines):
+            if identifier in merge_keys[record.key]:
                 identifier_owner[identifier] = owner
             else:
                 landline_links.add((identifier, owner))

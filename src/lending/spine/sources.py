@@ -134,6 +134,7 @@ def read_records(db: Session, readers: tuple[tuple[str, Reader], ...] = SOURCE_R
 
 
 def known_landlines(db: Session) -> frozenset[str]:
-    rows = db.execute(text("SELECT phone FROM lending.contacts WHERE phone IS NOT NULL AND line_type IS NOT NULL "
-                           "AND trim(line_type) <> '' AND lower(trim(line_type)) <> 'mobile'")).scalars()
+    # only a landline: VoIP is texted like a mobile (compliance.SMS_LINE_TYPES_ALLOWED) and "unknown" is not known
+    rows = db.execute(text("SELECT phone FROM lending.contacts WHERE phone IS NOT NULL "
+                           "AND lower(trim(line_type)) = 'landline'")).scalars()
     return frozenset(i.value for i in map(phone_identifier, rows) if i)

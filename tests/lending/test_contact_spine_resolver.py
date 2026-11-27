@@ -99,3 +99,22 @@ def test_similar_llc_names_do_not_merge():
     plan = _resolve([_rec("loan_files", 1, entity_identifier("Smith Holdings LLC")),
                      _rec("loan_files", 2, entity_identifier("Smith Holding LLC"))])
     assert len(plan.new_seeds) == 2
+
+
+def test_external_ids_on_a_landline_record_never_merge():
+    landline = phone_identifier(LANDLINE)
+    ghl = external_identifier("ghl_contact", "G-office")
+    plan = _resolve([_rec("web_leads", 1, landline, ghl, email_identifier("a@x.com")),
+                     _rec("web_leads", 2, landline, ghl, email_identifier("b@x.com"))],
+                    landlines=frozenset({LANDLINE}))
+    assert len(plan.new_seeds) == 2
+    assert ghl not in plan.identifier_owner
+    assert (ghl, "seed:web_leads:1") in plan.landline_links
+
+
+def test_nameless_record_with_only_a_landline_makes_no_contact():
+    landline = phone_identifier(LANDLINE)
+    plan = _resolve([_rec("call_dispositions", "c1", landline), _rec("contacts", 4, landline)],
+                    landlines=frozenset({LANDLINE}))
+    assert plan.new_seeds == ()
+    assert plan.source_owner == {}

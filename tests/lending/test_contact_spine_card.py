@@ -150,3 +150,22 @@ def test_tool_is_registered_read_only():
         ContactCardInput(query="ab")
     with pytest.raises(ValueError):
         ContactCardInput(query="ann", limit=500)
+
+
+def test_cli_writes_the_card_to_stdout_never_to_the_log(monkeypatch, db, capsys, caplog):
+    from src.lending import db as lending_db
+    from src.lending.spine import card as card_module
+
+    _borrower(db)
+
+    @contextmanager
+    def same_session():
+        yield db
+
+    monkeypatch.setattr(lending_db, "lending_session", same_session)
+    monkeypatch.setattr(cora_tools, "phone_flags", _flags)
+    monkeypatch.setattr(card_module, "live_sources", lambda: [])
+    caplog.set_level("INFO")
+    assert card_module.main(["--query", "ann@x.com"]) == 0
+    assert '"ann@x.com"' in capsys.readouterr().out
+    assert "ann@x.com" not in caplog.text and "test holdings" not in caplog.text

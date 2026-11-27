@@ -8,13 +8,16 @@ touch with that person once. Cora reads it with the `get_contact_card` tool.
 - A contact is a row in `lending.contact_spine`. Its phones, emails, LLC names, GHL contact ids and BatchDialer contact
   ids are rows in `lending.contact_identifiers`; the source rows it was built from are in `lending.contact_sources`.
 - Two records that share any **merge key** are the same contact. Merge keys are:
-  - a phone (normalized), unless `lending.contacts.line_type` says it is not a mobile;
+  - a phone (normalized), unless `lending.contacts.line_type` is `landline` (mobile, VoIP, unknown and unscrubbed
+    numbers all merge: most LendingFlow numbers are never scrubbed);
   - an email (lower case);
   - an LLC name, matched exactly after normalization (`"Smith Holdings, LLC"` = `"SMITH HOLDINGS LLC"`), never fuzzy;
   - a GHL contact id;
-  - a BatchDialer contact id.
+  - a BatchDialer contact id. On a record with a known landline, the GHL and BatchDialer ids only link (both systems
+    can key a contact on the phone itself, so the id may just be the office line).
 - A known landline is kept on the card (`merge_key = false`) but never joins two people (an office line, a family
-  number). Two people who share one LLC become one contact, as the spec says.
+  number). A call or `lending.contacts` row whose only identifier is a landline makes no contact of its own; its touches
+still reach every card that has that line. Two people who share one LLC become one contact, as the spec says.
 - `lending.contacts` is not changed. It stays the per-phone compliance record (opt-outs, DNC scrub, line type, pins),
   so a merge never moves an opt-out to another number. The new tables join back to it by phone.
 
@@ -56,8 +59,9 @@ SELECT m.merged_at, m.survivor_id, m.merged_id FROM lending.contact_spine_merges
 
 ### A wrong merge (by hand)
 
-A phone that was a merge key and is later found to be a landline stops merging from the next run, but a merge already
-made through it is not undone. To split a contact: create a new `contact_spine` row, move the wrong source rows
+A phone (or a GHL/BatchDialer id on it) that was a merge key and is later found to be a landline stops merging from the
+next run, but a merge already made through it is not undone: a shared office line seen before its scrub can join two
+people. To split a contact: create a new `contact_spine` row, move the wrong source rows
 (`contact_sources`) and their identifiers to it, and remove the bad shared identifier. Do it in one transaction, then
 run the sync with `--dry-run` and check it proposes no merge back.
 
@@ -69,7 +73,9 @@ run the sync with `--dry-run` and check it proposes no merge back.
 - The timeline holds local touches (calls, sent missed-call texts, Cora's sent actions, Instantly replies, GHL stage
   entries, routing and loan status events) and live ones (GHL messages and notes for the last 365 days, Instantly
   emails). A touch stored in two places (a text Cora sent that GHL also holds) shows once, keyed on the provider id.
-  GHL call messages are left to `call_dispositions`, where `ghl_call_import` already stores them.
+  A GHL call message has the same ref as the row `ghl_call_import` stores (`call:ghl:<message id>`), so it shows once
+  (the local row, which has the disposition), and still shows while that import is off. Cora's cold emails and stage
+  moves are left to the Instantly email list and `ghl_stage_events`, which hold the same touches.
 - When GHL or Instantly cannot be read (or has no account set), the card still shows the local touches and lists the
   system under `unavailable`.
 - UNVERIFIED: the GHL notes read (`GET /contacts/{id}/notes`) and the Instantly email list

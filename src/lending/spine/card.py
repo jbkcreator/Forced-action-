@@ -10,6 +10,7 @@ import argparse
 import json
 import logging
 import re
+import sys
 from dataclasses import dataclass
 from typing import Any, Callable, Mapping, Optional, Sequence
 
@@ -159,9 +160,11 @@ def main(argv: Optional[list[str]] = None) -> int:
         ids = find_contacts(db, args.query)
         loaded = load_card(db, ids[0], flags=phone_flags) if len(ids) == 1 else None
     if loaded is None:
-        logger.info("%d contacts matched: %s", len(ids), ids)
+        logger.info("%d contacts matched (ids %s); narrow the query", len(ids), ids)
         return 1
-    logger.info(json.dumps(finish_card(loaded, remote=live_sources(), limit=args.limit), indent=2, default=str))
+    # the card holds emails and LLC names: stdout for the operator, never the log
+    sys.stdout.write(json.dumps(finish_card(loaded, remote=live_sources(), limit=args.limit), indent=2, default=str) + "\n")
+    logger.info("contact card %s written", loaded.contact_id)
     return 0
 
 

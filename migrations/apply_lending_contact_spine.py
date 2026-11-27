@@ -48,7 +48,7 @@ def apply_to(conn: Connection, schema: str = LENDING_SCHEMA) -> None:
         f"CREATE INDEX IF NOT EXISTS ix_lending_contact_identifiers_contact ON {s}.contact_identifiers (contact_id)",
         f"""CREATE TABLE IF NOT EXISTS {s}.contact_sources (
             source     varchar(40) NOT NULL,
-            source_ref varchar(80) NOT NULL,
+            source_ref varchar(100) NOT NULL,
             contact_id bigint      NOT NULL REFERENCES {s}.contact_spine (id),
             seen_at    timestamptz NOT NULL DEFAULT now(),
             PRIMARY KEY (source, source_ref))""",

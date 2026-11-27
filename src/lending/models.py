@@ -2377,7 +2377,7 @@ class LendingContactSource(LendingBase):
     __tablename__ = "contact_sources"
 
     source: Mapped[str] = mapped_column(String(40), primary_key=True)
-    source_ref: Mapped[str] = mapped_column(String(80), primary_key=True)
+    source_ref: Mapped[str] = mapped_column(String(100), primary_key=True)  # fits call_dispositions.dialer_call_id
     contact_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("lending.contact_spine.id"), nullable=False)
     seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_now, server_default=text("now()"))
 

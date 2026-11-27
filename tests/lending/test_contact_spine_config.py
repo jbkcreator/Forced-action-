@@ -20,3 +20,9 @@ def test_setting_defaults_off():
     from config.settings import AppSettings
 
     assert AppSettings.model_fields["lending_contact_spine_enabled"].default is False
+
+
+def test_source_ref_fits_the_longest_dialer_call_id():
+    from src.lending.models import LendingCallDisposition, LendingContactSource
+
+    assert LendingContactSource.__table__.c.source_ref.type.length >= LendingCallDisposition.__table__.c.dialer_call_id.type.length

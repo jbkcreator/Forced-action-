@@ -125,12 +125,13 @@ def test_phone_later_known_as_landline_stops_merging(db):
     db.execute(text("INSERT INTO lending.contacts (id, phone, line_type) VALUES (1, '+18135550101', 'landline')"))
     _web(db, 2, "8135550101", "b@x.com")
     result = sync_contact_spine(db, now=NOW)
-    assert result.contacts_created == 2  # web_leads:2 and the lending.contacts row: a landline joins nobody
-    assert len({_owner(db, "web_leads", 1), _owner(db, "web_leads", 2), _owner(db, "contacts", 1)}) == 3
+    assert result.contacts_created == 1  # web_leads:2; the landline-only lending.contacts row makes no contact
+    assert _owner(db, "web_leads", 1) != _owner(db, "web_leads", 2)
+    assert _owner(db, "contacts", 1) is None
     assert db.execute(text("SELECT count(*) FROM lending.contact_identifiers WHERE kind = 'phone' "
                            "AND value = '+18135550101' AND merge_key")).scalar() == 0
     assert db.execute(text("SELECT count(*) FROM lending.contact_identifiers WHERE kind = 'phone' "
-                           "AND value = '+18135550101'")).scalar() == 3
+                           "AND value = '+18135550101'")).scalar() == 2
     assert sync_contact_spine(db, now=NOW).identifiers_written == 0
 
 
@@ -141,7 +142,7 @@ def test_landline_back_to_mobile_merges_again(db):
     sync_contact_spine(db, now=NOW)
     db.execute(text("UPDATE lending.contacts SET line_type = 'mobile'"))
     result = sync_contact_spine(db, now=NOW)
-    assert result.merges == 2  # both web leads and the lending.contacts row are one person again
+    assert result.merges == 1  # both web leads are one person again, and the lending.contacts row joins them
     assert _owner(db, "web_leads", 1) == _owner(db, "web_leads", 2) == _owner(db, "contacts", 1)
     assert db.execute(text("SELECT count(*) FROM lending.contact_identifiers WHERE kind = 'phone'")).scalar() == 1
     assert sync_contact_spine(db, now=NOW).identifiers_written == 0
@@ -177,3 +178,14 @@ def test_task_exits_1_when_a_source_failed(monkeypatch):
         records=1, contacts_created=0, merges=0, identifiers_written=0, sources_written=0,
         failed_sources=("web_leads",)))
     assert task.main([]) == 1
+
+
+def test_ghl_id_on_a_line_later_known_as_landline_stops_merging(db):
+    db.execute(text("INSERT INTO lending.web_leads (id, name, phone, ghl_contact_id) VALUES (1, 'A', '8135550101', 'G1')"))
+    sync_contact_spine(db, now=NOW)
+    db.execute(text("INSERT INTO lending.contacts (id, phone, line_type) VALUES (1, '+18135550101', 'landline')"))
+    db.execute(text("INSERT INTO lending.web_leads (id, name, phone, ghl_contact_id) VALUES (2, 'B', '8135550101', 'G1')"))
+    sync_contact_spine(db, now=NOW)
+    assert _owner(db, "web_leads", 1) != _owner(db, "web_leads", 2)
+    assert db.execute(text("SELECT count(*) FROM lending.contact_identifiers WHERE kind = 'ghl_contact' "
+                           "AND merge_key")).scalar() == 0
