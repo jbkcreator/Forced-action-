@@ -20,7 +20,13 @@ from sqlalchemy.orm import Session
 from migrations.apply_lending_doc_chase import apply_to as apply_doc_chase
 from migrations.apply_lending_lender_packages import ADDED_COLUMNS
 from src.lending.closing import doc_copies
-from src.lending.models import LENDING_SCHEMA, LendingDealAuditEvent, LendingLenderPackage, LendingLenderSubmission
+from src.lending.models import (
+    LENDING_SCHEMA,
+    LendingDealAuditEvent,
+    LendingGhlStageEvent,
+    LendingLenderPackage,
+    LendingLenderSubmission,
+)
 from src.lending.packaging import actions, quarantine
 from src.lending.packaging.package import CLOSED_STATUSES, CompileResult
 from src.lending.packaging.packet_validator import Outcome, Verdict
@@ -49,11 +55,12 @@ def pg():
         with engine.begin() as conn:
             conn.execute(text(f'CREATE TABLE "{schema}".loan_files (id BIGSERIAL PRIMARY KEY, '
                               "borrower_phone VARCHAR(20), partner_id BIGINT, created_at TIMESTAMPTZ DEFAULT now())"))
-            apply_doc_chase(conn, schema)
             translated = conn.execution_options(schema_translate_map={LENDING_SCHEMA: schema})
+            LendingGhlStageEvent.__table__.create(translated)  # the doc-chase migration backfills from it
+            apply_doc_chase(conn, schema)
             for model in (LendingLenderPackage, LendingLenderSubmission, LendingDealAuditEvent):
                 model.__table__.create(translated)
-            added = ", ".join(f"ADD COLUMN {n} {ddl}" for n, ddl in ADDED_COLUMNS["doc_chase_uploads"].items())
+            added = ", ".join(f"ADD COLUMN IF NOT EXISTS {n} {ddl}" for n, ddl in ADDED_COLUMNS["doc_chase_uploads"].items())
             conn.execute(text(f'ALTER TABLE "{schema}".doc_chase_uploads {added}'))
         yield engine
     finally:
