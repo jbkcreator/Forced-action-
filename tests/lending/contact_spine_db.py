@@ -47,12 +47,12 @@ SPINE_DDL = (
 
 TOUCH_DDL = (
     "CREATE TABLE lending.missed_call_events (id INTEGER PRIMARY KEY, phone TEXT, status TEXT,"
-    " provider_message_id TEXT, created_at TIMESTAMP)",
+    " provider_message_id TEXT, created_at TIMESTAMP, decided_at TIMESTAMP)",
     "CREATE TABLE lending.pending_actions (id INTEGER PRIMARY KEY, channel TEXT, status TEXT, provider_ref TEXT,"
-    " recipient_phone TEXT, recipient_email TEXT, sent_at TIMESTAMP)",
+    " recipient_phone TEXT, recipient_email TEXT, executed_at TIMESTAMP, created_at TIMESTAMP)",
     "CREATE TABLE lending.ghl_stage_events (id INTEGER PRIMARY KEY, phone TEXT, stage_name TEXT, event_at TIMESTAMP)",
     "CREATE TABLE lending.file_routing_events (id INTEGER PRIMARY KEY, lead_id INTEGER, loan_file_id INTEGER,"
-    " event_type TEXT, created_at TIMESTAMP)",
+    " action TEXT, created_at TIMESTAMP)",
     "CREATE TABLE lending.loan_file_status_events (id INTEGER PRIMARY KEY, loan_file_id INTEGER, status TEXT,"
     " at TIMESTAMP)",
 )
