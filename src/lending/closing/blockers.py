@@ -11,7 +11,7 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
-from typing import Callable, Optional
+from typing import Callable, Optional, Sequence
 from zoneinfo import ZoneInfo
 
 from sqlalchemy import text
@@ -70,6 +70,18 @@ def current_stage(db, opportunity_id: str) -> Optional[tuple[str, datetime]]:
     """(stage name, entered at) of the opportunity, or None."""
     row = db.execute(_CURRENT, {"opp": opportunity_id}).first()
     return (row.stage_name, row.entered_at) if row else None
+
+
+_CURRENT_MANY = text("SELECT ghl_opportunity_id, stage_name FROM lending.ghl_opportunity_stage "
+                     "WHERE ghl_opportunity_id = ANY(:opps)")
+
+
+def current_stages(db, opportunity_ids: Sequence[str]) -> dict[str, str]:
+    """Current stage name per opportunity, one query; opportunities with no stage are left out."""
+    if not opportunity_ids:
+        return {}
+    return {row.ghl_opportunity_id: row.stage_name
+            for row in db.execute(_CURRENT_MANY, {"opps": list(opportunity_ids)})}
 
 
 # ---- the 7 AM card -------------------------------------------------------------------------------------------------

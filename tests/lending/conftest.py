@@ -117,6 +117,13 @@ def _not_a_lendingflow_recipient(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _sms_line_type_allowed(monkeypatch):
+    """R1 0.11: the GHL SMS sender checks each number's line type (a DB read, maybe a paid Telnyx lookup). Tests never
+    read the shared database or call Telnyx for it; tests/lending/test_sms_line_type_gate.py covers the gate itself."""
+    monkeypatch.setattr("src.lending.ghl_sms._line_type_gate", lambda phone: None)
+
+
+@pytest.fixture(autouse=True)
 def _no_live_web_lead_sink(monkeypatch):
     """A test must never push a website lead into the real Next Deal Lending GHL account."""
     monkeypatch.setattr("src.lending.web_lead_ghl.get_live_sink", lambda: None)

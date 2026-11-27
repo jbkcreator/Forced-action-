@@ -27,6 +27,7 @@ from sqlalchemy import (
     SmallInteger,
     String,
     Text,
+    UniqueConstraint,
     text,
 )
 from sqlalchemy.dialects.postgresql import JSONB, UUID
@@ -80,6 +81,8 @@ class LendingContact(LendingBase):
     email: Mapped[Optional[str]] = mapped_column(String(255))
     last_dnc_scrub: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
     line_type: Mapped[Optional[str]] = mapped_column(String(20))  # Tracerfy phone_type (mobile/landline)
+    line_type_source: Mapped[Optional[str]] = mapped_column(String(20))  # telnyx when the 0.11 fallback looked it up
+    line_type_checked_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))  # when telnyx looked it up
     do_not_contact: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default=text("false"))
     nurture: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default=text("false"))  # phone blocked by DNC; email nurture only
     pinned_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))  # after-hours voicemail: call first next morning
@@ -1086,6 +1089,36 @@ class LendingWebhookFailure(LendingBase):
     )
 
 
+class LendingInboundEvent(LendingBase):
+    """R1 0.5 inbound journal: every journaled webhook body, saved raw before it is processed
+    (``src.lending.inbound.journal``). ``(source, dedup_key)`` is unique, so a redelivery is a duplicate.
+    ``status``: received -> processed, or failed (the body was saved to ``webhook_failures`` as ``failure_id``;
+    a successful replay sets processed). A row still ``received`` after two minutes is run again by the 5-minute
+    cron. ``last_error_class`` is an exception class only, no PII; ``raw`` is nulled 30 days after processing."""
+
+    __tablename__ = "inbound_events"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    source: Mapped[str] = mapped_column(String(40), nullable=False)
+    dedup_key: Mapped[str] = mapped_column(String(255), nullable=False)
+    raw: Mapped[Optional[dict]] = mapped_column(JSONB)
+    received_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False,
+                                                  server_default=text("now()"))
+    status: Mapped[str] = mapped_column(String(12), nullable=False, server_default=text("'received'"))
+    attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default=text("0"))
+    processed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    failure_id: Mapped[Optional[int]] = mapped_column(
+        Integer, ForeignKey("lending.webhook_failures.id", ondelete="SET NULL"))
+    last_error_class: Mapped[Optional[str]] = mapped_column(String(200))
+
+    __table_args__ = (
+        CheckConstraint("status IN ('received', 'processed', 'failed')", name="ck_lending_inbound_events_status"),
+        Index("uq_lending_inbound_events_source_key", "source", "dedup_key", unique=True),
+        Index("idx_lending_inbound_events_status_received", "status", "received_at"),
+        Index("idx_lending_inbound_events_failure", "failure_id", postgresql_where=text("failure_id IS NOT NULL")),
+    )
+
+
 class LendingCoraInboxItem(LendingBase):
     """One event for Cora to raise with the operator in her main thread before it goes to a team channel.
 
@@ -1173,6 +1206,8 @@ class LendingCoraMorningDigest(LendingBase):
     slack_channel: Mapped[Optional[str]] = mapped_column(String(32))
     slack_ts: Mapped[Optional[str]] = mapped_column(String(64))
     posted_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    # R1 1.3: David's thread replies Slack has not accepted yet (JSON list of block lists); NULL when all posted.
+    thread_pending: Mapped[Optional[str]] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_now, server_default=text("now()"))
 
 
@@ -2310,4 +2345,26 @@ class LendingLenderPackage(LendingBase):
         Index("idx_lending_lender_packages_source", "source_type", "source_id"),
         Index("uq_lending_lender_packages_open", "source_type", "source_id", "lender_key", unique=True,
               postgresql_where=text("status NOT IN ('submitted','dismissed')")),
+    )
+
+
+class LendingClayEnrichment(LendingBase):
+    """R1 1.3: one Clay lookup per (morning-list item, field). ``src.lending.morning_list.clay`` writes it; a row inside
+    ``LENDING_CLAY_TTL_DAYS`` means the lead is never paid for twice, and today's rows count toward the daily cap."""
+
+    __tablename__ = "clay_enrichments"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    lead_ref: Mapped[str] = mapped_column(String(64), nullable=False)  # morning-list ref, e.g. dlr:99, lf:12
+    field: Mapped[str] = mapped_column(String(20), nullable=False)  # email / llc_owner
+    run_id: Mapped[Optional[str]] = mapped_column(String(64))  # Clay routine_run_id
+    status: Mapped[str] = mapped_column(String(12), nullable=False)  # pending / found / not_found
+    value: Mapped[Optional[str]] = mapped_column(String(255))  # found email (lower-cased) or verified owner name
+    requested_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    enriched_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+
+    __table_args__ = (
+        UniqueConstraint("lead_ref", "field", name="uq_lending_clay_enrichments_ref_field"),
+        CheckConstraint("status IN ('pending', 'found', 'not_found')", name="ck_lending_clay_enrichments_status"),
+        Index("ix_lending_clay_enrichments_requested_at", "requested_at"),
     )

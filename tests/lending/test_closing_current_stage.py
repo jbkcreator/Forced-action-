@@ -29,7 +29,7 @@ def client(closing_db, monkeypatch):
 @pytest.fixture
 def clock(monkeypatch):
     now = {"t": T0}
-    monkeypatch.setattr("src.api.lending_ghl_router._now", lambda: now["t"])
+    monkeypatch.setattr("src.lending.inbound.ghl_stage._now", lambda: now["t"])
     return now
 
 
@@ -64,3 +64,11 @@ def test_scoreboard_events_unchanged(client, closing_db, clock):
     _post(client, "Submitted to lender")
     _post(client, "Application")
     assert closing_db.execute(text("SELECT count(*) FROM lending.ghl_stage_events")).scalar() == 2
+
+
+def test_current_stages_reads_many_deals_in_one_call(closing_db):
+    from src.lending.closing.blockers import current_stages, upsert_current_stage
+    upsert_current_stage(closing_db, opportunity_id="opp-a", stage_name="Funded", phone=None, now=T0)
+    upsert_current_stage(closing_db, opportunity_id="opp-b", stage_name="Application", phone=None, now=T0)
+    assert current_stages(closing_db, ["opp-a", "opp-b", "opp-none"]) == {"opp-a": "Funded", "opp-b": "Application"}
+    assert current_stages(closing_db, []) == {}

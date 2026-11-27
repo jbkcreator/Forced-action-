@@ -14,13 +14,16 @@ from src.lending.state_machine import IllegalStageTransitionError, PaymentResult
 class _Db:
     """The loan file linked to the opportunity (None: no link), and the rowcount a link UPDATE reports."""
 
-    def __init__(self, linked=None, link_rowcount=1):
+    def __init__(self, linked=None, link_rowcount=1, funded_event=False):
+        self.funded_event = funded_event
         self.linked, self.link_rowcount, self.queries = linked, link_rowcount, []
 
     def execute(self, stmt, params=None):
         self.queries.append((stmt, params))
         if stmt is bridge._LINK:
             return SimpleNamespace(rowcount=self.link_rowcount)
+        if "SELECT EXISTS" in str(stmt):
+            return SimpleNamespace(scalar=lambda: self.funded_event)
         row = SimpleNamespace(id=self.linked[0], stage=self.linked[1]) if self.linked else None
         return SimpleNamespace(first=lambda: row)
 
@@ -145,7 +148,7 @@ def test_every_stage_the_bridge_maps_counts_as_closed_for_the_scoreboard_and_doc
 # ── The webhook (PR #473 review 5) ─────────────────────────────────────────────
 
 def _router(monkeypatch, saved_id):
-    from src.api import lending_ghl_router as router
+    from src.lending.inbound import ghl_stage as router
 
     saved = []
 
@@ -160,14 +163,14 @@ def _router(monkeypatch, saved_id):
 
 def test_a_failed_loan_update_is_saved_for_retry_and_ghl_gets_its_200(monkeypatch):
     router, saved = _router(monkeypatch, saved_id=41)
-    router._apply_loan_stage(SimpleNamespace(begin_nested=nullcontext), "o1", "Funded", "+18135550101")
+    router.apply_loan_stage(SimpleNamespace(begin_nested=nullcontext), "o1", "Funded", "+18135550101")
     assert saved == [("ghl_loan_stage", {"opportunity_id": "o1", "stage_name": "Funded", "phone": "+18135550101"})]
 
 
 def test_when_the_retry_cannot_be_saved_the_webhook_fails_so_ghl_sends_it_again(monkeypatch):
     router, saved = _router(monkeypatch, saved_id=None)
     with pytest.raises(RuntimeError):
-        router._apply_loan_stage(SimpleNamespace(begin_nested=nullcontext), "o1", "Funded", "+18135550101")
+        router.apply_loan_stage(SimpleNamespace(begin_nested=nullcontext), "o1", "Funded", "+18135550101")
     assert len(saved) == 1
 
 
@@ -178,7 +181,7 @@ def test_the_saved_event_is_replayed_through_the_bridge():
 
 
 def _stage_write_fails(monkeypatch):
-    from src.api import lending_ghl_router as router
+    from src.lending.inbound import ghl_stage as router
 
     def boom(db, **kwargs):
         raise RuntimeError("database restarting")
@@ -192,9 +195,17 @@ def test_a_failed_stage_write_for_funded_or_paid_fails_the_webhook_so_ghl_sends_
     """PR #473 re-review: without the current-stage write the bridge would skip a valid Funded / Paid as stale."""
     router = _stage_write_fails(monkeypatch)
     with pytest.raises(RuntimeError):
-        router._record_current_stage(SimpleNamespace(begin_nested=nullcontext), "o1", stage, None, repeat=False)
+        router.record_current_stage(SimpleNamespace(begin_nested=nullcontext), "o1", stage, None, repeat=False)
 
 
 def test_a_failed_stage_write_for_another_stage_is_only_logged(monkeypatch):
     router = _stage_write_fails(monkeypatch)
-    router._record_current_stage(SimpleNamespace(begin_nested=nullcontext), "o1", "Showed", None, repeat=False)
+    router.record_current_stage(SimpleNamespace(begin_nested=nullcontext), "o1", "Showed", None, repeat=False)
+
+
+def test_paid_catches_up_a_closing_file_with_a_funded_webhook(calls):
+    calls["current"] = "paid"
+    db = _Db((7, "CLOSING"), funded_event=True)
+    assert bridge.apply_stage(db, opportunity_id="o1", stage_name="Paid") == "applied"
+    assert calls["transition"][0][1] is LoanStage.FUNDED
+    assert calls["payment"][0][1]["mark_paid"] is True

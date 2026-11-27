@@ -38,6 +38,7 @@ from src.services.phone_utils import normalize
 logger = logging.getLogger(__name__)
 
 Request = Callable[..., Any]
+SmsGate = Callable[[str], Optional[str]]  # phone -> None (may text) or the block reason
 
 _SEND_TIMEOUT = 15  # seconds, same as the shared GHL helper
 
@@ -95,12 +96,13 @@ class GhlSmsSender:
     _breaker_channel = circuit_breaker.CHANNEL_SMS
 
     def __init__(self, account: GhlAccount, from_number: str, request: Optional[Request] = None, *,
-                 internal_alert: bool = False) -> None:
+                 internal_alert: bool = False, sms_gate: Optional[SmsGate] = None) -> None:
         """``request`` (tests) replaces both calls; unset, both are single attempts. ``internal_alert`` marks a
         sender used only for alerts to the team's own phone (T-10 alarms), which keep going during the lending
         emergency halt: the halt stops outbound to borrowers, and a missed-lead alarm must never go quiet."""
         self._account, self._from, self._request = account, from_number, request
         self._internal_alert = internal_alert
+        self._sms_gate = sms_gate
 
     def _http(self) -> Request:
         return self._request or _single_attempt
@@ -144,6 +146,20 @@ class GhlSmsSender:
             logger.warning("%s send refused: %s", self._log_prefix, decision.block.value)
             raise GhlSendRefused(decision.block.value)
         return decision
+
+    def _line_type_check(self, phone: str) -> None:
+        """R1 0.11: raise GhlSendRefused unless the number is a mobile line. Alerts to the team's own phone skip it."""
+        if self._internal_alert:
+            return
+        try:
+            reason = (self._sms_gate or _line_type_gate)(phone)
+        except Exception as exc:  # class only: nothing sent, and the caller may retry (not a refusal)
+            logger.warning("%s line-type check failed (%s); nothing sent", self._log_prefix, type(exc).__name__)
+            raise GhlSmsError(f"line-type check unavailable ({type(exc).__name__}); nothing sent") from None
+        if reason is not None:
+            reason = getattr(reason, "value", reason)
+            logger.warning("%s send refused: %s", self._log_prefix, reason)
+            raise GhlSendRefused(reason)
 
     def _lift_cold_dnd(self, contact_id: str, identity: dict, channels: tuple[str, ...]) -> None:
         """Lift ``channels`` only where the GHL contact's do-not-disturb is the cold push's own. Do-not-disturb set
@@ -195,6 +211,7 @@ class GhlSmsSender:
         """Upsert the contact, then send. ``deadline`` (UTC) is the latest moment a send may still start;
         past it nothing is sent and a non-ambiguous GhlSmsError is raised."""
         decision = self._cold_lead_check(phone, SendChannel.SMS)
+        self._line_type_check(phone)
         self._admit()
         contact: dict[str, Any] = {"locationId": self._account.location_id, "phone": phone}
         if first_name:
@@ -219,6 +236,15 @@ class GhlSmsSender:
             raise GhlSmsError("GHL message send returned no message id", ambiguous=True)
         self._count_success()
         return str(message_id)
+
+
+def _line_type_gate(phone: str) -> Optional[str]:
+    """``compliance.sms_block_reason`` in its own short transaction (it may store a Telnyx lookup)."""
+    from src.core.database import get_db_context
+    from src.lending.compliance import sms_block_reason
+
+    with get_db_context() as db:
+        return sms_block_reason(db, phone)
 
 
 def get_sender(*, internal_alert: bool = False) -> Optional[GhlSmsSender]:

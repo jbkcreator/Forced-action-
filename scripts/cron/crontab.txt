@@ -1346,6 +1346,11 @@ COUNTY_ID=hillsborough
 # lending, in case the GHL "DND changed" workflow webhook is missing or down. Idempotent.
 */15 * * * * $PROJECT/scripts/cron/run.sh src.lending.ghl_dnd_backstop
 
+# R1 0.11 nightly opt-out sync (2:37 AM ET, off the */15 GHL backstop minutes): pulls GHL DND + NDL's Instantly block list into lending opt-outs, then
+# pushes anything not yet done to GHL DND, BatchDialer removals and the Instantly block-list queue. Adds only, never
+# removes. A failed step posts to LENDING_OPS_NOTICE_CHANNEL and retries the next night.
+37 7 * * * $PROJECT/scripts/cron/run.sh src.tasks.nightly_dnc_sync
+
 # Lending opt-out mailbox: email sent to LENDING_OPTOUT_ADDRESS is suppressed (address + any phone in it) and
 # posted to LENDING_OPS_CHANNEL. Reads the mailbox read-only over IMAP; idle until LENDING_OPTOUT_IMAP_USER/_PASSWORD are set.
 */5 * * * * $PROJECT/scripts/cron/run.sh src.lending.email_opt_out
@@ -1353,6 +1358,18 @@ COUNTY_ID=hillsborough
 # Lending opt-out webhook recovery: replays GHL opt-out / consent webhook calls that failed (saved in
 # lending.webhook_failures) until they succeed; alerts LENDING_OPS_CHANNEL when one is given up.
 */5 * * * * $PROJECT/scripts/cron/run.sh src.lending.webhook_failures
+
+# Lending inbound retention (R1 0.5 D11) — 08:30 UTC (03:30 EST / 04:30 EDT): nulls the raw body of inbound_events
+# processed 30+ days ago and empties the payload of webhook_failures resolved 30+ days ago; open/failed rows untouched.
+# Idle until LENDING_INBOUND_JOURNAL_ENABLED=true.
+30 8 * * * $PROJECT/scripts/cron/run.sh src.lending.inbound.retention
+
+# Lending nightly reconcile (R1 0.5 D9/D10) — 2:00 AM ET: GHL stage changes of the NDL pipeline(s) updated in the last 24 h that
+# never reached us are healed through the ghl_stage journal handler. Two lines because ET is UTC-4 until Nov 1 and UTC-5 after;
+# the task acts only at 2:xx ET. Posts to LENDING_OPS_CHANNEL only when it healed something or failed. Idle until
+# LENDING_RECONCILE_ENABLED=true (+ LENDING_RECONCILE_GHL_PIPELINE_IDS).
+0 6 * * * $PROJECT/scripts/cron/run.sh src.tasks.lending_reconciliation
+0 7 * * * $PROJECT/scripts/cron/run.sh src.tasks.lending_reconciliation
 
 # OFR mortgage-broker refresh (WP-W0-1 Pool 3) — MONTHLY.
 # OFR publishes the MBR-MBRB file monthly; this downloads + unzips + loads it
