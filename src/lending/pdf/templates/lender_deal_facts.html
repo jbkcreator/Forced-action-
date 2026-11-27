@@ -1,0 +1,39 @@
+{% extends "base.html" %}
+{% block title %}Deal Facts{% endblock %}
+{% block header_tag %}Deal Facts{% endblock %}
+{% block extra_head %}
+<style>
+  h1 { font-size: 20pt; font-weight: 850; margin: 0 0 4px; }
+  .address { font-size: 13pt; font-weight: 750; color: var(--green); margin: 0 0 18px; }
+  h2 { font-size: 12pt; margin: 22px 0 6px; letter-spacing: .04em; text-transform: uppercase; color: var(--ink-2); }
+  table { width: 100%; border-collapse: collapse; margin: 4px 0 12px; }
+  td, th { padding: 7px 4px; border-bottom: 1px solid var(--line); font-size: 10.5pt; text-align: left; }
+  td.num, th.num { text-align: right; }
+  .muted { color: var(--ink-2); font-size: 9.5pt; }
+  .stamp { border: 2px solid #b42318; color: #b42318; font-weight: 800; padding: 6px 10px; display: inline-block; }
+</style>
+{% endblock %}
+{% block body %}
+<p class="muted">{{ generated_date }} · Ref {{ package_ref }} · Prepared for {{ lender_name }}</p>
+{% if not box_confirmed %}<p class="stamp">Box not confirmed — do not submit</p>{% endif %}
+{% if fit_needs %}<p class="stamp">Fit not confirmed — {{ fit_needs | join('; ') }}</p>{% endif %}
+<h1>Deal facts</h1>
+<p class="address">{{ address }}</p>
+
+<table>
+  {% for label, value in deal_rows %}<tr><td>{{ label }}</td><td class="num">{{ value }}</td></tr>{% endfor %}
+</table>
+
+{% if parties %}
+<h2>Borrower and guarantors</h2>
+<table>
+  {% for name in parties %}<tr><td>{{ name }}</td></tr>{% endfor %}
+</table>
+{% endif %}
+
+<h2>Documents</h2>
+<table>
+  <tr><th>Item</th><th class="num">Status</th></tr>
+  {% for item in checklist %}<tr><td>{{ item.label }}</td><td class="num">{{ "Received" if item.received else "Missing" }}</td></tr>{% endfor %}
+</table>
+{% endblock %}

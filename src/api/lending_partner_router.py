@@ -36,6 +36,8 @@ from config.lending_partners import (
 )
 from config.settings import get_settings
 from src.lending.db import get_lending_db
+from src.lending.packaging.packet_validator import PARTNER_FILE_UPLOADS
+from src.lending.packaging.quarantine import scan_new_uploads
 from src.lending.partner_pipeline import process_new_file
 from src.lending.partners import (
     ConsentEvidence,
@@ -184,6 +186,7 @@ def submit_file(
         logger.error("[partner-door] could not save submission partner=%s (%s)", partner.id, type(error).__name__)
         return _form(token, partner, consent_text, values=values, status_code=500,
                      errors=["We could not save this file. Please try again, or contact Next Deal Lending."])
+    scan_new_uploads(db, PARTNER_FILE_UPLOADS, partner_file_id=file_id)
     background_tasks.add_task(run_pipeline_in_background, file_id)
     return _page("received.html", token=token, file_id=file_id)
 

@@ -262,6 +262,24 @@ _CENTRAL_LENDING = LenderRules(
                           LoanType.BRIDGE, LoanType.DSCR_RENTAL}),
 )
 
+# CoreVest Finance — NOT VERIFIED, shell only (secondary lender; awaiting values from the client).
+_COREVEST = LenderRules(
+    key="corevest",
+    name="CoreVest Finance",
+    verified=False,
+    loan_types=frozenset({LoanType.FIX_AND_FLIP, LoanType.GROUND_UP_CONSTRUCTION,
+                          LoanType.BRIDGE, LoanType.DSCR_RENTAL}),
+)
+
+# Temple View Capital — NOT VERIFIED, shell only (secondary lender; awaiting values from the client).
+_TEMPLE_VIEW = LenderRules(
+    key="temple_view",
+    name="Temple View Capital",
+    verified=False,
+    loan_types=frozenset({LoanType.FIX_AND_FLIP, LoanType.GROUND_UP_CONSTRUCTION,
+                          LoanType.BRIDGE}),
+)
+
 # Canonical order: used by evaluate_lender_fit when no matrix is passed.
 # Backflip entries are split by product but share "generic_backflip" in
 # display grouping; the evaluator picks the first qualifying entry.
@@ -273,7 +291,17 @@ LENDER_MATRIX: tuple[LenderRules, ...] = (
     _KIAVI_AFFILIATE,
     _ABL,
     _CENTRAL_LENDING,
+    _COREVEST,
+    _TEMPLE_VIEW,
 )
+
+# Lenders a declined or unassigned file is screened against for a drafted package (not Easy Street or Kiavi).
+SECONDARY_LENDER_KEYS: frozenset[str] = frozenset({
+    "corevest",
+    "rcn_capital",
+    "temple_view",
+    "abl",
+})
 
 # The date each lender's config values took effect; seeded into lender_rule_values.effective_from.
 RULES_EFFECTIVE_FROM: dict[str, date] = {
@@ -284,6 +312,8 @@ RULES_EFFECTIVE_FROM: dict[str, date] = {
     "kiavi_affiliate": date(2026, 11, 3),
     "abl": date(2026, 11, 3),
     "central_lending": date(2026, 11, 3),
+    "corevest": date(2026, 11, 26),                      # unverified shells
+    "temple_view": date(2026, 11, 26),
 }
 
 

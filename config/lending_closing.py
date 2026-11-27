@@ -44,6 +44,15 @@ class ChecklistItem:
 
 # Josh's Term Sheet Intake Checklist (Nov 2), "what can wait until after the term sheet". Central Lending only:
 # Backflip stays blocked until Josh approves it in writing.
+# Secondary lenders start as a copy of Central Lending's items, marked placeholder until the client confirms them.
+_PLACEHOLDER_SECONDARY: tuple[ChecklistItem, ...] = (
+    ChecklistItem("purchase_agreement", "Signed purchase agreement [placeholder]"),
+    ChecklistItem("valuation", "Valuation or appraisal [placeholder]"),
+    ChecklistItem("scope_of_work", "Scope of work and budget [placeholder]"),
+    ChecklistItem("entity_docs", "LLC documents [placeholder]"),
+    ChecklistItem("government_id", "Photo ID for each guarantor [placeholder]"),
+    ChecklistItem("bank_statements", "Last 30 days of bank statements (down payment plus reserves) [placeholder]"),
+)
 LENDER_CHECKLISTS: dict[str, tuple[ChecklistItem, ...]] = {
     "central_lending": (
         ChecklistItem("purchase_agreement", "Signed purchase agreement"),
@@ -53,12 +62,28 @@ LENDER_CHECKLISTS: dict[str, tuple[ChecklistItem, ...]] = {
         ChecklistItem("government_id", "Photo ID for each guarantor"),
         ChecklistItem("bank_statements", "Last 30 days of bank statements (down payment plus reserves)"),
     ),
+    "corevest": _PLACEHOLDER_SECONDARY,
+    "rcn_capital": _PLACEHOLDER_SECONDARY,
+    "temple_view": _PLACEHOLDER_SECONDARY,
+    "abl": _PLACEHOLDER_SECONDARY,
 }
+
+# Required by no lender yet; its maximum age is LENDING_PRICING_SHEET_MAX_AGE_DAYS.
+PRICING_SHEET_ITEM = ChecklistItem("pricing_sheet", "Pricing sheet")
+
 
 # P2.2 instant-quote condition codes that add a document.
 CONDITION_ITEMS: dict[str, ChecklistItem] = {
     "INTEREST_RESERVE_FULL_TERM": ChecklistItem("interest_reserve_funds",
                                                 "Proof of funds for the full-term interest reserve"),
+}
+
+# Every document type a staff member may tag an upload with.
+DOCUMENT_TYPES: dict[str, str] = {
+    **{item.code: item.label for items in LENDER_CHECKLISTS.values() for item in items
+       if not item.label.endswith("[placeholder]")},
+    **{item.code: item.label for item in CONDITION_ITEMS.values()},
+    PRICING_SHEET_ITEM.code: PRICING_SHEET_ITEM.label,
 }
 
 

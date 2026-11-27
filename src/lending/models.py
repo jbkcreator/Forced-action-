@@ -1723,6 +1723,10 @@ class LendingPartnerFileUpload(LendingBase):
     content_type: Mapped[str] = mapped_column(String(80), nullable=False)
     size_bytes: Mapped[int] = mapped_column(Integer, nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_now, server_default=text("now()"))
+    quarantine_status: Mapped[Optional[str]] = mapped_column(String(20))  # 'quarantined' or 'released'; NULL = clean
+    quarantine_reason: Mapped[Optional[str]] = mapped_column(String(300))
+    item_code: Mapped[Optional[str]] = mapped_column(String(40))  # set by staff; NULL = unclassified, kept out of packages
+    superseded_by: Mapped[Optional[str]] = mapped_column(String(60))  # doc key of the staff-chosen replacement
 
     __table_args__ = (Index("idx_lending_partner_file_uploads_file", "file_id"),)
 
@@ -2038,6 +2042,9 @@ class LendingDocChaseUpload(LendingBase):
     drive_file_id: Mapped[Optional[str]] = mapped_column(String(100))  # set once copied to Josh's folder (doc_copies)
     drive_attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default=text("0"))
     drive_retry_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))  # next try after a failure
+    quarantine_status: Mapped[Optional[str]] = mapped_column(String(20))  # 'quarantined' or 'released'; NULL = clean
+    quarantine_reason: Mapped[Optional[str]] = mapped_column(String(300))
+    superseded_by: Mapped[Optional[str]] = mapped_column(String(60))  # doc key of the staff-chosen replacement
 
     __table_args__ = (Index("idx_lending_doc_chase_uploads_chase", "chase_id"),)
 
@@ -2309,6 +2316,53 @@ class LendingSunbizLlcContact(LendingBase):
     __table_args__ = (
         CheckConstraint("subject_role IN ('officer', 'agent')", name="ck_lending_sunbiz_llc_contacts_role"),
     )
+
+
+class LendingLenderPackage(LendingBase):
+    """A drafted package for one file and one secondary lender; at most one open (not submitted / dismissed) per pair."""
+
+    __tablename__ = "lender_packages"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    source_type: Mapped[str] = mapped_column(String(20), nullable=False)  # loan_file | lf_lead
+    source_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    lender_key: Mapped[str] = mapped_column(String(60), nullable=False)
+    status: Mapped[str] = mapped_column(String(20), nullable=False, default="draft", server_default=text("'draft'"))
+    box_confirmed: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default=text("false"))
+    fit_result: Mapped[Optional[dict]] = mapped_column(JSONB)
+    checklist: Mapped[Optional[list]] = mapped_column(JSONB)
+    validator_verdict: Mapped[Optional[dict]] = mapped_column(JSONB)
+    overrides: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict, server_default=text("'{}'::jsonb"))
+    screen_fingerprint: Mapped[Optional[str]] = mapped_column(String(64))
+    deal_facts_path: Mapped[Optional[str]] = mapped_column(String(300))
+    card_channel: Mapped[Optional[str]] = mapped_column(String(40))
+    card_ts: Mapped[Optional[str]] = mapped_column(String(40))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_now, server_default=text("now()"))
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_now, server_default=text("now()"))
+
+    __table_args__ = (
+        CheckConstraint("status IN ('draft','blocked','ready','submitted','dismissed')",
+                        name="ck_lending_lender_packages_status"),
+        CheckConstraint("source_type IN ('loan_file','lf_lead')", name="ck_lending_lender_packages_source_type"),
+        Index("idx_lending_lender_packages_source", "source_type", "source_id"),
+        Index("uq_lending_lender_packages_open", "source_type", "source_id", "lender_key", unique=True,
+              postgresql_where=text("status NOT IN ('submitted','dismissed')")),
+    )
+
+
+class LendingLoanFileGuarantor(LendingBase):
+    """A guarantor staff recorded on a loan file; the packet validator accepts their name on the file's documents."""
+
+    __tablename__ = "loan_file_guarantors"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    loan_file_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("lending.loan_files.id", ondelete="CASCADE"),
+                                              nullable=False)
+    name: Mapped[str] = mapped_column(String(200), nullable=False)
+    added_by: Mapped[str] = mapped_column(String(80), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_now, server_default=text("now()"))
+
+    __table_args__ = (UniqueConstraint("loan_file_id", "name", name="uq_lending_loan_file_guarantors_name"),)
 
 
 # ── R1 0.9: Shadow mode ─────────────────────────────────────────────────────────

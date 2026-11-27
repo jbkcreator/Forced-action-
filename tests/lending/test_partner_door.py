@@ -21,6 +21,7 @@ from sqlalchemy.orm import Session
 from sqlalchemy.pool import StaticPool
 
 from config.settings import get_settings
+from migrations.apply_lending_lender_packages import ADDED_COLUMNS as PACKAGE_COLUMNS
 from migrations.apply_lending_loan_state_machine import ADDED_COLUMNS
 from migrations.apply_lending_partner_door import apply_to
 from src.api import lending_partner_router
@@ -589,7 +590,8 @@ def test_migration_and_models_have_the_same_columns(model) -> None:
     body = ddl.split("(", 1)[1]
     ddl_columns = {line.split()[0] for line in body.splitlines() if re.match(r"^\s+[a-z_]+\s", line)}
     # Columns the R1 0.1 migration adds later are not in the CREATE statement.
-    assert ddl_columns | ADDED_COLUMNS.get(model.__tablename__, frozenset()) == {column.name for column in model.__table__.columns}
+    later = ADDED_COLUMNS.get(model.__tablename__, frozenset()) | set(PACKAGE_COLUMNS.get(model.__tablename__, {}))
+    assert ddl_columns | later == {column.name for column in model.__table__.columns}
 
 
 def test_migration_is_rerunnable() -> None:
