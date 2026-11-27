@@ -35,6 +35,7 @@ from typing import Any, Mapping, Optional
 from sqlalchemy import text
 
 from config.lending_dispositions import GHL_UNKNOWN_CALLER, canonical_ghl_caller
+from config.lending_unified_inbox import CHANNEL_MISSED_CALL, GHL_INBOUND_DIRECTIONS, SOURCE_GHL
 from config.lending_followup import CALL_SOURCE_GHL, GHL_CALL_ID_PREFIX, GHL_CALLER_SEAT, GHL_CAMPAIGN_TAG
 from config.lending_missed_call import (
     GHL_MISSED_CALL_KEY_PREFIX,
@@ -47,6 +48,7 @@ from src.lending.compliance import phone_hash
 from src.lending.dispositions import _to_dt, queue_missed_call
 from src.lending.ghl_consent_events import InvalidEvent
 from src.lending.ghl_disposition_match import _value
+from src.lending.inbox.unified_triage import InboundItem
 from src.services.phone_utils import normalize
 
 logger = logging.getLogger(__name__)
@@ -161,6 +163,32 @@ def parse_missed_call(body: Mapping[str, Any], received_at: datetime) -> Optiona
         dialer_call_id=key, phone=phone, status=status, started_at=started, ended_at=ended,
         contact_id=_value(body, "contact_id"), caller_name=canonical_ghl_caller((_value(body, "user") or "")[:200] or None),
     )
+
+
+def parse_inbound_missed_call(body: Mapping[str, Any], received_at: datetime) -> Optional[InboundItem]:
+    """R1 1.5: a borrower called NDL and nobody picked up. The inbox item, None when the post is not one (answered,
+    outbound or no direction), InvalidMissedCall when it has no phone. Never a call row or a text-back event: those
+    belong to our own unanswered outbound calls (``parse_missed_call``).
+
+    UNVERIFIED: the status GHL reports for a missed INBOUND call. Capture one with LENDING_GHL_LOG_PAYLOAD_SHAPE and,
+    when it is outside GHL_MISSED_CALL_STATUSES, add it there (docs/lending/unified-inbox.md)."""
+    status = _status(_value(body, "call_status"))
+    direction = (_value(body, "direction") or "").strip().lower()
+    if status not in GHL_MISSED_CALL_STATUSES or direction not in GHL_INBOUND_DIRECTIONS:
+        return None
+    phone = _phone(body)
+    if not phone:
+        raise InvalidMissedCall(REASON_NO_PHONE)
+    started_sent, ended_sent = _time(body, "called_at"), _time(body, "ended_at")
+    ended = min(ended_sent or started_sent or received_at, received_at)
+    started = min(started_sent or ended, ended)
+    call_id = _value(body, "call_id")
+    key = (f"{GHL_CALL_ID_PREFIX}{call_id}"[:100] if call_id
+           else missed_call_key(phone, started if (started_sent or ended_sent)
+                                else received_at.replace(second=0, microsecond=0)))
+    return InboundItem(source=SOURCE_GHL, channel=CHANNEL_MISSED_CALL, dedup_key=f"ghl_call:{key}",
+                       ghl_contact_id=_value(body, "contact_id"), phone=phone,
+                       occurred_at=started)
 
 
 def _window(at: datetime) -> dict[str, Any]:

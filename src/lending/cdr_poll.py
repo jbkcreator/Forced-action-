@@ -17,9 +17,11 @@ from urllib.parse import urlencode
 from sqlalchemy import text
 
 from config.lending_dispositions import DNC_CODE
+from config.lending_unified_inbox import CHANNEL_MISSED_CALL, SOURCE_BATCHDIALER
 from src.lending.call_pipeline import follow_up, lending_campaign_ids, process_event
 from src.lending.consent import record_consent
 from src.lending.dispositions import DialerCallEvent, normalize_code, parse_event
+from src.lending.inbox.unified_triage import InboundItem, record_inbound
 from src.services.phone_utils import normalize
 
 logger = logging.getLogger(__name__)
@@ -120,6 +122,21 @@ def _grant_inbound_consent(db, ev: DialerCallEvent) -> None:
     db.commit()
 
 
+def _record_missed_inbound(db, ev: DialerCallEvent) -> None:
+    """R1 1.5: an inbound call nobody talked to becomes an inbox item (idempotent per CDR). Best effort: a failed
+    write is logged and never stops ingestion."""
+    phone = normalize(ev.phone) if ev.phone else None
+    if not phone:
+        return
+    try:
+        with db.begin_nested():
+            record_inbound(db, InboundItem(source=SOURCE_BATCHDIALER, channel=CHANNEL_MISSED_CALL,
+                                           dedup_key=f"bd_cdr:{ev.call_id}", phone=phone,
+                                           occurred_at=ev.started_at or ev.ended_at))
+    except Exception as exc:  # class only: SQL errors embed bound params (phones)
+        logger.error("[lending] CDR %s inbox missed call failed: %s", ev.call_id, type(exc).__name__)
+
+
 def known_lead_phones(db, phones: list[str]) -> set[str]:
     """The phones (normalized) that belong to one of our leads: loaded into the dialer, or a lending contact."""
     if not phones:
@@ -171,6 +188,10 @@ def ingest(db, items: list[dict], *, only_changed: bool) -> IngestStats:
             except Exception as exc:  # consent capture must never stop ingestion
                 db.rollback()
                 logger.error("[lending] CDR %s inbound consent failed: %s", ev.call_id, type(exc).__name__)
+    for ev in parsed:
+        if (ev.campaign_id in campaigns and ev.direction == "inbound" and not (ev.duration or 0)
+                and ev.call_id not in recorded_ids):
+            _record_missed_inbound(db, ev)
     if only_changed:
         pending = _changed(db, events)
         stats.skipped = len(events) - len(pending)

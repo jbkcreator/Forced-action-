@@ -169,10 +169,12 @@ def test_the_ghl_workflow_body_with_outgoing_direction_is_queued(route):
 
 
 @pytest.mark.parametrize("direction", ["Incoming", "inbound"])
-def test_an_incoming_call_from_the_workflow_is_still_ignored(route, direction):
+def test_an_incoming_call_never_reaches_text_back_and_is_a_no_op_while_the_unified_inbox_is_off(route, direction):
+    """R1 1.5 changed the answer from "ignored" to "disabled" (LENDING_UNIFIED_INBOX_ENABLED is off by default): an
+    inbound miss is the inbox's, never a text-back attempt."""
     client, db, got = route
     resp = client.post("/webhooks/lending/ghl-missed-call", headers=HEADERS, json={**GHL_BODY, "direction": direction})
-    assert resp.json() == {"queued": False, "ignored": True} and got["recorded"] == [] and db.commits == 0
+    assert resp.json() == {"queued": False, "status": "disabled"} and got["recorded"] == [] and db.commits == 0
 
 
 def test_a_wrong_secret_is_refused(route):
