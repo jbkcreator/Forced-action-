@@ -555,8 +555,8 @@ class ReplyProcessor:
                 return True
             if self._hand_off is not None:
                 self._hand_off(row)
-        except HandoffPaused:
-            logger.warning("[instantly-replies] reply %s GHL handoff pending: opt-outs can't be verified", row["id"])
+        except HandoffPaused as paused:
+            logger.warning("[instantly-replies] reply %s GHL handoff pending: %s", row["id"], paused)
             db.execute(_HANDOFF_PENDING, {"id": row["id"]})
             return False
         except Exception as exc:  # the step name and status carry no address; the class alone for anything else

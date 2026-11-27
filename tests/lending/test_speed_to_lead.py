@@ -366,9 +366,14 @@ def test_an_unreadable_suppression_table_holds_the_text_and_still_records_the_le
     def unreadable(db, phone):
         raise RuntimeError("suppression_list unreadable")
 
+    def gate_unreadable(db, phones, *, now, halted):
+        raise RuntimeError("suppression_list unreadable")
+
     monkeypatch.setattr(speed_to_lead, "has_text_consent", unreadable)
+    monkeypatch.setattr("src.lending.ghl_call_gate.blocked_reasons", gate_unreadable)  # the call gate reads it too
     outcome, tags, db = run(web_lead())
     assert outcome.text_status == TEXT_HELD and ("add", "c-7", GHL_TAG_WEB_INTRO_READY) not in tags.calls
+    assert outcome.call_status == CALL_QUEUED  # fails closed: queued, never started, never lost
     assert db.records and db.records[-1]["text_status"] == TEXT_HELD
 
 

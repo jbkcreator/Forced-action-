@@ -186,3 +186,17 @@ def test_the_bridge_query_leaves_out_excluded_segments():
 @contextmanager
 def _ctx(db):
     yield db
+
+
+def test_the_nightly_schedule_in_config_matches_the_runner_cron_lines():
+    """The freshness check judges ``PROPERTYRADAR_NIGHTLY_CAMPAIGNS`` x ``ENABLED_STATES``; a cron line added or
+    dropped without updating it would leave a pull unjudged (or judged but never run)."""
+    import re
+    from pathlib import Path
+
+    from config.lending_fallbacks import PROPERTYRADAR_NIGHTLY_CAMPAIGNS
+    from config.property_radar_campaigns import ENABLED_STATES
+
+    cron = Path(__file__).resolve().parents[2].joinpath("scripts/cron/crontab.txt").read_text()
+    lines = re.findall(r"^[^#\n].*property_radar_runner .*--mode daily --state (\w+) --campaign (\w+)", cron, re.M)
+    assert set(lines) == {(s, c) for s in ENABLED_STATES for c in PROPERTYRADAR_NIGHTLY_CAMPAIGNS}

@@ -438,7 +438,12 @@ def _call(db, source: str, lead: Mapping[str, Any], tags: TagClient, *, halted: 
     queue it (or block it for good)."""
     if not get_settings().lending_speed_to_lead_enabled:
         return CallStep(CALL_OFF)
-    gated = _gate(db, source, lead, halted=halted, now=now, scrubber=scrubber)
+    try:
+        with db.begin_nested():
+            gated = _gate(db, source, lead, halted=halted, now=now, scrubber=scrubber)
+    except Exception as exc:  # class only: the call gate reads the suppression list; the lead is already claimed
+        logger.error("[speed-to-lead] call gate unreadable lead=%s:%s: %s", source, lead["id"], type(exc).__name__)
+        return CallStep(CALL_QUEUED, queue_reason=QUEUE_DELAYED)  # fails closed; the queue sweep checks it again
     if gated is not None:
         return gated
     if now - lead["received_at"] > FRESH_LEAD_WINDOW:

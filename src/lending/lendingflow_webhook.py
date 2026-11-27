@@ -114,6 +114,7 @@ def _ingest(parsed, payload: dict, background_tasks: BackgroundTasks) -> dict:
     except Exception as exc:  # raw save failed: 5xx so LendingFlow delivers it again (class only: SQL echoes the body)
         logger.error("[lendingflow] raw save failed vendor=%s: %s", parsed.vendor_lead_id, type(exc).__name__)
         raise HTTPException(status_code=500, detail="Could not store the lead") from None
+    dependency_health.record_success(FEED_LENDINGFLOW_INBOUND)  # R1 0.6: the delivery is saved, even if its lead is not yet
     if result.outcome == "failed":
         return {"status": "accepted"}
     if result.outcome == "duplicate" or not result.value.created:
