@@ -3,8 +3,8 @@
 Counts the contacts David can actually call today, or names every dialer pool that ran dry. A short queue also goes
 to the ops channel. Nothing is padded and nothing is pushed to BatchDialer.
 
-Cron fires at 10:20 and 11:20 UTC, Mon-Fri; only the one that is 6:xx ET acts, so daylight saving needs no change. Off
-until LENDING_DIALER_QUEUE_CHECK_ENABLED=true.
+Cron fires at 10:20 and 11:20 UTC, Mon-Fri; the one that is 6:xx ET acts, so daylight saving needs no change. A later
+call the same day only finishes an unfinished run. Off until LENDING_DIALER_QUEUE_CHECK_ENABLED=true.
 
     python -m src.tasks.lending_dialer_queue_check [--force] [--dry-run]
 

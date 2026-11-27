@@ -3,8 +3,8 @@
 The main post has his day's numbers and top calls. When a connected call has no recording and no notes, an "Add notes"
 thread under it opens a Slack form (src/lending/dialer/call_notes.py).
 
-Cron fires at 18:45 and 19:45 UTC, Mon-Fri; only the one that is 14:xx ET acts, so daylight saving needs no change.
-Off until LENDING_CALLER_SCORECARD_ENABLED=true.
+Cron fires at 18:45 and 19:45 UTC, Mon-Fri; the one that is 14:xx ET acts, so daylight saving needs no change. A later
+call the same day only finishes an unfinished run. Off until LENDING_CALLER_SCORECARD_ENABLED=true.
 
     python -m src.tasks.lending_caller_scorecard [--force] [--dry-run]
 
