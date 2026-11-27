@@ -67,3 +67,26 @@ def test_release_endpoint_only_takes_upload_tables(client, monkeypatch):
     assert http.post("/api/lending/docs/staff/documents/users/1/release", json={"reason": "fine"}).status_code == 404
     ok = http.post("/api/lending/docs/staff/documents/partner_file_uploads/4/release", json={"reason": "checked"})
     assert ok.status_code == 200 and released == [("partner_file_uploads", 4, "human:staff_token:4")]
+
+
+def test_supersede_endpoint_passes_both_documents_and_the_staff_actor(client, monkeypatch):
+    http, db = client
+    seen = {}
+    monkeypatch.setattr(router_module, "supersede_document",
+                        lambda db, t, u, bt, bu, *, actor: seen.update(old=(t, u), new=(bt, bu), actor=actor))
+    response = http.post("/api/lending/docs/staff/documents/doc_chase_uploads/3/superseded",
+                         json={"by_table": "doc_chase_uploads", "by_id": 8})
+    assert response.status_code == 200 and db.commits == 1
+    assert seen == {"old": ("doc_chase_uploads", 3), "new": ("doc_chase_uploads", 8), "actor": "human:staff_token:4"}
+    assert http.post("/api/lending/docs/staff/documents/users/3/superseded",
+                     json={"by_table": "doc_chase_uploads", "by_id": 8}).status_code == 404
+
+
+def test_guarantor_endpoint_records_the_name(client, monkeypatch):
+    http, db = client
+    seen = {}
+    monkeypatch.setattr(router_module, "add_guarantor",
+                        lambda db, fid, name, *, actor: seen.update(fid=fid, name=name, actor=actor) or True)
+    response = http.post("/api/lending/docs/staff/loan-files/7/guarantors", json={"name": "Carol White"})
+    assert response.status_code == 200 and response.json() == {"loan_file_id": 7, "added": True}
+    assert seen == {"fid": 7, "name": "Carol White", "actor": "human:staff_token:4"} and db.commits == 1

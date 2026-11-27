@@ -8,7 +8,7 @@ from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from config.lending_closing import DOCUMENT_TYPES
-from src.lending.packaging import quarantine
+from src.lending.packaging import quarantine, screen
 from src.lending.packaging.package import (
     CLOSED_STATUSES,
     DISMISSED,
@@ -17,10 +17,12 @@ from src.lending.packaging.package import (
     CompileResult,
     compile_package,
 )
-from src.lending.packaging.packet_validator import PARTNER_FILE_UPLOADS, Outcome, doc_key
+from src.lending.packaging.packet_validator import DOC_CHASE_UPLOADS, PARTNER_FILE_UPLOADS, UPLOAD_TABLES, Outcome, doc_key
 
 _CLOSE = text("UPDATE lending.lender_packages SET status = :status, updated_at = now() "
               "WHERE id = :id AND status NOT IN ('submitted', 'dismissed')")
+# Held until the transaction ends, so two clicks on one package run one after the other, never both on an open row.
+_LOCK = text("SELECT id FROM lending.lender_packages WHERE id = :id FOR UPDATE")
 _ADD_OVERRIDE = text("UPDATE lending.lender_packages SET overrides = overrides || CAST(:entry AS jsonb), "
                      "updated_at = now() WHERE id = :id")
 
@@ -30,6 +32,7 @@ class ActionRefused(Exception):
 
 
 def _open(db: Session, package_id: int, today: date) -> CompileResult:
+    db.execute(_LOCK, {"id": package_id})
     result = compile_package(db, package_id, today=today, renderer=None)
     if result is None:
         raise ActionRefused("That package is no longer open (submitted, dismissed or removed).")
@@ -37,7 +40,8 @@ def _open(db: Session, package_id: int, today: date) -> CompileResult:
 
 
 def mark_submitted(db: Session, package_id: int, *, actor: str, today: date) -> int:
-    """Re-validate now, then record the lender submission. Returns the lender_submissions id."""
+    """Re-validate the documents and re-check the fit against today's facts and rules, then close the package and
+    record the lender submission in the same transaction. Returns the lender_submissions id."""
     from src.lending.state_machine import record_lender_submission
 
     result = _open(db, package_id, today)
@@ -50,8 +54,12 @@ def mark_submitted(db: Session, package_id: int, *, actor: str, today: date) -> 
     if result.source_type != LOAN_FILE:
         raise ActionRefused("This is a LendingFlow lead with no loan file, so the submission cannot be recorded. "
                             "Open a loan file for the borrower first.")
+    problem = screen.current_fit_problem(db, result.source_type, result.source_id, result.lender_key)
+    if problem:
+        raise ActionRefused(problem)
+    if db.execute(_CLOSE, {"id": package_id, "status": SUBMITTED}).rowcount != 1:
+        raise ActionRefused("That package is no longer open (submitted, dismissed or removed).")
     submission_id = record_lender_submission(db, result.source_id, result.lender_key, actor=actor)
-    db.execute(_CLOSE, {"id": package_id, "status": SUBMITTED})
     quarantine.ledger(db, result.source_id, "package_submitted", actor=actor,
                       detail={"lender_key": result.lender_key, "submission_id": submission_id},
                       ref_table="lender_packages", ref_id=package_id)
@@ -60,10 +68,11 @@ def mark_submitted(db: Session, package_id: int, *, actor: str, today: date) -> 
 
 def dismiss(db: Session, package_id: int, *, actor: str) -> None:
     row = db.execute(text("SELECT source_type, source_id, lender_key, status FROM lending.lender_packages "
-                          "WHERE id = :id"), {"id": package_id}).mappings().first()
+                          "WHERE id = :id FOR UPDATE"), {"id": package_id}).mappings().first()
     if row is None or row["status"] in CLOSED_STATUSES:
         raise ActionRefused("That package is no longer open.")
-    db.execute(_CLOSE, {"id": package_id, "status": DISMISSED})
+    if db.execute(_CLOSE, {"id": package_id, "status": DISMISSED}).rowcount != 1:
+        raise ActionRefused("That package is no longer open.")
     quarantine.ledger(db, row["source_id"] if row["source_type"] == LOAN_FILE else None, "package_dismissed",
                       actor=actor, detail={"lender_key": row["lender_key"]}, ref_table="lender_packages",
                       ref_id=package_id)
@@ -116,3 +125,66 @@ def release_document(db: Session, upload_table: str, upload_id: int, *, reason: 
         raise ActionRefused("No such document.")
     except ValueError as exc:
         raise ActionRefused(str(exc))
+
+
+_UPLOAD_OWNER = {
+    DOC_CHASE_UPLOADS: text("SELECT c.loan_file_id, c.lead_ref, u.item_code, u.superseded_by "
+                            "FROM lending.doc_chase_uploads u JOIN lending.doc_chases c ON c.id = u.chase_id "
+                            "WHERE u.id = :id"),
+    PARTNER_FILE_UPLOADS: text("SELECT file_id AS loan_file_id, NULL AS lead_ref, item_code, superseded_by "
+                               "FROM lending.partner_file_uploads WHERE id = :id"),
+}
+
+
+def _upload_owner(db: Session, upload_table: str, upload_id: int):
+    if upload_table not in UPLOAD_TABLES:
+        raise ActionRefused(f"Unknown document table {upload_table!r}.")
+    row = db.execute(_UPLOAD_OWNER[upload_table], {"id": upload_id}).mappings().first()
+    if row is None:
+        raise ActionRefused(f"No such document #{upload_id}.")
+    return row
+
+
+def supersede_document(db: Session, upload_table: str, upload_id: int, by_table: str, by_id: int, *,
+                       actor: str) -> None:
+    """Mark one upload as replaced by a newer upload of the same type on the same file. The old upload and its
+    history are kept; packages stop checking it. A quarantine on it stays (no link, no Drive copy)."""
+    if (upload_table, upload_id) == (by_table, by_id):
+        raise ActionRefused("A document cannot replace itself.")
+    old, new = _upload_owner(db, upload_table, upload_id), _upload_owner(db, by_table, by_id)
+    same_file = (old["loan_file_id"] is not None and old["loan_file_id"] == new["loan_file_id"]) or (
+        old["loan_file_id"] is None and new["loan_file_id"] is None and old["lead_ref"] == new["lead_ref"])
+    if not same_file:
+        raise ActionRefused("The replacement must be a document on the same file.")
+    if old["item_code"] is None or old["item_code"] != new["item_code"]:
+        raise ActionRefused("The replacement must be a document of the same type.")
+    if new["superseded_by"] is not None:
+        raise ActionRefused(f"#{by_id} has itself been replaced.")
+    by_key = doc_key(by_table, by_id)
+    updated = db.execute(text(f"UPDATE lending.{upload_table} SET superseded_by = :by "
+                              "WHERE id = :id AND superseded_by IS NULL"), {"id": upload_id, "by": by_key}).rowcount
+    if updated != 1:
+        raise ActionRefused(f"#{upload_id} has already been replaced.")
+    quarantine.ledger(db, old["loan_file_id"], "doc_superseded", actor=actor, detail={"superseded_by": by_key},
+                      ref_table=upload_table, ref_id=upload_id)
+
+
+_ADD_GUARANTOR = text("""
+    INSERT INTO lending.loan_file_guarantors (loan_file_id, name, added_by) VALUES (:id, :name, :actor)
+    ON CONFLICT (loan_file_id, name) DO NOTHING
+    RETURNING id
+""")
+
+
+def add_guarantor(db: Session, loan_file_id: int, name: str, *, actor: str) -> bool:
+    """Record a guarantor on a loan file, so their ID and statements pass the name check. False when already there."""
+    clean = " ".join(name.split())
+    if len(clean.split(" ")) < 2 or len(clean) > 200:
+        raise ActionRefused("Give the guarantor's full name (first and last).")
+    if db.execute(text("SELECT 1 FROM lending.loan_files WHERE id = :id"), {"id": loan_file_id}).first() is None:
+        raise ActionRefused("No such loan file.")
+    if db.execute(_ADD_GUARANTOR, {"id": loan_file_id, "name": clean, "actor": actor}).first() is None:
+        return False
+    quarantine.ledger(db, loan_file_id, "guarantor_added", actor=actor, detail={"name": clean},
+                      ref_table="loan_files", ref_id=loan_file_id)
+    return True

@@ -18,21 +18,26 @@ from config.lending_packaging import (
     ACTION_DISMISS,
     ACTION_IDS,
     ACTION_OVERRIDE,
+    ACTION_REPLACE,
     ACTION_SUBMIT,
     ACTION_TAG,
     OVERRIDE_CALLBACK_ID,
+    REPLACE_CALLBACK_ID,
+    REPLACE_CHOICES_MAX,
     TAG_CALLBACK_ID,
 )
 from src.lending.audit import deal_ledger
 from src.lending.packaging import actions
 from src.lending.packaging.package import LOAN_FILE, CompileResult, compile_package, lender_name
-from src.lending.packaging.packet_validator import PARTNER_FILE_UPLOADS, Outcome
+from src.lending.packaging.packet_validator import PARTNER_FILE_UPLOADS, DocVerdict, Outcome
 
 logger = logging.getLogger(__name__)
 
 SessionFactory = Callable[[], ContextManager[Session]]
 Scheduler = Callable[..., None]
 _OUTCOME_MARK = {Outcome.PASS: ":white_check_mark:", Outcome.BLOCK: ":warning:", Outcome.QUARANTINE: ":no_entry:"}
+# Each form's callback id and the block holding its one input.
+_FORM_BLOCK = {OVERRIDE_CALLBACK_ID: "reason_b", TAG_CALLBACK_ID: "type_b", REPLACE_CALLBACK_ID: "by_b"}
 
 
 def _section(body: str) -> dict:
@@ -114,10 +119,24 @@ def card_blocks(result: CompileResult, *, note: str = "") -> list[dict]:
             buttons.append(_button(f"Tag type #{doc.upload_id}", f"{ACTION_TAG}:{doc.upload_id}", value))
         else:
             buttons.append(_button(f"Override #{doc.upload_id}", f"{ACTION_OVERRIDE}:{doc.key}", value))
+    for doc in (*result.verdict.blocked, *result.verdict.quarantined):
+        choices = _replacements(result, doc)
+        if choices:
+            value = json.dumps({"p": result.package_id, "t": doc.upload_table, "u": doc.upload_id, "c": choices})
+            buttons.append(_button(f"Replace #{doc.upload_id}", f"{ACTION_REPLACE}:{doc.key}", value))
     buttons.append(_button("Dismiss", ACTION_DISMISS, str(result.package_id), "danger"))
     for start in range(0, len(buttons), 25):
         blocks.append({"type": "actions", "elements": buttons[start:start + 25]})
     return blocks
+
+
+def _replacements(result: CompileResult, doc: DocVerdict) -> list[list]:
+    """Other uploads of the same type on this file that could replace ``doc``: [[table, id], ...], newest first."""
+    if doc.item_code is None:
+        return []
+    found = [[d.upload_table, d.upload_id] for d in result.verdict.per_doc
+             if d.item_code == doc.item_code and d.key != doc.key and d.outcome is not Outcome.QUARANTINE]
+    return sorted(found, key=lambda c: c[1], reverse=True)[:REPLACE_CHOICES_MAX]
 
 
 def cora_client() -> Any:
@@ -149,7 +168,7 @@ def post_card(db: Session, client: Any, channel: str, result: CompileResult) -> 
     return ts
 
 
-def _refresh(client: Any, db: Session, package_id: int, note: str, today: date) -> None:
+def refresh_card(client: Any, db: Session, package_id: int, note: str, today: date) -> None:
     row = db.execute(text("SELECT card_channel, card_ts, status FROM lending.lender_packages WHERE id = :id"),
                      {"id": package_id}).mappings().first()
     if not row or not row["card_channel"] or not row["card_ts"]:
@@ -180,12 +199,12 @@ def is_package_action(payload: dict) -> bool:
 
 def opens_form(payload: dict) -> bool:
     action_id = str(((payload.get("actions") or [{}])[0]).get("action_id") or "")
-    return action_id.split(":")[0] in (ACTION_OVERRIDE, ACTION_TAG)
+    return action_id.split(":")[0] in (ACTION_OVERRIDE, ACTION_TAG, ACTION_REPLACE)
 
 
 def is_package_submission(payload: dict) -> bool:
     return (payload.get("type") == "view_submission"
-            and (payload.get("view") or {}).get("callback_id") in (OVERRIDE_CALLBACK_ID, TAG_CALLBACK_ID))
+            and (payload.get("view") or {}).get("callback_id") in _FORM_BLOCK)
 
 
 def _user(payload: dict) -> str:
@@ -196,6 +215,15 @@ def _modal(callback_id: str, title: str, meta: dict, field: dict) -> dict:
     return {"type": "modal", "callback_id": callback_id, "title": {"type": "plain_text", "text": title},
             "submit": {"type": "plain_text", "text": "Save"}, "close": {"type": "plain_text", "text": "Cancel"},
             "private_metadata": json.dumps(meta), "blocks": [field]}
+
+
+def replace_view(meta: dict) -> dict:
+    options = [{"text": {"type": "plain_text", "text": f"#{upload_id}"}, "value": f"{table}:{upload_id}"}
+               for table, upload_id in meta.get("c") or []]
+    return _modal(REPLACE_CALLBACK_ID, "Replace document", meta, {
+        "type": "input", "block_id": "by_b",
+        "label": {"type": "plain_text", "text": f"Which upload replaces #{meta.get('u')}?"},
+        "element": {"type": "static_select", "action_id": "v", "options": options}})
 
 
 def override_view(meta: dict) -> dict:
@@ -224,9 +252,9 @@ def handle_action(payload: dict, client: Any, *, approvers: frozenset[str], sess
     kind = str(action.get("action_id") or "").split(":")[0]
     actor = deal_ledger.human(user)
     try:
-        if kind in (ACTION_OVERRIDE, ACTION_TAG):
+        if kind in (ACTION_OVERRIDE, ACTION_TAG, ACTION_REPLACE):
             meta = json.loads(action.get("value") or "{}")
-            view = override_view(meta) if kind == ACTION_OVERRIDE else tag_view(meta)
+            view = {ACTION_OVERRIDE: override_view, ACTION_TAG: tag_view, ACTION_REPLACE: replace_view}[kind](meta)
             client.views_open(trigger_id=payload.get("trigger_id", ""), view=view)
             return
         package_id = int(action.get("value") or 0)
@@ -237,7 +265,7 @@ def handle_action(payload: dict, client: Any, *, approvers: frozenset[str], sess
             else:
                 actions.dismiss(db, package_id, actor=actor)
                 note = f":wastebasket: Dismissed by <@{user}>."
-            _refresh(client, db, package_id, note, today)
+            refresh_card(client, db, package_id, note, today)
     except actions.ActionRefused as refused:
         _tell(client, channel, user, str(refused))
     except Exception as exc:  # class only: SQL errors can embed bound values
@@ -254,37 +282,44 @@ def _field(values: dict, block: str) -> str:
 
 def handle_submission(payload: dict, client: Any, run_later: Scheduler, *, approvers: frozenset[str],
                       session_factory: SessionFactory, today: date) -> dict:
-    """An Override or Tag type form. Checked here (errors stay in the form); applied after the ack."""
+    """An Override, Tag type or Replace form. Checked here (errors stay in the form); applied after the ack."""
     user = _user(payload)
     view = payload.get("view") or {}
-    is_override = view.get("callback_id") == OVERRIDE_CALLBACK_ID
-    block = "reason_b" if is_override else "type_b"
+    form = str(view.get("callback_id") or "")
+    block = _FORM_BLOCK[form]
     if user not in approvers:
         return {"response_action": "errors", "errors": {block: "Only approved users can do this."}}
     value = _field((view.get("state") or {}).get("values") or {}, block)
     if not value:
         return {"response_action": "errors", "errors": {block: "Required."}}
-    if not is_override and value not in DOCUMENT_TYPES:
+    if form == TAG_CALLBACK_ID and value not in DOCUMENT_TYPES:
         return {"response_action": "errors", "errors": {block: "Pick a document type from the list."}}
     meta = json.loads(view.get("private_metadata") or "{}")
-    run_later(_apply_form, client, is_override, meta, value, user, session_factory, today)
+    if form == REPLACE_CALLBACK_ID and value not in {f"{t}:{u}" for t, u in meta.get("c") or []}:
+        return {"response_action": "errors", "errors": {block: "Pick a document from the list."}}
+    run_later(_apply_form, client, form, meta, value, user, session_factory, today)
     return {}
 
 
-def _apply_form(client: Any, is_override: bool, meta: dict, value: str, user: str,
+def _apply_form(client: Any, form: str, meta: dict, value: str, user: str,
                 session_factory: SessionFactory, today: date) -> None:
     actor = deal_ledger.human(user)
     package_id = int(meta.get("p") or 0)
     try:
         with session_factory() as db:
-            if is_override:
+            if form == OVERRIDE_CALLBACK_ID:
                 actions.override_block(db, package_id, str(meta.get("t")), int(meta.get("u") or 0), reason=value,
                                        actor=actor, today=today)
                 note = f":unlock: Block on #{meta.get('u')} overridden by <@{user}>: {value[:200]}"
+            elif form == REPLACE_CALLBACK_ID:
+                by_table, by_id = value.rsplit(":", 1)
+                actions.supersede_document(db, str(meta.get("t")), int(meta.get("u") or 0), by_table, int(by_id),
+                                           actor=actor)
+                note = f":arrows_counterclockwise: #{meta.get('u')} replaced by #{by_id} (<@{user}>)."
             else:
                 actions.tag_document_type(db, int(meta.get("u") or 0), value, actor=actor)
                 note = f":label: #{meta.get('u')} tagged {DOCUMENT_TYPES[value]} by <@{user}>."
-            _refresh(client, db, package_id, note, today)
+            refresh_card(client, db, package_id, note, today)
     except actions.ActionRefused as refused:
         logger.info("[packaging] form refused: %s", refused)
         _tell_user(client, user, str(refused))

@@ -1726,6 +1726,7 @@ class LendingPartnerFileUpload(LendingBase):
     quarantine_status: Mapped[Optional[str]] = mapped_column(String(20))  # 'quarantined' or 'released'; NULL = clean
     quarantine_reason: Mapped[Optional[str]] = mapped_column(String(300))
     item_code: Mapped[Optional[str]] = mapped_column(String(40))  # set by staff; NULL = unclassified, kept out of packages
+    superseded_by: Mapped[Optional[str]] = mapped_column(String(60))  # doc key of the staff-chosen replacement
 
     __table_args__ = (Index("idx_lending_partner_file_uploads_file", "file_id"),)
 
@@ -2043,6 +2044,7 @@ class LendingDocChaseUpload(LendingBase):
     drive_retry_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))  # next try after a failure
     quarantine_status: Mapped[Optional[str]] = mapped_column(String(20))  # 'quarantined' or 'released'; NULL = clean
     quarantine_reason: Mapped[Optional[str]] = mapped_column(String(300))
+    superseded_by: Mapped[Optional[str]] = mapped_column(String(60))  # doc key of the staff-chosen replacement
 
     __table_args__ = (Index("idx_lending_doc_chase_uploads_chase", "chase_id"),)
 
@@ -2346,6 +2348,21 @@ class LendingLenderPackage(LendingBase):
         Index("uq_lending_lender_packages_open", "source_type", "source_id", "lender_key", unique=True,
               postgresql_where=text("status NOT IN ('submitted','dismissed')")),
     )
+
+
+class LendingLoanFileGuarantor(LendingBase):
+    """A guarantor staff recorded on a loan file; the packet validator accepts their name on the file's documents."""
+
+    __tablename__ = "loan_file_guarantors"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    loan_file_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("lending.loan_files.id", ondelete="CASCADE"),
+                                              nullable=False)
+    name: Mapped[str] = mapped_column(String(200), nullable=False)
+    added_by: Mapped[str] = mapped_column(String(80), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_now, server_default=text("now()"))
+
+    __table_args__ = (UniqueConstraint("loan_file_id", "name", name="uq_lending_loan_file_guarantors_name"),)
 
 
 class LendingClayEnrichment(LendingBase):

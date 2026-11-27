@@ -7,7 +7,15 @@ from datetime import date
 
 import pytest
 
-from config.lending_packaging import ACTION_DISMISS, ACTION_OVERRIDE, ACTION_SUBMIT, OVERRIDE_CALLBACK_ID, TAG_CALLBACK_ID
+from config.lending_packaging import (
+    ACTION_DISMISS,
+    ACTION_OVERRIDE,
+    ACTION_REPLACE,
+    ACTION_SUBMIT,
+    OVERRIDE_CALLBACK_ID,
+    REPLACE_CALLBACK_ID,
+    TAG_CALLBACK_ID,
+)
 from src.lending.packaging import actions, slack_card
 from src.lending.packaging.package import CompileResult
 from src.lending.packaging.packet_validator import DocVerdict, Outcome, Verdict
@@ -58,7 +66,9 @@ def test_blocked_and_quarantined_documents_remove_mark_submitted_and_show_reason
     ids = _action_ids(blocks)
     assert ACTION_SUBMIT not in ids
     assert f"{ACTION_OVERRIDE}:doc_chase_uploads:3" in ids  # override for a block
-    assert not any(i.endswith(":4") for i in ids)  # never for a quarantine
+    assert not any(i.startswith(ACTION_OVERRIDE) and i.endswith(":4") for i in ids)  # never override a quarantine
+    assert f"{ACTION_REPLACE}:doc_chase_uploads:4" in ids  # but it can be replaced by another statement (#3)
+    assert f"{ACTION_REPLACE}:doc_chase_uploads:3" not in ids  # a quarantined upload is never offered as a replacement
     assert "lender_pkg_tag:5" in ids  # tag type for an untyped partner upload
     assert "name not found" in _text(blocks) and "hidden text" in _text(blocks)
 
@@ -152,7 +162,7 @@ def test_tag_form_tags_the_document(monkeypatch):
     seen = {}
     monkeypatch.setattr(actions, "tag_document_type",
                         lambda db, uid, code, *, actor: seen.update(uid=uid, code=code, actor=actor))
-    slack_card._apply_form(FakeSlack(), False, {"p": 11, "u": 5}, "pricing_sheet", "U1", _session, TODAY)
+    slack_card._apply_form(FakeSlack(), TAG_CALLBACK_ID, {"p": 11, "u": 5}, "pricing_sheet", "U1", _session, TODAY)
     assert seen == {"uid": 5, "code": "pricing_sheet", "actor": "human:U1"}
 
 
@@ -172,3 +182,41 @@ def test_possible_fit_is_flagged_and_mark_submitted_is_not_on_the_card():
     blocks = slack_card.card_blocks(_result(fit={**FIT, "needs": ["ARV unknown — cannot verify LTV"]}))
     assert "Fit not confirmed" in _text(blocks) and "ARV unknown" in _text(blocks)
     assert ACTION_SUBMIT not in _action_ids(blocks)
+
+
+def test_replace_click_offers_only_the_listed_uploads_and_applies_the_choice(monkeypatch):
+    blocks = slack_card.card_blocks(_result(docs=(BLOCKED, DocVerdict(8, "doc_chase_uploads", "bank_statements",
+                                                                      Outcome.PASS))))
+    button = next(e for b in blocks if b["type"] == "actions" for e in b["elements"]
+                  if e["action_id"] == f"{ACTION_REPLACE}:doc_chase_uploads:3")
+    slack = FakeSlack()
+    payload = _click(button["action_id"], button["value"])
+    assert slack_card.opens_form(payload)
+    slack_card.handle_action(payload, slack, approvers=frozenset({"U1"}), session_factory=_session, today=TODAY)
+    view = slack.calls[0][1]["view"]
+    assert view["callback_id"] == REPLACE_CALLBACK_ID
+    assert [o["value"] for o in view["blocks"][0]["element"]["options"]] == ["doc_chase_uploads:8"]
+
+    def submitted(value):
+        return {"type": "view_submission", "user": {"id": "U1"},
+                "view": {"callback_id": REPLACE_CALLBACK_ID, "private_metadata": view["private_metadata"],
+                         "state": {"values": {"by_b": {"v": {"type": "static_select",
+                                                             "selected_option": {"value": value}}}}}}}
+
+    later = []
+    assert slack_card.is_package_submission(submitted("doc_chase_uploads:8"))
+    forged = slack_card.handle_submission(submitted("doc_chase_uploads:99"), None, lambda *a: later.append(a),
+                                          approvers=frozenset({"U1"}), session_factory=_session, today=TODAY)
+    assert forged["response_action"] == "errors" and not later
+    assert slack_card.handle_submission(submitted("doc_chase_uploads:8"), None, lambda *a: later.append(a),
+                                        approvers=frozenset({"U1"}), session_factory=_session, today=TODAY) == {}
+    seen = {}
+    monkeypatch.setattr(actions, "supersede_document",
+                        lambda db, t, u, bt, bu, *, actor: seen.update(old=(t, u), new=(bt, bu), actor=actor))
+    apply, *args = later[0]
+    apply(*args)
+    assert seen == {"old": ("doc_chase_uploads", 3), "new": ("doc_chase_uploads", 8), "actor": "human:U1"}
+
+
+def test_no_replace_button_without_another_upload_of_the_same_type():
+    assert not any(i.startswith(ACTION_REPLACE) for i in _action_ids(slack_card.card_blocks(_result(docs=(BLOCKED,)))))

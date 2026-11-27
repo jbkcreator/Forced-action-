@@ -108,18 +108,32 @@ def scan_upload(db: Session, upload_table: str, upload_id: int, stored_path: str
     return False
 
 
-def scan_new_uploads(db: Session, upload_table: str, *, stored_path: Optional[str] = None,
-                     partner_file_id: Optional[int] = None) -> None:
-    """Scan the upload just stored at ``stored_path``, or every unscanned upload of a partner file. Never raises:
-    the uploader's response must not depend on it (a failed scan is logged; the package check scans again)."""
+def quarantine_before_commit(db: Session, upload_table: str, stored_path: str) -> Optional[tuple[int, tuple[str, ...]]]:
+    """Scan the upload just written at ``stored_path`` inside the uploader's still-open transaction, so no other
+    reader (the Drive copier) sees the row before its verdict. Fails closed: a scan error quarantines. Never commits;
+    returns (upload id, reasons) when it quarantined, for ``alert_quarantine`` once the caller has committed."""
+    table = _table(upload_table)
+    upload_id = db.execute(text(f"SELECT id FROM lending.{table} WHERE stored_path = :p ORDER BY id DESC LIMIT 1"),
+                           {"p": stored_path}).scalar()
+    if upload_id is None:
+        return None
+    try:
+        verdict = validate_injection_only(DocInput(upload_id, table, None, stored_path))
+        reasons = verdict.reasons if verdict.outcome is Outcome.QUARANTINE else ()
+    except Exception as exc:  # class only
+        reasons = (f"scan failed ({type(exc).__name__})",)
+    if reasons and record_quarantine(db, table, upload_id, "; ".join(reasons)):
+        return upload_id, tuple(reasons)
+    return None
+
+
+def scan_new_uploads(db: Session, upload_table: str, *, partner_file_id: int) -> None:
+    """Scan every unscanned upload of a partner file. Never raises: the uploader's response must not depend on it (a
+    failed scan is logged; the package check scans again). Nothing copies partner uploads before that check."""
     table = _table(upload_table)
     try:
-        if stored_path is not None:
-            rows = db.execute(text(f"SELECT id, stored_path FROM lending.{table} WHERE stored_path = :p "
-                                   "ORDER BY id DESC LIMIT 1"), {"p": stored_path}).all()
-        else:
-            rows = db.execute(text("SELECT id, stored_path FROM lending.partner_file_uploads "
-                                   "WHERE file_id = :f AND quarantine_status IS NULL"), {"f": partner_file_id}).all()
+        rows = db.execute(text("SELECT id, stored_path FROM lending.partner_file_uploads "
+                               "WHERE file_id = :f AND quarantine_status IS NULL"), {"f": partner_file_id}).all()
         for upload_id, path in rows:
             scan_upload(db, table, upload_id, path)
     except Exception as exc:  # class only: SQL errors embed bound parameters

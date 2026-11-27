@@ -1,8 +1,8 @@
 """Screen declined and unassigned files against the secondary lenders and draft one package per lender that fits.
 
 Separate from the router: it never routes a file. Every fitting lender gets a package (an unconfirmed box still
-drafts, flagged); every lender that misses is listed with why. A file is re-drafted only when its facts or the
-lender rules change (the fingerprint).
+drafts, flagged); every lender that misses is listed with why, and its open package is retired. A file is re-drafted
+only when its facts or the lender rules change (the fingerprint).
 """
 from __future__ import annotations
 
@@ -23,6 +23,8 @@ from src.lending.contracts import BorrowerProfile, LenderFitResult, LoanRequest,
 from src.lending.enrichment.fit_card import parse_band_bounds
 from src.lending.lender_fit import evaluate_lender_fit
 from src.lending.lender_rules_store import current_matrix_with_version
+from src.lending.audit import deal_ledger
+from src.lending.packaging import quarantine
 from src.lending.packaging.package import LF_LEAD, LOAN_FILE, file_facts
 
 logger = logging.getLogger(__name__)
@@ -32,7 +34,7 @@ UNASSIGNED_STATUSES = ["held", "unrouted", "exhausted"]
 
 # (a) a decline from the primary lender (by id), or (b) unassigned; never a test file, a suppressed or
 # owner-occupied hold, or a file a lender already approved or funded.
-ELIGIBLE_SQL = text("""
+_ELIGIBLE = """
     SELECT fr.lead_id, fr.loan_file_id
       FROM lending.file_routing fr
      WHERE NOT fr.is_test
@@ -45,7 +47,12 @@ ELIGIBLE_SQL = text("""
        AND NOT EXISTS (SELECT 1 FROM lending.file_routing_events e
                         WHERE e.action IN ('approved', 'funded')
                           AND (e.lead_id = fr.lead_id OR e.loan_file_id = fr.loan_file_id))
-     ORDER BY fr.id
+"""
+ELIGIBLE_SQL = text(_ELIGIBLE + " ORDER BY fr.id")
+_STILL_ELIGIBLE = text(f"""
+    SELECT 1 FROM ({_ELIGIBLE}) e
+     WHERE (:st = 'loan_file' AND e.loan_file_id = :sid) OR (:st = 'lf_lead' AND e.loan_file_id IS NULL AND e.lead_id = :sid)
+     LIMIT 1
 """)
 _EXISTING = text("SELECT lender_key, screen_fingerprint FROM lending.lender_packages "
                  "WHERE source_type = :st AND source_id = :sid")
@@ -58,6 +65,11 @@ _UPSERT = text("""
                   screen_fingerprint = EXCLUDED.screen_fingerprint, updated_at = now()
     RETURNING id
 """)
+_RETIRE = text("""
+    UPDATE lending.lender_packages SET status = 'dismissed', screen_fingerprint = NULL, updated_at = now()
+     WHERE source_type = :st AND source_id = :sid AND lender_key = ANY(:keys) AND status NOT IN ('submitted', 'dismissed')
+    RETURNING id, lender_key
+""")
 _LEAD_FLAGS = text("SELECT suppressed, is_test FROM lending.lendingflow_leads WHERE id = :id")
 _FILE_FLAGS = text("SELECT occupancy, is_test FROM lending.loan_files WHERE id = :id")
 
@@ -66,6 +78,12 @@ _FILE_FLAGS = text("SELECT occupancy, is_test FROM lending.loan_files WHERE id =
 class FileRef:
     source_type: str
     source_id: int
+
+
+@dataclass(frozen=True)
+class Screened:
+    changed: list[int]  # new or changed packages: compile and post a card
+    retired: list[int]  # open packages whose lender no longer fits: dismissed here, their cards need refreshing
 
 
 class NotScreenable(ValueError):
@@ -152,21 +170,36 @@ def _excluded(db: Session, ref: FileRef) -> Optional[str]:
     return "owner occupied" if flags.occupancy == OWNER_OCCUPIED else ("test" if flags.is_test else None)
 
 
-def screen_file(db: Session, ref: FileRef, *, matrix: tuple[LenderRules, ...], rules_version: str) -> list[int]:
-    """Draft or refresh this file's packages; returns the ids of packages that are new or changed."""
+def _retire_misfits(db: Session, ref: FileRef, fit: LenderFitResult) -> list[int]:
+    """Dismiss the open packages of lenders that now definitely miss this file (changed facts or stricter rules)."""
+    misses = {m.lender_key: "; ".join(m.reasons) for m in fit.non_fitting}
+    if not misses:
+        return []
+    rows = db.execute(_RETIRE, {"st": ref.source_type, "sid": ref.source_id, "keys": list(misses)}).all()
+    for row in rows:
+        quarantine.ledger(db, ref.source_id if ref.source_type == LOAN_FILE else None, "package_dismissed",
+                          actor=deal_ledger.system("secondary_screen"),
+                          detail={"lender_key": row.lender_key, "reason": f"no longer fits: {misses[row.lender_key]}"[:300]},
+                          ref_table="lender_packages", ref_id=row.id)
+    return [row.id for row in rows]
+
+
+def screen_file(db: Session, ref: FileRef, *, matrix: tuple[LenderRules, ...], rules_version: str) -> Screened:
+    """Draft or refresh this file's packages, and retire the open ones whose lender no longer fits."""
     excluded = _excluded(db, ref)
     if excluded:
         logger.info("[packaging] %s %s not screened: %s", ref.source_type, ref.source_id, excluded)
-        return []
+        return Screened([], [])
     facts = file_facts(db, ref.source_type, ref.source_id)
     if facts is None:
-        return []
+        return Screened([], [])
     try:
         borrower, loan = fit_inputs(ref.source_type, facts)
     except NotScreenable as missing:
         logger.info("[packaging] %s %s not screened: missing %s", ref.source_type, ref.source_id, missing)
-        return []
+        return Screened([], [])
     fit = evaluate_lender_fit(borrower, loan, matrix=matrix)
+    retired = _retire_misfits(db, ref, fit)
     fp = fingerprint(facts, rules_version)
     seen = {(row.lender_key, row.screen_fingerprint)
             for row in db.execute(_EXISTING, {"st": ref.source_type, "sid": ref.source_id})}
@@ -181,4 +214,37 @@ def screen_file(db: Session, ref: FileRef, *, matrix: tuple[LenderRules, ...], r
             "st": ref.source_type, "sid": ref.source_id, "lk": lender.lender_key, "confirmed": confirmed,
             "fit": json.dumps(fit_summary(fit, lender.lender_key)), "fp": fp}).scalar_one()
         changed.append(package_id)
-    return changed
+    return Screened(changed, retired)
+
+
+def current_fit_problem(db: Session, source_type: str, source_id: int, lender_key: str) -> Optional[str]:
+    """Why this lender cannot take this file under today's facts and rules, or None when it fits with a confirmed
+    box. Checked again at submission: the package's stored fit may be older than a fact or rule change."""
+    ref = FileRef(source_type, source_id)
+    excluded = _excluded(db, ref)
+    if excluded:
+        return f"The file can no longer be screened ({excluded})."
+    if db.execute(_STILL_ELIGIBLE, {"st": source_type, "sid": source_id, "excluded_holds": EXCLUDED_HOLDS,
+                                    "unassigned": UNASSIGNED_STATUSES}).first() is None:
+        return "The file is no longer declined or unassigned, or a lender has approved or funded it."
+    facts = file_facts(db, source_type, source_id)
+    if facts is None:
+        return "The file is gone."
+    try:
+        borrower, loan = fit_inputs(source_type, facts)
+    except NotScreenable as missing:
+        return f"The file is now missing its {missing}."
+    matrix, _ = secondary_matrix()
+    rules = next((r for r in matrix if r.key == lender_key), None)
+    if rules is None:
+        return "This lender is no longer a secondary lender."
+    if has_placeholder_rules(rules):
+        return "This lender's box is not confirmed. Do not submit."
+    fit = evaluate_lender_fit(borrower, loan, matrix=matrix)
+    if any(f.lender_key == lender_key for f in fit.fitting):
+        return None
+    miss = next((m for m in fit.non_fitting if m.lender_key == lender_key), None)
+    if miss is not None:
+        return "The deal no longer fits this lender: " + ("; ".join(miss.reasons) or "no reason given") + "."
+    maybe = next((p for p in fit.possible if p.lender_key == lender_key), None)
+    return "The fit is not confirmed yet: " + ("; ".join(maybe.why_unknown) if maybe else "unknown") + "."

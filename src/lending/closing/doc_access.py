@@ -220,7 +220,10 @@ def issue_view_link(db, upload_id: int, issued_to: str, now: datetime) -> Issued
     upload = db.execute(_UPLOAD, {"id": upload_id}).first()
     if upload is None:
         raise LookupError(upload_id)
-    if upload.quarantine_status == "quarantined" or _quarantined_on_rescan(db, upload_id, upload.stored_path):
+    if upload.quarantine_status == "quarantined":
+        raise DocumentQuarantined(upload_id)
+    # A released upload is not rescanned: the admin release stands, as it does in the package validator.
+    if upload.quarantine_status != "released" and _quarantined_on_rescan(db, upload_id, upload.stored_path):
         raise DocumentQuarantined(upload_id)
     base = link_base_url()
     if base is None:

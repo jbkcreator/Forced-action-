@@ -21,6 +21,14 @@ FACTS = {"id": 7, "first_name": "Alice", "last_name": "Smith", "phone": "+181355
 
 
 @pytest.fixture(autouse=True)
+def _fits_today(monkeypatch):
+    """The submission-time fit re-check passes unless a test says otherwise (its own tests are in test_screen)."""
+    problems = []
+    monkeypatch.setattr(actions.screen, "current_fit_problem", lambda *args: problems[0] if problems else None)
+    return problems
+
+
+@pytest.fixture(autouse=True)
 def _no_alerts(monkeypatch):
     sent = []
     monkeypatch.setattr(quarantine, "alert_quarantine", lambda *args: sent.append(args))
@@ -42,7 +50,7 @@ def _db(docs, *, confirmed=False, status="draft", overrides=None, source_type="l
             "source_type": source_type, "source_id": 7, "lender_key": "corevest", "status": status}],
         "FROM lending.loan_files f LEFT JOIN lending.entities": [FACTS],
         "UNION ALL": docs,
-        "facts -> 'guarantors'": [{"g": guarantors}],
+        "FROM lending.loan_file_guarantors": [{"name": n} for n in guarantors or []],
         "borrower_first_name || ' ' || borrower_last_name": [{"n": "Bob Jones"}],
         "SELECT DISTINCT e.name": [],
         "SELECT file_id FROM lending.partner_file_uploads": [{"file_id": 7}],
@@ -84,7 +92,7 @@ def test_confirmed_box_and_clean_documents_are_ready(tmp_path):
 
 def test_guarantor_and_entity_names_count_as_the_files_names(tmp_path):
     path = write_pdf(tmp_path, "g.pdf", lines("Carol White", "Statement 11/20/2026"))
-    db = _db([_doc_row(path)], confirmed=True, guarantors=[{"name": "Carol White"}])
+    db = _db([_doc_row(path)], confirmed=True, guarantors=["Carol White"])
     assert compile_package(db, 11, today=TODAY, renderer=None).status == "ready"
     path = write_pdf(tmp_path, "e.pdf", lines("SMITH HOLDINGS", "Statement 11/20/2026"))
     assert compile_package(_db([_doc_row(path)], confirmed=True), 11, today=TODAY, renderer=None).status == "ready"
@@ -226,3 +234,129 @@ def test_possible_fit_stays_draft_even_with_a_confirmed_box_and_clean_documents(
     db = _db([_doc_row(_statement(tmp_path))], confirmed=True, fit={"misses": [], "needs": ["ARV unknown"]})
     result = package.compile_package(db, 11, today=TODAY, renderer=None)
     assert result.status == "draft" and result.fit_needs == ["ARV unknown"] and not result.submittable
+
+
+# ── review fixes: stale fit, double submit, replacement documents, guarantors ──
+
+def test_mark_submitted_refuses_when_the_deal_no_longer_fits_today(tmp_path, submissions, _fits_today):
+    _fits_today.append("The deal no longer fits this lender: loan amount above the maximum.")
+    db = _db([_doc_row(_statement(tmp_path))], confirmed=True)
+    with pytest.raises(actions.ActionRefused, match="no longer fits"):
+        actions.mark_submitted(db, 11, actor="human:U1", today=TODAY)
+    assert submissions == [] and not db.ran("UPDATE lending.lender_packages SET status = :status")
+
+
+def test_mark_submitted_locks_the_package_before_reading_it(tmp_path, submissions):
+    db = _db([_doc_row(_statement(tmp_path))], confirmed=True)
+    actions.mark_submitted(db, 11, actor="human:U1", today=TODAY)
+    sql = [statement for statement, _ in db.executed]
+    lock = next(i for i, q in enumerate(sql) if "FOR UPDATE" in q and "lender_packages" in q)
+    read = next(i for i, q in enumerate(sql) if q.startswith("SELECT id, source_type, source_id, lender_key, status"))
+    assert lock < read
+
+
+def test_a_second_click_on_a_package_closed_meanwhile_records_nothing(tmp_path, submissions):
+    """The guarded close matched no open row (another click got there first): no second submission."""
+    from tests.lending.packaging.fakes import Result
+
+    db = _db([_doc_row(_statement(tmp_path))], confirmed=True)
+    db.answers["UPDATE lending.lender_packages SET status = :status"] = lambda p: Result([], rowcount=0)
+    with pytest.raises(actions.ActionRefused, match="no longer open"):
+        actions.mark_submitted(db, 11, actor="human:U1", today=TODAY)
+    assert submissions == [] and "package_submitted" not in _ledgered(db)
+
+
+def test_compile_never_reopens_a_closed_package():
+    assert "status NOT IN ('submitted', 'dismissed')" in str(package._SAVE)
+
+
+def test_dismiss_locks_and_refuses_when_already_closed():
+    from tests.lending.packaging.fakes import Result
+
+    db = _db([])
+    db.answers["UPDATE lending.lender_packages SET status = :status"] = lambda p: Result([], rowcount=0)
+    with pytest.raises(actions.ActionRefused):
+        actions.dismiss(db, 11, actor="human:U1")
+    assert "FOR UPDATE" in db.executed[0][0] and "package_dismissed" not in _ledgered(db)
+
+
+def test_superseded_uploads_are_left_out_of_every_package_query():
+    for query in (package._LOAN_FILE_DOCS, package._LEAD_DOCS):
+        assert str(query).count("u.superseded_by IS NULL") == str(query).count("SELECT u.id")
+
+
+def _owners(old, new):
+    def answer(params):
+        return [old if params["id"] == 3 else new]
+    return FakeSession({"FROM lending.doc_chase_uploads u JOIN lending.doc_chases c ON c.id = u.chase_id": answer})
+
+
+_OLD = {"loan_file_id": 7, "lead_ref": None, "item_code": "bank_statements", "superseded_by": None}
+
+
+def test_replacing_a_document_marks_the_old_one_and_ledgers_it():
+    db = _owners(_OLD, dict(_OLD))
+    actions.supersede_document(db, "doc_chase_uploads", 3, "doc_chase_uploads", 8, actor="human:U1")
+    update = db.ran("SET superseded_by = :by")[0]
+    assert update == {"id": 3, "by": "doc_chase_uploads:8"}
+    assert "AND superseded_by IS NULL" in next(q for q, _ in db.executed if "SET superseded_by" in q)
+    assert _ledgered(db) == ["doc_superseded"]
+
+
+@pytest.mark.parametrize("new, message", [
+    ({**_OLD, "loan_file_id": 9}, "same file"),
+    ({**_OLD, "item_code": "government_id"}, "same type"),
+    ({**_OLD, "superseded_by": "doc_chase_uploads:1"}, "itself been replaced"),
+])
+def test_a_replacement_must_be_a_live_document_of_the_same_type_on_the_same_file(new, message):
+    db = _owners(_OLD, new)
+    with pytest.raises(actions.ActionRefused, match=message):
+        actions.supersede_document(db, "doc_chase_uploads", 3, "doc_chase_uploads", 8, actor="human:U1")
+    assert not db.ran("SET superseded_by")
+
+
+def test_a_document_cannot_replace_itself():
+    with pytest.raises(actions.ActionRefused, match="itself"):
+        actions.supersede_document(FakeSession(), "doc_chase_uploads", 3, "doc_chase_uploads", 3, actor="human:U1")
+
+
+def test_replacing_an_expired_statement_clears_its_block_but_another_block_still_stops_submission(tmp_path):
+    """The expired statement (#1) is replaced by a current one (#2): only #3 (someone else's ID) still blocks."""
+    expired = _doc_row(_statement(tmp_path, days_ago=90, name="old.pdf"), upload_id=1)
+    current = _doc_row(_statement(tmp_path, days_ago=3, name="new.pdf"), upload_id=2)
+    wrong_id = _doc_row(write_pdf(tmp_path, "id.pdf", lines("Bob Jones", "Driver License")), upload_id=3,
+                        item_code="government_id")
+    before = compile_package(_db([expired, current, wrong_id], confirmed=True), 11, today=TODAY, renderer=None)
+    assert {d.upload_id for d in before.verdict.blocked} == {1, 3}
+    after = compile_package(_db([current, wrong_id], confirmed=True), 11, today=TODAY, renderer=None)  # #1 superseded
+    assert {d.upload_id for d in after.verdict.blocked} == {3} and after.status == "blocked"
+
+
+def test_a_recorded_guarantor_s_id_passes_the_name_check_without_an_override(tmp_path):
+    photo_id = _doc_row(write_pdf(tmp_path, "id.pdf", lines("CAROL WHITE", "Driver License")), item_code="government_id")
+    assert compile_package(_db([photo_id], confirmed=True), 11, today=TODAY, renderer=None).status == "blocked"
+    result = compile_package(_db([photo_id], confirmed=True, guarantors=["Carol White"]), 11, today=TODAY,
+                             renderer=None)
+    assert result.status == "ready" and not result.verdict.per_doc[0].overridden
+
+
+def test_add_guarantor_records_and_ledgers_once():
+    db = FakeSession({"SELECT 1 FROM lending.loan_files": [{"one": 1}],
+                      "INSERT INTO lending.loan_file_guarantors": [{"id": 1}]})
+    assert actions.add_guarantor(db, 7, "  Carol   White ", actor="human:U1") is True
+    assert db.ran("INSERT INTO lending.loan_file_guarantors")[0]["name"] == "Carol White"
+    assert _ledgered(db) == ["guarantor_added"]
+    db.answers["INSERT INTO lending.loan_file_guarantors"] = []  # already recorded
+    assert actions.add_guarantor(db, 7, "Carol White", actor="human:U1") is False
+    assert _ledgered(db) == ["guarantor_added"]
+
+
+@pytest.mark.parametrize("name", ["Carol", "x" * 201])
+def test_add_guarantor_needs_a_full_name(name):
+    with pytest.raises(actions.ActionRefused):
+        actions.add_guarantor(FakeSession({"SELECT 1 FROM lending.loan_files": [{"one": 1}]}), 7, name, actor="h")
+
+
+def test_add_guarantor_refuses_an_unknown_loan_file():
+    with pytest.raises(actions.ActionRefused, match="No such loan file"):
+        actions.add_guarantor(FakeSession(), 7, "Carol White", actor="human:U1")

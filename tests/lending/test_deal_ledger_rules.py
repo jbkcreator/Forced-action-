@@ -53,7 +53,9 @@ def test_record_refuses_an_untagged_actor_or_an_unknown_type_before_touching_the
 def test_the_event_types_cover_every_kind_the_design_names():
     assert {"stage_transition", "stage_rejected", "closed", "quote_generated", "field_update", "payment_recorded",
             "cora_draft", "human_edit", "card_approved", "file_created", "status_change", "lender_submission",
-            "card_rejected"} == deal_ledger.EVENT_TYPES
+            "card_rejected", "doc_quarantined", "doc_released", "doc_type_tagged", "doc_block_override",
+            "package_blocked", "package_submitted", "package_dismissed", "doc_superseded",
+            "guarantor_added"} == deal_ledger.EVENT_TYPES
 
 
 # ── Diffs and display ──────────────────────────────────────────────────────────

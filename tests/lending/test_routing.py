@@ -805,18 +805,18 @@ def test_route_file_holds_suppressed_lead(rdb):
 
 
 def test_seed_from_t05_matrix_is_inert_idempotent_and_correct(rdb, monkeypatch):
-    """B: the seven T-05 rows seed the table as pending lenders; nothing routes until they are signed and verified."""
+    """B: the nine T-05 rows seed the table as pending lenders; nothing routes until they are signed and verified."""
     from migrations.apply_lending_lender_routing_seed import apply_to as seed
 
     conn = rdb.get_bind()
-    assert seed(conn) == 6  # seven matrix rows, two of which share the primary lender
+    assert seed(conn) == 8  # nine matrix rows, two of which share the primary lender
     assert seed(conn) == 0  # idempotent
 
     lenders = rdb.execute(text(
         "SELECT id, name, is_primary, agreement_status, monthly_cap, construction_min_amount"
         "  FROM lending.lender_routing_rules ORDER BY priority"
     )).mappings().all()
-    assert len(lenders) == 6
+    assert len(lenders) == 8
     assert all(r["agreement_status"] == "pending" for r in lenders)
     primaries = [r for r in lenders if r["is_primary"]]
     assert len(primaries) == 1
@@ -824,7 +824,7 @@ def test_seed_from_t05_matrix_is_inert_idempotent_and_correct(rdb, monkeypatch):
     assert rdb.execute(text("SELECT COUNT(*) FROM lending.lender_product_boxes")).scalar() == 0  # numbers live in T-05
     keyed = {r["name"]: r["rule_keys"] for r in rdb.execute(text(
         "SELECT name, rule_keys FROM lending.lender_routing_rules")).mappings()}
-    assert all(keyed.values()) and sum(len(v) for v in keyed.values()) == 7  # seven T-05 rows, six lenders
+    assert all(keyed.values()) and sum(len(v) for v in keyed.values()) == 9  # nine T-05 rows, eight lenders
     assert keyed["Central Lending"] == ["central_lending"]
 
     flip = _make_lead(rdb, phone_suffix="1701")
@@ -1834,11 +1834,11 @@ def test_reseeding_never_adds_a_duplicate_of_a_renamed_lender(rdb):
     from migrations.apply_lending_lender_routing_seed import apply_to as seed
 
     conn = rdb.get_bind()
-    assert seed(conn) == 6
+    assert seed(conn) == 8
     rdb.execute(text("UPDATE lending.lender_routing_rules SET name = 'Renamed Primary' WHERE is_primary"))
     rdb.commit()
     assert seed(conn) == 0
-    assert rdb.execute(text("SELECT COUNT(*) FROM lending.lender_routing_rules")).scalar() == 6
+    assert rdb.execute(text("SELECT COUNT(*) FROM lending.lender_routing_rules")).scalar() == 8
 
 
 # ── Slack lender form (R1.4: edit the rules from Slack, not a web screen) ─────

@@ -1,5 +1,5 @@
-"""Secondary lender packages: ``lending.lender_packages`` and the quarantine / document-type columns on both upload
-tables (``doc_chase_uploads``, ``partner_file_uploads``).
+"""Secondary lender packages: ``lending.lender_packages``, ``lending.loan_file_guarantors`` and the quarantine /
+document-type / superseded columns on both upload tables (``doc_chase_uploads``, ``partner_file_uploads``).
 
 Idempotent. RUN BEFORE deploying the code: the upload routes write the quarantine columns.
 
@@ -15,19 +15,20 @@ from sqlalchemy.engine import Connection, Engine
 from sqlalchemy.schema import CreateIndex
 
 from config.settings import get_settings
-from src.lending.models import LENDING_SCHEMA, LendingLenderPackage
+from src.lending.models import LENDING_SCHEMA, LendingLenderPackage, LendingLoanFileGuarantor
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
 
-TABLES = (LendingLenderPackage,)
+TABLES = (LendingLenderPackage, LendingLoanFileGuarantor)
 # Columns this script adds to tables other migrations create, with their DDL types.
 ADDED_COLUMNS: dict[str, dict[str, str]] = {
     "lender_packages": {"overrides": "jsonb NOT NULL DEFAULT '{}'::jsonb", "deal_facts_path": "varchar(300)",
                         "card_channel": "varchar(40)", "card_ts": "varchar(40)"},
-    "doc_chase_uploads": {"quarantine_status": "varchar(20)", "quarantine_reason": "varchar(300)"},
+    "doc_chase_uploads": {"quarantine_status": "varchar(20)", "quarantine_reason": "varchar(300)",
+                          "superseded_by": "varchar(60)"},
     "partner_file_uploads": {"quarantine_status": "varchar(20)", "quarantine_reason": "varchar(300)",
-                             "item_code": "varchar(40)"},
+                             "item_code": "varchar(40)", "superseded_by": "varchar(60)"},
 }
 
 

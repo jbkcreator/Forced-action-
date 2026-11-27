@@ -42,15 +42,15 @@ _PACKAGE = text("SELECT id, source_type, source_id, lender_key, status, box_conf
 _LOAN_FILE_DOCS = text("""
     SELECT u.id, :chase AS upload_table, u.item_code, u.stored_path, u.quarantine_status, u.quarantine_reason
       FROM lending.doc_chase_uploads u JOIN lending.doc_chases c ON c.id = u.chase_id
-     WHERE c.loan_file_id = :id
+     WHERE c.loan_file_id = :id AND u.superseded_by IS NULL
     UNION ALL
     SELECT u.id, :partner AS upload_table, u.item_code, u.stored_path, u.quarantine_status, u.quarantine_reason
-      FROM lending.partner_file_uploads u WHERE u.file_id = :id
+      FROM lending.partner_file_uploads u WHERE u.file_id = :id AND u.superseded_by IS NULL
 """)
 _LEAD_DOCS = text("""
     SELECT u.id, :chase AS upload_table, u.item_code, u.stored_path, u.quarantine_status, u.quarantine_reason
       FROM lending.doc_chase_uploads u JOIN lending.doc_chases c ON c.id = u.chase_id
-     WHERE c.lead_ref = :ref AND c.loan_file_id IS NULL
+     WHERE c.lead_ref = :ref AND c.loan_file_id IS NULL AND u.superseded_by IS NULL
 """)
 _LOAN_FILE_FACTS = text("""
     SELECT f.id, f.borrower_first_name AS first_name, f.borrower_last_name AS last_name, f.borrower_phone AS phone,
@@ -66,7 +66,7 @@ _LEAD_FACTS = text("""
            credit_band, credit_band_min_fico, NULL AS completed_projects, NULL AS entity_name
       FROM lending.lendingflow_leads WHERE id = :id
 """)
-_GUARANTORS = text("SELECT facts -> 'guarantors' FROM lending.soft_approvals WHERE phone = :phone")
+_GUARANTORS = text("SELECT name FROM lending.loan_file_guarantors WHERE loan_file_id = :id ORDER BY id")
 _OTHER_PERSONS = text("""
     SELECT borrower_first_name || ' ' || borrower_last_name FROM lending.loan_files
      WHERE NOT COALESCE(is_test, false) AND NOT (:kind = 'loan_file' AND id = :id)
@@ -83,7 +83,7 @@ _SAVE = text("""
     UPDATE lending.lender_packages
        SET status = :status, checklist = CAST(:checklist AS jsonb), validator_verdict = CAST(:verdict AS jsonb),
            deal_facts_path = COALESCE(:pdf, deal_facts_path), updated_at = now()
-     WHERE id = :id
+     WHERE id = :id AND status NOT IN ('submitted', 'dismissed')
 """)
 
 
@@ -138,23 +138,9 @@ def load_docs(db: Session, source_type: str, source_id: int) -> list[DocInput]:
             for r in rows]
 
 
-def _guarantor_names(db: Session, phone: Optional[str]) -> list[str]:
-    if not phone:
-        return []
-    try:
-        with db.begin_nested():
-            raw = db.execute(_GUARANTORS, {"phone": phone}).scalar()
-    except Exception as exc:  # class only: the soft-approval table may be absent
-        logger.warning("[packaging] guarantor lookup failed (%s)", type(exc).__name__)
-        return []
-    if isinstance(raw, str):
-        raw = json.loads(raw)
-    names = []
-    for item in raw or []:
-        name = item.get("name") if isinstance(item, dict) else item
-        if isinstance(name, str) and name.strip():
-            names.append(name.strip())
-    return names
+def guarantor_names(db: Session, loan_file_id: int) -> list[str]:
+    """The guarantors staff recorded on this loan file (``actions.add_guarantor``)."""
+    return [n for n in db.execute(_GUARANTORS, {"id": loan_file_id}).scalars() if n]
 
 
 def file_context(db: Session, source_type: str, source_id: int, facts: dict) -> FileContext:
@@ -162,7 +148,7 @@ def file_context(db: Session, source_type: str, source_id: int, facts: dict) -> 
     persons = [borrower] if borrower else []
     entities: list[str] = []
     if source_type == LOAN_FILE:
-        persons += _guarantor_names(db, facts.get("phone"))
+        persons += guarantor_names(db, source_id)
         if facts.get("entity_name"):
             entities.append(facts["entity_name"])
     params = {"kind": source_type, "id": source_id}

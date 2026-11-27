@@ -52,9 +52,16 @@ from src.lending.closing.doc_chase import (
 )
 from src.lending.audit import deal_ledger
 from src.lending.db import get_lending_db
-from src.lending.packaging.actions import ActionRefused, override_block, release_document, tag_document_type
+from src.lending.packaging.actions import (
+    ActionRefused,
+    add_guarantor,
+    override_block,
+    release_document,
+    supersede_document,
+    tag_document_type,
+)
 from src.lending.packaging.packet_validator import DOC_CHASE_UPLOADS, UPLOAD_TABLES
-from src.lending.packaging.quarantine import scan_new_uploads
+from src.lending.packaging.quarantine import alert_quarantine, quarantine_before_commit
 from src.lending.partner_service import PartnerLinkNotConfigured
 from src.lending.partners import InvalidSubmission, Upload
 from src.lending.security.rbac import (
@@ -165,8 +172,11 @@ def upload_document(token: str, request: Request, item_code: str = Form(default=
     data = document.file.read(MAX_UPLOAD_BYTES + 1)  # one byte past the limit detects an oversize file
     upload = Upload(original_name=document.filename or "", content_type=document.content_type or "", data=data)
     stored: Optional[str] = None
+    quarantined = None
     try:
         stored = record_upload(db, chase, item_code, upload, upload_dir=upload_dir(), now=now)
+        if stored:  # scanned before the commit: the Drive copier never sees an unscanned row
+            quarantined = quarantine_before_commit(db, DOC_CHASE_UPLOADS, stored)
         db.commit()
     except InvalidSubmission as exc:  # refused before anything is written
         return _checklist(db, token, chase, errors=[str(exc)], status_code=400)
@@ -183,8 +193,8 @@ def upload_document(token: str, request: Request, item_code: str = Form(default=
         logger.error("[doc-upload] chase %s upload failed (%s)", chase["id"], type(exc).__name__)
         return _checklist(db, token, chase, errors=["The upload didn't go through. Please try again."], status_code=500)
 
-    if stored:
-        scan_new_uploads(db, DOC_CHASE_UPLOADS, stored_path=stored)
+    if quarantined:
+        alert_quarantine(DOC_CHASE_UPLOADS, *quarantined)
     return RedirectResponse(f"/api/lending/docs/{token}", status_code=303)
 
 
@@ -288,6 +298,15 @@ class ReleaseIn(BaseModel):
     reason: str = Field(..., min_length=3, max_length=300)
 
 
+class SupersedeIn(BaseModel):
+    by_table: str = Field(..., pattern="^(doc_chase_uploads|partner_file_uploads)$")
+    by_id: int
+
+
+class GuarantorIn(BaseModel):
+    name: str = Field(..., min_length=3, max_length=200)
+
+
 def _staff_actor(token: StaffToken) -> str:
     return deal_ledger.human(f"staff_token:{token.id}")
 
@@ -330,3 +349,22 @@ def staff_release(upload_table: str, upload_id: int, body: ReleaseIn, token: Sta
     _apply(db, "release", lambda: release_document(db, upload_table, upload_id, reason=body.reason,
                                                     actor=_staff_actor(token)))
     return {"upload_table": upload_table, "upload_id": upload_id, "quarantine_status": "released"}
+
+
+@router.post("/staff/documents/{upload_table}/{upload_id}/superseded")
+def staff_supersede(upload_table: str, upload_id: int, body: SupersedeIn, token: StaffToken = Depends(staff_admin),
+                    db: Session = Depends(get_lending_db)) -> dict[str, Any]:
+    """Mark an upload as replaced by a newer one of the same type on the same file; packages stop checking it."""
+    if upload_table not in UPLOAD_TABLES:
+        raise HTTPException(status_code=404, detail="no such document table")
+    _apply(db, "supersede", lambda: supersede_document(db, upload_table, upload_id, body.by_table, body.by_id,
+                                                       actor=_staff_actor(token)))
+    return {"upload_table": upload_table, "upload_id": upload_id, "superseded_by": f"{body.by_table}:{body.by_id}"}
+
+
+@router.post("/staff/loan-files/{loan_file_id}/guarantors")
+def staff_add_guarantor(loan_file_id: int, body: GuarantorIn, token: StaffToken = Depends(staff_admin),
+                        db: Session = Depends(get_lending_db)) -> dict[str, Any]:
+    """Record a guarantor on a loan file, so their documents pass the packet validator's name check."""
+    added = _apply(db, "add guarantor", lambda: add_guarantor(db, loan_file_id, body.name, actor=_staff_actor(token)))
+    return {"loan_file_id": loan_file_id, "added": added}
