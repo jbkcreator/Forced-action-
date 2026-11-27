@@ -205,3 +205,23 @@ def test_overlapping_runs_wait_on_the_lock_and_send_the_thread_once(run):
     release.set()
     first.join(5), second.join(5)
     assert results == [0, 0] and len(run.client.posts) == 2 and run.built == 1
+
+
+def test_more_than_20_calls_get_several_replies_and_a_retry_sends_only_the_missing_ones(run):
+    run.card = _card(*(_call(f"c{n:02d}", recorded=False) for n in range(21)))
+    real, replies = run.client.chat_postMessage, []
+
+    def second_reply_fails_once(**kw):
+        if "thread_ts" in kw:
+            if replies and run.second_down:  # down for every retry of this run
+                raise RuntimeError("slack down")
+            replies.append(kw)
+        return real(**kw)
+
+    run.second_down = True
+    run.client.chat_postMessage = second_reply_fails_once
+    assert run.go() == 1 and len(replies) == 1
+    run.second_down = False
+    assert run.go(TUE_3_00) == 0
+    assert [len(r["blocks"]) for r in replies] == [20, 1] and {r["thread_ts"] for r in replies} == {"1.1"}
+    assert run.built == 1

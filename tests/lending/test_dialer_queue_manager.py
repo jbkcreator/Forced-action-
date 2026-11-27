@@ -213,6 +213,15 @@ def test_staged_phone_already_loaded_is_not_counted(db, monkeypatch):
     assert _counts(_read(db))["transaction_ready"].staged == 1
 
 
+def test_staged_phone_that_is_only_a_warm_lead_is_not_hidden_from_the_pool(db, monkeypatch):
+    _callback(db, "+17275550001")  # counted in the queue, but has no active dialer record: the autoload will load it
+    _pool(db, "transaction_ready", "+17275550009", active=False)  # used recently, now empty
+    monkeypatch.setattr(queue_manager, "staged_pr_records", lambda db: [
+        {"pool": "transaction_ready", "phone": "+17275550001"}])
+    report = _read(db)
+    assert _counts(report)["transaction_ready"].staged == 1 and "transaction_ready" not in report.dry_sources
+
+
 def test_pool_whose_only_staged_phones_are_already_loaded_is_still_dry(db, monkeypatch):
     _pool(db, "wholesalers", "+17275550001")
     _pool(db, "transaction_ready", "+17275550009", active=False)

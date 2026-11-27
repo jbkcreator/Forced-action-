@@ -104,12 +104,13 @@ def test_post_shows_booked_by_stage_and_what_he_reported():
     assert "all callers" in out and "2" in out and "reported 3" in out
 
 
-def test_notes_thread_has_a_button_per_call_and_caps_at_20_with_a_count_of_the_rest():
-    many = [call(f"c{n:02d}", recorded=False, ext=None) for n in range(NOTES_LIST_MAX + 5)]
-    blocks = render_notes_thread(card(many))
-    buttons = [b["accessory"] for b in blocks if b.get("accessory")]
-    assert len(buttons) == NOTES_LIST_MAX and buttons[0]["action_id"] == NOTES_OPEN_ACTION_ID
-    assert "5 more" in flatten(blocks)
+def test_notes_thread_gives_every_call_a_button_in_replies_of_at_most_20():
+    many = [call(f"c{n:02d}", recorded=False, ext=None) for n in range(NOTES_LIST_MAX + 1)]
+    replies = render_notes_thread(card(many))
+    buttons = [b["accessory"] for reply in replies for b in reply]
+    assert [len(r) for r in replies] == [NOTES_LIST_MAX, 1] and len(buttons) == NOTES_LIST_MAX + 1
+    assert buttons[0]["action_id"] == NOTES_OPEN_ACTION_ID
+    assert {b["value"] for b in buttons} == {c.dialer_call_id for c in many}
 
 
 def test_notes_thread_is_empty_when_no_call_needs_notes():
@@ -118,7 +119,7 @@ def test_notes_thread_is_empty_when_no_call_needs_notes():
 
 def test_no_full_phone_in_blocks():
     calls = [call("a", phone="+18135559876", recorded=False)]
-    out = flatten(render_scorecard(card(calls))) + flatten(render_notes_thread(card(calls)))
+    out = flatten(render_scorecard(card(calls))) + flatten([b for reply in render_notes_thread(card(calls)) for b in reply])
     assert "9876" in out and "8135559876" not in out
 
 

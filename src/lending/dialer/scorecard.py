@@ -183,13 +183,11 @@ def render_scorecard(card: Scorecard) -> list[dict]:
     return blocks
 
 
-def render_notes_thread(card: Scorecard) -> list[dict]:
-    """One line and an "Add notes" button per connected call that has no recording and no notes."""
+def render_notes_thread(card: Scorecard) -> list[list[dict]]:
+    """Thread replies: one line and an "Add notes" button per connected call that has no recording and no notes,
+    NOTES_LIST_MAX calls to a reply so every call gets its button. No replies when no call needs notes."""
     wanted = needs_notes(card.calls)
-    blocks = [{"type": "section", "text": {"type": "mrkdwn", "text": (
+    return [[{"type": "section", "text": {"type": "mrkdwn", "text": (
         f"…{c.phone_last4} · {_minutes(c.talk_sec)} · {c.disposition or 'no result logged'}")},
-        "accessory": notes_button(c.dialer_call_id)} for c in wanted[:NOTES_LIST_MAX]]
-    if len(wanted) > NOTES_LIST_MAX:
-        blocks.append({"type": "context", "elements": [{"type": "mrkdwn", "text": (
-            f"{len(wanted) - NOTES_LIST_MAX} more calls need notes; they are not listed here.")}]})
-    return blocks
+        "accessory": notes_button(c.dialer_call_id)} for c in wanted[i:i + NOTES_LIST_MAX]]
+        for i in range(0, len(wanted), NOTES_LIST_MAX)]

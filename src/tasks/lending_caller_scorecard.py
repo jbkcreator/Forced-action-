@@ -14,7 +14,7 @@ with the switch off.
 Delivery is tracked for the ET day (``src/lending/dialer/delivery_state.py``): the main post's Slack timestamp is
 saved as soon as it is sent, and the rendered main post and notes thread are saved before either is sent. A run that
 fails returns 1, and the cron retry (run.sh, +15 and +30 min, so after 3 PM) resumes it from the saved payload without
-reading the database again: the main post is sent only if it was not, and the notes thread goes under the saved one.
+reading the database again: the main post is sent only if it was not, and the notes thread goes under the saved one, one reply per 20 calls, and a retry skips the replies already sent.
 A finished day is never posted again. Overlapping runs wait on a per-day lock. ``--force`` and ``--dry-run`` neither
 read nor write that state.
 """
@@ -105,12 +105,12 @@ def _run(args: argparse.Namespace, now: datetime, client: Any, stateful: bool) -
             return 1
         blocks, notes = render_scorecard(card), render_notes_thread(card)
         if args.dry_run:
-            logger.info("[scorecard] dry run for %s:\n%s\nnotes thread: %d lines", card.day,
+            logger.info("[scorecard] dry run for %s:\n%s\nnotes thread: %d replies", card.day,
                         json.dumps(blocks, ensure_ascii=False), len(notes))
             return 0
         state.update(blocks=blocks, notes=notes)
         remember()
-        logger.info("[scorecard] built for %s: %d connected calls, %d need notes", card.day, len(card.calls),
+        logger.info("[scorecard] built for %s: %d connected calls, %d notes replies", card.day, len(card.calls),
                     len(notes))
     if client is None:
         from slack_sdk import WebClient
@@ -120,9 +120,12 @@ def _run(args: argparse.Namespace, now: datetime, client: Any, stateful: bool) -
             state["parent_ts"] = _send(client, channel=channel, text=f"David's scorecard for {now_et.date()}",
                                        blocks=state["blocks"])["ts"]
             remember()
-        if state["notes"]:
-            _send(client, channel=channel, thread_ts=state["parent_ts"], text="Calls that need notes",
-                  blocks=state["notes"])
+        for n, blocks in enumerate(state["notes"]):
+            if n < state.get("notes_sent", 0):  # a retry skips the replies already in the thread
+                continue
+            _send(client, channel=channel, thread_ts=state["parent_ts"], text="Calls that need notes", blocks=blocks)
+            state["notes_sent"] = n + 1
+            remember()
     except Exception:
         logger.exception("[scorecard] post failed for %s", now_et.date())
         return 1

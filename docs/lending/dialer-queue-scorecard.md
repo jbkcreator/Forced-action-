@@ -35,8 +35,8 @@ Read-only. It counts, alerts, and pushes nothing to BatchDialer; the loaders (`l
   members, also those credited to an earlier source in the total ("N more counted above"), so a pool whose contacts are
   also callbacks or new leads is not dry. A pool with no recent loads shows "not in use".
   Callbacks and new leads are never dry (zero is a normal day).
-- **Staged for 9:05** ("+N may load at 9:05") counts the PropertyRadar records staged for the autoload whose phone is not
-  already loaded. The autoload's other gates run at load time, so this is an upper bound; the 9:05 run can load fewer.
+- **Staged for 9:05** ("+N may load at 9:05") counts the PropertyRadar records staged for the autoload whose phone has no active dialer
+  load record (the autoload's own check: a phone that is only a warm lead or callback still counts). The autoload's other gates run at load time, so this is an upper bound; the 9:05 run can load fewer.
   If the staged records cannot be read, no pool is called dry. While `LENDING_PR_DIALER_AUTOLOAD_ENABLED` is off,
   staged records are ignored: they will not load, so they never keep a pool from being called dry.
 - **Not available** means a source could not be read. It is never reported as dry, and the total is built from the
@@ -73,7 +73,7 @@ count in the next day's quality figures for that call only if it is still in the
 **Delivery and retries.** The rendered main post and notes thread are saved before either is sent, and the main post's
 Slack timestamp as soon as it is sent (`data/dialer_posts/`). If the main post or the notes thread fails, the run
 returns 1 and the cron retry (+15, +30 min, so after 3 PM) resumes from that saved payload without reading the database
-again: the main post only if it was not sent, and the notes thread under the saved one. A finished day is not posted
+again: the main post only if it was not sent, and the notes thread under the saved one (one reply per 20 calls, so every call has its button; a retry skips replies already sent). A finished day is not posted
 again, and overlapping runs wait on a per-day lock.
 `--force` and `--dry-run` neither read nor write this state, so a forced run always posts a fresh card.
 

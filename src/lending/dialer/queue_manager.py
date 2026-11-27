@@ -38,6 +38,7 @@ _REASONS_SHOWN = 2
 _POOL_PHONES = text(
     "SELECT pool, phone FROM lending.dialer_load_records WHERE active AND pool IN :pools AND phone IS NOT NULL"
 ).bindparams(bindparam("pools", expanding=True))
+_ACTIVE_PHONES = text("SELECT DISTINCT phone FROM lending.dialer_load_records WHERE active AND phone IS NOT NULL")
 _POOL_RECENT_LOADS = text(
     "SELECT pool, count(*) AS n FROM lending.dialer_load_records WHERE loaded_at >= :since GROUP BY pool")
 
@@ -164,16 +165,18 @@ def _recent_loads(db: Session, now: datetime) -> Optional[Mapping[str, int]]:
         return None
 
 
-def _staged_by_pool(db: Session, loaded: set[str]) -> Optional[Mapping[str, int]]:
-    """Staged records per pool that the 9:05 autoload could still load: it loads phones not already loaded only.
-    None when they could not be read. The autoload's other gates run at load time, so this is an upper bound."""
+def _staged_by_pool(db: Session) -> Optional[Mapping[str, int]]:
+    """Staged records per pool that the 9:05 autoload could still load: it skips a phone with an active dialer load
+    record (the autoload's own check, not a phone merely counted elsewhere in the queue). None when they could not be
+    read. The autoload's other gates run at load time, so this is an upper bound."""
     try:
         with db.begin_nested():
             records = staged_pr_records(db)
+            active = {normalize(row[0]) for row in db.execute(_ACTIVE_PHONES)}
     except Exception as exc:
         logger.warning("[queue-check] staged records not available (%s)", type(exc).__name__)
         return None
-    return Counter(r["pool"] for r in records if normalize(r.get("phone")) and normalize(r.get("phone")) not in loaded)
+    return Counter(r["pool"] for r in records if normalize(r.get("phone")) and normalize(r.get("phone")) not in active)
 
 
 def read_queue(db: Session, now: datetime, *, lead_days: int, autoload_enabled: bool,
@@ -189,7 +192,7 @@ def read_queue(db: Session, now: datetime, *, lead_days: int, autoload_enabled: 
         kept[source] = fresh
     blocked_by_phone = blocks(db, sorted(seen), now) if seen else {}
     recent = _recent_loads(db, now)
-    staged = _staged_by_pool(db, seen) if autoload_enabled else {}
+    staged = _staged_by_pool(db) if autoload_enabled else {}
 
     sources = []
     for source in QUEUE_SOURCES:
