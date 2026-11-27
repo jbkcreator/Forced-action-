@@ -17,22 +17,25 @@ from contextlib import AbstractContextManager, contextmanager
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
-from typing import Any, Literal, Optional
+from typing import Any, Literal, Optional, Sequence
 from zoneinfo import ZoneInfo
 
 from pydantic import BaseModel, ConfigDict, Field
-from sqlalchemy import text
+from sqlalchemy import bindparam, text
 from sqlalchemy.engine import Engine
 from sqlalchemy.exc import DBAPIError, IntegrityError
 from sqlalchemy.orm import Session
 
 from config.lending_compliance import DEFAULT_TZ
+from config.lending_contact_spine import TIMELINE_LIMIT
 from config.lending_instant_quote import MAX_DEAL_AMOUNT as MAX_QUOTE_AMOUNT
 from config.lending_reply_agent import QUOTED_NUMBER_PATTERNS
 from config.settings import get_settings
 from packages.agent_core.governance import SafetyLevel
 from packages.agent_core.memory import AgentMemory, MemoryFull
 from packages.agent_core.tools import EgressDraft, Tool, ToolContext, ToolInputError
+from src.lending.spine.card import finish_card, find_contacts, live_sources, load_card
+from src.lending.spine.touches import TouchSource
 from src.lending.attempt_log import (
     AttemptLog,
     LeadNotFound,
@@ -202,6 +205,12 @@ class CallActivityInput(DayInput):
 
 class FindLeadInput(_Input):
     query: str = Field(..., min_length=2, max_length=120, description="A name, phone number or email address.")
+
+
+class ContactCardInput(_Input):
+    query: str = Field(..., min_length=3, max_length=200,
+                       description="A phone number, email address, name or lead_ref (e.g. lendingflow_lead:12).")
+    limit: int = Field(TIMELINE_LIMIT, ge=1, le=200, description="How many touches to list, newest first.")
 
 
 class WebLeadsInput(_Input):
@@ -465,6 +474,47 @@ def _crm_draft(lead: _Lead, channel: str, fields: dict[str, str], summary: str) 
                        summary=summary, recipient_phone=lead.phone, recipient_email=lead.email, contact_ref=lead.ref)
 
 
+_PHONE_FLAGS_SQL = text("""
+            SELECT p.phone,
+                   -- the send check's rule (consent.has_text_consent): recorded consent, or a LendingFlow lead
+                   -- with no revoked consent (client decision Nov 3); never while suppressed or do-not-contact
+                   ((EXISTS (SELECT 1 FROM lending.text_consents t WHERE t.phone = p.phone AND t.revoked_at IS NULL)
+                     OR (EXISTS (SELECT 1 FROM lending.lendingflow_leads l WHERE l.phone = p.phone)
+                         AND NOT EXISTS (SELECT 1 FROM lending.text_consents t
+                                          WHERE t.phone = p.phone AND t.revoked_at IS NOT NULL)))
+                    AND NOT EXISTS (SELECT 1 FROM lending.suppression_list s WHERE s.phone = p.phone)
+                    AND NOT EXISTS (SELECT 1 FROM lending.contacts c WHERE c.phone = p.phone AND c.do_not_contact))
+                     AS text_consent,
+                   EXISTS (SELECT 1 FROM lending.suppression_list s WHERE s.phone = p.phone) AS suppressed,
+                   EXISTS (SELECT 1 FROM lending.contacts c WHERE c.phone = p.phone AND c.do_not_contact) AS do_not_contact,
+                   (SELECT json_build_object('ended_at', d.call_ended_at, 'caller', d.caller_name,
+                                             'disposition', COALESCE(d.disposition, d.disposition_raw))
+                      FROM lending.call_dispositions d WHERE d.phone = p.phone
+                     ORDER BY d.call_ended_at DESC NULLS LAST LIMIT 1) AS last_call
+              FROM unnest(CAST(:phones AS text[])) AS p(phone)
+        """)
+
+
+def phone_flags(session: Session, phones: list[str]) -> dict[str, Mapping[str, Any]]:
+    """Per phone: text consent (the send check's rule), suppressed, do-not-contact and the last call (Postgres)."""
+    return {row["phone"]: row for row in session.execute(_PHONE_FLAGS_SQL, {"phones": phones}).mappings()}
+
+
+def _contact_matches(session: Session, ids: list[int]) -> dict[str, Any]:
+    if not ids:
+        return {"matches": [], "note": "no contact matched"}
+    rows = session.execute(text(
+        "SELECT s.id, s.display_name, i.value FROM lending.contact_spine s "
+        "LEFT JOIN lending.contact_identifiers i ON i.contact_id = s.id AND i.kind = 'phone' "
+        "WHERE s.id IN :ids ORDER BY s.id, i.value").bindparams(bindparam("ids", expanding=True)), {"ids": ids})
+    matches: dict[int, dict[str, Any]] = {}
+    for contact_id, name, phone in rows:
+        match = matches.setdefault(contact_id, {"contact_id": contact_id, "display_name": name, "phones_last4": []})
+        if phone:
+            match["phones_last4"].append(_last4(phone))
+    return {"matches": list(matches.values()), "note": "pick one"}
+
+
 class CoraToolkit:
     def __init__(self, engine: Engine, memory: AgentMemory,
                  campaign_names: Optional[Mapping[str, str]] = None, *,
@@ -473,7 +523,8 @@ class CoraToolkit:
                  attempt_messages: Optional[MessageReader] = None,
                  attempt_recordings: Optional[RecordingCheck] = None,
                  ledger_manifest: Optional[Callable[[], Optional[dict]]] = None,
-                 quote_store: Optional[QuoteStore] = None) -> None:
+                 quote_store: Optional[QuoteStore] = None,
+                 contact_sources: Optional[Callable[[], Sequence[TouchSource]]] = None) -> None:
         """``channels`` is the channels Cora's bot is in: listed, read and routed to. ``inbox_session``
         overrides where the inbox tools read and write; tests pass their rolled-back session.
         ``attempt_messages`` reads a lead's GHL messages for the attempt log (None: calls only);
@@ -487,6 +538,7 @@ class CoraToolkit:
         self._attempt_recordings = attempt_recordings
         self._ledger_manifest = ledger_manifest
         self._quote_store = quote_store
+        self._contact_sources = contact_sources or live_sources
 
     @contextmanager
     def _inbox(self) -> Iterator[Session]:
@@ -577,25 +629,7 @@ class CoraToolkit:
                  ORDER BY 5 DESC NULLS LAST LIMIT 5
             """), {"phone": phone, "email": email, "name": name}).mappings().all()
             phones = sorted({lead["phone"] for lead in leads if lead["phone"]})
-            status = {row["phone"]: row for row in session.execute(text("""
-                SELECT p.phone,
-                       -- the send check's rule (consent.has_text_consent): recorded consent, or a LendingFlow lead
-                       -- with no revoked consent (client decision Nov 3); never while suppressed or do-not-contact
-                       ((EXISTS (SELECT 1 FROM lending.text_consents t WHERE t.phone = p.phone AND t.revoked_at IS NULL)
-                         OR (EXISTS (SELECT 1 FROM lending.lendingflow_leads l WHERE l.phone = p.phone)
-                             AND NOT EXISTS (SELECT 1 FROM lending.text_consents t
-                                              WHERE t.phone = p.phone AND t.revoked_at IS NOT NULL)))
-                        AND NOT EXISTS (SELECT 1 FROM lending.suppression_list s WHERE s.phone = p.phone)
-                        AND NOT EXISTS (SELECT 1 FROM lending.contacts c WHERE c.phone = p.phone AND c.do_not_contact))
-                         AS text_consent,
-                       EXISTS (SELECT 1 FROM lending.suppression_list s WHERE s.phone = p.phone) AS suppressed,
-                       EXISTS (SELECT 1 FROM lending.contacts c WHERE c.phone = p.phone AND c.do_not_contact) AS do_not_contact,
-                       (SELECT json_build_object('ended_at', d.call_ended_at, 'caller', d.caller_name,
-                                                 'disposition', COALESCE(d.disposition, d.disposition_raw))
-                          FROM lending.call_dispositions d WHERE d.phone = p.phone
-                         ORDER BY d.call_ended_at DESC NULLS LAST LIMIT 1) AS last_call
-                  FROM unnest(CAST(:phones AS text[])) AS p(phone)
-            """), {"phones": phones}).mappings()} if phones else {}
+            status = phone_flags(session, phones) if phones else {}
         results = []
         for lead in leads:
             flags = status.get(lead["phone"], {})
@@ -607,6 +641,16 @@ class CoraToolkit:
                 "do_not_contact": flags.get("do_not_contact", False), "last_call": flags.get("last_call"),
             })
         return {"matches": results} if results else {"matches": [], "note": "no lead matched"}
+
+    def contact_card(self, args: ContactCardInput, _: ToolContext) -> dict[str, Any]:
+        with self._read_only() as session:
+            ids = find_contacts(session, args.query)
+            if len(ids) != 1:
+                return _contact_matches(session, ids)
+            loaded = load_card(session, ids[0], flags=phone_flags)
+        if loaded is None:
+            return {"matches": [], "note": "no contact matched"}
+        return finish_card(loaded, remote=self._contact_sources(), limit=args.limit)
 
     def list_web_leads(self, args: WebLeadsInput, _: ToolContext) -> dict[str, Any]:
         with self._read_only() as session:
@@ -984,6 +1028,9 @@ class CoraToolkit:
                  "for one caller.", CallActivityInput, read, self.call_activity),
             Tool("find_lead", "Look up a lead by name, phone or email. Returns lead_ref (needed for drafts), last "
                  "call, text consent, opt-out and do-not-contact status.", FindLeadInput, read, self.find_lead),
+            Tool("get_contact_card", "One person's unified contact card: phones (last 4), emails, LLCs, which of GHL, "
+                 "BatchDialer and Instantly know them, and every touch newest first with no duplicates. Look up by "
+                 "phone, email, name or lead_ref.", ContactCardInput, read, self.contact_card),
             Tool("list_web_leads", "Recent nextdeallending.com form leads and whether they reached GoHighLevel.",
                  WebLeadsInput, read, self.list_web_leads),
             Tool("list_upcoming_bookings", "Booked calls starting soon with their reminder status, and open "

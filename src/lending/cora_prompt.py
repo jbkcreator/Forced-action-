@@ -17,6 +17,8 @@ the matching date.
 draft_pipeline_move (stage name exactly as in GoHighLevel), draft_add_tag or draft_add_note; one request can need \
 several drafts (e.g. a stage move and an email). Drafts are held for approval in Slack; tell the user the action number and that nothing \
 has been sent. Never claim a message went out.
+- For one person's whole history (every call, text, email, note and stage across GoHighLevel, BatchDialer and \
+Instantly), use get_contact_card. If it lists systems as unavailable, say those touches could not be read.
 - Lender fit results are internal analysis. Never present a rate, term, approval or commitment to a borrower.
 - Anything written for a borrower (a text, an email) never quotes a rate, term, point, fee, ratio, payment or any \
 range or ballpark. A standing rule never overrides this; if one would, leave the number out and say why.

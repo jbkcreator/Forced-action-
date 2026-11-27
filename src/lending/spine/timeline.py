@@ -4,12 +4,12 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from typing import Sequence
+from typing import Iterable, Sequence
 
 from sqlalchemy.orm import Session
 
 from config.lending_contact_spine import TIMELINE_LIMIT
-from src.lending.spine.touches import Touch, TouchSource, contact_keys, local_touches
+from src.lending.spine.touches import ContactKeys, Touch, TouchSource, contact_keys, local_touches
 
 logger = logging.getLogger(__name__)
 
@@ -26,7 +26,14 @@ def _newest_first(touch: Touch) -> tuple[bool, float]:
 
 def timeline(db: Session, contact_id: int, *, remote: Sequence[TouchSource], limit: int = TIMELINE_LIMIT) -> Timeline:
     keys = contact_keys(db, contact_id)
-    by_ref = {touch.ref: touch for touch in local_touches(db, keys)}
+    return merge_touches(local_touches(db, keys), keys, remote=remote, limit=limit)
+
+
+def merge_touches(local: Iterable[Touch], keys: ContactKeys, *, remote: Sequence[TouchSource],
+                  limit: int = TIMELINE_LIMIT) -> Timeline:
+    """Local touches plus each live source's, one per ref (the provider's own record wins), newest first. Needs no
+    database session, so a caller can close its read-only transaction before the live reads."""
+    by_ref = {touch.ref: touch for touch in local}
     unavailable: list[str] = []
     for source in remote:
         if not getattr(source, "configured", True):
@@ -38,6 +45,6 @@ def timeline(db: Session, contact_id: int, *, remote: Sequence[TouchSource], lim
             logger.warning("contact timeline: %s unavailable (%s)", source.system, type(exc).__name__)
             unavailable.append(source.system)
             continue
-        by_ref.update((touch.ref, touch) for touch in found)  # the provider's own record wins
+        by_ref.update((touch.ref, touch) for touch in found)
     ordered = sorted(by_ref.values(), key=_newest_first)
     return Timeline(touches=tuple(ordered[:limit]), unavailable=tuple(unavailable))
