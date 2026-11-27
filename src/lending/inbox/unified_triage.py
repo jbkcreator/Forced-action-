@@ -12,16 +12,20 @@ import json
 import logging
 import re
 from dataclasses import dataclass, replace
+from datetime import datetime
 from typing import Any, Optional
+
+from sqlalchemy import text
 
 from config.lending_reply_agent import SNIPPET_CHARS
 from config.lending_text_back import BOOKING_LINK
-from config.lending_unified_inbox import CHANNEL_GHL_SMS, CHANNEL_LABELS
+from config.lending_unified_inbox import CHANNEL_GHL_SMS, CHANNEL_LABELS, CHANNELS, SOURCES
 from config.settings import get_settings
 from packages.agent_core.config import parse_user_ids
 from src.lending.cora_inbox import slack_safe
 from src.lending.cora_tools import borrower_draft_problem
 from src.lending.reply_guard import redact_financial_digits
+from src.services.phone_utils import normalize
 
 logger = logging.getLogger(__name__)
 
@@ -183,3 +187,61 @@ def triage_line(*, channel: str, intent: str, who: str, contact_hint: str, summa
         lines.append("> " + slack_safe(cut[:SNIPPET_CHARS]) + ("…" if len(cut) > SNIPPET_CHARS else ""))
     lines.append(slack_safe(next_step))
     return "\n".join(lines), bool(mention)
+
+
+# ── The one write path ───────────────────────────────────────────────────────
+
+@dataclass(frozen=True)
+class InboundItem:
+    """One inbound message or missed call, as an adapter reports it. ``stop=True`` is a stop request already
+    opted out by the adapter: it is stored done, so the sweep never drafts for it."""
+
+    source: str
+    channel: str
+    dedup_key: str
+    ghl_contact_id: Optional[str] = None
+    phone: Optional[str] = None
+    email: Optional[str] = None
+    first_name: Optional[str] = None
+    subject: Optional[str] = None
+    body: Optional[str] = None
+    occurred_at: Optional[datetime] = None
+    stop: bool = False
+
+
+_INSERT = text("""
+    INSERT INTO lending.inbox_events
+        (dedup_key, source, channel, ghl_contact_id, phone, email, first_name, subject, body, occurred_at,
+         status, intent, processed_at)
+    VALUES (:dedup_key, :source, :channel, :ghl_contact_id, :phone, :email, :first_name, :subject, :body,
+            :occurred_at, :status, :intent, CASE WHEN :status = 'done' THEN now() END)
+    ON CONFLICT (dedup_key) DO NOTHING
+    RETURNING id
+""")
+
+
+def _cut(value: Optional[str], length: int) -> Optional[str]:
+    return value[:length] if value else None
+
+
+def record_inbound(db, item: InboundItem) -> Optional[int]:
+    """Store the item once; returns the new row id, or None for a repeat or while the inbox is switched off.
+    Does not commit. Raises ValueError for an item no adapter should produce."""
+    if item.channel not in CHANNELS or item.source not in SOURCES:
+        raise ValueError("inbox item has an unknown channel or source")
+    dedup_key = item.dedup_key.strip()
+    if not dedup_key:
+        raise ValueError("inbox item needs a dedup_key")
+    phone = normalize(item.phone) if item.phone else None
+    email = item.email.strip().lower() if item.email and item.email.strip() else None
+    if not (phone or email or item.ghl_contact_id):
+        raise ValueError("inbox item needs a phone, an email or a GHL contact")
+    if not get_settings().lending_unified_inbox_enabled:
+        return None
+    return db.execute(_INSERT, {
+        "dedup_key": dedup_key[:200], "source": item.source, "channel": item.channel,
+        "ghl_contact_id": _cut(item.ghl_contact_id, 64), "phone": phone, "email": _cut(email, 320),
+        "first_name": _cut(item.first_name, 100), "subject": _cut(item.subject, 500), "body": item.body,
+        "occurred_at": item.occurred_at, "status": "done" if item.stop else "new",
+        "intent": "stop" if item.stop else None,
+    }).scalar_one_or_none()

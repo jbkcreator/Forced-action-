@@ -23,11 +23,10 @@ accepts the documented names and a few alternatives.
 from __future__ import annotations
 
 import hashlib
-import json
 import logging
 import re
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from typing import Any, Optional
 
 from sqlalchemy import text
