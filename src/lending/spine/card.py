@@ -107,13 +107,11 @@ def load_card(db: Session, contact_id: int, *, flags: Flags) -> Optional[LoadedC
 
 def finish_card(loaded: LoadedCard, *, remote: Sequence[TouchSource], limit: int = TIMELINE_LIMIT) -> dict[str, Any]:
     result = merge_touches(loaded.local, loaded.keys, remote=remote, limit=limit)
+    # every local touch (uncapped) plus the live ones; a call's system is its call_source, never guessed from its id
     every = list(loaded.local) + list(result.touches)
-    calls = [s for s in loaded.sources if s.startswith("call:")]
     systems = {
-        "ghl": bool(loaded.keys.ghl_contact_ids) or any(t.system == "ghl" for t in every)
-               or any(s.startswith("call:ghl:") for s in calls),
-        "batchdialer": bool(loaded.keys.dialer_contact_ids) or any(t.system == "batchdialer" for t in every)
-                       or any(not s.startswith("call:ghl:") for s in calls),
+        "ghl": bool(loaded.keys.ghl_contact_ids) or any(t.system == "ghl" for t in every),
+        "batchdialer": bool(loaded.keys.dialer_contact_ids) or any(t.system == "batchdialer" for t in every),
         "instantly": any(t.system == "instantly" for t in every)
                      or any(s.startswith("instantly_reply:") for s in loaded.sources),
     }

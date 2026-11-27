@@ -53,7 +53,7 @@ def test_contact_keys_gather_phones_emails_and_ids(db):
 
 
 def test_same_touch_from_local_and_ghl_appears_once(db):
-    db.execute(text("INSERT INTO lending.pending_actions (id, channel, status, provider_ref, recipient_phone, executed_at)"
+    db.execute(text("INSERT INTO lending.pending_actions (action_id, channel, status, provider_ref, recipient_phone, executed_at)"
                     " VALUES (1, 'ghl_sms', 'sent', 'm1', :p, :at)"), {"p": PHONE, "at": _at(2)})
     ghl = _ghl([{"id": "m1", "messageType": "TYPE_SMS", "direction": "outbound", "dateAdded": _at(2), "body": "hi"}])
     result = timeline(db, _contact(db), remote=[ghl])
@@ -126,7 +126,7 @@ def test_no_message_text_or_full_phone_in_touches(db):
 
 
 def test_cold_email_and_stage_drafts_are_left_to_their_own_records(db):
-    db.execute(text("INSERT INTO lending.pending_actions (id, channel, status, provider_ref, recipient_phone, "
+    db.execute(text("INSERT INTO lending.pending_actions (action_id, channel, status, provider_ref, recipient_phone, "
                     "recipient_email, executed_at) VALUES (1, 'instantly_cold_email', 'sent', 'lead-9', NULL, "
                     "'ann@x.com', :at), (2, 'ghl_stage', 'sent', 'opp-1', :p, NULL, :at)"), {"p": PHONE, "at": _at(2)})
     assert timeline(db, _contact(db), remote=[]).touches == ()

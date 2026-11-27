@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 import logging
+import sys
 from datetime import datetime, timedelta, timezone
 from typing import Iterator, Optional
 
@@ -37,10 +38,20 @@ _IN_ALL_THREE = text("""
     SELECT s.contact_id FROM lending.contact_sources s
      GROUP BY s.contact_id
     HAVING bool_or(s.source = 'instantly_replies')
-       AND bool_or(s.source = 'call_dispositions' AND s.source_ref NOT LIKE 'ghl:%')
+       AND bool_or(s.source = 'call_dispositions' AND EXISTS (
+           SELECT 1 FROM lending.call_dispositions d WHERE d.dialer_call_id = s.source_ref AND d.call_source = 'batchdialer'))
        AND EXISTS (SELECT 1 FROM lending.contact_identifiers i
                     WHERE i.contact_id = s.contact_id AND i.kind = 'ghl_contact')
      ORDER BY s.contact_id LIMIT 1""")
+
+_IN_GHL_AND_BATCHDIALER = text("""
+    SELECT s.contact_id FROM lending.contact_sources s
+     GROUP BY s.contact_id
+    HAVING bool_or(s.source = 'call_dispositions' AND EXISTS (
+           SELECT 1 FROM lending.call_dispositions d WHERE d.dialer_call_id = s.source_ref AND d.call_source = 'batchdialer'))
+       AND EXISTS (SELECT 1 FROM lending.contact_identifiers i
+                    WHERE i.contact_id = s.contact_id AND i.kind = 'ghl_contact')
+     ORDER BY count(*) DESC, s.contact_id LIMIT 1""")
 
 _SYNTHETIC_PHONE = "+18135550188"
 
@@ -75,7 +86,10 @@ def _synthetic_sources(now: datetime) -> list:
 
 
 def _show(label: str, card: Optional[dict]) -> None:
-    logger.info("=== %s ===\n%s", label, json.dumps(card, indent=2, default=str))
+    # the card holds emails and LLC names: the operator's screen, never the log
+    logger.info("=== %s ===", label)
+    sys.stdout.write(json.dumps(card, indent=2, default=str) + "\n")
+    sys.stdout.flush()
 
 
 def main() -> int:
@@ -98,7 +112,13 @@ def main() -> int:
                 loaded = load_card(db, real, flags=phone_flags)
                 _show(f"real contact {real} (live GHL + Instantly)", finish_card(loaded, remote=live_sources()))
                 return 0
-            logger.info("no real contact is in GHL, BatchDialer and Instantly; showing a synthetic borrower")
+            logger.info("no real contact is in GHL, BatchDialer and Instantly")
+            two = db.execute(_IN_GHL_AND_BATCHDIALER).scalar()
+            if two is not None:
+                loaded = load_card(db, two, flags=phone_flags)
+                _show(f"real contact {two} in GHL + BatchDialer (live GHL + Instantly reads)",
+                      finish_card(loaded, remote=live_sources()))
+            logger.info("showing a synthetic borrower in all three")
             sync_contact_spine(db, now=now, readers=SOURCE_READERS + (("synthetic", _synthetic_records),))
             (contact_id,) = find_contacts(db, _SYNTHETIC_PHONE)
             loaded = load_card(db, contact_id, flags=lambda _db, phones: {})

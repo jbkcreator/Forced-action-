@@ -169,3 +169,13 @@ def test_cli_writes_the_card_to_stdout_never_to_the_log(monkeypatch, db, capsys,
     assert card_module.main(["--query", "ann@x.com"]) == 0
     assert '"ann@x.com"' in capsys.readouterr().out
     assert "ann@x.com" not in caplog.text and "test holdings" not in caplog.text
+
+
+def test_a_ghl_call_without_the_ghl_prefix_is_not_batchdialer(db):
+    db.execute(text("INSERT INTO lending.web_leads VALUES (1, 'Cy', '8135550104', NULL, 'G4')"))
+    db.execute(text("INSERT INTO lending.call_dispositions (id, dialer_call_id, phone, call_source, call_started_at) "
+                    "VALUES (1, 'abc-123', '+18135550104', 'ghl', :at)"), {"at": _at(1)})
+    sync_contact_spine(db, now=NOW)
+    (contact_id,) = find_contacts(db, "8135550104")
+    assert contact_card(db, contact_id, remote=[], flags=_flags)["systems"] == {
+        "ghl": True, "batchdialer": False, "instantly": False}

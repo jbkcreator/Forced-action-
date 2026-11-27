@@ -101,11 +101,11 @@ _BRANCHES: tuple[tuple[dict[str, str], tuple[tuple[str, str, str], ...]], ...] =
           kind="CASE WHEN channel = 'ghl_sms' THEN 'text' WHEN channel LIKE '%email' THEN 'email' "
                "WHEN channel = 'ghl_note' THEN 'note' ELSE 'message' END",
           direction="'outbound'", outcome=_NULL,
-          ref="CASE WHEN provider_ref IS NULL THEN 'pending_actions:' || id "
+          ref="CASE WHEN provider_ref IS NULL THEN 'pending_actions:' || action_id "
               "WHEN channel IN ('ghl_sms', 'ghl_email') THEN 'ghl_msg:' || provider_ref "
               "WHEN channel = 'ghl_note' THEN 'ghl_note:' || provider_ref "
               "WHEN channel LIKE 'instantly%' THEN 'instantly:' || provider_ref "
-              "ELSE 'pending_actions:' || id END",
+              "ELSE 'pending_actions:' || action_id END",
           # a cold email's provider ref is an Instantly lead id (the live email list has it) and a stage move has its
           # own ghl_stage_events row: either would show twice
           base="status = 'sent' AND channel NOT IN ('instantly_cold_email', 'ghl_stage')"),
