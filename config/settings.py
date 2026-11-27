@@ -1003,6 +1003,9 @@ class AppSettings(BaseSettings):
 	# T-11 LendingFlow intake. Off by default; the receiver is closed (503) until the flag is on AND the secret is set.
 	lending_lendingflow_enabled: bool = Field(default=False, env="LENDING_LENDINGFLOW_ENABLED")
 	lending_lendingflow_webhook_secret: Optional[SecretStr] = Field(default=None, env="LENDING_LENDINGFLOW_WEBHOOK_SECRET")
+	# R1 0.5 D6: optional HMAC-SHA256 (hex) of the raw LendingFlow body in this header; checked only while the key is set
+	lending_lendingflow_hmac_secret: Optional[SecretStr] = Field(default=None, env="LENDING_LENDINGFLOW_HMAC_SECRET")
+	lending_lendingflow_hmac_header: str = Field(default="X-LendingFlow-Signature", env="LENDING_LENDINGFLOW_HMAC_HEADER")
 	# Pipeline stage (in LENDING_GHL_PIPELINE_ID) for new LendingFlow leads; unset = contact only.
 	lending_ghl_stage_lendingflow_new: Optional[str] = Field(default=None, env="LENDING_GHL_STAGE_LENDINGFLOW_NEW")
 	# LendingFlow -> BatchDialer campaign "LendingFlow" (src/lending/lendingflow_dialer.py). Off: nothing is loaded; leads
@@ -1121,6 +1124,13 @@ class AppSettings(BaseSettings):
 	lending_ghl_call_gate_enabled: bool = Field(default=False, env="LENDING_GHL_CALL_GATE_ENABLED")
 	# BatchDialer load -> GHL contact sync (src/lending/ghl_load_sync.py): every active dialer load pushed to GHL as a cold contact
 	lending_ghl_load_sync_enabled: bool = Field(default=False, env="LENDING_GHL_LOAD_SYNC_ENABLED")
+	# R1 0.5 durable inbound (src/lending/inbound/journal.py): webhooks save the raw body to lending.inbound_events first,
+	# then process it; a failure goes to webhook_failures and the endpoint still answers 200. Off = endpoints as before
+	lending_inbound_journal_enabled: bool = Field(default=False, env="LENDING_INBOUND_JOURNAL_ENABLED")
+	# R1 0.5 nightly reconcile (src/tasks/lending_reconciliation.py, acts at 2:xx ET): GHL stages of the NDL pipeline(s) updated in the
+	# last 24 h that our current stage lacks are fed through the ghl_stage journal handler. Pipeline ids comma-separated; unset = GHL slot fails
+	lending_reconcile_enabled: bool = Field(default=False, env="LENDING_RECONCILE_ENABLED")
+	lending_reconcile_ghl_pipeline_ids: str = Field(default="", env="LENDING_RECONCILE_GHL_PIPELINE_IDS")
 	# Morning BatchDialer load of the PropertyRadar pool the bridge stages (src/tasks/lending_pr_dialer_autoload.py,
 	# 09:xx and 12:xx ET): only phones not already loaded. The cap is Tracerfy do-not-call credits per ET day (a phone with a
 	# fresh check costs nothing); 0 = only phones already checked are loaded

@@ -11,6 +11,9 @@ grant is closed as superseded instead of applied.
 Alerts carry the GHL contact id, the endpoint and the error class: never a phone number or message text.
 Keyword STOPs are also covered by the 15-minute GHL DND backstop; free-text opt-outs are covered only here.
 
+The same cron also runs ``src.lending.inbound.journal.reclaim_stuck`` (R1 0.5) while LENDING_INBOUND_JOURNAL_ENABLED.
+Sources registered through the inbound journal add their own handler, label and resend hint to the dicts below.
+
 Usage (cron, every 5 minutes):
     python -m src.lending.webhook_failures
 """
@@ -49,8 +52,13 @@ ENDPOINT_HANDLERS: dict[str, Callable[[Any, dict[str, Any]], Any]] = {
     GHL_TEXT_CONSENT: record_inbound_consent,
     AFTER_HOURS_INTAKE: record_intake,  # a replay keeps the original call id, so it never pins twice
 }
-ENDPOINT_LABELS = {GHL_OPT_OUT: "opt-out (DND changed)", GHL_TEXT_CONSENT: "inbound text / consent",
-                   AFTER_HOURS_INTAKE: "after-hours voicemail", GHL_LOAN_STAGE: "loan stage (Funded / Paid)"}
+ENDPOINT_LABELS = {GHL_OPT_OUT: "GHL opt-out (DND changed)", GHL_TEXT_CONSENT: "GHL inbound text / consent",
+                   AFTER_HOURS_INTAKE: "GHL after-hours voicemail", GHL_LOAN_STAGE: "GHL loan stage (Funded / Paid)"}
+# What ops does by hand when an event cannot be retried; sources registered by the inbound journal add their own.
+DEFAULT_RESEND_HINT = "re-run the GHL workflow for this contact"
+ENDPOINT_RESEND_HINTS: dict[str, str] = {}
+# Run in the replay's savepoint after a handler succeeds (the inbound journal marks its row processed here).
+ON_RESOLVED: dict[str, Callable[[Any, int], None]] = {}
 MAX_RETRY_ATTEMPTS = 5
 RETRY_BATCH_SIZE = 50
 
@@ -81,11 +89,21 @@ def _label(endpoint: str) -> str:
     return ENDPOINT_LABELS.get(endpoint, endpoint)
 
 
+def _resend_hint(endpoint: str) -> str:
+    return ENDPOINT_RESEND_HINTS.get(endpoint, DEFAULT_RESEND_HINT)
+
+
 def save_failure(endpoint: str, body: dict[str, Any], error: str) -> int:
     """Store the payload for replay on a connection of its own (the request's transaction has failed)."""
     with lending_session() as db:
-        return int(db.execute(_INSERT, {"endpoint": endpoint, "payload": json.dumps(body),
-                                        "contact": contact_id_of(body), "error": error}).scalar_one())
+        return insert_failure(db, endpoint, body, error)
+
+
+def insert_failure(db, endpoint: str, body: dict[str, Any], error: str) -> int:
+    """Insert a retry row in the caller's transaction."""
+    return int(db.execute(_INSERT, {"endpoint": endpoint, "payload": json.dumps(body),
+                                    "contact": contact_id_of(body), "error": error}).scalar_one())
+
 
 
 def report_webhook_failure(endpoint: str, body: dict[str, Any], error: BaseException, *,
@@ -101,12 +119,12 @@ def report_webhook_failure(endpoint: str, body: dict[str, Any], error: BaseExcep
         logger.error("[lending-webhook-failure] %s could not be saved for retry: %s", endpoint, type(exc).__name__)
         failure_id = None
     if failure_id is not None:
-        message = (f":warning: GHL {_label(endpoint)} webhook failed ({error_name}) for GHL contact {contact}. "
+        message = (f":warning: {_label(endpoint)} webhook failed ({error_name}) for contact {contact}. "
                    f"Saved as #{failure_id}; it is retried automatically every 5 minutes.")
     else:
-        message = (f":rotating_light: GHL {_label(endpoint)} webhook failed ({error_name}) for GHL contact {contact}, "
-                   "and it could not be saved for retry. This event is NOT recorded: re-run the "
-                   "GHL workflow for this contact once the database is healthy.")
+        message = (f":rotating_light: {_label(endpoint)} webhook failed ({error_name}) for contact {contact}, "
+                   f"and it could not be saved for retry. This event is NOT recorded: {_resend_hint(endpoint)} "
+                   "once the database is healthy.")
     logger.error("[lending-webhook-failure] %s failed for contact %s: %s (saved=%s)", endpoint, contact, error_name,
                  failure_id)
     notify(message)
@@ -146,6 +164,9 @@ def _retry_one(db, row, result: RetryResult) -> None:
                 raise InvalidEvent(f"no handler for endpoint {row.endpoint}")
             handler(db, payload)
             db.execute(_RESOLVED, {"id": row.id})
+            on_resolved = ON_RESOLVED.get(row.endpoint)
+            if on_resolved is not None:
+                on_resolved(db, row.id)
         result.resolved += 1
         logger.info("[lending-webhook-failure] #%s replayed (%s)", row.id, row.endpoint)
         return
@@ -159,14 +180,21 @@ def _retry_one(db, row, result: RetryResult) -> None:
     if give_up:
         result.gave_up += 1
         result.alerts.append(
-            f":rotating_light: GHL {_label(row.endpoint)} webhook #{row.id} for GHL contact "
+            f":rotating_light: {_label(row.endpoint)} webhook #{row.id} for contact "
             f"{row.ghl_contact_id or 'unknown'} still fails after {attempts} attempt(s) ({error}). It is no longer "
-            "retried: this event is NOT recorded. Check it and re-run the GHL workflow.")
+            f"retried: this event is NOT recorded. Check it and {_resend_hint(row.endpoint)}.")
         result.gave_up_events.append({"webhook_failure_id": row.id, "endpoint": row.endpoint,
                                       "ghl_contact_id": row.ghl_contact_id, "attempts": attempts, "error": error})
     else:
         result.still_failing += 1
         logger.warning("[lending-webhook-failure] #%s retry %s failed: %s", row.id, attempts, error)
+
+
+def replay_one(db, row) -> RetryResult:
+    """Run one saved failure once now, exactly as the sweep would (the DLQ replay CLI)."""
+    result = RetryResult()
+    _retry_one(db, row, result)
+    return result
 
 
 def retry_pending(*, session_factory: Callable = lending_session,
@@ -181,7 +209,7 @@ def retry_pending(*, session_factory: Callable = lending_session,
         add_to_inbox_in_own_session(
             event_type="consent_webhook_gave_up", dedup_key=str(event["webhook_failure_id"]), target_channel="ops_notice",
             channel_posted=bool(posted), payload=event,
-            summary=f"GHL {_label(event['endpoint'])} webhook no longer retried: the change is NOT recorded",
+            summary=f"{_label(event['endpoint'])} webhook no longer retried: the change is NOT recorded",
         )
     return result
 
@@ -189,7 +217,10 @@ def retry_pending(*, session_factory: Callable = lending_session,
 def main() -> int:
     if not logging.getLogger().handlers:
         logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
+    from src.lending.inbound import journal
+
     try:
+        journal.load_handlers()
         result = retry_pending()
     except Exception as exc:  # class only
         logger.error("[lending-webhook-failure] retry sweep failed: %s", type(exc).__name__)
@@ -197,8 +228,27 @@ def main() -> int:
     if result.resolved or result.superseded or result.still_failing or result.gave_up:
         logger.info("[lending-webhook-failure] resolved=%d superseded=%d still_failing=%d gave_up=%d",
                     result.resolved, result.superseded, result.still_failing, result.gave_up)
+    return _reclaim_inbound_journal()
+
+
+def _reclaim_inbound_journal() -> int:
+    """R1 0.5: run inbound journal rows a killed worker left unprocessed (only while the journal is on)."""
+    from src.lending.inbound import journal  # the journal imports this module
+
+    if not journal.journal_enabled():
+        return 0
+    try:
+        reclaimed = journal.reclaim_stuck()
+    except Exception as exc:  # class only
+        logger.error("[lending-webhook-failure] inbound journal reclaim failed: %s", type(exc).__name__)
+        return 1
+    if reclaimed.processed or reclaimed.failed or reclaimed.skipped:
+        logger.info("[lending-webhook-failure] journal reclaimed processed=%d failed=%d skipped=%d",
+                    reclaimed.processed, reclaimed.failed, reclaimed.skipped)
     return 0
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    from src.lending import webhook_failures
+
+    raise SystemExit(webhook_failures.main())

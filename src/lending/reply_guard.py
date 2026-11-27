@@ -225,13 +225,20 @@ def _queue_for_cora(db, kind: str, event: ReplyEvent) -> None:
     )
 
 
-def handle_reply_event(db, event: ReplyEvent, *, poster: Optional[SlackPoster]) -> str:
+def _commit(db, commit: bool) -> None:
+    if commit:
+        db.commit()
+
+
+def handle_reply_event(db, event: ReplyEvent, *, poster: Optional[SlackPoster], commit: bool = True) -> str:
     """Returns "ignored", "duplicate", "posted", "not_configured" or "test_skipped" (a test contact while
     LENDING_SLACK_TEST_ENABLED is off). Commits the claim before posting (so
-    a failed post is retried on redelivery) and the post result after. Raises if the post itself fails."""
+    a failed post is retried on redelivery) and the post result after. Raises if the post itself fails.
+    ``commit=False`` (the inbound journal's handler) never commits: the caller's transaction holds the claim and
+    the post result together, and a failed post rolls both back for the journal's retry."""
     if event.direction == "outbound" and event.from_user and event.contact_id:
         answered = db.execute(_RESPONDED, {"contact_id": event.contact_id}).rowcount
-        db.commit()
+        _commit(db, commit)
         if answered:
             logger.info("[reply-guard] %d handoff(s) answered by a person contact=%s", answered, event.contact_id)
     kind = classify(event)
@@ -239,7 +246,7 @@ def handle_reply_event(db, event: ReplyEvent, *, poster: Optional[SlackPoster]) 
         return "ignored"
     db.execute(_CLAIM, {"message_id": event.message_id, "kind": kind, "contact_id": event.contact_id,
                         "phone_hash": phone_hash(event.phone)[:12] if event.phone else None})
-    db.commit()
+    _commit(db, commit)
     if db.execute(_STATE, {"message_id": event.message_id}).scalar():
         return "duplicate"
     if poster is None:
@@ -254,7 +261,7 @@ def handle_reply_event(db, event: ReplyEvent, *, poster: Optional[SlackPoster]) 
     poster(format_slack(kind, event, full_name=full_name))
     db.execute(_POSTED, {"message_id": event.message_id})
     _queue_for_cora(db, kind, event)
-    db.commit()
+    _commit(db, commit)
     logger.info("[reply-guard] posted %s message=%s phone_hash=%s", kind, event.message_id,
                 phone_hash(event.phone)[:12] if event.phone else "-")
     return "posted"
