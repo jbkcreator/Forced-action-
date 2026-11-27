@@ -5,11 +5,13 @@ An unreadable file counts as no state: the retry then re-sends rather than dropp
 """
 from __future__ import annotations
 
+import fcntl
 import json
 import logging
+from contextlib import contextmanager
 from datetime import date
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Iterator, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -36,3 +38,13 @@ def save(name: str, day: date, state: dict[str, Any]) -> None:
     tmp = path.with_suffix(".tmp")
     tmp.write_text(json.dumps(state))
     tmp.replace(path)
+
+
+@contextmanager
+def locked(name: str, day: date) -> Iterator[None]:
+    """Serialises overlapping runs of one post on one day (a slow retry and the next cron line): the second waits, then
+    reads the state the first saved."""
+    ROOT.mkdir(parents=True, exist_ok=True)
+    with open(ROOT / f"{name}-{day.isoformat()}.lock", "w") as handle:
+        fcntl.flock(handle, fcntl.LOCK_EX)  # released when the file closes
+        yield

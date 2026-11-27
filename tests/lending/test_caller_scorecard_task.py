@@ -167,3 +167,41 @@ def test_a_finished_day_is_not_posted_again(run):
     assert run.go() == 0
     assert run.go(TUE_3_00) == 0 and run.go(TUE_3_45) == 0
     assert len(run.client.posts) == 1 and run.built == 1
+
+
+
+def test_failed_read_on_retry_cannot_drop_the_notes_thread(run):
+    run.card = _card(_call("c2", recorded=False))
+    run.client.down = "thread"
+    assert run.go() == 1
+    run.client.down = False
+    run.card = RuntimeError("call list down")  # the retry must not need the database
+    assert run.go(TUE_3_00) == 0
+    main, thread = run.client.posts
+    assert thread["thread_ts"] == "1.1" and thread["blocks"][0]["accessory"]["value"] == "c2"
+    assert run.built == 1 and run.ops == []
+
+
+def test_overlapping_runs_wait_on_the_lock_and_send_the_thread_once(run):
+    import threading
+    run.card = _card(_call("c2", recorded=False))
+    entered, release, results = threading.Event(), threading.Event(), []
+    real = run.client.chat_postMessage
+
+    def slow(**kw):
+        if "thread_ts" in kw:
+            entered.set()
+            release.wait(5)
+        return real(**kw)
+
+    run.client.chat_postMessage = slow
+    first = threading.Thread(target=lambda: results.append(run.go()))
+    first.start()
+    assert entered.wait(5)
+    second = threading.Thread(target=lambda: results.append(run.go(TUE_3_45)))
+    second.start()
+    second.join(0.3)
+    assert second.is_alive()  # waiting on the first run's lock
+    release.set()
+    first.join(5), second.join(5)
+    assert results == [0, 0] and len(run.client.posts) == 2 and run.built == 1

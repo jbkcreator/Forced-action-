@@ -46,7 +46,8 @@ Read-only. It counts, alerts, and pushes nothing to BatchDialer; the loaders (`l
 - If the whole check fails, ops gets a notice and no count is posted.
 - **Delivery and retries.** David's post and the ops alert are each tried on every run and tracked separately for the
   ET day in `data/dialer_posts/` (gitignored). If either fails the run returns 1 and the cron retry (+15, +30 min) sends
-  only the missing one, with the same text, even after 7:00 ET. A finished day is not posted again.
+  only the missing one, with the same text, even after 7:00 ET. An unset `LENDING_DAVID_CHANNEL` fails only David's
+  post; the ops alert still goes. A finished day is not posted again, and overlapping runs wait on a per-day lock.
 
 **0.6 reuse.** `read_queue(db, now, lead_days=..., autoload_enabled=...)` returns a `QueueReport`; 0.6's outage case should call it rather than
 build a second eligibility rule or a second "no eligible work" alert.
@@ -69,9 +70,11 @@ Slack form that saves the call's extraction fields to `lending.call_extractions`
 `LENDING_DAVID_SLACK_USER_ID` and `LENDING_CORA_APPROVER_USER_IDS` can open or submit it. Notes entered after 2:45 PM
 count in the next day's quality figures for that call only if it is still in the day's window, so enter them the same day.
 
-**Delivery and retries.** The main post's Slack timestamp is saved as soon as it is sent (`data/dialer_posts/`). If the
-main post or the notes thread fails, the run returns 1 and the cron retry (+15, +30 min, so after 3 PM) resumes: the
-main post only if it was not sent, and the notes thread under the saved one. A finished day is not posted again.
+**Delivery and retries.** The rendered main post and notes thread are saved before either is sent, and the main post's
+Slack timestamp as soon as it is sent (`data/dialer_posts/`). If the main post or the notes thread fails, the run
+returns 1 and the cron retry (+15, +30 min, so after 3 PM) resumes from that saved payload without reading the database
+again: the main post only if it was not sent, and the notes thread under the saved one. A finished day is not posted
+again, and overlapping runs wait on a per-day lock.
 `--force` and `--dry-run` neither read nor write this state, so a forced run always posts a fresh card.
 
 ## Setup

@@ -98,10 +98,10 @@ def test_unreadable_queue_alerts_ops_instead_of_posting_a_count(run):
     assert run.posts == [] and len(run.ops) == 1 and "RuntimeError" in run.ops[0]
 
 
-def test_unset_channel_is_reported_and_nothing_posts(run, monkeypatch):
+def test_unset_david_channel_is_reported_and_a_full_queue_posts_nothing(run):
     run.channel = ""
     assert task.main([], now=TUE_6_10) == 1
-    assert run.unset == ["David's dialer queue check"] and run.reads == 0
+    assert run.unset == ["David's dialer queue check"] and run.ops == []
 
 
 def test_dry_run_failure_does_not_ping_ops(run):
@@ -146,3 +146,33 @@ def test_the_autoload_switch_is_passed_to_the_queue_read(run):
     run.autoload = False
     run.go()
     assert run.read_kw == {"autoload_enabled": False}
+
+
+def test_unset_david_channel_still_sends_the_ops_shortage_alert(run):
+    run.channel, run.report = "", _report(4)
+    assert task.main([], now=TUE_6_10) == 1  # David's post is still missing
+    assert run.reads == 1 and len(run.ops) == 1 and run.ops[0].startswith(":warning: Only 4 of 50 eligible")
+    assert run.unset == ["David's dialer queue check"]
+    run.channel = "C_DAVID"
+    assert run.go(TUE_7_05) == 0 and run.posts == run.ops and len(run.ops) == 1  # ops not alerted twice
+
+
+def test_overlapping_runs_wait_on_the_lock_and_post_once(run):
+    import threading
+    entered, release, results = threading.Event(), threading.Event(), []
+
+    def slow_post(message):
+        entered.set()
+        release.wait(5)
+        run.posts.append(message)
+
+    first = threading.Thread(target=lambda: results.append(task.main([], now=TUE_6_10, post=slow_post)))
+    first.start()
+    assert entered.wait(5)
+    second = threading.Thread(target=lambda: results.append(run.go(TUE_6_25)))
+    second.start()
+    second.join(0.3)
+    assert second.is_alive()  # waiting on the first run's lock
+    release.set()
+    first.join(5), second.join(5)
+    assert results == [0, 0] and len(run.posts) == 1 and run.reads == 1

@@ -13,13 +13,15 @@ with the switch off.
 
 Delivery is tracked per destination for the ET day (``src/lending/dialer/delivery_state.py``). A run that fails
 returns 1; the cron retry (run.sh, +15 and +30 min) then sends only the message that is still missing, with the text
-first composed, even after 7:00 ET. A finished day is never posted again. ``--force`` and ``--dry-run`` neither read
-nor write that state.
+first composed, even after 7:00 ET. An unset David channel fails only David's post: the ops alert still goes. A finished
+day is never posted again. Overlapping runs wait on a per-day lock. ``--force`` and ``--dry-run`` neither read nor
+write that state.
 """
 from __future__ import annotations
 
 import argparse
 import logging
+from contextlib import nullcontext
 from datetime import datetime, timezone
 from typing import Callable, Optional
 from zoneinfo import ZoneInfo
@@ -56,8 +58,14 @@ def main(argv=None, *, now: Optional[datetime] = None, post: Optional[Callable[[
     parser.add_argument("--dry-run", action="store_true", help="log the post, do not send it")
     args = parser.parse_args(argv)
     now = now or datetime.now(timezone.utc)
-    now_et = now.astimezone(ZoneInfo(DEFAULT_TZ))
     stateful = not (args.force or args.dry_run)
+    day = now.astimezone(ZoneInfo(DEFAULT_TZ)).date()
+    with delivery_state.locked(STATE, day) if stateful else nullcontext():
+        return _run(args, now, post, stateful)
+
+
+def _run(args: argparse.Namespace, now: datetime, post: Optional[Callable[[str], bool]], stateful: bool) -> int:
+    now_et = now.astimezone(ZoneInfo(DEFAULT_TZ))
     state = delivery_state.load(STATE, now_et.date()) if stateful else None
     if state is not None and state.get("done"):
         return 0
@@ -69,10 +77,7 @@ def main(argv=None, *, now: Optional[datetime] = None, post: Optional[Callable[[
         logger.info("[queue-check] off (LENDING_DIALER_QUEUE_CHECK_ENABLED is not true)")
         return 0
     channel = s.lending_david_channel.strip()
-    if post is None and not args.dry_run:
-        if not (channel and s.lending_slack_bot_token):
-            report_unset("David's dialer queue check", ("LENDING_DAVID_CHANNEL", BOT_TOKEN))
-            return 1
+    if post is None and not args.dry_run and channel and s.lending_slack_bot_token:
         post = _slack_poster(s.lending_slack_bot_token.get_secret_value(), channel)
     state = state or {}
 
@@ -99,7 +104,9 @@ def main(argv=None, *, now: Optional[datetime] = None, post: Optional[Callable[[
         state.update(message=message, david=False, ops=not report.short)  # a short queue also goes to ops
         remember()
         logger.info("[queue-check] %s: %d eligible", report.day, report.eligible_total)
-    if not state["david"]:
+    if not state["david"] and post is None:  # unset: David's post fails, the ops alert below still goes
+        report_unset("David's dialer queue check", ("LENDING_DAVID_CHANNEL", BOT_TOKEN))
+    elif not state["david"]:
         try:
             post(state["message"])
             state["david"] = True
