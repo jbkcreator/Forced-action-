@@ -29,6 +29,10 @@ TOKEN_TTL = timedelta(days=30)
 MAX_UPLOADS_PER_ITEM = 5  # a leaked link cannot fill the disk: newer copies are allowed up to this
 MAX_UPLOADS_PER_CHASE = 40
 UPLOAD_LINK_PATH = "/api/lending/docs/{token}"
+# R1 0.2: an admin's link to view or download one stored document, and a staff API token's life.
+DOC_VIEW_LINK_TTL = timedelta(minutes=15)
+DOC_VIEW_LINK_PATH = "/api/lending/docs/view/{token}"
+STAFF_TOKEN_TTL = timedelta(days=90)
 REQUESTED_BY = "doc_chase"  # pending_actions.requested_by for every P2.4 draft
 
 

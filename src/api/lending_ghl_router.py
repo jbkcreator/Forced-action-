@@ -15,7 +15,6 @@ POST /webhooks/lending/after-hours-intake (after-hours voicemail / answering ser
 from __future__ import annotations
 
 import hmac
-import json
 import logging
 from typing import Any, Optional
 
@@ -24,16 +23,14 @@ from datetime import datetime, timezone
 from fastapi import APIRouter, BackgroundTasks, Depends, Header, HTTPException
 from sqlalchemy.orm import Session
 
-from sqlalchemy import text
 
 from config.settings import get_settings
 from src.api.deps import get_db
 from src.lending.after_hours_conversation import conversations_enabled
 from src.lending.after_hours_intake import record_intake
 from src.lending.after_hours_responder import run_send_cycle_now
-from src.lending.closing.blockers import current_stage, upsert_current_stage
-from src.lending.cora_inbox import add_to_inbox_safely
-from src.lending.ghl_stage_bridge import GHL_STAGE_TO_LOAN_STAGE, apply_stage
+from src.lending.inbound import ghl_stage as ghl_stage_handler, journal
+from src.lending.inbound.ghl_stage import UNRESOLVED_VALUES
 from src.lending.ghl_disposition_match import (
     InvalidDispositionEvent,
     attach_pending,
@@ -44,9 +41,7 @@ from src.lending.ghl_disposition_match import record_event as record_disposition
 from src.lending.ghl_missed_call import InvalidMissedCall, parse_missed_call, record_missed_call, run_text_back_now
 from src.lending.payload_shape import log_shape
 from src.lending.ghl_consent_events import InvalidEvent, field as _field, record_ghl_opt_out, record_inbound_consent
-from src.lending.webhook_failures import (AFTER_HOURS_INTAKE, GHL_LOAN_STAGE, GHL_OPT_OUT, GHL_TEXT_CONSENT,
-                                         report_webhook_failure)
-from src.services.phone_utils import normalize
+from src.lending.webhook_failures import AFTER_HOURS_INTAKE, GHL_OPT_OUT, GHL_TEXT_CONSENT, report_webhook_failure
 
 logger = logging.getLogger(__name__)
 
@@ -110,73 +105,6 @@ def ghl_text_consent(
     return result
 
 
-# What a GHL merge field becomes when it does not resolve (the workflow's variable is wrong or empty). Saving such
-# a value as a stage would hide the mistake: the event would never match "funded" and nobody would be told.
-_UNRESOLVED_VALUES = frozenset({"null", "none", "undefined", "nan"})
-
-
-def _resolved(body: dict[str, Any], name: str) -> Optional[str]:
-    """An optional field, or None when GHL sent an unresolved merge field ("null") in its place."""
-    value = _field(body, name)
-    return None if value is None or value.strip().lower() in _UNRESOLVED_VALUES else value
-
-
-def _now() -> datetime:
-    return datetime.now(timezone.utc)
-
-
-def _flag_held_stage(db: Session, opportunity_id: str, stage: str, now: datetime) -> None:
-    """A repeated stage event held as a redelivery: logged, and one Cora inbox item, because a real move back made
-    within the hour looks the same (GHL sends no event time)."""
-    current = current_stage(db, opportunity_id)
-    current_name = current[0] if current else "unknown"
-    logger.warning("[lending-ghl] repeated stage event held as a redelivery (deal moved stage within the hour)")
-    add_to_inbox_safely(
-        db, event_type="ghl_stage_repeat_held", dedup_key=f"{opportunity_id}:{stage.strip().lower()}:{now:%Y%m%d%H}",
-        summary=f"GHL sent \"{stage}\" again for deal {opportunity_id}, which moved to \"{current_name}\" less than an "
-                "hour ago. Treated as a repeat delivery. If the deal really went back, move it in GHL again after "
-                "the hour.", payload={"ghl_opportunity_id": opportunity_id, "stage": stage, "current": current_name})
-
-
-def _record_current_stage(db: Session, opportunity_id: str, stage: str, phone: Optional[str], *,
-                          repeat: bool) -> None:
-    """P2.4 current stage, in a savepoint: a failure is logged and never loses the scoreboard's stage event.
-    ``repeat``: the event was already recorded; a redelivery never moves the deal (blockers.upsert_current_stage).
-
-    R1 0.1: for a stage that moves a loan file (Funded / Paid) the failure is re-raised instead. The loan bridge applies
-    an event only while it is the deal's current stage, so without this write it would skip a valid update as stale.
-    The webhook then rolls back and answers 500, and GHL delivers the event again."""
-    try:
-        with db.begin_nested():
-            now = _now()
-            if not upsert_current_stage(db, opportunity_id=opportunity_id, stage_name=stage, phone=phone, now=now,
-                                        repeat=repeat):
-                _flag_held_stage(db, opportunity_id, stage, now)
-    except Exception as exc:  # class only: SQL errors embed bound parameters
-        logger.error("[lending-ghl] current stage not recorded (%s)", type(exc).__name__)
-        if stage.strip().lower() in GHL_STAGE_TO_LOAN_STAGE:
-            raise
-
-
-def _apply_loan_stage(db: Session, opportunity_id: str, stage: str, phone: Optional[str]) -> None:
-    """R1 0.1: a Funded / Paid stage moves the loan file (``ghl_stage_bridge``), in a savepoint: a failure never loses
-    the scoreboard's stage event, and the event is saved to ``lending.webhook_failures`` (with an ops alert) and
-    replayed every 5 minutes until the file takes it, so GHL's 200 never hides a lost loan update. A refused move is
-    stored and carded by the state machine; GHL still gets 200. If the retry cannot be saved either, the error is
-    re-raised: the webhook rolls back and answers 500, so GHL delivers the event again (the stage insert is idempotent)."""
-    try:
-        with db.begin_nested():
-            outcome = apply_stage(db, opportunity_id=opportunity_id, stage_name=stage, phone=phone)
-        if outcome:
-            logger.info("[lending-ghl] loan stage from GHL: %s", outcome)
-    except Exception as exc:
-        logger.error("[lending-ghl] loan stage not applied (%s); saving it for retry", type(exc).__name__)
-        saved = report_webhook_failure(GHL_LOAN_STAGE,
-                                       {"opportunity_id": opportunity_id, "stage_name": stage, "phone": phone}, exc)
-        if saved is None:  # not saved for retry either: fail the webhook so GHL delivers it again
-            raise
-
-
 @router.post("/ghl-stage")
 def ghl_stage(
     body: dict[str, Any],
@@ -189,26 +117,31 @@ def ghl_stage(
     opportunity_id, stage = _field(body, "opportunity_id") or _field(body, "id"), _field(body, "stage_name")
     if not opportunity_id or not stage:
         raise HTTPException(status_code=422, detail="opportunity_id and stage_name are required")
-    if stage.strip().lower() in _UNRESOLVED_VALUES or opportunity_id.strip().lower() in _UNRESOLVED_VALUES:
+    if stage.strip().lower() in UNRESOLVED_VALUES or opportunity_id.strip().lower() in UNRESOLVED_VALUES:
         logger.warning("[lending-ghl] stage webhook refused: a merge field did not resolve (opportunity_id/stage_name)")
         raise HTTPException(status_code=422, detail="stage_name or opportunity_id did not resolve: check the GHL merge fields")
+    if journal.journal_enabled():
+        return _ghl_stage_via_journal(body, opportunity_id, stage)
     try:
-        phone = normalize(_resolved(body, "phone"))
-        inserted = db.execute(
-            text("INSERT INTO lending.ghl_stage_events (ghl_opportunity_id, pipeline_id, stage_name, stage_key, phone, "
-                 "booked_by, raw_event) VALUES (:opp, :pipe, :stage, :key, :phone, :by, CAST(:raw AS jsonb)) "
-                 "ON CONFLICT (ghl_opportunity_id, stage_key) DO NOTHING"),
-            {"opp": opportunity_id, "pipe": _field(body, "pipeline_id"), "stage": stage, "key": stage.strip().lower(),
-             "phone": phone, "by": _resolved(body, "booked_by"), "raw": json.dumps(body)},
-        ).rowcount
-        _record_current_stage(db, opportunity_id, stage, phone, repeat=not inserted)
-        _apply_loan_stage(db, opportunity_id, stage, phone)
+        inserted = ghl_stage_handler.record_stage_event(db, body, opportunity_id, stage)
         db.commit()
     except Exception as exc:
         db.rollback()
         logger.error("[lending-ghl] stage webhook failed: %s", type(exc).__name__)
         raise HTTPException(status_code=500, detail="Stage event could not be recorded") from exc
     return {"recorded": bool(inserted)}
+
+
+def _ghl_stage_via_journal(body: dict[str, Any], opportunity_id: str, stage: str) -> dict[str, Any]:
+    """R1 0.5: raw body saved first, then handled (GHL read-through); 200 once saved, 500 only when it was not.
+    A repeat always reruns the idempotent handler (D5) so the redelivery hold keeps working."""
+    try:
+        result = journal.ingest(ghl_stage_handler.SOURCE, ghl_stage_handler.dedup_key(opportunity_id, stage), body,
+                                rerun_duplicates=True)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail="Stage event could not be recorded") from exc
+    recorded = bool(result.value.get("recorded")) if isinstance(result.value, dict) else False
+    return {"recorded": recorded, "status": result.outcome}
 
 
 @router.post("/ghl-disposition")

@@ -1,4 +1,4 @@
-"""Cora's 7:30 AM morning digest: when it is due, posting once a day, retry on a failed post, and what it shows.
+"""Cora's 7:47 AM morning digest: when it is due, posting once a day, retry on a failed post, and what it shows.
 SQLite with an attached ``lending`` schema and an in-memory chat: no Slack, no shared database."""
 from __future__ import annotations
 
@@ -12,15 +12,15 @@ from packages.agent_core.chatport import FakeChatPort, PostResult
 from src.lending import cora_agent
 from src.lending.cora_morning_digest import DigestData, digest_day, post_morning_digest, render
 
-# 2026-10-19 is EDT (UTC-4): 11:30 UTC is 7:30 AM ET.
-AT_7_29 = datetime(2026, 10, 19, 11, 29, tzinfo=timezone.utc)
-AT_7_30 = datetime(2026, 10, 19, 11, 30, tzinfo=timezone.utc)
+# 2026-10-19 is EDT (UTC-4): 11:47 UTC is 7:47 AM ET.
+AT_7_46 = datetime(2026, 10, 19, 11, 46, tzinfo=timezone.utc)
+AT_7_47 = datetime(2026, 10, 19, 11, 47, tzinfo=timezone.utc)
 AT_11_59 = datetime(2026, 10, 19, 15, 59, tzinfo=timezone.utc)
 AT_NOON = datetime(2026, 10, 19, 16, 0, tzinfo=timezone.utc)
 
 _DDL = (
     "CREATE TABLE lending.cora_morning_digests (digest_date DATE PRIMARY KEY, slack_channel TEXT, slack_ts TEXT,"
-    " posted_at TIMESTAMP, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)",
+    " posted_at TIMESTAMP, thread_pending TEXT, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)",
     "CREATE TABLE lending.pending_actions (action_id INTEGER PRIMARY KEY, tool_name TEXT, summary TEXT,"
     " contact_ref TEXT, status TEXT, created_at TIMESTAMP)",
     "CREATE TABLE lending.booking_messages (booking_ref TEXT, first_name TEXT, contact_phone TEXT, booked_by TEXT,"
@@ -65,21 +65,21 @@ def _rows(engine):
         return conn.execute(text("SELECT digest_date, slack_ts FROM lending.cora_morning_digests")).all()
 
 
-@pytest.mark.parametrize("now,due", [(AT_7_29, None), (AT_7_30, date(2026, 10, 19)), (AT_11_59, date(2026, 10, 19)),
+@pytest.mark.parametrize("now,due", [(AT_7_46, None), (AT_7_47, date(2026, 10, 19)), (AT_11_59, date(2026, 10, 19)),
                                      (AT_NOON, None)])
-def test_due_from_7_30_until_noon_et(now, due) -> None:
+def test_due_from_7_47_until_noon_et(now, due) -> None:
     assert digest_day(now) == due
 
 
-def test_due_at_7_30_et_in_winter_time_too() -> None:
-    assert digest_day(datetime(2026, 12, 1, 12, 30, tzinfo=timezone.utc)) == date(2026, 12, 1)  # EST, UTC-5
-    assert digest_day(datetime(2026, 12, 1, 11, 30, tzinfo=timezone.utc)) is None
+def test_due_at_7_47_et_in_winter_time_too() -> None:
+    assert digest_day(datetime(2026, 12, 1, 12, 47, tzinfo=timezone.utc)) == date(2026, 12, 1)  # EST, UTC-5
+    assert digest_day(datetime(2026, 12, 1, 12, 46, tzinfo=timezone.utc)) is None
 
 
 def test_posts_once_a_day_to_coras_channel(engine) -> None:
     chat = FakeChatPort(default_channel="C_CORA")
-    assert post_morning_digest(engine, chat, "C_CORA", halted=False, now=AT_7_30)
-    assert not post_morning_digest(engine, chat, "C_CORA", halted=False, now=AT_7_30)
+    assert post_morning_digest(engine, chat, "C_CORA", halted=False, now=AT_7_47)
+    assert not post_morning_digest(engine, chat, "C_CORA", halted=False, now=AT_7_47)
     assert not post_morning_digest(engine, chat, "C_CORA", halted=False, now=AT_11_59)
     assert len(chat.posts) == 1 and chat.posts[0]["channel"] == "C_CORA"
     assert _rows(engine) == [("2026-10-19", chat.posts[0]["ts"])]
@@ -87,22 +87,22 @@ def test_posts_once_a_day_to_coras_channel(engine) -> None:
 
 def test_nothing_is_posted_before_7_30_or_after_noon(engine) -> None:
     chat = FakeChatPort(default_channel="C_CORA")
-    assert not post_morning_digest(engine, chat, "C_CORA", halted=False, now=AT_7_29)
+    assert not post_morning_digest(engine, chat, "C_CORA", halted=False, now=AT_7_46)
     assert not post_morning_digest(engine, chat, "C_CORA", halted=False, now=AT_NOON)
     assert chat.posts == [] and _rows(engine) == []
 
 
 def test_a_failed_post_is_retried_next_sweep(engine) -> None:
     with pytest.raises(RuntimeError):
-        post_morning_digest(engine, FailingChat(default_channel="C_CORA"), "C_CORA", halted=False, now=AT_7_30)
+        post_morning_digest(engine, FailingChat(default_channel="C_CORA"), "C_CORA", halted=False, now=AT_7_47)
     assert _rows(engine) == []
     chat = FakeChatPort(default_channel="C_CORA")
-    assert post_morning_digest(engine, chat, "C_CORA", halted=False, now=AT_7_30)
+    assert post_morning_digest(engine, chat, "C_CORA", halted=False, now=AT_7_47)
     assert len(chat.posts) == 1
 
 
 def test_no_channel_means_no_post(engine) -> None:
-    assert not post_morning_digest(engine, FakeChatPort(), None, halted=False, now=AT_7_30)
+    assert not post_morning_digest(engine, FakeChatPort(), None, halted=False, now=AT_7_47)
 
 
 def _body(blocks) -> str:
@@ -145,7 +145,7 @@ def test_digest_follows_the_e5_morning_brief(engine) -> None:
         conn.execute(text("INSERT INTO lending.file_routing VALUES (1, 'held', 0), (2, 'held', 0), (3, 'exhausted', 0),"
                           " (4, 'held', 1), (5, 'routed', 0)"))
     chat = FakeChatPort(default_channel="C_CORA")
-    post_morning_digest(engine, chat, "C_CORA", halted=True, halt_reason="halted from Slack by U_JOSH", now=AT_7_30,
+    post_morning_digest(engine, chat, "C_CORA", halted=True, halt_reason="halted from Slack by U_JOSH", now=AT_7_47,
                         approvals_channel="C_APPROVALS")
     body = _body(chat.posts[0]["blocks"])
     assert chat.posts[0]["text"] == "Next Deal Lending morning update: Monday, October 19"
@@ -276,7 +276,7 @@ def test_a_missing_table_blanks_only_its_section(engine) -> None:
         conn.execute(text("INSERT INTO lending.pending_actions VALUES (4, 'draft_email', NULL, 'web_lead:7', 'pending',"
                           " '2026-10-19 01:00:00')"))
     chat = FakeChatPort(default_channel="C_CORA")
-    assert post_morning_digest(engine, chat, "C_CORA", halted=False, now=AT_7_30)
+    assert post_morning_digest(engine, chat, "C_CORA", halted=False, now=AT_7_47)
     body = _body(chat.posts[0]["blocks"])
     assert "Not available today: LendingFlow leads" in body
     assert "• Draft email. Waiting" in body
