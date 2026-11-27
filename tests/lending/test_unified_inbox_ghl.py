@@ -12,7 +12,7 @@ from sqlalchemy import create_engine, event, text
 from sqlalchemy.orm import Session
 
 from config.lending_compliance import OptOutChannel
-from config.lending_unified_inbox import REPLY_AGENT_HANDOFF_MESSAGES
+from config.lending_unified_inbox import REPLY_AGENT_HANDOFF_MESSAGES, REPLY_AGENT_OPT_OUT_MESSAGES
 from src.lending import reply_webhook
 from src.lending.inbox import ghl_adapter, unified_triage
 from src.lending.inbox.ghl_adapter import enqueue_ghl_message, ghl_message_item, mark_answered
@@ -122,6 +122,15 @@ def test_a_stop_text_without_an_email_is_opted_out_by_phone(monkeypatch):
     assert calls[0]["channel"] == OptOutChannel.SMS and calls[0]["phone"] and calls[0].get("email") is None
 
 
+def test_a_stop_text_opts_the_texting_phone_out_even_when_an_email_is_known(monkeypatch):
+    """Review finding 2: the number that texted must be suppressed directly, not only through a linked email."""
+    calls = []
+    monkeypatch.setattr(ghl_adapter, "propagate_opt_out", lambda db, **kw: calls.append(kw) or 5)
+    raw = raw_msg(body="please remove me from your list", email="m@example.com")
+    enqueue_ghl_message(Db(), parse_event(raw), raw)
+    assert calls[0]["channel"] == OptOutChannel.SMS and calls[0]["phone"] and calls[0]["email"] == "m@example.com"
+
+
 def test_a_stop_with_nothing_to_opt_out_goes_to_triage_instead(monkeypatch):
     monkeypatch.setattr(ghl_adapter, "propagate_opt_out", lambda db, **kw: pytest.fail("nothing to opt out"))
     raw = {"messageId": "m-2", "body": "remove me from your list", "direction": "inbound", "contact": {"id": "c-1"}}
@@ -191,7 +200,7 @@ def test_an_ai_handoff_message_sets_ai_handoff_even_with_odd_spacing_and_case(sq
 
 
 def test_a_curly_apostrophe_still_matches_a_handoff_message(sql):
-    mark_answered(sql, outbound(REPLY_AGENT_HANDOFF_MESSAGES[2].replace("'", "’")))
+    mark_answered(sql, outbound(REPLY_AGENT_HANDOFF_MESSAGES[0].replace("'", "’")))
     assert row(sql, "ghl_msg:m-1")[1] == 1
 
 

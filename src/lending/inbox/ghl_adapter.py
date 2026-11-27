@@ -7,7 +7,8 @@ Both steps are idempotent, keyed on the GHL message id.
 
 A keyword STOP text (the whole message is a stop word) is left to GHL's own do-not-disturb and the opt-out webhook.
 Any other stop wording, in a text or an email, is opted out here through ``compliance.propagate_opt_out`` (GHL sets no
-do-not-disturb for "remove me from your list"). Logs carry ids only, never message text.
+do-not-disturb for "remove me from your list"): the texting phone for a text, the address for an email. The reply
+agent's own "we won't text you again" message opts that phone out too. Logs carry ids only, never message text.
 """
 from __future__ import annotations
 
@@ -26,11 +27,12 @@ from config.lending_unified_inbox import (
     GHL_MESSAGE_TYPE_PATHS,
     GHL_SMS_TYPES,
     REPLY_AGENT_HANDOFF_MESSAGES,
+    REPLY_AGENT_OPT_OUT_MESSAGES,
     SOURCE_GHL,
 )
 from config.settings import get_settings
 from src.lending.compliance import propagate_opt_out
-from src.lending.inbox.unified_triage import InboundItem, record_inbound
+from src.lending.inbox.unified_triage import InboundItem, record_inbound, stop_opt_out
 from src.lending.instantly_replies import is_stop_line, is_stop_request
 from src.lending.reply_guard import ReplyEvent
 
@@ -93,10 +95,8 @@ def enqueue_ghl_message(db, event: ReplyEvent, raw: Mapping[str, Any]) -> Option
     with db.begin_nested():
         item_id = record_inbound(db, item)
         if item_id is not None and item.stop:
-            event_id = propagate_opt_out(
-                db, email=item.email, phone=None if item.email else item.phone,
-                source_ref=f"inbox:{item.dedup_key}", actor="ghl_reply",
-                channel=OptOutChannel.EMAIL if item.email else OptOutChannel.SMS)
+            event_id = propagate_opt_out(db, source_ref=f"inbox:{item.dedup_key}", actor="ghl_reply",
+                                         **stop_opt_out(item.channel, item.phone, item.email))
             logger.info("[unified-inbox] stop message %s opted out (opt-out event %s)", event.message_id, event_id)
     return item_id
 
@@ -109,12 +109,21 @@ def is_reply_agent_handoff(body: str) -> bool:
     return _normalized(body) in REPLY_AGENT_HANDOFF_MESSAGES
 
 
+def is_reply_agent_opt_out(body: str) -> bool:
+    return _normalized(body) in REPLY_AGENT_OPT_OUT_MESSAGES
+
+
 def mark_answered(db, event: ReplyEvent) -> int:
     """An outbound GHL message (the reply agent's, or a person's when ``userId`` is set) answers the contact's open
     texts: a person wins, a reply-agent handoff message is remembered, a plain agent answer never clears either.
     Returns the rows touched; does not commit."""
     if event.direction != "outbound" or not event.contact_id or not _enabled():
         return 0
+    if not event.from_user and event.phone and is_reply_agent_opt_out(event.body):
+        # The agent told the borrower "we won't text you again": keep that promise (idempotent per message id).
+        propagate_opt_out(db, phone=event.phone, source_ref=f"inbox:ghl_msg:{event.message_id}",
+                          actor="reply_agent", channel=OptOutChannel.SMS)
+        logger.info("[unified-inbox] reply agent opt-out message %s: phone opted out", event.message_id)
     return db.execute(_MARK_ANSWERED, {
         "contact_id": event.contact_id, "person": event.from_user,
         "handoff": (not event.from_user) and is_reply_agent_handoff(event.body)}).rowcount

@@ -28,6 +28,7 @@ from config.lending_unified_inbox import (
     BATCH_SIZE,
     CALLBACK_TASK_DUE_MINUTES,
     CHANNEL_GHL_EMAIL,
+    CHANNEL_GHL_EMAIL,
     CHANNEL_GHL_OTHER,
     CHANNEL_GHL_SMS,
     CHANNEL_LABELS,
@@ -43,7 +44,7 @@ from config.settings import get_settings
 from packages.agent_core.config import parse_user_ids
 from packages.agent_core.lane_guard import LaneViolation
 from packages.agent_core.redaction import mask_emails
-from src.lending.compliance import propagate_opt_out
+from src.lending.compliance import phone_hash, propagate_opt_out
 from src.lending.consent import has_text_consent
 from src.lending.contracts import LOAN_STAGE_ORDER, LoanStage
 from src.lending.cora_inbox import add_to_inbox_safely, slack_safe
@@ -215,6 +216,17 @@ def triage_line(*, channel: str, intent: str, who: str, contact_hint: str, summa
     return "\n".join(lines), bool(mention)
 
 
+def stop_opt_out(channel: str, phone: Optional[str], email: Optional[str]) -> Optional[dict[str, Any]]:
+    """The ``propagate_opt_out`` arguments for a stop request: an email stop opts the address out (``propagate_opt_out``
+    reaches its linked phones); anything else opts the phone that wrote out directly, with the address when known.
+    None when there is nothing to opt out."""
+    if email and (channel == CHANNEL_GHL_EMAIL or not phone):
+        return {"email": email, "phone": None, "channel": OptOutChannel.EMAIL}
+    if phone:
+        return {"phone": phone, "email": email, "channel": OptOutChannel.SMS}
+    return None
+
+
 # ── The one write path ───────────────────────────────────────────────────────
 
 @dataclass(frozen=True)
@@ -358,7 +370,10 @@ def _column(db, query, **params: Any) -> set[str]:
 
 
 def load_contexts(db, rows: list[Mapping[str, Any]]) -> dict[int, Context]:
-    """One ``Context`` per claimed row, from a handful of set-based queries for the whole batch (never one per row)."""
+    """One ``Context`` per claimed row, from a handful of set-based queries for the whole batch (never one per row).
+    The lead records come first; suppression, open loan files, open conversations and the test filter are then
+    asked about every phone and email the rows OR their lead records hold, so a contact opted out on its other
+    identifier is found too."""
     phones = sorted({r["phone"] for r in rows if r["phone"]})
     emails = sorted({r["email"].lower() for r in rows if r["email"]})
     contact_ids = sorted({r["ghl_contact_id"] for r in rows if r["ghl_contact_id"]})
@@ -370,23 +385,32 @@ def load_contexts(db, rows: list[Mapping[str, Any]]) -> dict[int, Context]:
             if key:
                 index.setdefault(key, lead)
     named = {lead["phone"]: lead["name"] for lead in leads if lead["name"] and lead["phone"]}
-    suppressed_phones = _column(db, _SUPPRESSED_PHONES, phones=phones)
-    suppressed_emails = _column(db, _SUPPRESSED_EMAILS, emails=emails)
-    open_loans = _column(db, _OPEN_LOAN_PHONES, phones=phones, stages=EARLY_STAGES)
-    after_hours = _column(db, _AFTER_HOURS_PHONES, phones=phones, states=list(AFTER_HOURS_OPEN_STATES))
-    hidden = hidden_phones(db, phones) | hidden_ghl_contacts(db, contact_ids)
-    contexts: dict[int, Context] = {}
+    matched = {}
     for row in rows:
         email = row["email"].lower() if row["email"] else None
-        lead = by_phone.get(row["phone"]) or by_email.get(email) or by_contact.get(row["ghl_contact_id"]) or {}
+        matched[row["id"]] = by_phone.get(row["phone"]) or by_email.get(email) or by_contact.get(row["ghl_contact_id"]) or {}
+    all_phones = sorted({*phones, *(m["phone"] for m in matched.values() if m.get("phone"))})
+    all_emails = sorted({*emails, *(m["email"] for m in matched.values() if m.get("email"))})
+    all_contacts = sorted({*contact_ids, *(m["ghl_contact_id"] for m in matched.values() if m.get("ghl_contact_id"))})
+    suppressed_phones = _column(db, _SUPPRESSED_PHONES, phones=all_phones)
+    suppressed_emails = _column(db, _SUPPRESSED_EMAILS, emails=all_emails)
+    open_loans = _column(db, _OPEN_LOAN_PHONES, phones=all_phones, stages=EARLY_STAGES)
+    after_hours = _column(db, _AFTER_HOURS_PHONES, phones=all_phones, states=list(AFTER_HOURS_OPEN_STATES))
+    hidden = hidden_phones(db, all_phones) | hidden_ghl_contacts(db, all_contacts)
+    contexts: dict[int, Context] = {}
+    for row in rows:
+        lead = matched[row["id"]]
+        row_email = row["email"].lower() if row["email"] else None
+        phone_keys = {key for key in (row["phone"], lead.get("phone")) if key}
+        email_keys = {key for key in (row_email, lead.get("email")) if key}
+        contact_keys = {key for key in (row["ghl_contact_id"], lead.get("ghl_contact_id")) if key}
         phone = row["phone"] or lead.get("phone")
-        contact = row["ghl_contact_id"] or lead.get("ghl_contact_id")
         contexts[row["id"]] = Context(
             lead_ref=lead.get("lead_ref"), name=lead.get("name") or named.get(phone), phone=phone,
-            email=email or lead.get("email"), ghl_contact_id=contact,
-            suppressed=bool(phone in suppressed_phones or (email or lead.get("email")) in suppressed_emails),
-            open_loan=phone in open_loans, after_hours_open=phone in after_hours,
-            hidden=bool(phone in hidden or contact in hidden))
+            email=row_email or lead.get("email"), ghl_contact_id=row["ghl_contact_id"] or lead.get("ghl_contact_id"),
+            suppressed=bool(phone_keys & suppressed_phones or email_keys & suppressed_emails),
+            open_loan=bool(phone_keys & open_loans), after_hours_open=bool(phone_keys & after_hours),
+            hidden=bool(phone_keys & hidden or contact_keys & hidden))
     return contexts
 
 
@@ -436,7 +460,15 @@ class UnifiedTriageProcessor:
                 _CLAIM, {"max_attempts": MAX_ATTEMPTS, "grace": AI_GRACE_SECONDS, "limit": limit}).mappings()]
             if not rows:
                 return result
-            contexts = self._context(db, rows)
+            try:
+                contexts = self._context(db, rows)
+            except Exception as exc:  # class only. A broken lookup must never leave every message waiting unseen:
+                db.rollback()  # each claimed row counts an attempt, and at the last one is posted as unclassified
+                logger.error("[unified-inbox] context lookup failed (%s)", type(exc).__name__)
+                for row in rows:
+                    self._fail(db, row, f"context lookup failed ({type(exc).__name__})", result)
+                db.commit()
+                return result
             for row in rows:
                 try:
                     self._handle(db, row, contexts[row["id"]], result)
@@ -489,14 +521,14 @@ class UnifiedTriageProcessor:
     def _stop(self, db, row: Mapping[str, Any], ctx: Context, triage: Triage, result: SweepResult) -> None:
         """A message the model read as a stop request: opted out through the Instantly path, never answered."""
         email, phone = row["email"] or ctx.email, row["phone"] or ctx.phone
-        if not (email or phone):
+        opt_out = stop_opt_out(row["channel"], phone, email)
+        if opt_out is None:
             return self._finish(db, row, ctx, triage, _Plan(
                 None, "Asked to stop but no phone or email is on file: opt them out by hand in GHL."), None, result)
         try:
             with db.begin_nested():
-                event_id = propagate_opt_out(
-                    db, email=email, phone=None if email else phone, source_ref=f"inbox:{row['dedup_key']}",
-                    actor="unified_inbox", channel=OptOutChannel.EMAIL if email else OptOutChannel.SMS)
+                event_id = propagate_opt_out(db, source_ref=f"inbox:{row['dedup_key']}", actor="unified_inbox",
+                                             **opt_out)
         except Exception as exc:  # class only: SQL errors embed the address
             self._fail(db, row, f"opt-out not recorded ({type(exc).__name__})", result, post_unclassified=False)
             if row["attempts"] + 1 >= MAX_ATTEMPTS:
@@ -548,8 +580,12 @@ class UnifiedTriageProcessor:
         contact = row["ghl_contact_id"] or ctx.ghl_contact_id
         contact_ref = ctx.lead_ref or (f"ghl:{contact}" if contact else f"inbox_event:{row['id']}")
         who = (ctx.name or row["first_name"] or "Unknown contact")
+        # A repeat caller gets one card per day, like text-back's once-per-ET-day rule: a second missed call the same
+        # day joins the first card instead of drafting another "Sorry I missed your call".
+        key = (f"inbox_missed_call:{phone_hash(phone)[:16]}:{(row['occurred_at'] or row['received_at']).astimezone(ET):%Y-%m-%d}"
+               if row["channel"] == CHANNEL_MISSED_CALL and phone else f"inbox_event:{row['id']}")
         base = {"tool_name": INBOX_TOOL_NAME, "requested_by": "unified_inbox", "contact_ref": contact_ref,
-                "idempotency_key": f"inbox_event:{row['id']}", "recipient_phone": phone, "recipient_email": email}
+                "idempotency_key": key, "recipient_phone": phone, "recipient_email": email}
         lead = {"lead_ref": ctx.lead_ref} if ctx.lead_ref else {}
 
         def summary(label: str) -> str:
@@ -590,8 +626,11 @@ class UnifiedTriageProcessor:
         hint = f"…{phone[-4:]}" if phone else mask_emails(email) if email else "no phone or email"
         who = name_and_ref(ctx.name or row["first_name"], readable_ref(ctx.lead_ref) if ctx.lead_ref else None,
                            escape=False)
+        latency = int((self._now() - row["received_at"]).total_seconds())
+        next_step = (plan.next_step if latency <= TRIAGE_SLA_SECONDS
+                     else f"{plan.next_step} Slower than the 2-minute target: {latency} s.")
         line, pinged = triage_line(channel=row["channel"], intent=triage.intent, who=who, contact_hint=hint,
-                                   summary=triage.summary, next_step=plan.next_step)
+                                   summary=triage.summary, next_step=next_step)
         posted = self._post_triage(line)
         db.execute(_DONE, {"id": row["id"], "intent": triage.intent, "summary": triage.summary or None,
                            "action_id": plan.action_id, "pinged": pinged, "posted": posted, "error": error})
@@ -602,7 +641,6 @@ class UnifiedTriageProcessor:
                      "channel": row["channel"], "phone_last4": phone[-4:] if phone else None,
                      "email_masked": mask_emails(email) if email else None})
         result.triaged += 1
-        latency = int((self._now() - row["received_at"]).total_seconds())
         logger.info("[unified-inbox] item %s intent=%s action=%s posted=%s latency_s=%d", row["id"], triage.intent,
                     plan.action_id, posted, latency)
         if latency > TRIAGE_SLA_SECONDS:

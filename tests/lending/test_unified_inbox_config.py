@@ -11,9 +11,11 @@ def test_channels_sources_and_copy():
     assert c.TRIAGE_SLA_SECONDS == 120 and c.AI_GRACE_SECONDS == 30
 
 
-def test_the_reply_agent_handoff_messages_are_the_three_stop_bot_finals():
-    assert len(c.REPLY_AGENT_HANDOFF_MESSAGES) == 3
-    assert all(m == " ".join(m.lower().split()) for m in c.REPLY_AGENT_HANDOFF_MESSAGES)
+def test_the_reply_agent_messages_are_the_stop_bot_finals_split_into_handoffs_and_the_opt_out():
+    assert len(c.REPLY_AGENT_HANDOFF_MESSAGES) == 2 and len(c.REPLY_AGENT_OPT_OUT_MESSAGES) == 1
+    assert all(m == " ".join(m.lower().split())
+               for m in (*c.REPLY_AGENT_HANDOFF_MESSAGES, *c.REPLY_AGENT_OPT_OUT_MESSAGES))
+    assert "won't text you again" in c.REPLY_AGENT_OPT_OUT_MESSAGES[0]
 
 
 def test_setting_defaults_off():

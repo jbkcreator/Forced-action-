@@ -32,15 +32,19 @@ Done-when is shown on the channels above.
 - **Cards** are Approve / Revise / Reject drafts, never auto-sent: they carry no template version, so they never
   graduate to standing auto-send. Dead items get the line only. A stop request gets no card.
 - A **stop** is opted out at once through `compliance.propagate_opt_out`: a stop phrase in a GHL email or text by the
-  webhook, wording only the model catches by the sweep. A text that is just a stop word (STOP, "please stop") is left
+  webhook (the address for an email, the texting phone for a text), wording only the model catches by the sweep. The
+  reply agent's own "we won't text you again" message opts that phone out too and never gets a card. A text that is just a stop word (STOP, "please stop") is left
   to GHL's own do-not-disturb. A stop that cannot be recorded after 5 attempts posts ":rotating_light: ... NOT
   suppressed: record it by hand".
 - **No card** when: the contact is opted out; an after-hours conversation is open (the night responder answers); the
   GHL reply agent already answered the text; a person already replied in GHL; a test contact while
   `LENDING_SLACK_TEST_ENABLED` is off (skipped silently).
 - **The GHL reply agent ("NDL Reply Agent")** answers texts only. A text waits 30 s (`AI_GRACE_SECONDS`) for the agent
-  or a person. If the agent hands it to Josh (its three Stop Bot final messages, or a rate/terms or reschedule text), or
+  or a person. If the agent hands it to Josh (its two handoff Stop Bot messages, or a rate/terms or reschedule text), or
   nobody answers, Cora drafts the card. With the agent off (as now) every text gets a card.
+- **One missed-call card per number per Eastern day**: a repeat caller joins the first card instead of getting another
+  "Sorry I missed your call" draft.
+- A line posted more than 2 minutes after the message says so ("Slower than the 2-minute target: N s.").
 - A rate/terms or reschedule text also still gets `reply_guard`'s handoff post and reply SLA, so it shows two lines.
 
 ## Setup, in order
@@ -81,8 +85,8 @@ Done-when is shown on the channels above.
 
 - The "Conversation AI sent a message" workflow posts to `/webhooks/lending/ghl-reply` with `direction: outbound` and no
   `userId`; a message a person typed carries `userId`.
-- The agent's three Stop Bot final messages equal `REPLY_AGENT_HANDOFF_MESSAGES` (in `config/lending_unified_inbox.py`)
-  word for word. If someone edits them in GHL, edit the config. A mismatch costs a card for non-rate, non-reschedule
+- The agent's Stop Bot final messages equal `REPLY_AGENT_HANDOFF_MESSAGES` (rate or terms, wants Josh) and
+  `REPLY_AGENT_OPT_OUT_MESSAGES` (opt-out) in `config/lending_unified_inbox.py`, word for word. If someone edits them in GHL, edit the config. A mismatch costs a card for non-rate, non-reschedule
   handoffs only; the triage line still shows the text.
 - The agent runs on GPT 4.1, which GHL marks "Retires 15 Dec": pick a new model and re-run its six hard-rule tests.
   Separate from 1.5.

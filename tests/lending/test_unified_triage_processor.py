@@ -259,8 +259,9 @@ def test_an_email_is_never_held_for_the_reply_agent():
 
 
 def missed(**overrides):
-    return row(channel="missed_call", source="ghl", dedup_key="ghl_call:x", body=None, subject=None, first_name=None,
-               **overrides)
+    base = {"channel": "missed_call", "source": "ghl", "dedup_key": "ghl_call:x", "body": None, "subject": None,
+            "first_name": None}
+    return row(**{**base, **overrides})
 
 
 def test_a_missed_call_with_text_consent_gets_the_fixed_sms_card_and_no_model_call():
@@ -369,3 +370,107 @@ def test_the_sql_parses_as_postgres():
                  "_OPEN_LOAN_PHONES", "_AFTER_HOURS_PHONES"):
         sql = re.sub(r":(\w+)", lambda m: "$" + str(abs(hash(m.group(1))) % 90 + 1), str(getattr(unified_triage, name)))
         pglast.parse_sql(sql)
+
+
+# ── review fixes ─────────────────────────────────────────────────────────────
+
+class _Rows:
+    def __init__(self, rows=()):
+        self._rows = list(rows)
+
+    def mappings(self):
+        return self._rows
+
+    def __iter__(self):
+        return iter(self._rows)
+
+
+class LookupDb:
+    """Answers load_contexts' queries: one lead (phone + email), and a suppression list."""
+
+    def __init__(self, lead, suppressed_phones=(), suppressed_emails=()):
+        self.lead, self.sp, self.se, self.seen = lead, set(suppressed_phones), set(suppressed_emails), []
+
+    @contextmanager
+    def begin_nested(self):
+        yield
+
+    def execute(self, stmt, params=None):
+        sql, params = str(stmt), params or {}
+        self.seen.append((sql, params))
+        if "lower(email) AS email" in sql:
+            return _Rows([self.lead])
+        if "FROM lending.suppression_list WHERE phone" in sql:
+            return _Rows([(p,) for p in params["phones"] if p in self.sp])
+        if "FROM lending.suppression_list WHERE lower(email)" in sql:
+            return _Rows([(e,) for e in params["emails"] if e in self.se])
+        return _Rows()
+
+
+def test_suppression_is_checked_for_the_leads_other_phone_and_email():
+    """Review finding 1: an email-only item from a lead whose phone opted out must not get a card."""
+    lead = {"rank": 1, "lead_ref": "lendingflow_lead:56", "name": "Mark Lee", "phone": PHONE,
+            "email": "mark@example.com", "ghl_contact_id": "c-1"}
+    db = LookupDb(lead, suppressed_phones={PHONE})
+    contexts = unified_triage.load_contexts(db, [row(channel="ghl_email", phone=None, email="mark@example.com")])
+    assert contexts[7].suppressed is True
+    phone_query = next(p for sql, p in db.seen if "FROM lending.suppression_list WHERE phone" in sql)
+    assert PHONE in phone_query["phones"]
+
+
+def test_suppression_by_the_leads_other_email_is_found_too():
+    lead = {"rank": 1, "lead_ref": "web_lead:3", "name": "Ann", "phone": PHONE, "email": "ann@example.com",
+            "ghl_contact_id": "c-1"}
+    db = LookupDb(lead, suppressed_emails={"ann@example.com"})
+    assert unified_triage.load_contexts(db, [row(phone=PHONE, email=None)])[7].suppressed is True
+
+
+def test_a_stop_found_by_the_model_in_a_text_opts_the_texting_phone_out_even_with_an_email(monkeypatch):
+    from config.lending_compliance import OptOutChannel
+
+    opted = []
+    monkeypatch.setattr(unified_triage, "propagate_opt_out", lambda db, **kw: opted.append(kw) or 5)
+    proc, _, _ = build([row()], FakeModel(STOP))  # LEAD has a phone and an email
+    proc.run()
+    assert opted[0]["phone"] == PHONE and opted[0]["email"] == "mark@example.com"
+    assert opted[0]["channel"] == OptOutChannel.SMS
+
+
+def test_a_failing_batch_lookup_counts_an_attempt_on_every_claimed_row_and_never_goes_silent():
+    """Review finding 3: a broken context query must not leave every message waiting without a trace."""
+    def broken(db, claimed):
+        raise RuntimeError("relation does not exist")
+
+    proc, session, calls = build([row(id=7, attempts=0), row(id=8, attempts=MAX_ATTEMPTS - 1)], FakeModel(),
+                                 context=broken)
+    result = proc.run()
+    assert result.failed == 2 and len(session.params("SET attempts = attempts + 1")) == 2
+    assert len(calls.triage) == 1 and "*Unclassified*" in calls.triage[0]
+    assert "relation does not exist" not in calls.triage[0] and session.rollbacks >= 1
+
+
+def test_a_slow_item_says_so_in_its_slack_line():
+    proc, _, calls = build([row(received_at=NOW - timedelta(seconds=300))], FakeModel(SMS_DEAL))
+    proc.run()
+    assert "Slower than the 2-minute target: 300 s." in calls.triage[0]
+    proc, _, calls = build([row(received_at=NOW - timedelta(seconds=60))], FakeModel(SMS_DEAL))
+    proc.run()
+    assert "Slower than" not in calls.triage[0]
+
+
+def test_two_missed_calls_from_one_number_on_one_day_share_one_card():
+    """Review finding 6: no second 'Sorry I missed your call' text for a repeat caller."""
+    proc, _, calls = build([missed(id=7), missed(id=8, dedup_key="bd_cdr:2")])
+    proc.run()
+    assert calls.enqueued[0]["idempotency_key"] == calls.enqueued[1]["idempotency_key"]
+    assert PHONE not in calls.enqueued[0]["idempotency_key"]
+    tomorrow = missed(id=9, received_at=NOW + timedelta(days=1))
+    proc, _, calls = build([missed(id=7), tomorrow])
+    proc.run()
+    assert calls.enqueued[0]["idempotency_key"] != calls.enqueued[1]["idempotency_key"]
+
+
+def test_a_text_keeps_its_own_card_per_message():
+    proc, _, calls = build([row(id=7), row(id=8, dedup_key="ghl_msg:m-2")], FakeModel(SMS_DEAL, SMS_DEAL))
+    proc.run()
+    assert [d["idempotency_key"] for d in calls.enqueued] == ["inbox_event:7", "inbox_event:8"]

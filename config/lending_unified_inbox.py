@@ -40,13 +40,16 @@ AI_GRACE_SECONDS = 30
 MISSED_CALL_REPLY_TEXT = ("Hi {first_name}, this is Josh with Next Deal Lending. Sorry I missed your call. "
                           "When is a good time to call you back? Reply STOP to opt out.")
 
-# The GHL "NDL Reply Agent" Stop Bot final messages (docs/lending/ghl-conversation-ai.md), lower-cased with
-# whitespace collapsed. Edit them here when they change in GHL; a mismatch only costs a card (reply_guard's
-# rate/terms and reschedule word checks are the backstop).
+# The GHL "NDL Reply Agent" Stop Bot final messages (docs/lending/ghl-conversation-ai.md), lower-cased with whitespace
+# collapsed. Edit them here when they change in GHL. A handoff message means the agent passed the text to Josh; a
+# mismatch only costs a card (reply_guard's rate/terms and reschedule word checks are the backstop). The opt-out
+# message is the agent's promise "we won't text you again": the sweep honours it (the phone is opted out, no card).
 REPLY_AGENT_HANDOFF_MESSAGES = (
     "honestly, i'd rather get you on a call with josh than guess over text. he'll give you real numbers on your "
     "deal and follow up shortly.",
     "thanks for letting us know. josh will follow up with you shortly.",
+)
+REPLY_AGENT_OPT_OUT_MESSAGES = (
     "understood, sorry for the mix-up. we won't text you again.",
 )
 

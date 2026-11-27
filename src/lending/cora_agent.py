@@ -636,15 +636,6 @@ def run_sweep(services: CoraServices) -> None:
             services.doc_link_revocation()
         except Exception as exc:  # class only: SQL errors embed bound parameters; retried next sweep
             logger.error("[cora] document link revocation failed (%s); retrying next sweep", type(exc).__name__)
-    if services.instantly_replies is not None:
-        try:
-            replies = services.instantly_replies()
-        except Exception as exc:  # class only; the replies stay new and are retried next sweep
-            logger.error("[cora] Instantly reply triage failed (%s); retrying next sweep", type(exc).__name__)
-        else:
-            if replies and (replies.triaged or replies.suppressed or replies.failed):
-                logger.info("[cora] Instantly replies triaged=%s drafted=%s suppressed=%s failed=%s", replies.triaged,
-                            replies.drafted, replies.suppressed, replies.failed)
     if services.unified_inbox is not None:
         try:
             inbox = services.unified_inbox()
@@ -654,6 +645,15 @@ def run_sweep(services: CoraServices) -> None:
             if inbox and (inbox.triaged or inbox.skipped or inbox.failed):
                 logger.info("[cora] unified inbox triaged=%s drafted=%s skipped=%s failed=%s", inbox.triaged,
                             inbox.drafted, inbox.skipped, inbox.failed)
+    if services.instantly_replies is not None:
+        try:
+            replies = services.instantly_replies()
+        except Exception as exc:  # class only; the replies stay new and are retried next sweep
+            logger.error("[cora] Instantly reply triage failed (%s); retrying next sweep", type(exc).__name__)
+        else:
+            if replies and (replies.triaged or replies.suppressed or replies.failed):
+                logger.info("[cora] Instantly replies triaged=%s drafted=%s suppressed=%s failed=%s", replies.triaged,
+                            replies.drafted, replies.suppressed, replies.failed)
     reposted = services.gate.retry_missing_cards()
     if reposted:
         logger.info("[cora] posted %s delayed approval card(s)", reposted)

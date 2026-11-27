@@ -603,8 +603,9 @@ def test_tool_context_marks_requests_inside_a_thread() -> None:
     assert (reply_context.thread_ts, reply_context.in_thread) == ("2.0", True)
 
 
-def test_the_unified_inbox_step_runs_right_after_instantly_replies_and_before_the_cards() -> None:
-    """R1 1.5: the 2-minute target means the inbox step sits ahead of the slow steps (Drive, agent jobs, closing)."""
+def test_the_unified_inbox_step_runs_before_instantly_replies_and_the_slow_steps() -> None:
+    """R1 1.5 (review finding 4): the 2-minute target means the inbox step is the first triage step of the pass, ahead
+    of the Instantly batch (up to 10 model calls) and the slow steps (Drive, agent jobs, closing)."""
     order: list[str] = []
     parts = _SweepParts()
     parts.retry_missing_cards = lambda: order.append("cards") or 0
@@ -613,7 +614,7 @@ def test_the_unified_inbox_step_runs_right_after_instantly_replies_and_before_th
         unified_inbox=lambda: order.append("unified"),
         agent_jobs=lambda: order.append("agent_jobs"))
     cora_agent.run_sweep(services)
-    assert order == ["instantly", "unified", "cards", "agent_jobs"]
+    assert order == ["unified", "instantly", "cards", "agent_jobs"]
 
 
 def test_a_failing_unified_inbox_step_never_stops_the_sends() -> None:
