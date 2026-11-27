@@ -8,6 +8,7 @@ from types import SimpleNamespace
 import pytest
 from pydantic import SecretStr
 
+from src.lending.dialer import delivery_state
 from src.lending.dialer.queue_manager import QueueReport, SourceCount
 from src.tasks import lending_dialer_queue_check as task
 
@@ -23,30 +24,40 @@ def _report(eligible: int) -> QueueReport:
 
 
 @pytest.fixture
-def run(monkeypatch):
+def run(monkeypatch, tmp_path):
+    monkeypatch.setattr(delivery_state, "ROOT", tmp_path)
     state = SimpleNamespace(enabled=True, channel="C_DAVID", token=SecretStr("xoxb"), report=_report(50),
-                            ops=[], posts=[], reads=0, unset=[])
+                            ops=[], posts=[], reads=0, unset=[], autoload=True, read_kw={})
     monkeypatch.setattr(task, "get_settings", lambda: SimpleNamespace(
         lending_dialer_queue_check_enabled=state.enabled, lending_david_channel=state.channel,
-        lending_slack_bot_token=state.token, lending_morning_list_lead_days=14))
+        lending_slack_bot_token=state.token, lending_morning_list_lead_days=14,
+        lending_pr_dialer_autoload_enabled=state.autoload))
 
     @contextmanager
     def session():
         yield None
 
-    def read(db, now, *, lead_days):
+    def read(db, now, *, lead_days, autoload_enabled):
         state.reads += 1
+        state.read_kw = {"autoload_enabled": autoload_enabled}
         if isinstance(state.report, Exception):
             raise state.report
         return state.report
 
     monkeypatch.setattr(task, "lending_session", session)
     monkeypatch.setattr(task, "read_queue", read)
-    monkeypatch.setattr(task, "post_ops_notice", lambda m: state.ops.append(m) or True)
+    state.ops_ok, state.post_fail = True, False
+    monkeypatch.setattr(task, "post_ops_notice", lambda m: state.ops.append(m) or state.ops_ok)
     monkeypatch.setattr(task, "report_unset", lambda post, needed: state.unset.append(post) or [])
 
+    def post(message):
+        if state.post_fail:
+            raise RuntimeError("slack down")
+        state.posts.append(message)
+        return True
+
     def go(now=TUE_6_10, argv=(), **kw):
-        return task.main(list(argv), now=now, post=lambda m: state.posts.append(m) or True, **kw)
+        return task.main(list(argv), now=now, post=post, **kw)
 
     state.go = go
     return state
@@ -96,3 +107,42 @@ def test_unset_channel_is_reported_and_nothing_posts(run, monkeypatch):
 def test_dry_run_failure_does_not_ping_ops(run):
     run.report = RuntimeError("boom")
     assert run.go(TUE_6_10, ["--dry-run"]) == 1 and run.ops == []
+
+
+# ---- PR 486 review fixes: each destination delivered independently, and a retry resumes ----
+TUE_6_25 = datetime(2026, 11, 24, 11, 25, tzinfo=timezone.utc)
+TUE_7_05 = datetime(2026, 11, 24, 12, 5, tzinfo=timezone.utc)  # run.sh's third attempt lands after 6:xx
+
+
+def test_david_channel_failure_still_alerts_ops_and_the_retry_posts_only_davids(run):
+    run.report, run.post_fail = _report(4), True
+    assert run.go() == 1
+    assert run.posts == [] and len(run.ops) == 1
+    run.post_fail = False
+    assert run.go(TUE_7_05) == 0
+    assert len(run.posts) == 1 and len(run.ops) == 1 and run.reads == 1  # same message, read once
+    assert run.posts[0] == run.ops[0]
+
+
+def test_ops_failure_fails_the_run_and_the_retry_sends_only_the_ops_alert(run):
+    run.report, run.ops_ok = _report(4), False
+    assert run.go() == 1 and len(run.posts) == 1
+    run.ops_ok = True
+    assert run.go(TUE_7_05) == 0
+    assert len(run.posts) == 1 and len(run.ops) == 2
+
+
+def test_a_finished_day_is_not_posted_again(run):
+    assert run.go() == 0
+    assert run.go(TUE_6_25) == 0 and run.go(TUE_7_05) == 0
+    assert len(run.posts) == 1 and run.reads == 1
+
+
+def test_no_run_today_means_nothing_after_6_et(run):
+    assert run.go(TUE_7_05) == 0 and run.posts == [] and run.reads == 0
+
+
+def test_the_autoload_switch_is_passed_to_the_queue_read(run):
+    run.autoload = False
+    run.go()
+    assert run.read_kw == {"autoload_enabled": False}

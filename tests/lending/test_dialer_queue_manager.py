@@ -73,7 +73,7 @@ def _counts(report):
 
 
 def _read(db, blocks=lambda *_: {}):
-    return read_queue(db, NOW, lead_days=14, blocks=blocks)
+    return read_queue(db, NOW, lead_days=14, autoload_enabled=True, blocks=blocks)
 
 
 def test_short_queue_names_every_dry_source(db):
@@ -139,7 +139,7 @@ def test_full_queue_headline(db):
     assert render_queue_post(report).startswith("Dialer queue ready: 50 eligible")
 
 
-def _patch_compliance(monkeypatch, *, dial=None, stale=(), lendingflow=(), suppressed=(), verdicts=None):
+def _patch_compliance(monkeypatch, *, dial=None, stale=(), lendingflow=(), suppressed=(), verdicts=None, exhausted=()):
     from src.lending import compliance
     calls = []
 
@@ -152,6 +152,8 @@ def _patch_compliance(monkeypatch, *, dial=None, stale=(), lendingflow=(), suppr
     monkeypatch.setattr(compliance, "lendingflow_lead_phones", lambda db, phones: set(lendingflow) & set(phones))
     monkeypatch.setattr(compliance, "suppressed_phones", lambda db, phones: set(suppressed))
     monkeypatch.setattr(compliance, "scrub_verdict_blocks", lambda db, phones: dict(verdicts or {}))
+    monkeypatch.setattr(compliance, "_attempt_history_exhausted_phones",
+                        lambda db, phones, now: set(exhausted) & set(phones))
     return calls
 
 
@@ -244,3 +246,45 @@ def test_zero_callbacks_is_never_dry(db):
 
 def test_every_source_is_reported_in_order(db):
     assert tuple(s.source for s in _read(db).sources) == QUEUE_SOURCES
+
+
+# ---- PR 486 review fixes ----
+
+def test_phone_at_both_the_daily_cap_and_the_attempt_history_is_ineligible(monkeypatch):
+    # dial_blocks reports only ATTEMPT_CAP_REACHED (transient) for such a phone; the history is checked separately.
+    from config.lending_compliance import ReasonCode as R
+    _patch_compliance(monkeypatch, dial={"p1": R.ATTEMPT_CAP_REACHED, "p2": R.ATTEMPT_CAP_REACHED}, exhausted={"p1"})
+    assert compliance_blocks(None, ["p1", "p2"], NOW) == {"p1": "ATTEMPT_HISTORY_EXCEEDED"}
+
+
+def test_pool_whose_only_contact_is_also_a_callback_is_not_dry(db):
+    _callback(db, "+17275550001")
+    _pool(db, "wholesalers", "+17275550001")
+    report = _read(db)
+    wh = _counts(report)["wholesalers"]
+    assert report.eligible_total == 1 and wh.loaded == 0 and wh.ready == 1  # counted once, still stocks the pool
+    assert "wholesalers" not in report.dry_sources
+    assert "1 more counted above" in render_queue_post(report)
+
+
+def test_pool_whose_shared_contact_is_blocked_is_still_dry(db):
+    _callback(db, "+17275550001")
+    _pool(db, "wholesalers", "+17275550001")
+    assert "wholesalers" in _read(db, blocks=lambda *_: {"+17275550001": "SUPPRESSED"}).dry_sources
+
+
+def test_staged_records_do_not_hide_a_dry_pool_while_the_autoload_is_off(db, monkeypatch):
+    _pool(db, "transaction_ready", "+17275550001", active=False)  # used recently, now empty
+    monkeypatch.setattr(queue_manager, "staged_pr_records", lambda db: [
+        {"pool": "transaction_ready", "phone": "+17275550099"}])
+    report = read_queue(db, NOW, lead_days=14, autoload_enabled=False, blocks=lambda *_: {})
+    assert "transaction_ready" in report.dry_sources
+    assert "may load at 9:05" not in render_queue_post(report)
+
+
+def test_partial_read_never_claims_no_work(db):
+    db.execute(text("DROP TABLE lending.dialer_load_records"))  # callbacks and leads read fine and are empty
+    report = _read(db)
+    assert not report.complete and report.eligible_total == 0
+    post = render_queue_post(report)
+    assert post.startswith(":warning: Partial count: at least 0 of 50 eligible") and "No eligible work" not in post

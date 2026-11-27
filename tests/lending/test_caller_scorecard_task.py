@@ -8,6 +8,7 @@ from types import SimpleNamespace
 import pytest
 from pydantic import SecretStr
 
+from src.lending.dialer import delivery_state
 from src.lending.dialer.scorecard import Scorecard, ScoredCall
 from src.tasks import lending_caller_scorecard as task
 
@@ -30,9 +31,11 @@ def _call(cid, *, recorded) -> ScoredCall:
 
 class FakeClient:
     def __init__(self):
-        self.posts, self.fail_first = [], 0
+        self.posts, self.fail_first, self.down = [], 0, False
 
     def chat_postMessage(self, **kw):
+        if self.down is True or (self.down == "thread" and "thread_ts" in kw):
+            raise RuntimeError("slack down")
         if self.fail_first:
             self.fail_first -= 1
             raise RuntimeError("slack down")
@@ -41,7 +44,8 @@ class FakeClient:
 
 
 @pytest.fixture
-def run(monkeypatch):
+def run(monkeypatch, tmp_path):
+    monkeypatch.setattr(delivery_state, "ROOT", tmp_path)
     state = SimpleNamespace(enabled=True, channel="C_DAVID", agent="D1", token=SecretStr("xoxb"),
                             card=_card(_call("c1", recorded=True)), ops=[], unset=[], client=FakeClient(), built=0)
     monkeypatch.setattr(task, "get_settings", lambda: SimpleNamespace(
@@ -79,7 +83,7 @@ def test_notes_thread_posted_only_when_calls_need_notes(run):
     assert len(run.client.posts) == 1
     run.client.posts.clear()
     run.card = _card(_call("c1", recorded=True), _call("c2", recorded=False))
-    run.go()
+    run.go(argv=["--force"])  # today is already done; --force neither reads nor writes the delivery state
     main, thread = run.client.posts
     assert "thread_ts" not in main and thread["thread_ts"] == "1.1" and thread["channel"] == "C_DAVID"
     assert thread["blocks"][0]["accessory"]["value"] == "c2"
@@ -124,3 +128,42 @@ def test_unreadable_database_alerts_ops_instead_of_posting(run):
 def test_dry_run_failure_does_not_ping_ops(run):
     run.card = RuntimeError("db down")
     assert run.go(TUE_2_10, ["--dry-run"]) == 1 and run.ops == []
+
+
+# ---- PR 486 review fixes: a retry after 3 PM resumes the run ----
+TUE_3_00 = datetime(2026, 11, 24, 20, 0, tzinfo=timezone.utc)
+TUE_3_45 = datetime(2026, 11, 24, 20, 45, tzinfo=timezone.utc)
+
+
+def test_failed_notes_thread_is_resumed_after_3_pm_under_the_same_main_post(run):
+    run.card = _card(_call("c2", recorded=False))
+    run.client.down = "thread"
+    assert run.go() == 1
+    (main,) = run.client.posts
+    run.client.down = False
+    assert run.go(TUE_3_00) == 0
+    main_again, thread = run.client.posts
+    assert main_again is main and thread["thread_ts"] == "1.1"  # no second main post
+
+
+def test_failed_main_post_is_resumed_after_3_pm(run):
+    run.card = _card(_call("c2", recorded=False))
+    run.client.down = True
+    assert run.go() == 1 and run.client.posts == []
+    run.client.down = False
+    assert run.go(TUE_3_00) == 0
+    main, thread = run.client.posts
+    assert "thread_ts" not in main and thread["thread_ts"] == "1.1"
+
+
+def test_failed_build_is_retried_after_3_pm(run):
+    run.card = RuntimeError("db down")
+    assert run.go() == 1
+    run.card = _card(_call("c1", recorded=True))
+    assert run.go(TUE_3_00) == 0 and len(run.client.posts) == 1
+
+
+def test_a_finished_day_is_not_posted_again(run):
+    assert run.go() == 0
+    assert run.go(TUE_3_00) == 0 and run.go(TUE_3_45) == 0
+    assert len(run.client.posts) == 1 and run.built == 1

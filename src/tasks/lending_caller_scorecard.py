@@ -10,6 +10,11 @@ Off until LENDING_CALLER_SCORECARD_ENABLED=true.
 
 ``--force`` skips the hour and weekday checks. ``--dry-run`` builds and logs the post instead of sending it, and works
 with the switch off.
+
+Delivery is tracked for the ET day (``src/lending/dialer/delivery_state.py``): the main post's Slack timestamp is
+saved as soon as it is sent. A run that fails returns 1, and the cron retry (run.sh, +15 and +30 min, so after 3 PM)
+resumes it: the main post is sent only if it was not, and the notes thread goes under the saved one. A finished day
+is never posted again. ``--force`` and ``--dry-run`` neither read nor write that state.
 """
 from __future__ import annotations
 
@@ -25,6 +30,7 @@ from config.lending_compliance import DEFAULT_TZ
 from config.lending_dialer_queue import SCORECARD_HOUR_ET, WORKDAYS
 from config.settings import get_settings
 from src.lending.db import lending_session
+from src.lending.dialer import delivery_state
 from src.lending.dialer.scorecard import build_scorecard, render_notes_thread, render_scorecard
 from src.lending.ops_alerts import post_ops_notice
 from src.lending.slack_channels import BOT_TOKEN, report_unset
@@ -32,6 +38,7 @@ from src.tasks.lending_daily_scoreboard import SLACK_ATTEMPTS, SLACK_RETRY_SECON
 
 logger = logging.getLogger(__name__)
 POST = "David's 2:45 PM scorecard"
+STATE = "caller_scorecard"
 
 
 def _send(client: Any, **kwargs: Any) -> Any:
@@ -52,7 +59,12 @@ def main(argv=None, *, now: Optional[datetime] = None, client: Any = None) -> in
     args = parser.parse_args(argv)
     now = now or datetime.now(timezone.utc)
     now_et = now.astimezone(ZoneInfo(DEFAULT_TZ))
-    if not args.force and (now_et.hour != SCORECARD_HOUR_ET or now_et.weekday() not in WORKDAYS):
+    stateful = not (args.force or args.dry_run)
+    state = delivery_state.load(STATE, now_et.date()) if stateful else None
+    if state is not None and state.get("done"):
+        return 0
+    due = now_et.hour == SCORECARD_HOUR_ET and now_et.weekday() in WORKDAYS
+    if not args.force and not due and state is None:  # a retry of today's unfinished run may act after 14:xx
         return 0
     s = get_settings()
     if not s.lending_caller_scorecard_enabled and not args.dry_run:
@@ -65,6 +77,13 @@ def main(argv=None, *, now: Optional[datetime] = None, client: Any = None) -> in
     if args.dry_run and not agent_id:
         logger.error("[scorecard] LENDING_DAVID_BD_AGENT_ID is not set")
         return 1
+    state = state or {}
+
+    def remember() -> None:
+        if stateful:
+            delivery_state.save(STATE, now_et.date(), state)
+
+    remember()  # marks today's run as started, so a retry after 14:xx still acts
     try:
         with lending_session() as db:
             card = build_scorecard(db, now_et.date(), agent_id=agent_id, as_of=now)
@@ -84,12 +103,16 @@ def main(argv=None, *, now: Optional[datetime] = None, client: Any = None) -> in
         client = WebClient(token=s.lending_slack_bot_token.get_secret_value())
     fallback = f"David's scorecard for {card.day}"
     try:
-        posted = _send(client, channel=channel, text=fallback, blocks=blocks)
+        if not state.get("parent_ts"):
+            state["parent_ts"] = _send(client, channel=channel, text=fallback, blocks=blocks)["ts"]
+            remember()
         if notes:
-            _send(client, channel=channel, thread_ts=posted["ts"], text="Calls that need notes", blocks=notes)
+            _send(client, channel=channel, thread_ts=state["parent_ts"], text="Calls that need notes", blocks=notes)
     except Exception:
         logger.exception("[scorecard] post failed for %s", card.day)
         return 1
+    state["done"] = True
+    remember()
     logger.info("[scorecard] posted for %s: %d connected calls, %d need notes", card.day, len(card.calls), len(notes))
     return 0
 

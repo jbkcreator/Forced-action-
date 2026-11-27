@@ -20,7 +20,7 @@ from sqlalchemy.orm import Session
 from config.lending_compliance import DEFAULT_TZ
 from config.lending_dialer_queue import NOTES_LIST_MAX, QUALITY_CHECKS, TOP_CALLS
 from config.lending_dispositions import BOOKED_CODE, LONG_CONVERSATION_SECONDS, RECORDING_RECORDED
-from src.lending.david_activity import batchdialer_counts, day_bounds, stage_counts
+from src.lending.david_activity import batchdialer_counts, day_bounds, read_stage_counts
 from src.lending.dialer.call_notes import notes_button
 from src.lending.dispositions import contact_view_url
 
@@ -62,6 +62,7 @@ class Scorecard:
     booked_reported: int
     calls: tuple[ScoredCall, ...]
     read_failed: bool
+    booked_available: bool = True  # False when the GHL stage read failed: shown as not available, never as 0
 
 
 def quality_score(call: ScoredCall) -> Optional[int]:
@@ -118,11 +119,18 @@ def build_scorecard(db: Session, day: date, *, agent_id: str, as_of: datetime) -
     except Exception as exc:
         read_failed = True
         logger.warning("[scorecard] call list failed for %s (%s)", day, type(exc).__name__)
-    booked_stage, _held = stage_counts(db, day)
+    booked_stage, booked_available = 0, True
+    try:
+        with db.begin_nested():
+            booked_stage, _held = read_stage_counts(db, day)
+    except Exception as exc:
+        booked_available = False
+        logger.warning("[scorecard] GHL stage counts failed for %s (%s)", day, type(exc).__name__)
     return Scorecard(
         day=day, as_of=as_of, dials=counts.get("bd_dials", 0), connects=counts.get("bd_connected", 0),
         long_conversations=sum(c.talk_sec >= LONG_CONVERSATION_SECONDS for c in calls), booked_stage=booked_stage,
-        booked_reported=counts.get("bd_booked_reported", 0), calls=calls, read_failed=read_failed)
+        booked_reported=counts.get("bd_booked_reported", 0), calls=calls, read_failed=read_failed,
+        booked_available=booked_available)
 
 
 def _minutes(seconds: int) -> str:
@@ -157,7 +165,8 @@ def render_scorecard(card: Scorecard) -> list[dict]:
         f"*Dials* (all dials in his campaigns): {card.dials}",
         f"*Connects*: {card.connects}",
         f"*Conversations 2+ min*: {card.long_conversations}",
-        f"*Booked* (GHL stage, all callers): {card.booked_stage} · he reported {card.booked_reported}",
+        f"*Booked* (GHL stage, all callers): {card.booked_stage if card.booked_available else 'not available'}"
+        f" · he reported {card.booked_reported}",
         _quality_line(card),
         f"Recorded calls with no disclosure reported by the dialer: {no_disclosure}",
     ]

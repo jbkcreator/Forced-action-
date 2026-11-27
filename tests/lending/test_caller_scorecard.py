@@ -133,7 +133,7 @@ def db(monkeypatch):
     with eng.begin() as conn:
         for statement in _DDL:
             conn.execute(text(statement))
-    monkeypatch.setattr(scorecard, "stage_counts", lambda db, day: (2, 1))
+    monkeypatch.setattr(scorecard, "read_stage_counts", lambda db, day: (2, 1))
     with Session(eng) as session:
         yield session
     eng.dispose()
@@ -176,3 +176,14 @@ def test_failed_read_is_flagged_not_hidden(db):
     result = build_scorecard(db, DAY, agent_id="D1", as_of=AS_OF)
     assert result.read_failed and result.calls == ()
     assert "could not be read" in flatten(render_scorecard(result))
+
+
+def test_failed_booking_read_shows_not_available_not_zero(db, monkeypatch):
+    def boom(db, day):
+        raise RuntimeError("stage table gone")
+    monkeypatch.setattr(scorecard, "read_stage_counts", boom)
+    _insert(db, "c1")
+    result = build_scorecard(db, DAY, agent_id="D1", as_of=AS_OF)
+    assert not result.booked_available and not result.read_failed and result.dials == 1  # BatchDialer reads fine
+    text_ = flatten(render_scorecard(result))
+    assert "*Booked* (GHL stage, all callers): not available" in text_
