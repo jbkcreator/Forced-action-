@@ -30,6 +30,11 @@ if [[ "$1" == *"property_radar_runner"* || "$1" == *"sunbiz_llc_trace"* ]]; then
     MAX_ATTEMPTS=1
 fi
 
+# R1 1.1 contact spine sync: never retried; the next */15 run is the retry (a retry would overlap it)
+if [[ "$1" == *"lending_contact_spine_sync"* ]]; then
+    MAX_ATTEMPTS=1
+fi
+
 # Master parcel pipeline: bulk download + ~500k-row load/update (weekly Sunday)
 if [[ "$1" == *"master_engine"* ]]; then
     TIMEOUT=14400                          # 4 hours (worst-case scrape + convert + load/update)
