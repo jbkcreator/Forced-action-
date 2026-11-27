@@ -601,3 +601,45 @@ def test_tool_context_marks_requests_inside_a_thread() -> None:
     top_context, reply_context = conversation._context(top, "t1"), conversation._context(reply, "t2")
     assert (top_context.thread_ts, top_context.in_thread) == ("2.0", False)
     assert (reply_context.thread_ts, reply_context.in_thread) == ("2.0", True)
+
+
+def test_the_unified_inbox_step_runs_right_after_instantly_replies_and_before_the_cards() -> None:
+    """R1 1.5: the 2-minute target means the inbox step sits ahead of the slow steps (Drive, agent jobs, closing)."""
+    order: list[str] = []
+    parts = _SweepParts()
+    parts.retry_missing_cards = lambda: order.append("cards") or 0
+    services = _sweep_services(parts, None)._replace(
+        instantly_replies=lambda: order.append("instantly"),
+        unified_inbox=lambda: order.append("unified"),
+        agent_jobs=lambda: order.append("agent_jobs"))
+    cora_agent.run_sweep(services)
+    assert order == ["instantly", "unified", "cards", "agent_jobs"]
+
+
+def test_a_failing_unified_inbox_step_never_stops_the_sends() -> None:
+    def database_down():
+        raise RuntimeError("db down")
+
+    parts = _SweepParts()
+    cora_agent.run_sweep(_sweep_services(parts, None)._replace(unified_inbox=database_down))
+    assert parts.relay_runs == 1
+
+
+def test_a_handled_unified_inbox_pass_is_logged(caplog) -> None:
+    import logging
+    from src.lending.inbox.unified_triage import SweepResult
+
+    with caplog.at_level(logging.INFO):
+        cora_agent.run_sweep(_sweep_services(_SweepParts(), None)._replace(
+            unified_inbox=lambda: SweepResult(triaged=2, drafted=1)))
+    assert "unified inbox triaged=2 drafted=1 skipped=0 failed=0" in caplog.text
+
+
+def test_the_unified_inbox_step_is_only_built_while_the_inbox_is_enabled(monkeypatch) -> None:
+    from types import SimpleNamespace
+
+    built = []
+    monkeypatch.setattr(cora_agent, "make_unified_inbox", lambda *a, **k: built.append(1) or (lambda: None))
+    off, on = SimpleNamespace(lending_unified_inbox_enabled=False), SimpleNamespace(lending_unified_inbox_enabled=True)
+    assert cora_agent.build_unified_inbox(off, None, None, None, None, None) is None and built == []
+    assert cora_agent.build_unified_inbox(on, None, None, None, None, None) is not None and built == [1]
