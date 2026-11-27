@@ -130,6 +130,9 @@ class MemoryLog:
         row["outcome"] = "failed"
         return row["attempts"]
 
+    def unrecorded(self):
+        return sum(1 for row in self.rows.values() if row["outcome"] in ("failed", "gave_up"))
+
 
 def _recorder(monkeypatch):
     """record_opt_out scripted: a new id per new key, None for one already recorded."""
@@ -310,3 +313,75 @@ def test_an_opt_out_given_up_is_raised_in_coras_inbox_without_the_address(monkey
         _sweep(mailbox, log, [])
     assert [e["event_type"] for e in inbox_writes] == ["opt_out_email_not_recorded"]
     assert "sam.lee@example.com" not in inbox_writes[0]["payload"].lower()
+
+
+# ── R1 0.6: an opt-out that is not recorded keeps the feed unhealthy ─────────
+
+def _live_run(monkeypatch, mailbox, log, record):
+    """run() against a fake mailbox and message log; returns the feed health calls it made."""
+    from pydantic import SecretStr
+
+    monkeypatch.setattr(email_opt_out, "get_settings", lambda: SimpleNamespace(
+        lending_optout_imap_user="hello@nextdeallending.com", lending_optout_imap_password=SecretStr("x"),
+        lending_optout_imap_host="imap.example.com", lending_optout_imap_port=993, lending_optout_address=OPTOUT,
+        lending_ghl_sms_from_number=None))
+
+    @contextmanager
+    def opened(**kwargs):
+        yield mailbox
+
+    real_sweep = email_opt_out.sweep
+    monkeypatch.setattr(email_opt_out, "ImapMailbox", opened)
+    monkeypatch.setattr(email_opt_out, "sweep", lambda mb, lg, **kw: real_sweep(
+        mb, lg, **{**kw, "session_factory": _session, "notify": lambda text: True}))
+    monkeypatch.setattr(email_opt_out, "record_opt_out", record)
+    monkeypatch.setattr(email_opt_out, "add_to_inbox_in_own_session", lambda **kwargs: None)
+    health: list[str] = []
+    monkeypatch.setattr(email_opt_out.dependency_health, "record_success", lambda feed: health.append("success"))
+    monkeypatch.setattr(email_opt_out.dependency_health, "record_failure", lambda feed, detail: health.append("failure"))
+    monkeypatch.setattr(email_opt_out.dependency_health, "record_unverified",
+                        lambda feed, detail: health.append("unverified"))
+    return health
+
+
+def test_a_failed_opt_out_write_makes_the_feed_unverified_at_once_not_a_success(monkeypatch):
+    def failing(db, opt_out):
+        raise RuntimeError("database unavailable")
+
+    log = MemoryLog()
+    health = _live_run(monkeypatch, FakeMailbox([_raw()]), log, failing)
+    assert email_opt_out.run(log=log) == 1
+    assert health == ["unverified"]
+
+
+def test_an_opt_out_given_up_keeps_the_feed_unhealthy_until_resolved(monkeypatch):
+    def failing(db, opt_out):
+        raise RuntimeError("database unavailable")
+
+    monkeypatch.setattr(email_opt_out, "MAX_MESSAGE_ATTEMPTS", 2)
+    log = MemoryLog()
+    health = _live_run(monkeypatch, FakeMailbox([_raw()]), log, failing)
+    for _ in range(4):  # retries run out on the second; later sweeps skip the message
+        assert email_opt_out.run(log=log) == 1
+    assert health == ["unverified"] * 4
+    assert [row["outcome"] for row in log.rows.values()] == ["gave_up"]
+    for row in log.rows.values():  # recorded by hand, then --resolve
+        row["outcome"] = "recorded"
+    assert email_opt_out.run(log=log) == 0
+    assert health[-1] == "success"
+
+
+def test_an_opt_out_recorded_on_retry_makes_the_feed_healthy_again(monkeypatch):
+    outcomes = iter([RuntimeError("database unavailable"), 7])
+
+    def flaky(db, opt_out):
+        result = next(outcomes)
+        if isinstance(result, Exception):
+            raise result
+        return result
+
+    log = MemoryLog()
+    health = _live_run(monkeypatch, FakeMailbox([_raw()]), log, flaky)
+    assert email_opt_out.run(log=log) == 1
+    assert email_opt_out.run(log=log) == 0
+    assert health == ["unverified", "success"]

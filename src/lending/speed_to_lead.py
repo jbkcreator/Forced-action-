@@ -108,6 +108,8 @@ from config.settings import get_settings
 from src.lending.compliance import text_window_open
 from src.lending.consent import has_text_consent
 from src.lending.global_halt import is_globally_halted
+from config.lending_fallbacks import CHANNEL_GHL_CRM
+from src.lending.dependency_health import outbound_paused
 
 logger = logging.getLogger(__name__)
 
@@ -269,15 +271,35 @@ def _night_responder_texts(db, lead_id: int) -> bool:
     return db.execute(_NIGHT_CONVERSATION, {"key": f"after_hours:{SOURCE_WEB_FORM}:{lead_id}"}).first() is not None
 
 
-def _web_text(db, lead: Mapping[str, Any], tags: TagClient, *, halted: bool, now: datetime) -> tuple[str, Optional[datetime]]:
+def _read_text_consent(db, phone: str) -> Optional[bool]:
+    """``has_text_consent`` in a savepoint: a failed read (the suppression table unreadable) must not abort the lead's
+    transaction, because the held text has to be saved after it. None = could not be read."""
+    try:
+        with db.begin_nested():
+            return has_text_consent(db, phone)
+    except Exception as exc:  # class only
+        logger.error("[speed-to-lead] text consent unreadable: %s", type(exc).__name__)
+        return None
+
+
+def _web_text(db, lead: Mapping[str, Any], tags: TagClient, *, halted: bool, paused: bool,
+              now: datetime) -> tuple[str, Optional[datetime]]:
     if not intro_sms_on():
         return TEXT_OFF, None
     if _night_responder_texts(db, lead["id"]):
         return TEXT_BY_NIGHT_RESPONDER, None
     if now - lead["received_at"] > TEXT_LAST_CHANCE:
         return TEXT_TOO_LATE, None
-    if halted or not lead["sms_consent"] or lead["suppressed"] or not has_text_consent(db, lead["phone"]):
+    if halted or not lead["sms_consent"] or lead["suppressed"]:
         return TEXT_NOT_ALLOWED, None
+    consent = _read_text_consent(db, lead["phone"])
+    if consent is None:  # unreadable now: keep the text for the release sweep, which reads consent again
+        return TEXT_HELD, None
+    if not consent:
+        return TEXT_NOT_ALLOWED, None
+    if paused:  # R1 0.6: the release sweep sends it once the opt-out feeds are fresh (consent, window, age rechecked)
+        logger.info("[speed-to-lead] web intro text held while opt-outs can't be verified lead=%s", lead["id"])
+        return TEXT_HELD, None
     if not text_window_open(lead["phone"], property_state=lead["property_state"], now=now):
         logger.info("[speed-to-lead] web intro text held for the send window lead=%s", lead["id"])
         return TEXT_HELD, None
@@ -416,7 +438,12 @@ def _call(db, source: str, lead: Mapping[str, Any], tags: TagClient, *, halted: 
     queue it (or block it for good)."""
     if not get_settings().lending_speed_to_lead_enabled:
         return CallStep(CALL_OFF)
-    gated = _gate(db, source, lead, halted=halted, now=now, scrubber=scrubber)
+    try:
+        with db.begin_nested():
+            gated = _gate(db, source, lead, halted=halted, now=now, scrubber=scrubber)
+    except Exception as exc:  # class only: the call gate reads the suppression list; the lead is already claimed
+        logger.error("[speed-to-lead] call gate unreadable lead=%s:%s: %s", source, lead["id"], type(exc).__name__)
+        return CallStep(CALL_QUEUED, queue_reason=QUEUE_DELAYED)  # fails closed; the queue sweep checks it again
     if gated is not None:
         return gated
     if now - lead["received_at"] > FRESH_LEAD_WINDOW:
@@ -514,12 +541,13 @@ def start(db, source: str, lead_id: int, *, tags: TagClient, scrubber: Optional[
                            "received_at": lead["received_at"], "now": now})
     if row_id is None:
         return None
-    halted = is_globally_halted()
+    global_halt, paused = is_globally_halted(), outbound_paused(CHANNEL_GHL_CRM)  # R1 0.6: stale opt-out feed
+    halted = global_halt or paused
     if source == SOURCE_LENDINGFLOW:
         text_status, text_at = TEXT_BY_LENDINGFLOW, lead["intro_sms_tagged_at"]
     else:
         try:
-            text_status, text_at = _web_text(db, lead, tags, halted=halted, now=now)
+            text_status, text_at = _web_text(db, lead, tags, halted=global_halt, paused=paused, now=now)
         except Exception as exc:  # class only
             logger.error("[speed-to-lead] web intro tag failed lead=%s: %s", lead_id, type(exc).__name__)
             text_status, text_at = TEXT_NOT_ALLOWED, None
@@ -613,14 +641,20 @@ _TEXT_DONE = text("UPDATE lending.speed_to_lead SET text_status = :status, text_
 def release_held_web_intro(db, tags: Optional[TagClient], *, now: Optional[datetime] = None) -> int:
     """Web-lead sweep: tag the website intro texts held for the send window once it opens. Re-checks consent (an
     opt-out since arrival withholds it for good). Returns how many were tagged. Does not commit."""
-    if tags is None or not intro_sms_on() or is_globally_halted():
+    if tags is None or not intro_sms_on() or is_globally_halted() or outbound_paused(CHANNEL_GHL_CRM):
         return 0
     now = now or datetime.now(timezone.utc)
     tagged = 0
     rows = db.execute(_HELD_WEB, {"held": TEXT_HELD, "limit": WEB_INTRO_RELEASE_BATCH,
                                   "cutoff": now - TEXT_LAST_CHANCE}).mappings().all()
     for lead in rows:
-        if lead["suppressed"] or not lead["sms_consent"] or not has_text_consent(db, lead["phone"]):
+        if lead["suppressed"] or not lead["sms_consent"]:
+            db.execute(_TEXT_DONE, {"status": TEXT_NOT_ALLOWED, "at": None, "id": lead["row_id"]})
+            continue
+        consent = _read_text_consent(db, lead["phone"])
+        if consent is None:  # unreadable: stays held, read again next sweep
+            continue
+        if not consent:
             db.execute(_TEXT_DONE, {"status": TEXT_NOT_ALLOWED, "at": None, "id": lead["row_id"]})
             continue
         if not text_window_open(lead["phone"], property_state=lead["property_state"], now=now):
@@ -912,7 +946,7 @@ def _try_release(db, row: Mapping[str, Any], *, tags: TagClient, scrubber: Optio
     if db.execute(_STILL_QUEUED, {"id": row["row_id"]}).first() is None:
         db.commit()
         return NEXT
-    if is_globally_halted() or db.execute(_CASCADE_RUNNING, {"spacing_since": at - CASCADE_SPACING}).scalar():
+    if is_globally_halted() or outbound_paused(CHANNEL_GHL_CRM) or db.execute(_CASCADE_RUNNING, {"spacing_since": at - CASCADE_SPACING}).scalar():
         db.commit()
         return STOP
     stop, voice = _admit(db, lead, at)
@@ -972,7 +1006,7 @@ def release_queue(db, *, tags: Optional[TagClient], scrubber: Optional[Scrubber]
     if tags is None or read_calls is None:
         logger.warning("[speed-to-lead] queue: GHL is not configured, nothing released")
         return run
-    if is_globally_halted():
+    if is_globally_halted() or outbound_paused(CHANNEL_GHL_CRM):
         return run
     if db.execute(_CASCADE_RUNNING, {"spacing_since": start_at - CASCADE_SPACING}).scalar():
         return run

@@ -354,6 +354,74 @@ def test_an_intro_text_outside_the_window_is_held(gates):
     assert outcome.text_status == TEXT_HELD and ("add", "c-7", GHL_TAG_WEB_INTRO_READY) not in tags.calls
 
 
+def test_a_consented_intro_text_during_a_dependency_pause_is_held_for_release(gates, monkeypatch):
+    """Review F5: a stale opt-out feed holds the text (released once fresh), never withholds it for good."""
+    monkeypatch.setattr(speed_to_lead, "outbound_paused", lambda channel: True)
+    outcome, tags, _ = run(web_lead())
+    assert outcome.text_status == TEXT_HELD and ("add", "c-7", GHL_TAG_WEB_INTRO_READY) not in tags.calls
+
+
+def test_an_unreadable_suppression_table_holds_the_text_and_still_records_the_lead(gates, monkeypatch):
+    """Review (round 2) F3: the consent read fails after the lead is claimed; the held text must still be saved."""
+    def unreadable(db, phone):
+        raise RuntimeError("suppression_list unreadable")
+
+    def gate_unreadable(db, phones, *, now, halted):
+        raise RuntimeError("suppression_list unreadable")
+
+    monkeypatch.setattr(speed_to_lead, "has_text_consent", unreadable)
+    monkeypatch.setattr("src.lending.ghl_call_gate.blocked_reasons", gate_unreadable)  # the call gate reads it too
+    outcome, tags, db = run(web_lead())
+    assert outcome.text_status == TEXT_HELD and ("add", "c-7", GHL_TAG_WEB_INTRO_READY) not in tags.calls
+    assert outcome.call_status == CALL_QUEUED  # fails closed: queued, never started, never lost
+    assert db.records and db.records[-1]["text_status"] == TEXT_HELD
+
+
+@pytest.mark.parametrize("over,consent", [({"sms_consent": False}, True), ({"suppressed": True}, True), ({}, False)])
+def test_a_dependency_pause_never_holds_a_text_that_is_not_allowed(gates, monkeypatch, over, consent):
+    monkeypatch.setattr(speed_to_lead, "outbound_paused", lambda channel: True)
+    gates.consent = consent
+    outcome, _, _ = run(web_lead(**over))
+    assert outcome.text_status == TEXT_NOT_ALLOWED
+
+
+def test_a_text_held_during_a_pause_is_released_once_the_feeds_are_fresh(gates, monkeypatch):
+    """Review F5 recovery: the held-text sweep sends nothing while paused, then tags it once fresh (consent, window
+    and age rechecked by the sweep)."""
+    class HeldDb:
+        def __init__(self):
+            self.done = []
+
+        @contextmanager
+        def begin_nested(self):
+            yield
+
+        def execute(self, stmt, params):
+            if stmt is speed_to_lead._HELD_WEB:
+                assert params["held"] == TEXT_HELD and params["cutoff"] == NOW - speed_to_lead.TEXT_LAST_CHANCE
+                row = {"row_id": 1, "id": 7, "phone": PHONE, "property_state": "FL", "ghl_contact_id": "c-7",
+                       "suppressed": False, "sms_consent": True}
+                return SimpleNamespace(mappings=lambda: SimpleNamespace(all=lambda: [row]))
+            assert stmt is speed_to_lead._TEXT_DONE
+            self.done.append(params["status"])
+
+    paused = {"on": True}
+    monkeypatch.setattr(speed_to_lead, "outbound_paused", lambda channel: paused["on"])
+    outcome, _, _ = run(web_lead())
+    assert outcome.text_status == TEXT_HELD
+    db, tags = HeldDb(), FakeTags()
+    assert speed_to_lead.release_held_web_intro(db, tags, now=NOW) == 0 and db.done == [] and tags.calls == []
+    paused["on"] = False
+    assert speed_to_lead.release_held_web_intro(db, tags, now=NOW) == 1
+    assert db.done == [TEXT_TAGGED] and ("add", "c-7", GHL_TAG_WEB_INTRO_READY) in tags.calls
+
+
+def test_the_emergency_halt_still_withholds_the_intro_text(gates):
+    gates.halted = True
+    outcome, _, _ = run(web_lead())
+    assert outcome.text_status == TEXT_NOT_ALLOWED
+
+
 def test_a_website_lead_the_night_responder_is_texting_gets_no_intro_text(gates, monkeypatch):
     # Team decision Q8: the night responder's first question is the lead's first text, never a second message.
     monkeypatch.setattr("src.lending.after_hours_conversation.conversations_enabled", lambda: True)

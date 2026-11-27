@@ -78,6 +78,7 @@ class InstantlySendPaused(InstantlySendError):
         super().__init__(str(cause))
         self.channel = cause.channel
         self.rate_limited = isinstance(cause, circuit_breaker.RateLimited)
+        self.held_reason = cause.held_reason
 
 
 class InstantlyLaneBlock(InstantlySendError, LaneViolation):

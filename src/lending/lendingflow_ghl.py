@@ -23,6 +23,8 @@ from config.lending_lendingflow import (
 from config.settings import get_settings
 from src.lending.cold_leads import reconcile_warm_contact
 from src.lending.global_halt import is_globally_halted
+from config.lending_fallbacks import CHANNEL_GHL_CRM
+from src.lending.dependency_health import outbound_paused
 from src.lending.ghl_account import GhlAccount, ghl_headers, lending_ghl_account
 from src.lending.web_leads import DeliveryError, PushResult
 
@@ -39,7 +41,7 @@ def _intro_ready_tags(lead: Mapping[str, Any]) -> list[str]:
     after re-checking the current suppression list and do-not-contact flag at push time (an opt-out still blocks the
     text). A lead without that flag is never tagged (fail closed). ``sms_clear`` is only ever True while
     ``LENDING_INTRO_SMS_ENABLED`` is on; the switch is re-checked here so no caller can skip it."""
-    if not get_settings().lending_intro_sms_enabled or is_globally_halted():
+    if not get_settings().lending_intro_sms_enabled or is_globally_halted() or outbound_paused(CHANNEL_GHL_CRM):
         return []
     if lead.get("sms_clear") is True:
         return [GHL_TAG_INTRO_READY]

@@ -53,6 +53,8 @@ from config.lending_compliance import (
 from config.lending_wholesalers import GHL_TAG_SOURCE_PREFIX, GHL_TAG_STATE_PREFIX, WHOLESALER_STATES
 from config.settings import get_settings
 from src.lending.global_halt import is_globally_halted
+from config.lending_fallbacks import CHANNEL_GHL_CRM
+from src.lending.dependency_health import outbound_paused
 from src.lending.wholesaler_lists import GhlTagSink, ghl_sink
 
 logger = logging.getLogger(__name__)
@@ -332,6 +334,9 @@ def main(argv: Optional[list[str]] = None) -> int:
         return EXIT_OK
     if is_globally_halted():
         logger.warning("[ghl-load-sync] lending emergency halt is on; nothing pushed")
+        return EXIT_REFUSED
+    if outbound_paused(CHANNEL_GHL_CRM):
+        logger.warning("[ghl-load-sync] opt-outs can't be verified (a feed is stale); nothing pushed")
         return EXIT_REFUSED
     sink = ghl_sink()
     if sink is None:

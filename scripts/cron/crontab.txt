@@ -1355,6 +1355,12 @@ COUNTY_ID=hillsborough
 # posted to LENDING_OPS_CHANNEL. Reads the mailbox read-only over IMAP; idle until LENDING_OPTOUT_IMAP_USER/_PASSWORD are set.
 */5 * * * * $PROJECT/scripts/cron/run.sh src.lending.email_opt_out
 
+# R1 0.6 dependency watch: alerts when an opt-out feed (GHL DND backstop, FA opt-out poller, opt-out mailbox) is past
+# its freshness limit (automated sends pause while LENDING_FAILCLOSED_PAUSE_ENABLED=true; off = "would have paused"),
+# reopens cards held for it once fresh, alerts when no LendingFlow lead arrives for 4 business hours, and marks
+# exhausted phones. Dry check first: PYTHONPATH=. python -m src.lending.dependency_watch --dry-run
+*/5 * * * * $PROJECT/scripts/cron/run.sh src.lending.dependency_watch
+
 # Lending opt-out webhook recovery: replays GHL opt-out / consent webhook calls that failed (saved in
 # lending.webhook_failures) until they succeed; alerts LENDING_OPS_CHANNEL when one is given up.
 */5 * * * * $PROJECT/scripts/cron/run.sh src.lending.webhook_failures

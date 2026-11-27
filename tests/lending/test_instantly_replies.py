@@ -192,12 +192,15 @@ class _Result:
 
 
 class FakeSession:
-    def __init__(self, rows):
+    def __init__(self, rows, pending_handoffs=()):
         self.rows, self.executed, self.commits = rows, [], 0
+        self.pending_handoffs = list(pending_handoffs)  # rows whose GHL handoff waited out a dependency pause
 
     def execute(self, stmt, params=None):
         sql = str(stmt)
         self.executed.append((sql, params or {}))
+        if "WHERE ghl_handoff_pending_at IS NOT NULL" in sql:
+            return _Result(self.pending_handoffs)
         if "FOR UPDATE SKIP LOCKED" in sql:
             return _Result(self.rows)
         if "INSERT INTO lending.cora_inbox" in sql:

@@ -151,7 +151,7 @@ class TestRunSelection:
         calls = {"cleared": [], "written": []}
         record = TestBuildPoolRow()._record()
         monkeypatch.setattr(bridge, "latest_run_id", lambda session: latest)
-        monkeypatch.setattr(bridge, "_iter_record_pages", lambda session, state: iter([[record]]))
+        monkeypatch.setattr(bridge, "_iter_record_pages", lambda session, state, exclude=(): iter([[record]]))
         monkeypatch.setattr(bridge, "load_trace_contacts", lambda session, keys: {})
         monkeypatch.setattr(bridge, "_phones_in_other_pools", lambda session, run_id, state=None: set())
         monkeypatch.setattr(bridge, "_clear_previous_rows",
@@ -175,7 +175,7 @@ class TestRunSelection:
     def test_shared_traced_phone_goes_to_one_row_only(self, monkeypatch):
         bridge, calls = self._patch(monkeypatch, latest="extract-run-1")
         r1, r2 = TestBuildPoolRow()._record(radar_id="R1"), TestBuildPoolRow()._record(radar_id="R2")
-        monkeypatch.setattr(bridge, "_iter_record_pages", lambda session, state: iter([[r1], [r2]]))
+        monkeypatch.setattr(bridge, "_iter_record_pages", lambda session, state, exclude=(): iter([[r1], [r2]]))
         shared = {"phones": ["8135550142"], "emails": []}
         monkeypatch.setattr(bridge, "load_trace_contacts",
                             lambda session, keys: {k: shared for k in keys})

@@ -354,7 +354,7 @@ def breaker_aware(executor: EgressExecutor) -> EgressExecutor:
             except (GhlChannelPaused, InstantlyChannelPaused, InstantlySendPaused) as exc:
                 if exc.rate_limited:
                     raise SendRetryLater() from None
-                raise SendHeld(circuit_breaker.HELD_BREAKER_OPEN, str(exc)) from None
+                raise SendHeld(exc.held_reason, str(exc)) from None
             except (GhlSmsError, InstantlyError, InstantlySendError) as exc:
                 if exc.ambiguous:
                     raise SendHeld(revalidate.HOLD_UNCERTAIN_OUTCOME,

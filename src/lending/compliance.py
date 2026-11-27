@@ -27,7 +27,6 @@ from src.lending.dialer_removal import DialerRemovalUndecided
 from src.lending.ghl_calling import ghl_calling_phones
 from config.lending_compliance import (
     AREA_CODE_TZ,
-    ATTEMPT_HISTORY_BUSINESS_DAYS,
     ATTEMPT_PERIOD_HOURS,
     CALL_WINDOW_END,
     CALL_WINDOW_START,
@@ -46,7 +45,6 @@ from config.lending_compliance import (
     HOMESTEAD_GATE_EXCLUDED_SOURCE_TAGS,
     INVESTOR_ENTITY_TYPES,
     MAX_ATTEMPTS_PER_PERIOD,
-    MAX_ATTEMPTS_TOTAL,
     OPT_OUT_EXCLUDED_SOURCES,
     OPT_OUT_POLL_LOCK_KEY,
     SMS_OPT_OUT_SOURCES,
@@ -703,47 +701,27 @@ def _attempt_cap(db, phone: str, now: datetime) -> GateResult:
     return GateResult(phone=phone, allowed=True)
 
 
-def _business_days_ago(now: datetime, business_days: int) -> datetime:
-    """``now`` minus N business days, skipping Sat/Sun — a rolling compliance window,
-    not a trading-holiday calendar."""
-    remaining = business_days
-    cursor = now
-    while remaining > 0:
-        cursor -= timedelta(days=1)
-        if cursor.weekday() < 5:  # Mon=0 .. Fri=4
-            remaining -= 1
-    return cursor
-
-
-def _total_attempt_counts(db, phones: list[str], since: datetime, now: datetime) -> dict[str, int]:
-    """All outbound attempts per phone since ``since`` — unlike ``_attempt_counts``'s
-    rolling 24h, this spans the full ``ATTEMPT_HISTORY_BUSINESS_DAYS`` window (Josh,
-    Oct 4 answers §6: 3 per 24h, 6 total over 10 business days, then nurture)."""
-    if not phones:
-        return {}
-    rows = db.execute(
-        text(
-            "SELECT phone, count(*) FROM lending.call_dispositions "
-            "WHERE phone = ANY(:phones) AND (direction = 'outbound' OR direction IS NULL) "
-            "AND call_ended_at > :since AND call_ended_at <= :now GROUP BY phone"
-        ),
-        {"phones": phones, "since": since, "now": now},
-    ).fetchall()
-    return {r[0]: r[1] for r in rows}
-
-
 def _attempt_history_exhausted_phones(db, phones: list[str], now: datetime) -> set[str]:
-    since = _business_days_ago(now, ATTEMPT_HISTORY_BUSINESS_DAYS)
-    counts = _total_attempt_counts(db, phones, since, now)
-    return {p for p, n in counts.items() if n >= MAX_ATTEMPTS_TOTAL}
+    """R1 0.6: over the total cap in the window (counted since the phone's last new inbound), or marked exhausted
+    and not cleared since: a worked-out phone never comes back from a list when its attempts age out."""
+    from src.lending.exhausted import exhausted_phones
+
+    return exhausted_phones(db, phones, now)
+
+
+def _mark_exhausted(db, phone: str, now: datetime) -> None:
+    """R1 0.6: the durable mark (``lending.exhausted_phones``) that outlives the rolling window."""
+    from src.lending.exhausted import mark_one
+
+    mark_one(db, phone, now)
 
 
 def _close_exhausted_load_row(db, phone: str) -> None:
     """Closes the load row once total attempt history crosses the cap, and the contact
     moves to nurture — the same disposition as a DNC/litigator verdict, not a temporary
-    sweep hold. The count is a rolling ATTEMPT_HISTORY_BUSINESS_DAYS window, so it can
-    fall again as attempts age out, but nothing reopens this row: the contact only
-    returns if a later load run re-pushes it."""
+    sweep hold. Nothing reopens this row, and since R1 0.6 the phone is marked exhausted
+    (``src.lending.exhausted``), so a later list run does not re-push it either; only a new
+    inbound (LendingFlow lead or website form) clears the mark."""
     db.execute(
         text(
             "UPDATE lending.dialer_load_records SET active = false, deactivated_at = now(), "
@@ -773,6 +751,7 @@ def on_attempt_recorded(
     now = now or datetime.now(timezone.utc)
     result = _attempt_cap(db, normalized, now)
     if _attempt_history_exhausted_phones(db, [normalized], now):
+        _mark_exhausted(db, normalized, now)
         _flag_nurture(db, [normalized])
         # Close the row only once the dialer confirmed the removal: the sweep and weekly
         # job read active rows only, so closing it after a failed removal would leave the

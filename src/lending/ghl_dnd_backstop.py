@@ -12,6 +12,8 @@ from typing import Any, Callable
 from sqlalchemy import text
 
 from config.lending_compliance import GHL_BACKSTOP_MAX_PAGES, GHL_BACKSTOP_PAGE_SIZE, OptOutChannel
+from config.lending_fallbacks import FEED_GHL_DND_BACKSTOP
+from src.lending import dependency_health
 from src.lending.compliance import propagate_opt_out
 from src.lending.ghl_account import ghl_headers, lending_ghl_account
 
@@ -65,6 +67,7 @@ def main() -> None:
 
     if lending_ghl_account() is None:
         logger.error("[lending-ghl-backstop] LENDING_GHL_API_KEY / LENDING_GHL_LOCATION_ID not set")
+        dependency_health.record_failure(FEED_GHL_DND_BACKSTOP, "GHL account not configured")
         return
     try:
         with get_db_context() as db:
@@ -73,7 +76,9 @@ def main() -> None:
         logger.info("[lending-ghl-backstop] new_dnd_opt_outs=%d", recorded)
     except Exception as exc:
         logger.error("[lending-ghl-backstop] run failed (%s)", type(exc).__name__)
+        dependency_health.record_failure(FEED_GHL_DND_BACKSTOP, type(exc).__name__)
         raise
+    dependency_health.record_success(FEED_GHL_DND_BACKSTOP)
 
 
 if __name__ == "__main__":

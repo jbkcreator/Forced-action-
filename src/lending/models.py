@@ -1857,7 +1857,8 @@ class LendingInstantlyReply(LendingBase):
     suppressed (a STOP or unsubscribe: no answer is ever drafted; ``suppressed_at`` is set once the opt-out is
     recorded, and the sweep retries one that failed) or failed (gave up after ``attempts``). ``reply_text`` is kept
     so the answer can be drafted; it is never logged or put in the inbox payload. ``action_id`` is the approval card
-    in ``pending_actions``; ``triage_posted_at`` the post in the replies channel."""
+    in ``pending_actions``; ``triage_posted_at`` the post in the replies channel. ``ghl_handoff_pending_at``: a Deal
+    reply whose GHL handoff waited out an R1 0.6 dependency pause; the sweep retries it until it is handed over."""
 
     __tablename__ = "instantly_replies"
 
@@ -1884,6 +1885,7 @@ class LendingInstantlyReply(LendingBase):
     last_error: Mapped[Optional[str]] = mapped_column(String(200))  # exception class or a fixed reason only
     received_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_now, server_default=text("now()"))
     processed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    ghl_handoff_pending_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
 
     __table_args__ = (
         CheckConstraint("status IN ('new', 'suppressed', 'done', 'failed')", name="ck_instantly_replies_status"),
@@ -1892,6 +1894,8 @@ class LendingInstantlyReply(LendingBase):
         Index("uq_instantly_replies_dedup", "dedup_key", unique=True),
         Index("ix_instantly_replies_open", "received_at",
               postgresql_where=text("status = 'new' OR (status = 'suppressed' AND suppressed_at IS NULL)")),
+        Index("ix_instantly_replies_handoff_pending", "ghl_handoff_pending_at",
+              postgresql_where=text("ghl_handoff_pending_at IS NOT NULL")),
     )
 
 
@@ -2309,6 +2313,50 @@ class LendingSunbizLlcContact(LendingBase):
     __table_args__ = (
         CheckConstraint("subject_role IN ('officer', 'agent')", name="ck_lending_sunbiz_llc_contacts_role"),
     )
+
+
+class LendingDependencyHealth(LendingBase):
+    """R1 0.6: when each outside service or feed last worked (``src.lending.dependency_health``). One row per
+    dependency key from ``config/lending_fallbacks.py``; a success clears ``failing_since``. An opt-out feed whose
+    ``last_success_at`` is older than its limit means suppression cannot be verified for the channels it protects."""
+
+    __tablename__ = "dependency_health"
+
+    dependency: Mapped[str] = mapped_column(String(40), primary_key=True)
+    last_success_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    failing_since: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    detail: Mapped[Optional[str]] = mapped_column(String(200))
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_now, server_default=text("now()"))
+
+
+class LendingDependencyAlert(LendingBase):
+    """R1 0.6: one row per alert episode key (a stale feed, LendingFlow silence), so each episode posts once when it
+    starts and once when it clears. The episode is saved before it is posted; ``unposted`` names the post Slack has
+    not accepted yet, retried every pass until it is."""
+
+    __tablename__ = "dependency_alerts"
+
+    alert_key: Mapped[str] = mapped_column(String(60), primary_key=True)
+    active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default=text("false"))
+    since: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    detail: Mapped[Optional[str]] = mapped_column(String(300))
+    unposted: Mapped[Optional[str]] = mapped_column(String(12))  # start / clear / clear_missed: Slack has not taken it
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_now, server_default=text("now()"))
+
+
+class LendingExhaustedPhone(LendingBase):
+    """R1 0.6: a phone that reached the total attempt history cap (6 attempts in 10 business days). The mark stays
+    after the attempts age out, so the phone never reloads from a calling list; only a new inbound (a LendingFlow lead
+    or a website form for that phone) clears it (``cleared_at``)."""
+
+    __tablename__ = "exhausted_phones"
+
+    phone: Mapped[str] = mapped_column(String(20), primary_key=True)
+    exhausted_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_now, server_default=text("now()"))
+    attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default=text("0"))
+    cleared_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    cleared_reason: Mapped[Optional[str]] = mapped_column(String(40))
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_now, server_default=text("now()"))
 
 
 # ── R1 0.9: Shadow mode ─────────────────────────────────────────────────────────

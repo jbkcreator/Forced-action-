@@ -20,11 +20,17 @@ message is never recorded twice.
 
 Logs carry message keys and counts only, never addresses, phone numbers or message text.
 
+R1 0.6: while any message is ``failed`` or ``gave_up`` (an opt-out that is not recorded), the run records a failure,
+not a success, so the feed goes stale and the fail-closed pause stops outbound until it is recorded. After recording
+one by hand, ``--resolve <message key>`` marks it recorded (the key is in the alert).
+
 Usage (cron, every 5 minutes):
     python -m src.lending.email_opt_out
+    python -m src.lending.email_opt_out --resolve <message key>
 """
 from __future__ import annotations
 
+import argparse
 import hashlib
 import imaplib
 import logging
@@ -42,6 +48,8 @@ from sqlalchemy import text
 from config.lending_compliance import OptOutChannel
 from config.lending_prequal import BORROWER_CALLBACK_PHONE
 from config.settings import get_settings
+from config.lending_fallbacks import FEED_IMAP_OPT_OUT
+from src.lending import dependency_health
 from packages.agent_core.redaction import mask_emails
 from src.lending.compliance import propagate_opt_out
 from src.lending.cora_inbox import add_to_inbox_in_own_session
@@ -206,6 +214,9 @@ class MessageLog(Protocol):
     def mark_failed(self, key: str, error: str) -> int:
         """Record a failed attempt; returns the attempt count."""
 
+    def unrecorded(self) -> int:
+        """How many messages are opt-outs that are not recorded yet (failed or given up)."""
+
 
 class SqlMessageLog:
     """``lending.email_opt_out_messages``: durable progress across sweeps."""
@@ -225,6 +236,10 @@ class SqlMessageLog:
         "last_attempt_at = now() RETURNING attempts"
     )
 
+    _UNRECORDED = text("SELECT count(*) FROM lending.email_opt_out_messages WHERE outcome IN ('failed', 'gave_up')")
+    _RESOLVE = text("UPDATE lending.email_opt_out_messages SET outcome = 'recorded', last_error = 'resolved by hand', "
+                    "last_attempt_at = now() WHERE message_key = :key AND outcome IN ('failed', 'gave_up')")
+
     def __init__(self, session_factory: Callable = lending_session) -> None:
         self._session_factory = session_factory
 
@@ -241,6 +256,15 @@ class SqlMessageLog:
     def mark_failed(self, key: str, error: str) -> int:
         with self._session_factory() as db:
             return int(db.execute(self._FAILED, {"key": key, "error": error}).scalar_one())
+
+    def unrecorded(self) -> int:
+        with self._session_factory() as db:
+            return int(db.execute(self._UNRECORDED).scalar_one())
+
+    def resolve(self, key: str) -> bool:
+        """An operator recorded this opt-out by hand: it no longer holds the feed unhealthy."""
+        with self._session_factory() as db:
+            return bool(db.execute(self._RESOLVE, {"key": key}).rowcount)
 
 
 @dataclass
@@ -280,7 +304,8 @@ def _process_one(mailbox: Mailbox, log: MessageLog, message_number: bytes, key: 
             log.mark(key, "gave_up", error=type(exc).__name__)
             posted = notify(f":rotating_light: An opt-out email from {mask_emails(opt_out.sender)} could not be "
                             f"recorded after {attempts} attempts ({type(exc).__name__}, message {key}). It is NOT "
-                            "recorded: record it by hand.")
+                            "recorded and outbound stays paused: record it by hand, then run "
+                            f"`python -m src.lending.email_opt_out --resolve {key}`.")
             add_to_inbox_in_own_session(
                 event_type="opt_out_email_not_recorded", dedup_key=key, target_channel="ops_notice",
                 channel_posted=bool(posted),
@@ -316,31 +341,49 @@ def sweep(mailbox: Mailbox, log: MessageLog, *, since: date, optout_address: str
     return result
 
 
-def run(now: Optional[datetime] = None) -> int:
-    """One pass. Returns 0 on success or when not configured, 1 when the mailbox or the database failed."""
+def run(now: Optional[datetime] = None, *, log: Optional[MessageLog] = None) -> int:
+    """One pass. Returns 0 on success or when not configured, 1 when the mailbox or the database failed or an opt-out
+    is still not recorded."""
     settings = get_settings()
     password = settings.lending_optout_imap_password
     if not (settings.lending_optout_imap_user and password):
         logger.info("[lending-email-opt-out] not configured (LENDING_OPTOUT_IMAP_USER / _PASSWORD); skipped")
+        # No mailbox = no opt-out can wait in one: nothing to verify, so the feed is not stale (R1 0.6).
+        dependency_health.record_success(FEED_IMAP_OPT_OUT)
         return 0
     since = (now or datetime.now(timezone.utc)).date() - timedelta(days=LOOKBACK_DAYS)
+    log = log or SqlMessageLog()
     try:
         with ImapMailbox(host=settings.lending_optout_imap_host, port=settings.lending_optout_imap_port,
                          user=settings.lending_optout_imap_user, password=password.get_secret_value(),
                          optout_address=settings.lending_optout_address) as mailbox:
-            result = sweep(mailbox, SqlMessageLog(), since=since, optout_address=settings.lending_optout_address,
+            result = sweep(mailbox, log, since=since, optout_address=settings.lending_optout_address,
                            own_numbers=own_business_numbers())
+        unrecorded = log.unrecorded()
     except Exception as exc:  # class only: IMAP and SQL errors can echo the login or addresses
         logger.error("[lending-email-opt-out] sweep failed: %s", type(exc).__name__)
+        dependency_health.record_failure(FEED_IMAP_OPT_OUT, type(exc).__name__)
         return 1
+    if unrecorded:  # a known opt-out is missing from suppression: the feed is not healthy (R1 0.6)
+        logger.error("[lending-email-opt-out] %d opt-out(s) not recorded; feed kept unhealthy", unrecorded)
+        dependency_health.record_unverified(FEED_IMAP_OPT_OUT, f"{unrecorded} opt-out(s) not recorded")
+        return 1
+    dependency_health.record_success(FEED_IMAP_OPT_OUT)
     logger.info("[lending-email-opt-out] examined %d message(s), %d new opt-out(s), %d failed", result.examined,
                 result.recorded, result.failed)
     return 0
 
 
-def main() -> int:
+def main(argv: Optional[list[str]] = None) -> int:
     if not logging.getLogger().handlers:
         logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
+    parser = argparse.ArgumentParser(description="Opt-out mailbox listener")
+    parser.add_argument("--resolve", metavar="KEY", help="mark an opt-out recorded by hand (key from the alert)")
+    args = parser.parse_args(argv)
+    if args.resolve:
+        resolved = SqlMessageLog().resolve(args.resolve)
+        logger.info("[lending-email-opt-out] %s %s", args.resolve, "resolved" if resolved else "not failed; unchanged")
+        return 0 if resolved else 1
     return run()
 
 

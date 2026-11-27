@@ -153,6 +153,19 @@ def test_the_retry_queue_replays_the_saved_body_into_one_lead(client, leads, rep
     assert webhook_failures.ENDPOINT_LABELS[endpoint] == "LendingFlow lead"
 
 
+def test_a_journaled_delivery_counts_for_the_silence_watch_and_a_lost_one_does_not(client, leads, store, monkeypatch):
+    """R1 0.6 after the R1 0.5 merge: the journaled path must also mark LendingFlow as delivering."""
+    from src.lending import lendingflow_webhook as hook
+
+    seen = []
+    monkeypatch.setattr(hook.dependency_health, "record_success", lambda feed: seen.append(feed))
+    assert _post(client).status_code == 200
+    assert seen == [hook.FEED_LENDINGFLOW_INBOUND]
+    store.insert_error = DatabaseDown()
+    assert _post(client, raw=json.dumps({**_payload(), "id": "x-2"}).encode()).status_code == 500
+    assert seen == [hook.FEED_LENDINGFLOW_INBOUND]  # a delivery that could not be saved is not a success
+
+
 def test_a_raw_save_failure_is_500_so_lendingflow_sends_again(client, leads, store):
     store.insert_error = DatabaseDown()
     response = _post(client)

@@ -69,6 +69,8 @@ from src.lending.dialer_display import NOT_AVAILABLE
 from src.lending.dialer_load import CARD_TIMEZONE, DialerContacts, LoadRefused, LoadReport, run_dialer_load
 from src.lending.ghl_call_import import CALL_DIRECTIONS, CallReader, ImportStats, _store_contact
 from src.lending.global_halt import is_globally_halted
+from config.lending_fallbacks import CHANNEL_DIALER
+from src.lending.dependency_health import outbound_paused
 from src.services.phone_utils import normalize
 
 logger = logging.getLogger(__name__)
@@ -662,6 +664,9 @@ def _may_load(dialer: Optional[DialerContacts], scrubber: Optional[Scrubber], re
         return False
     if is_globally_halted():
         logger.info("[lendingflow-dialer] emergency halt is on: nothing loaded")
+        return False
+    if outbound_paused(CHANNEL_DIALER):
+        logger.warning("[lendingflow-dialer] opt-outs can't be verified (a feed is stale): nothing loaded")
         return False
     return True
 

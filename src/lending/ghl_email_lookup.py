@@ -18,6 +18,7 @@ from typing import Any, Iterable, Optional
 import requests
 from sqlalchemy import text
 
+from config.lending_fallbacks import quick_timeout
 from src.lending.ghl_account import ghl_headers, lending_ghl_account
 from src.services import ghl_webhook
 from src.services.phone_utils import normalize
@@ -25,7 +26,7 @@ from src.services.phone_utils import normalize
 logger = logging.getLogger(__name__)
 
 MAX_LOOKUPS_PER_BATCH = 10
-_TIMEOUT = 4  # seconds per request
+_TIMEOUT = quick_timeout("ghl")  # seconds per request (R1 0.6 policy table)
 _BUDGET = 30.0  # seconds for the whole batch: it runs inside the webhook's 60-second stop budget
 
 _LOAD_PHONES = text(

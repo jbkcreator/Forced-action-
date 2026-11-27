@@ -60,17 +60,29 @@ RESUME_WORDS = {"sms": CHANNEL_SMS, "ghl_sms": CHANNEL_SMS, "email": CHANNEL_EMA
 FAILURE_THRESHOLD = 5
 LIVE_REPLY_RESERVE = 10  # per-minute slots approval cards leave free for live replies
 HELD_BREAKER_OPEN = "breaker_open"
+HELD_SUPPRESSION_UNVERIFIED = "suppression_unverified"  # R1 0.6: an opt-out feed is stale; back for approval once fresh
 STATE_CLOSED, STATE_OPEN = "closed", "open"
 _PRUNE_AFTER = "1 hour"
 
 
 class ChannelPaused(RuntimeError):
-    """The channel may not send right now (breaker open, or its state could not be read). Nothing was sent."""
+    """The channel may not send right now (breaker open, or its state could not be read). Nothing was sent.
+    ``held_reason`` is what an approval card held for it records."""
+
+    held_reason = HELD_BREAKER_OPEN
 
     def __init__(self, channel: str, why: str) -> None:
         super().__init__(f"{LABELS.get(channel, channel)} sending is paused: {why}")
         self.channel = channel
         self.why = why
+
+
+class SuppressionUnverified(ChannelPaused):
+    """R1 0.6: an opt-out feed protecting the channel is stale (or the suppression list is unreadable), so nobody can
+    be sure the recipient has not opted out. Clears by itself when the feeds are fresh; held cards then come back for
+    a fresh approval (``src.lending.dependency_watch``)."""
+
+    held_reason = HELD_SUPPRESSION_UNVERIFIED
 
 
 class RateLimited(ChannelPaused):
@@ -166,7 +178,13 @@ _HELD_LIST = text("""
 
 def admit(channel: str) -> None:
     """Raise ``ChannelPaused`` / ``RateLimited`` when ``channel`` may not send now; take one slot of the minute
-    otherwise. An unreadable breaker counts as open: no send without knowing the channel is healthy."""
+    otherwise. An unreadable breaker counts as open: no send without knowing the channel is healthy. First, R1 0.6:
+    ``SuppressionUnverified`` while the opt-out feeds protecting the channel are stale (pause switch on)."""
+    from src.lending.dependency_health import outbound_allowed
+
+    decision = outbound_allowed(channel)
+    if not decision.allowed:
+        raise SuppressionUnverified(channel, decision.reason or "opt-outs can't be verified")
     limit = max(per_minute_cap(channel) - _RESERVE.get(), 1)
     paused: Optional[str] = None
     limited = False
@@ -195,7 +213,13 @@ def admit(channel: str) -> None:
 
 def recheck(channel: str) -> None:
     """Raise ``ChannelPaused`` when the breaker opened since ``admit`` (another worker recorded the fifth failure while
-    this send was preparing). Takes no rate-limit slot. Called right before the final provider request."""
+    this send was preparing), or ``SuppressionUnverified`` when an opt-out feed went stale meanwhile (R1 0.6). Takes no
+    rate-limit slot. Called right before the final provider request."""
+    from src.lending.dependency_health import outbound_allowed
+
+    decision = outbound_allowed(channel)
+    if not decision.allowed:
+        raise SuppressionUnverified(channel, decision.reason or "opt-outs can't be verified")
     paused: Optional[str] = None
     try:
         with lending_session() as db:
@@ -302,6 +326,18 @@ def reset(channel: str, actor: str) -> ResetResult:
         post_ops_alert(f":white_check_mark: {LABELS[channel]} sending reopened by {actor}. "
                        f"{len(reopened)} held card(s) are back for approval.")
     return ResetResult(channel, was_open, len(reopened))
+
+
+def reopen_held(channel: str, reason: str, actor: str) -> int:
+    """Send the cards held on ``channel`` for ``reason`` back for a fresh approval (R1 0.6: the opt-out feeds are
+    fresh again). Returns how many; the breaker state is not touched."""
+    with lending_session() as db:
+        reopened = [int(i) for i in db.execute(_REOPEN_HELD, {"channels": list(CARD_CHANNELS[channel]),
+                                                              "reason": reason}).scalars()]
+        if reopened:
+            db.execute(_EVENT, {"c": channel, "event": "reopened", "actor": actor,
+                                "detail": json.dumps({"reason": reason, "reopened_cards": reopened})})
+    return len(reopened)
 
 
 def release_held(action_id: int) -> bool:

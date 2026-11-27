@@ -52,6 +52,7 @@ from typing import Optional
 import requests
 
 from config.settings import get_settings
+from config.lending_fallbacks import timeout
 from src.core.database import get_db_context
 from src.core.models import (
     DistressScore, EnrichedContact, EnrichmentUsageLog, Owner, Property, SmsOptOut,
@@ -291,7 +292,7 @@ def _submit_trace_batch(
         _TRACE_ENDPOINT,
         headers={"Authorization": f"Bearer {api_key}"},
         files=multipart,
-        timeout=30,
+        timeout=timeout("tracerfy"),
     )
     if resp.status_code in (401, 403):
         raise RuntimeError(f"Tracerfy: invalid API key ({resp.status_code})")
@@ -353,7 +354,7 @@ def _poll_trace_queue(
 
     for attempt in range(120):
         try:
-            resp = requests.get(url, headers=_headers(api_key), timeout=30)
+            resp = requests.get(url, headers=_headers(api_key), timeout=timeout("tracerfy"))
         except requests.RequestException as e:
             logger.warning(
                 "[Tracerfy] queue=%s poll failed attempt=%d/%d: %s",

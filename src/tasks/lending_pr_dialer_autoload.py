@@ -184,8 +184,14 @@ def pre_check_verdicts(db, records: Sequence[Mapping[str, Any]]) -> list[Optiona
     return [None if r.allowed else r.reason.value for r in results]
 
 
-def plan_load(db, *, day: date, cap: int, root: Optional[Path] = None) -> tuple[list[dict], dict]:
+def plan_load(db, *, day: date, cap: int, root: Optional[Path] = None,
+              stale: Optional[dict] = None) -> tuple[list[dict], dict]:
+    """``stale`` = PropertyRadar segments whose nightly pull is too old (R1 0.6): their staged rows are not loaded."""
+    from src.lending.pr_maturity_bridge import segment_of
+
     records = staged_pr_records(db)
+    if stale:
+        records = [r for r in records if segment_of(r) not in stale]
     phones = sorted({r["phone"] for r in records if r.get("phone")})
     active = {row[0] for row in db.execute(_ACTIVE_PHONES_SQL, {"p": phones})} if phones else set()
     left = max(0, cap - credits_spent(day, root))
@@ -217,6 +223,10 @@ def main(argv: Optional[list[str]] = None) -> int:
         return EXIT_OK
     cap = max(0, settings.lending_pr_dialer_autoload_max_scrub_credits)
     summary, code = _run(now, cap, apply=args.apply)
+    if summary.get("stale_data"):  # R1 0.6: a failed overnight pull; say so plainly, never load that segment
+        logger.warning("[pr-autoload] %s", summary["stale_data"])
+        if args.apply:
+            _notify(summary["stale_data"], failed=True)
     message = f"PropertyRadar morning dialer load{'' if args.apply else ' (dry run)'}: {json.dumps(summary, default=str)}"
     logger.info("[pr-autoload] %s", message)
     if args.apply and (summary.get("to_load") or code != EXIT_OK):
@@ -227,9 +237,14 @@ def main(argv: Optional[list[str]] = None) -> int:
 def _run(now: datetime, cap: int, *, apply: bool) -> tuple[dict[str, Any], int]:
     from src.core.database import get_db_context
 
+    from src.lending.pool_source import stale_message, stale_segments
+
     day = day_of(now)
     with get_db_context() as db:
-        records, counts = plan_load(db, day=day, cap=cap)
+        stale = stale_segments(db, now)
+        records, counts = plan_load(db, day=day, cap=cap, stale=stale)
+        if stale:
+            counts["stale_data"] = stale_message(stale)
         if not apply or not records:
             db.rollback()
             return counts, EXIT_OK

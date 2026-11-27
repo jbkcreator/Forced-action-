@@ -20,8 +20,11 @@ from typing import Any, Callable, Optional
 import requests
 
 from config.lending_compliance import GHL_DND_CHANNELS
+from config.lending_fallbacks import timeout
 from config.settings import get_settings
 from src.lending.global_halt import is_globally_halted
+from config.lending_fallbacks import CHANNEL_GHL_CRM
+from src.lending.dependency_health import outbound_paused
 from src.lending.ghl_account import GhlAccount, ghl_headers, lending_ghl_account
 from src.services import ghl_webhook
 from src.services.phone_utils import normalize
@@ -30,7 +33,7 @@ logger = logging.getLogger(__name__)
 
 Request = Callable[..., Any]
 
-_TIMEOUT = 15  # seconds
+_TIMEOUT = timeout("ghl")  # seconds, from the R1 0.6 policy table
 _CLOSED_STATUSES = frozenset({"won", "lost", "abandoned"})
 
 
@@ -94,6 +97,9 @@ class GhlCrmWriter:
         if is_globally_halted():
             logger.warning("%s %s refused: lending emergency halt is on", self._log_prefix, what)
             raise GhlCrmError("lending emergency halt is on; nothing changed in GHL")
+        if outbound_paused(CHANNEL_GHL_CRM):  # R1 0.6: an opt-out feed is stale
+            logger.warning("%s %s refused: opt-outs can't be verified", self._log_prefix, what)
+            raise GhlCrmError("opt-outs can't be verified (a feed is stale); nothing changed in GHL")
 
     def move_stage(self, contact_id: str, stage_name: str) -> str:
         """Move the contact's open card in the lending pipeline to ``stage_name``; returns the opportunity id."""
