@@ -114,7 +114,7 @@ def block_address(account: InstantlyAccount, email: str) -> bool:
     """Add ``email`` to the workspace block list so no NDL campaign emails it again. Best effort: False (logged)
     when Instantly refuses; the opt-out is already recorded in our stores either way."""
     try:
-        _post(account, "/api/v2/block-lists-entries", {"entries": [email]})
+        _post(account, "/api/v2/block-lists-entries", {"bl_value": email})
     except InstantlyError as exc:
         if "HTTP 409" in str(exc):  # already on the list
             return True

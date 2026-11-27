@@ -27,6 +27,7 @@ from sqlalchemy import (
     SmallInteger,
     String,
     Text,
+    UniqueConstraint,
     text,
 )
 from sqlalchemy.dialects.postgresql import JSONB, UUID
@@ -80,6 +81,8 @@ class LendingContact(LendingBase):
     email: Mapped[Optional[str]] = mapped_column(String(255))
     last_dnc_scrub: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
     line_type: Mapped[Optional[str]] = mapped_column(String(20))  # Tracerfy phone_type (mobile/landline)
+    line_type_source: Mapped[Optional[str]] = mapped_column(String(20))  # telnyx when the 0.11 fallback looked it up
+    line_type_checked_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))  # when telnyx looked it up
     do_not_contact: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default=text("false"))
     nurture: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default=text("false"))  # phone blocked by DNC; email nurture only
     pinned_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))  # after-hours voicemail: call first next morning
@@ -1086,6 +1089,36 @@ class LendingWebhookFailure(LendingBase):
     )
 
 
+class LendingInboundEvent(LendingBase):
+    """R1 0.5 inbound journal: every journaled webhook body, saved raw before it is processed
+    (``src.lending.inbound.journal``). ``(source, dedup_key)`` is unique, so a redelivery is a duplicate.
+    ``status``: received -> processed, or failed (the body was saved to ``webhook_failures`` as ``failure_id``;
+    a successful replay sets processed). A row still ``received`` after two minutes is run again by the 5-minute
+    cron. ``last_error_class`` is an exception class only, no PII; ``raw`` is nulled 30 days after processing."""
+
+    __tablename__ = "inbound_events"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    source: Mapped[str] = mapped_column(String(40), nullable=False)
+    dedup_key: Mapped[str] = mapped_column(String(255), nullable=False)
+    raw: Mapped[Optional[dict]] = mapped_column(JSONB)
+    received_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False,
+                                                  server_default=text("now()"))
+    status: Mapped[str] = mapped_column(String(12), nullable=False, server_default=text("'received'"))
+    attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default=text("0"))
+    processed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    failure_id: Mapped[Optional[int]] = mapped_column(
+        Integer, ForeignKey("lending.webhook_failures.id", ondelete="SET NULL"))
+    last_error_class: Mapped[Optional[str]] = mapped_column(String(200))
+
+    __table_args__ = (
+        CheckConstraint("status IN ('received', 'processed', 'failed')", name="ck_lending_inbound_events_status"),
+        Index("uq_lending_inbound_events_source_key", "source", "dedup_key", unique=True),
+        Index("idx_lending_inbound_events_status_received", "status", "received_at"),
+        Index("idx_lending_inbound_events_failure", "failure_id", postgresql_where=text("failure_id IS NOT NULL")),
+    )
+
+
 class LendingCoraInboxItem(LendingBase):
     """One event for Cora to raise with the operator in her main thread before it goes to a team channel.
 
@@ -1173,6 +1206,8 @@ class LendingCoraMorningDigest(LendingBase):
     slack_channel: Mapped[Optional[str]] = mapped_column(String(32))
     slack_ts: Mapped[Optional[str]] = mapped_column(String(64))
     posted_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    # R1 1.3: David's thread replies Slack has not accepted yet (JSON list of block lists); NULL when all posted.
+    thread_pending: Mapped[Optional[str]] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_now, server_default=text("now()"))
 
 
@@ -2320,3 +2355,103 @@ class LendingExhaustedPhone(LendingBase):
     cleared_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
     cleared_reason: Mapped[Optional[str]] = mapped_column(String(40))
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_now, server_default=text("now()"))
+
+
+# ── R1 0.9: Shadow mode ─────────────────────────────────────────────────────────
+
+class LendingShadowClass(LendingBase):
+    """One named decision-maker in the shadow harness (R1 0.9).
+
+    ``mode`` = off | shadow | live.  ``live`` is not wired for the auto-send judge in this release.
+    ``started_at`` is set when mode transitions to shadow; ``ended_at`` when it moves back to off.
+    ``changed_by`` is the CLI operator who ran ``--start`` / ``--stop``.
+    """
+
+    __tablename__ = "shadow_classes"
+
+    class_name: Mapped[str] = mapped_column(String(80), primary_key=True)
+    mode: Mapped[str] = mapped_column(String(10), nullable=False, default="off", server_default=text("'off'"))
+    started_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    ended_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    changed_by: Mapped[Optional[str]] = mapped_column(String(80))
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_now, server_default=text("now()"))
+
+    __table_args__ = (
+        CheckConstraint("mode IN ('off', 'shadow', 'live')", name="ck_lending_shadow_classes_mode"),
+    )
+
+
+class LendingShadowDecision(LendingBase):
+    """One shadow prediction by one class for one card (R1 0.9).
+
+    ``subject_kind`` = pending_action | lead | loan_file.  ``subject_ref`` is the string key
+    (e.g. ``"action:42"`` for a pending action with id 42).  Unique on ``(class_name, subject_ref)``
+    so sweeps are idempotent.
+
+    ``inputs`` holds references and features only — no phone, email or message body.
+    ``proposed`` is the judge's prediction payload (e.g. ``{"decision": "approve"}``) plus optional confidence.
+    ``rule_version`` is the lender rule version at card creation; NULL before snapshots exist.
+
+    Match fields (filled in by later sweeps):
+    * ``actual`` = approve | edit | reject | no_decision
+    * ``decision_match`` = True when proposed == actual
+    * ``decision_seconds`` = seconds from card creation to Josh's decision
+    * ``edit_distance`` = normalised Levenshtein of first draft vs final text
+    * ``send_result`` = sent | failed | held
+    * ``deal_outcome`` = funded | paid | declined (only for cards with a deal_ref)
+    """
+
+    __tablename__ = "shadow_decisions"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    class_name: Mapped[str] = mapped_column(String(80), nullable=False)
+    class_version: Mapped[int] = mapped_column(Integer, nullable=False, default=1, server_default=text("1"))
+    subject_kind: Mapped[str] = mapped_column(String(20), nullable=False)
+    subject_ref: Mapped[str] = mapped_column(String(80), nullable=False)
+    inputs: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict, server_default=text("'{}'::jsonb"))
+    rule_version: Mapped[Optional[int]] = mapped_column(Integer)
+    confidence: Mapped[Optional[float]] = mapped_column(Numeric(5, 4))
+    proposed: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict, server_default=text("'{}'::jsonb"))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_now, server_default=text("now()"))
+    # match fields — filled in by later sweeps
+    actual: Mapped[Optional[str]] = mapped_column(String(16))
+    decision_match: Mapped[Optional[bool]] = mapped_column(Boolean)
+    decided_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    decision_seconds: Mapped[Optional[float]] = mapped_column(Numeric(10, 2))
+    edit_distance: Mapped[Optional[float]] = mapped_column(Numeric(5, 4))
+    send_result: Mapped[Optional[str]] = mapped_column(String(16))
+    deal_outcome: Mapped[Optional[str]] = mapped_column(String(20))
+    outcome_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+
+    __table_args__ = (
+        CheckConstraint("subject_kind IN ('pending_action', 'lead', 'loan_file')",
+                        name="ck_lending_shadow_decisions_subject_kind"),
+        CheckConstraint("actual IN ('approve', 'edit', 'reject', 'no_decision') OR actual IS NULL",
+                        name="ck_lending_shadow_decisions_actual"),
+        CheckConstraint("send_result IN ('sent', 'failed', 'held') OR send_result IS NULL",
+                        name="ck_lending_shadow_decisions_send_result"),
+        Index("uq_lending_shadow_decisions_class_ref", "class_name", "subject_ref", unique=True),
+        Index("ix_lending_shadow_decisions_created_at", "created_at"),
+    )
+
+
+class LendingClayEnrichment(LendingBase):
+    """R1 1.3: one Clay lookup per (morning-list item, field). ``src.lending.morning_list.clay`` writes it; a row inside
+    ``LENDING_CLAY_TTL_DAYS`` means the lead is never paid for twice, and today's rows count toward the daily cap."""
+
+    __tablename__ = "clay_enrichments"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    lead_ref: Mapped[str] = mapped_column(String(64), nullable=False)  # morning-list ref, e.g. dlr:99, lf:12
+    field: Mapped[str] = mapped_column(String(20), nullable=False)  # email / llc_owner
+    run_id: Mapped[Optional[str]] = mapped_column(String(64))  # Clay routine_run_id
+    status: Mapped[str] = mapped_column(String(12), nullable=False)  # pending / found / not_found
+    value: Mapped[Optional[str]] = mapped_column(String(255))  # found email (lower-cased) or verified owner name
+    requested_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    enriched_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+
+    __table_args__ = (
+        UniqueConstraint("lead_ref", "field", name="uq_lending_clay_enrichments_ref_field"),
+        CheckConstraint("status IN ('pending', 'found', 'not_found')", name="ck_lending_clay_enrichments_status"),
+        Index("ix_lending_clay_enrichments_requested_at", "requested_at"),
+    )
