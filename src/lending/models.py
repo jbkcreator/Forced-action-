@@ -2331,3 +2331,65 @@ class LendingClayEnrichment(LendingBase):
         CheckConstraint("status IN ('pending', 'found', 'not_found')", name="ck_lending_clay_enrichments_status"),
         Index("ix_lending_clay_enrichments_requested_at", "requested_at"),
     )
+
+
+_SPINE_KINDS_SQL = "kind IN ('phone', 'email', 'entity', 'ghl_contact', 'batchdialer_contact')"
+
+
+class LendingContactSpine(LendingBase):
+    """R1 1.1: one canonical contact per person (``lending.contacts`` stays the per-phone compliance record)."""
+
+    __tablename__ = "contact_spine"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    seed_key: Mapped[str] = mapped_column(String(120), nullable=False, unique=True)  # smallest "source:ref" that created it
+    display_name: Mapped[Optional[str]] = mapped_column(String(200))
+    merged_into: Mapped[Optional[int]] = mapped_column(BigInteger, ForeignKey("lending.contact_spine.id"))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_now, server_default=text("now()"))
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_now, server_default=text("now()"))
+
+
+class LendingContactIdentifier(LendingBase):
+    """A phone / email / LLC / external id of a spine contact. ``merge_key`` false = a known landline (never merges)."""
+
+    __tablename__ = "contact_identifiers"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    contact_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("lending.contact_spine.id"), nullable=False)
+    kind: Mapped[str] = mapped_column(String(30), nullable=False)
+    value: Mapped[str] = mapped_column(String(320), nullable=False)
+    merge_key: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    first_seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_now, server_default=text("now()"))
+    last_seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_now, server_default=text("now()"))
+
+    __table_args__ = (
+        CheckConstraint(_SPINE_KINDS_SQL, name="ck_lending_contact_identifiers_kind"),
+        UniqueConstraint("kind", "value", "contact_id", name="uq_lending_contact_identifiers_kind_value_contact"),
+        Index("uq_lending_contact_identifiers_merge_key", "kind", "value", unique=True,
+              postgresql_where=text("merge_key"), sqlite_where=text("merge_key")),
+        Index("ix_lending_contact_identifiers_contact", "contact_id"),
+    )
+
+
+class LendingContactSource(LendingBase):
+    """Which spine contact a source row (``source`` = table name, ``source_ref`` = its row ref) belongs to."""
+
+    __tablename__ = "contact_sources"
+
+    source: Mapped[str] = mapped_column(String(40), primary_key=True)
+    source_ref: Mapped[str] = mapped_column(String(80), primary_key=True)
+    contact_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("lending.contact_spine.id"), nullable=False)
+    seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_now, server_default=text("now()"))
+
+    __table_args__ = (Index("ix_lending_contact_sources_contact", "contact_id"),)
+
+
+class LendingContactSpineMerge(LendingBase):
+    """Append-only merge audit: ids only, never the shared value."""
+
+    __tablename__ = "contact_spine_merges"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    survivor_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    merged_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    merged_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_now, server_default=text("now()"))
