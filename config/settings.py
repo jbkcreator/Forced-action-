@@ -951,6 +951,21 @@ class AppSettings(BaseSettings):
 	lending_partner_consent_text: str = Field(default="", env="LENDING_PARTNER_CONSENT_TEXT")
 	lending_partner_upload_dir: str = Field(default="data/partner_uploads", env="LENDING_PARTNER_UPLOAD_DIR")  # uploads + generated pre-qual PDFs
 	lending_partner_link_base_url: str = Field(default="", env="LENDING_PARTNER_LINK_BASE_URL")  # public host of partner links, e.g. https://api.nextdeallending.com; unset = /partners creates no links
+	# R1 1.3 morning list ("Today's list" in Cora's morning digest, src/lending/morning_list/); off = digest unchanged.
+	lending_morning_digest_time: str = Field(default="07:47", env="LENDING_MORNING_DIGEST_TIME")  # ET HH:MM; posts until noon
+	lending_morning_list_enabled: bool = Field(default=False, env="LENDING_MORNING_LIST_ENABLED")
+	lending_morning_drafts_enabled: bool = Field(default=False, env="LENDING_MORNING_DRAFTS_ENABLED")  # approval cards only, never auto-sent
+	lending_morning_list_size: int = Field(default=50, env="LENDING_MORNING_LIST_SIZE")
+	lending_morning_list_lead_days: int = Field(default=14, env="LENDING_MORNING_LIST_LEAD_DAYS")
+	lending_david_slack_user_id: str = Field(default="", env="LENDING_DAVID_SLACK_USER_ID")  # @-mentioned on David's block
+	# R1 1.3 Clay gap lookups (FA workspace routines; key CLAY_API_KEY). Cap 0 = no lookups until the client sets a budget.
+	lending_clay_api_base: str = Field(default="https://api.clay.com/public/v0", env="LENDING_CLAY_API_BASE")
+	lending_clay_email_enabled: bool = Field(default=False, env="LENDING_CLAY_EMAIL_ENABLED")
+	lending_clay_llc_enabled: bool = Field(default=False, env="LENDING_CLAY_LLC_ENABLED")  # 0/12 live matches 2026-11-25
+	lending_clay_email_routine: str = Field(default="", env="LENDING_CLAY_EMAIL_ROUTINE")  # e.g. workflow:wf_...
+	lending_clay_llc_routine: str = Field(default="", env="LENDING_CLAY_LLC_ROUTINE")
+	lending_clay_daily_cap: int = Field(default=0, env="LENDING_CLAY_DAILY_CAP")
+	lending_clay_ttl_days: int = Field(default=30, env="LENDING_CLAY_TTL_DAYS")
 	# P2.4 closing blocker card (7 AM, LENDING_CORA_CHANNEL) and document chase (src/lending/closing/); both off by default.
 	lending_closing_blockers_enabled: bool = Field(default=False, env="LENDING_CLOSING_BLOCKERS_ENABLED")
 	lending_doc_chase_enabled: bool = Field(default=False, env="LENDING_DOC_CHASE_ENABLED")
