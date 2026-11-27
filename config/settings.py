@@ -1065,6 +1065,7 @@ class AppSettings(BaseSettings):
 	lending_dial_tasks_channel: str = Field(default="", env="LENDING_DIAL_TASKS_CHANNEL")  # #dial-tasks channel ID
 	lending_dnc_alert_channel: str = Field(default="", env="LENDING_DNC_ALERT_CHANNEL")  # DNC not propagated / removal pending; channel ID, unset = not posted
 	lending_replies_channel: str = Field(default="", env="LENDING_REPLIES_CHANNEL")  # #lead-alerts: rate/terms and reschedule handoffs, AI-quote alerts, reply SLA; channel ID, Cora's bot must be a member
+	lending_unified_inbox_enabled: bool = Field(default=False, env="LENDING_UNIFIED_INBOX_ENABLED")  # R1 1.5: GHL texts/emails and missed inbound calls into one triage stream; docs/lending/unified-inbox.md
 	lending_daily_channel: str = Field(default="", env="LENDING_DAILY_CHANNEL")  # #lending-daily: 7:20pm and hourly scoreboards; channel ID
 	lending_partner_channel: str = Field(default="", env="LENDING_PARTNER_CHANNEL")  # #deals: P-1 partner file cards; Cora's bot must be a member; unset = no card
 	# T-10 uncalled-lead alarms (src/lending/uncalled_alarm_worker.py)

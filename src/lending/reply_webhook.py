@@ -23,6 +23,7 @@ from src.lending.after_hours_conversation import (OUTCOME_ANSWERED, OUTCOME_NO_C
 from src.lending.after_hours_responder import run_send_cycle_now
 from src.lending import webhook_failures
 from src.lending.inbound import journal
+from src.lending.inbox.ghl_adapter import record_ghl_event
 from src.lending.instantly_replies import is_stop_request
 from src.lending.payload_shape import log_shape
 from src.lending.reply_guard import ReplyEvent, handle_reply_event, in_reply_hours, parse_event, slack_poster
@@ -119,6 +120,7 @@ def handle_ghl_reply(db: Session, raw: dict[str, Any]) -> dict[str, Any]:
     if event is None:
         return {"status": "ignored", "advanced": False}
     advanced = _apply_after_hours(db, event)
+    record_ghl_event(db, event, raw)  # R1 1.5: the unified inbox item (or who answered); raises, so the journal retries
     try:
         with db.begin_nested():
             status = handle_reply_handoff(db, raw)
@@ -167,6 +169,13 @@ def ghl_reply(
         return {"status": "ignored", "reason": "no_message"}
     if journal.journal_enabled():
         return _ghl_reply_via_journal(body, event, background)
+    try:
+        record_ghl_event(db, event, body)
+        db.commit()
+    except Exception as exc:  # class only: the message text can carry personal details
+        logger.error("[reply-webhook] inbox item for message %s not saved (%s)", event.message_id, type(exc).__name__)
+        db.rollback()
+        raise HTTPException(status_code=503, detail="The reply could not be saved; it will be retried") from None
     advanced = _advance_after_hours_conversation(db, event)
     if advanced:
         background.add_task(run_send_cycle_now)  # the next question, right after the response

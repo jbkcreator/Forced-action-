@@ -1887,11 +1887,55 @@ class LendingInstantlyReply(LendingBase):
 
     __table_args__ = (
         CheckConstraint("status IN ('new', 'suppressed', 'done', 'failed')", name="ck_instantly_replies_status"),
-        CheckConstraint("intent IS NULL OR intent IN ('deal', 'objection', 'dead', 'unsubscribe', 'unclassified')",
+        CheckConstraint("intent IS NULL OR intent IN ('deal', 'question', 'objection', 'dead', 'unsubscribe', 'unclassified')",
                         name="ck_instantly_replies_intent"),
         Index("uq_instantly_replies_dedup", "dedup_key", unique=True),
         Index("ix_instantly_replies_open", "received_at",
               postgresql_where=text("status = 'new' OR (status = 'suppressed' AND suppressed_at IS NULL)")),
+    )
+
+
+class LendingInboxEvent(LendingBase):
+    """R1 1.5: one inbound GHL message or missed inbound call waiting for (or past) Cora's triage.
+
+    Written only by ``src.lending.inbox.unified_triage.record_inbound``. ``status``: new -> done, failed (gave up
+    after ``attempts``) or skipped_test. ``body`` is kept so the answer can be drafted (NULL for calls); it is never
+    logged or put in the inbox payload. ``answered_by`` / ``ai_handoff`` record what the GHL reply agent or a person
+    did with a text before Cora's grace period ended. ``action_id`` is the approval card in ``pending_actions``."""
+
+    __tablename__ = "inbox_events"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    dedup_key: Mapped[str] = mapped_column(String(200), nullable=False)
+    source: Mapped[str] = mapped_column(String(20), nullable=False)
+    channel: Mapped[str] = mapped_column(String(20), nullable=False)
+    ghl_contact_id: Mapped[Optional[str]] = mapped_column(String(64))
+    phone: Mapped[Optional[str]] = mapped_column(String(20))
+    email: Mapped[Optional[str]] = mapped_column(String(320))
+    first_name: Mapped[Optional[str]] = mapped_column(String(100))
+    subject: Mapped[Optional[str]] = mapped_column(String(500))
+    body: Mapped[Optional[str]] = mapped_column(Text)
+    occurred_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    received_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_now, server_default=text("now()"))
+    status: Mapped[str] = mapped_column(String(16), nullable=False, default="new", server_default=text("'new'"))
+    intent: Mapped[Optional[str]] = mapped_column(String(16))
+    summary: Mapped[Optional[str]] = mapped_column(String(300))
+    action_id: Mapped[Optional[int]] = mapped_column(BigInteger)
+    josh_pinged: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default=text("false"))
+    answered_by: Mapped[Optional[str]] = mapped_column(String(16))
+    answered_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    ai_handoff: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default=text("false"))
+    triage_posted_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    processed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default=text("0"))
+    last_error: Mapped[Optional[str]] = mapped_column(String(200))  # exception class or a fixed reason only
+
+    __table_args__ = (
+        CheckConstraint("status IN ('new', 'done', 'failed', 'skipped_test')", name="ck_inbox_events_status"),
+        CheckConstraint("intent IS NULL OR intent IN ('deal', 'question', 'objection', 'dead', 'stop', 'unclassified')",
+                        name="ck_inbox_events_intent"),
+        Index("uq_inbox_events_dedup", "dedup_key", unique=True),
+        Index("ix_inbox_events_new", "received_at", postgresql_where=text("status = 'new'")),
     )
 
 

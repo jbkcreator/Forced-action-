@@ -79,6 +79,7 @@ from src.lending.instantly_client import (InstantlyAccount, InstantlyChannelPaus
 from src.lending.instantly_email import (InstantlySendError, InstantlySendPaused, NdlInstantlySender,
                                          get_ndl_instantly_sender)
 from src.lending.after_hours_responder import run_send_cycle
+from src.lending.inbox.unified_triage import UnifiedTriageProcessor
 from src.lending.instantly_replies import CHANNEL as INSTANTLY_CHANNEL, ReplyProcessor
 from src.lending.shadow.shadow_runner import ShadowRunnerStep
 from src.lending.standing_sends import (
@@ -140,6 +141,7 @@ class CoraServices(NamedTuple):
     inbox_digest: Optional[Callable[[], int]] = None  # posts new inbox items to Cora's channel; returns how many
     morning_digest: Optional[Callable[[], bool]] = None  # posts the 7:30 AM ET digest once a day; True when posted
     instantly_replies: Optional[Callable[[], Any]] = None  # P1.3: triages new Instantly replies
+    unified_inbox: Optional[Callable[[], Any]] = None  # R1 1.5: triages new GHL texts, emails and missed inbound calls
     queue: Optional[PendingActionQueue] = None  # the drafts table the session, gate and relay share
     agent_jobs: Optional[Callable[[], Any]] = None  # P1.1: one pass of the Drive job queue worker
     standing_sends: Optional[Callable[[], Any]] = None  # P1.4: graduates templates that meet the rule
@@ -634,6 +636,15 @@ def run_sweep(services: CoraServices) -> None:
             services.doc_link_revocation()
         except Exception as exc:  # class only: SQL errors embed bound parameters; retried next sweep
             logger.error("[cora] document link revocation failed (%s); retrying next sweep", type(exc).__name__)
+    if services.unified_inbox is not None:
+        try:
+            inbox = services.unified_inbox()
+        except Exception as exc:  # class only; the items stay new and are retried next sweep
+            logger.error("[cora] unified inbox triage failed (%s); retrying next sweep", type(exc).__name__)
+        else:
+            if inbox and (inbox.triaged or inbox.skipped or inbox.failed):
+                logger.info("[cora] unified inbox triaged=%s drafted=%s skipped=%s failed=%s", inbox.triaged,
+                            inbox.drafted, inbox.skipped, inbox.failed)
     if services.instantly_replies is not None:
         try:
             replies = services.instantly_replies()
@@ -817,6 +828,8 @@ def build_live_services(settings: AppSettings) -> Optional[CoraServices]:
                              morning_enrichment=make_morning_enrichment(engine, settings),
                              instantly_replies=make_instantly_replies(engine, store, config, messages_client,
                                                                       services.gate),
+                             unified_inbox=build_unified_inbox(settings, engine, store, config, messages_client,
+                                                               services.gate),
                              agent_jobs=worker.run_once if worker is not None else None,
                              standing_sends=make_standing_sends_step(engine),
                              deal_ledger_sync=make_deal_ledger_step(engine),
@@ -926,6 +939,27 @@ def make_instantly_replies(engine: Engine, store: AgentStore, config: AgentCoreC
         block_address=(lambda email: block_address(instantly, email)) if instantly else (lambda email: False),
         hand_off=get_handoff())
     return processor.run
+
+
+def make_unified_inbox(engine: Engine, store: AgentStore, config: AgentCoreConfig, messages_client: MessagesClient,
+                       gate: SendGate) -> Callable[[], Any]:
+    """R1 1.5: the sweep step that classifies new GHL texts, emails and missed inbound calls, queues the drafted answer
+    as an approval card (posted at once; a refused card is re-posted by ``retry_missing_cards``) and posts the triage
+    line, with Josh mentioned on deals only."""
+    queue = PendingActionQueue(store, default_ttl=timedelta(hours=config.pending_action_ttl_hours))
+    memory = AgentMemory(store)
+    return UnifiedTriageProcessor(
+        session_factory=lambda: Session(engine), client=messages_client, model=config.model,
+        enqueue=lane_checked_enqueue(queue), post_card=gate.post_card, post_triage=post_replies_notice,
+        rules=lambda: [rule.rule_text for rule in memory.active_rules()]).run
+
+
+def build_unified_inbox(settings: AppSettings, engine: Engine, store: AgentStore, config: AgentCoreConfig,
+                        messages_client: MessagesClient, gate: SendGate) -> Optional[Callable[[], Any]]:
+    """The unified inbox step, or None while LENDING_UNIFIED_INBOX_ENABLED is off (nothing is recorded then either)."""
+    if not settings.lending_unified_inbox_enabled:
+        return None
+    return make_unified_inbox(engine, store, config, messages_client, gate)
 
 
 def _adopt_open_cards(services: CoraServices) -> None:

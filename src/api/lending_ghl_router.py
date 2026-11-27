@@ -38,7 +38,14 @@ from src.lending.ghl_disposition_match import (
     parse_event as parse_disposition_event,
 )
 from src.lending.ghl_disposition_match import record_event as record_disposition_event
-from src.lending.ghl_missed_call import InvalidMissedCall, parse_missed_call, record_missed_call, run_text_back_now
+from src.lending.ghl_missed_call import (
+    InvalidMissedCall,
+    parse_inbound_missed_call,
+    parse_missed_call,
+    record_missed_call,
+    run_text_back_now,
+)
+from src.lending.inbox.unified_triage import record_inbound
 from src.lending.payload_shape import log_shape
 from src.lending.ghl_consent_events import InvalidEvent, field as _field, record_ghl_opt_out, record_inbound_consent
 from src.lending.webhook_failures import AFTER_HOURS_INTAKE, GHL_OPT_OUT, GHL_TEXT_CONSENT, report_webhook_failure
@@ -174,6 +181,20 @@ def ghl_disposition(
     return {"recorded": True, "duplicate": duplicate, "matched": len(matched)}
 
 
+def _record_inbound_missed_call(db: Session, item) -> dict[str, Any]:
+    """R1 1.5: a call to NDL nobody answered goes to the unified inbox (never to text-back)."""
+    if not get_settings().lending_unified_inbox_enabled:
+        return {"queued": False, "status": "disabled"}
+    try:
+        item_id = record_inbound(db, item)
+        db.commit()
+    except Exception as exc:
+        db.rollback()
+        logger.error("[lending-ghl] inbound missed-call webhook failed: %s", type(exc).__name__)
+        raise HTTPException(status_code=500, detail="Missed call could not be recorded") from exc
+    return {"queued": False, "status": "inbox_recorded" if item_id else "duplicate"}
+
+
 @router.post("/ghl-missed-call")
 def ghl_missed_call(
     body: dict[str, Any],
@@ -182,13 +203,21 @@ def ghl_missed_call(
     db: Session = Depends(get_db),
 ) -> dict[str, Any]:
     """G4: a GHL workflow posts a call nobody picked up the moment it ends; its missed-call text is queued and decided
-    right after the response, with every BatchDialer gate (src/lending/ghl_missed_call.py). Answered or inbound calls
-    are ignored. UNVERIFIED body (Dev A builds the workflow): call_id, phone, call_status, contact_id, direction,
+    right after the response, with every BatchDialer gate (src/lending/ghl_missed_call.py). Answered calls are ignored;
+    a missed INBOUND call goes to the unified inbox instead (R1 1.5, never to text-back). UNVERIFIED body (Dev A builds the workflow): call_id, phone, call_status, contact_id, direction,
     user, called_at, ended_at."""
     _verify_secret(x_webhook_secret)
     log_shape("ghl-missed-call", body)
+    now = datetime.now(timezone.utc)
     try:
-        call = parse_missed_call(body, datetime.now(timezone.utc))
+        inbound = parse_inbound_missed_call(body, now)
+    except InvalidMissedCall as exc:
+        logger.warning("[lending-ghl] missed-call webhook refused: %s", exc.reason)
+        raise HTTPException(status_code=422, detail=exc.reason) from None
+    if inbound is not None:
+        return _record_inbound_missed_call(db, inbound)
+    try:
+        call = parse_missed_call(body, now)
     except InvalidMissedCall as exc:
         logger.warning("[lending-ghl] missed-call webhook refused: %s", exc.reason)
         raise HTTPException(status_code=422, detail=exc.reason) from None
