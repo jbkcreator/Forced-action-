@@ -1117,6 +1117,8 @@ class AppSettings(BaseSettings):
 	lending_instantly_base_url: str = Field(default="https://api.instantly.ai", env="LENDING_INSTANTLY_BASE_URL")
 	# 14-day follow-up (src/lending/ghl_call_import.py): record calls made in GoHighLevel in lending.call_dispositions
 	lending_ghl_call_import_enabled: bool = Field(default=False, env="LENDING_GHL_CALL_IMPORT_ENABLED")
+	# R1 1.1 contact spine sync (src/tasks/lending_contact_spine_sync.py, cron */15); --dry-run still reads while off
+	lending_contact_spine_enabled: bool = Field(default=False, env="LENDING_CONTACT_SPINE_ENABLED")
 	# G3: GHL calls ended at/after this (ISO time) are flagged by the missing-disposition alert; unset = GHL calls are not
 	# flagged (set it once the GHL disposition workflow is live, so calls from before it are not reported)
 	lending_ghl_outcomes_live_since: Optional[datetime] = Field(default=None, env="LENDING_GHL_OUTCOMES_LIVE_SINCE")
