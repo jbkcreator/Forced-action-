@@ -80,6 +80,7 @@ from src.lending.instantly_email import (InstantlySendError, InstantlySendPaused
                                          get_ndl_instantly_sender)
 from src.lending.after_hours_responder import run_send_cycle
 from src.lending.instantly_replies import CHANNEL as INSTANTLY_CHANNEL, ReplyProcessor
+from src.lending.shadow.shadow_runner import ShadowRunnerStep
 from src.lending.standing_sends import (
     StandingSendsStep,
     auto_approval_lapsed,
@@ -151,6 +152,7 @@ class CoraServices(NamedTuple):
     backflip_alerts: Optional[Callable[[], int]] = None  # queues each new Backflip block for the inbox digest
     doc_link_revocation: Optional[Callable[[], int]] = None  # R1 0.2: revokes former approvers' document links
     deal_ledger_sync: Optional[Callable[[], int]] = None  # R1 0.8: records card drafts, edits and approvals in the deal audit ledger
+    shadow_runner: Optional[Callable[[], Any]] = None  # R1 0.9: scores new cards for shadow classes and fills in outcomes
 
 
 def make_doc_link_revocation(engine: Engine, approver_ids: frozenset[str]) -> Callable[[], int]:
@@ -673,6 +675,14 @@ def run_sweep(services: CoraServices) -> None:
             services.deal_ledger_sync()
         except Exception as exc:  # class only; the events are found again next sweep (each has a dedupe key)
             logger.error("[cora] deal ledger catch-up failed (%s); retrying next sweep", type(exc).__name__)
+    if services.shadow_runner is not None:
+        try:
+            shadow_run = services.shadow_runner()
+        except Exception as exc:  # class only; the same cards are rescanned next sweep
+            logger.error("[cora] shadow runner failed (%s); retrying next sweep", type(exc).__name__)
+        else:
+            if shadow_run:
+                logger.info("[cora] shadow runner %s", shadow_run)
     if services.block_list is not None:
         try:
             services.block_list()
@@ -810,6 +820,7 @@ def build_live_services(settings: AppSettings) -> Optional[CoraServices]:
                              agent_jobs=worker.run_once if worker is not None else None,
                              standing_sends=make_standing_sends_step(engine),
                              deal_ledger_sync=make_deal_ledger_step(engine),
+                             shadow_runner=make_shadow_runner_step(engine),
                              closing_blockers=closing_blockers, doc_chase=doc_chase,
                              block_list=BlockListSweep(engine),
                              after_hours_responder=run_send_cycle,
@@ -894,6 +905,11 @@ def make_standing_sends_step(engine: Engine) -> Callable[[], Any]:
     """P1.4 sweep step: record any card edit the revise handler missed, then graduate templates that meet the rule.
     Incremental (only drafts decided or revised since the last run), with a full pass at start and once a day."""
     return StandingSendsStep(engine)
+
+
+def make_shadow_runner_step(engine: Engine) -> Callable[[], Any]:
+    """R1 0.9 sweep step: score new cards for active shadow classes, fill in outcomes for older rows."""
+    return ShadowRunnerStep(engine)
 
 
 def make_instantly_replies(engine: Engine, store: AgentStore, config: AgentCoreConfig, messages_client: MessagesClient,

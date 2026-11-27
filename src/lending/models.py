@@ -2365,6 +2365,84 @@ class LendingLoanFileGuarantor(LendingBase):
     __table_args__ = (UniqueConstraint("loan_file_id", "name", name="uq_lending_loan_file_guarantors_name"),)
 
 
+# ── R1 0.9: Shadow mode ─────────────────────────────────────────────────────────
+
+class LendingShadowClass(LendingBase):
+    """One named decision-maker in the shadow harness (R1 0.9).
+
+    ``mode`` = off | shadow | live.  ``live`` is not wired for the auto-send judge in this release.
+    ``started_at`` is set when mode transitions to shadow; ``ended_at`` when it moves back to off.
+    ``changed_by`` is the CLI operator who ran ``--start`` / ``--stop``.
+    """
+
+    __tablename__ = "shadow_classes"
+
+    class_name: Mapped[str] = mapped_column(String(80), primary_key=True)
+    mode: Mapped[str] = mapped_column(String(10), nullable=False, default="off", server_default=text("'off'"))
+    started_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    ended_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    changed_by: Mapped[Optional[str]] = mapped_column(String(80))
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_now, server_default=text("now()"))
+
+    __table_args__ = (
+        CheckConstraint("mode IN ('off', 'shadow', 'live')", name="ck_lending_shadow_classes_mode"),
+    )
+
+
+class LendingShadowDecision(LendingBase):
+    """One shadow prediction by one class for one card (R1 0.9).
+
+    ``subject_kind`` = pending_action | lead | loan_file.  ``subject_ref`` is the string key
+    (e.g. ``"action:42"`` for a pending action with id 42).  Unique on ``(class_name, subject_ref)``
+    so sweeps are idempotent.
+
+    ``inputs`` holds references and features only — no phone, email or message body.
+    ``proposed`` is the judge's prediction payload (e.g. ``{"decision": "approve"}``) plus optional confidence.
+    ``rule_version`` is the lender rule version at card creation; NULL before snapshots exist.
+
+    Match fields (filled in by later sweeps):
+    * ``actual`` = approve | edit | reject | no_decision
+    * ``decision_match`` = True when proposed == actual
+    * ``decision_seconds`` = seconds from card creation to Josh's decision
+    * ``edit_distance`` = normalised Levenshtein of first draft vs final text
+    * ``send_result`` = sent | failed | held
+    * ``deal_outcome`` = funded | paid | declined (only for cards with a deal_ref)
+    """
+
+    __tablename__ = "shadow_decisions"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    class_name: Mapped[str] = mapped_column(String(80), nullable=False)
+    class_version: Mapped[int] = mapped_column(Integer, nullable=False, default=1, server_default=text("1"))
+    subject_kind: Mapped[str] = mapped_column(String(20), nullable=False)
+    subject_ref: Mapped[str] = mapped_column(String(80), nullable=False)
+    inputs: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict, server_default=text("'{}'::jsonb"))
+    rule_version: Mapped[Optional[int]] = mapped_column(Integer)
+    confidence: Mapped[Optional[float]] = mapped_column(Numeric(5, 4))
+    proposed: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict, server_default=text("'{}'::jsonb"))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_now, server_default=text("now()"))
+    # match fields — filled in by later sweeps
+    actual: Mapped[Optional[str]] = mapped_column(String(16))
+    decision_match: Mapped[Optional[bool]] = mapped_column(Boolean)
+    decided_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    decision_seconds: Mapped[Optional[float]] = mapped_column(Numeric(10, 2))
+    edit_distance: Mapped[Optional[float]] = mapped_column(Numeric(5, 4))
+    send_result: Mapped[Optional[str]] = mapped_column(String(16))
+    deal_outcome: Mapped[Optional[str]] = mapped_column(String(20))
+    outcome_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+
+    __table_args__ = (
+        CheckConstraint("subject_kind IN ('pending_action', 'lead', 'loan_file')",
+                        name="ck_lending_shadow_decisions_subject_kind"),
+        CheckConstraint("actual IN ('approve', 'edit', 'reject', 'no_decision') OR actual IS NULL",
+                        name="ck_lending_shadow_decisions_actual"),
+        CheckConstraint("send_result IN ('sent', 'failed', 'held') OR send_result IS NULL",
+                        name="ck_lending_shadow_decisions_send_result"),
+        Index("uq_lending_shadow_decisions_class_ref", "class_name", "subject_ref", unique=True),
+        Index("ix_lending_shadow_decisions_created_at", "created_at"),
+    )
+
+
 class LendingClayEnrichment(LendingBase):
     """R1 1.3: one Clay lookup per (morning-list item, field). ``src.lending.morning_list.clay`` writes it; a row inside
     ``LENDING_CLAY_TTL_DAYS`` means the lead is never paid for twice, and today's rows count toward the daily cap."""
