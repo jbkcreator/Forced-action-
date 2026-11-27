@@ -204,19 +204,24 @@ def flagged_leads(post: Post, base: str, headers: Mapping[str, str], location_id
 def stage_counts(db, day: date) -> tuple[int, int]:
     """(booked, held) stage entries on ``day``. A missing table or failed query reports 0 / 0 rather than losing
     the rest of the summary; the savepoint keeps the outer transaction usable."""
-    start, end = day_bounds(day)
     try:
         with db.begin_nested():
-            row = db.execute(
-                text("SELECT (SELECT count(*) FROM lending.ghl_stage_events WHERE stage_key = ANY(:booked) "
-                     "AND event_at >= :start AND event_at < :end), "
-                     "(SELECT count(*) FROM lending.ghl_stage_events WHERE stage_key = ANY(:held) "
-                     "AND event_at >= :start AND event_at < :end)"),
-                {"booked": sorted(BOOKED_STAGE_KEYS), "held": sorted(SHOWED_STAGE_KEYS), "start": start, "end": end},
-            ).one()
+            return read_stage_counts(db, day)
     except Exception as exc:
         logger.warning("[david-activity] stage query failed, reporting 0: %s", type(exc).__name__)
         return 0, 0
+
+
+def read_stage_counts(db, day: date) -> tuple[int, int]:
+    """(booked, held) stage entries on ``day``; raises when the query fails."""
+    start, end = day_bounds(day)
+    row = db.execute(
+        text("SELECT (SELECT count(*) FROM lending.ghl_stage_events WHERE stage_key = ANY(:booked) "
+             "AND event_at >= :start AND event_at < :end), "
+             "(SELECT count(*) FROM lending.ghl_stage_events WHERE stage_key = ANY(:held) "
+             "AND event_at >= :start AND event_at < :end)"),
+        {"booked": sorted(BOOKED_STAGE_KEYS), "held": sorted(SHOWED_STAGE_KEYS), "start": start, "end": end},
+    ).one()
     return int(row[0] or 0), int(row[1] or 0)
 
 

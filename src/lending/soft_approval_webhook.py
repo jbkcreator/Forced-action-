@@ -24,6 +24,7 @@ from sqlalchemy import text
 from config.lending_soft_approval import FORM_CALLBACK_ID, OPEN_FORM_ACTION_ID
 from config.settings import get_settings
 from src.lending.db import lending_session
+from src.lending.dialer.call_notes import handle_notes_interaction
 from src.lending.slack_names import names_by_phone
 from src.lending.soft_approval.enrichment_link import share_facts_with_enrichment
 from src.lending.soft_approval.facts import SoftApprovalFacts
@@ -246,6 +247,11 @@ async def slack_interactivity(request: Request, background: BackgroundTasks) -> 
     if isinstance(payload, dict) and is_moved_cora_click(payload):
         background.add_task(_retire_moved_cora_card, payload)
         return {}
+    # R1 1.6 caller notes form: its own switch, so it is dispatched before the soft-approval one.
+    if isinstance(payload, dict):
+        handled = await run_in_threadpool(handle_notes_interaction, payload)
+        if handled is not None:
+            return handled
     if not get_settings().lending_soft_approval_enabled:
         return {}
     if not isinstance(payload, dict):

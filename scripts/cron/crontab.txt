@@ -1305,6 +1305,10 @@ COUNTY_ID=hillsborough
 # No-op until LENDING_DAVID_SUMMARY_ENABLED=true and LENDING_DAVID_GHL_USER_ID is set.
 25 23 * * * $PROJECT/scripts/cron/run.sh src.tasks.lending_david_summary
 25 0 * * * $PROJECT/scripts/cron/run.sh src.tasks.lending_david_summary
+# R1 1.6 David's dialer queue check (6:xx ET, Mon-Fri; off until LENDING_DIALER_QUEUE_CHECK_ENABLED). Two lines for EST/EDT; the task acts at 6:xx ET, or later the same day to finish an unfinished run.
+20 10,11 * * 1-5 $PROJECT/scripts/cron/run.sh src.tasks.lending_dialer_queue_check
+# R1 1.6 David's 2:45 PM caller scorecard + notes thread (Mon-Fri; off until LENDING_CALLER_SCORECARD_ENABLED). Two lines for EST/EDT; the task acts at 14:xx ET, or later the same day to finish an unfinished run.
+45 18,19 * * 1-5 $PROJECT/scripts/cron/run.sh src.tasks.lending_caller_scorecard
 # Lending hourly scoreboard (launch runbook Line 11): the day so far, posted at 10:00 through 19:00 ET (the 7:20pm closing board follows the 7:00pm one), and skipped when there are no dials yet. Runs every UTC hour; the task acts only when the ET hour is one of those, so daylight saving needs no second line.
 0 * * * * $PROJECT/scripts/cron/run.sh src.tasks.lending_daily_scoreboard --hourly
 

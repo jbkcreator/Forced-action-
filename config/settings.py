@@ -1104,6 +1104,9 @@ class AppSettings(BaseSettings):
 	lending_david_channel: str = Field(default="", env="LENDING_DAVID_CHANNEL")  # #isa-daily channel ID; unset = not posted
 	lending_david_ghl_user_id: str = Field(default="", env="LENDING_DAVID_GHL_USER_ID")  # David's GHL user id: his calls, texts and emails
 	lending_david_bd_agent_id: str = Field(default="", env="LENDING_DAVID_BD_AGENT_ID")  # David's BatchDialer agent id (CDR agent.id): his BatchDialer calls; unset = no BatchDialer section
+	# R1 1.6: David's 6 AM dialer queue check (src/tasks/lending_dialer_queue_check.py) and 2:45 PM scorecard + notes form (src/tasks/lending_caller_scorecard.py); both off until enabled
+	lending_dialer_queue_check_enabled: bool = Field(default=False, env="LENDING_DIALER_QUEUE_CHECK_ENABLED")
+	lending_caller_scorecard_enabled: bool = Field(default=False, env="LENDING_CALLER_SCORECARD_ENABLED")
 	lending_flagged_tag: str = Field(default="flag-for-josh", env="LENDING_FLAGGED_TAG")  # GHL tag David adds to a lead for Josh (name TBC by client)
 	# Retargeting audience export (src/tasks/lending_audience_export.py): nightly hashed files, written only when both are set
 	lending_audience_export_enabled: bool = Field(default=False, env="LENDING_AUDIENCE_EXPORT_ENABLED")
